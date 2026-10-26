@@ -174,7 +174,9 @@ class Terminal:
     def command(self, command, expected):
         self.until(self.editor_ready, f"idle composer before {command!r}")
         mark = self.mark()
-        self.send(command + "\r")
+        # Submit a prepared command as one paste. Explicit send() scenarios
+        # below still exercise individual keys, completion, paste and resize.
+        self.send("\x1b[200~" + command + "\x1b[201~\r")
         if command in ["/model", "/effort", "/provider", "/permissions"]:
             self.expect(expected, mark)
             self.until(lambda: self.grid.cursor_visible
