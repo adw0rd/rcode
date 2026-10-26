@@ -248,6 +248,9 @@ fn long_tool_turn_compacts_without_replaying_actions_or_forgetting_denials() {
     assert!(loaded.context_chars() < 150_000);
 }
 
+// Windows rejects a 160 KiB command line before rcode starts. The shared turn
+// guard is also tested directly in app::tests on every platform.
+#[cfg(unix)]
 #[test]
 fn oversized_new_request_is_rejected_without_network_or_losing_the_session() {
     let temporary = tempfile::tempdir().unwrap();

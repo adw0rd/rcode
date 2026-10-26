@@ -1118,6 +1118,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_request_leaves_memory_and_saved_history_unchanged_without_network() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
+        settings.base_url = Some(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let mut session = Session::new(&root, settings.clone()).unwrap();
+        session
+            .messages
+            .push(Message::user("Сохрани старую задачу"));
+        session.save(&store).unwrap();
+        let saved_path = session.dir(&store).join("session.json");
+        let saved_before = std::fs::read(&saved_path).unwrap();
+        let before = serde_json::to_value(&session).unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        let mut client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
+        let events = Events::new(true);
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            turn(
+                &mut session,
+                &store,
+                &mut tools,
+                &mut client,
+                &events,
+                &default_cli(),
+                &"x".repeat(crate::state::CONTEXT_LIMIT + 1),
+                false,
+            ),
+        )
+        .await
+        .expect("oversized input must be rejected locally")
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(std::fs::read(&saved_path).unwrap(), saved_before);
+        assert_eq!(
+            serde_json::to_value(Session::load(&store, &session.id, &root).unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
     async fn excess_image_input_leaves_memory_and_saved_history_unchanged() {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("project");

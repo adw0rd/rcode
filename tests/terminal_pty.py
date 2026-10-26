@@ -95,8 +95,13 @@ class Terminal:
             if self.grid.frame_complete and predicate():
                 return
             if self.status is not None:
-                raise AssertionError(f"rcode exited {self.status} while waiting for {label}")
-        raise AssertionError(f"Timed out waiting for {label}")
+                raise AssertionError(f"rcode exited {self.status} while waiting for {label}\n{self.dump()}")
+        limit = "fixture deadline" if end == DEADLINE else f"{seconds}-second wait"
+        raise AssertionError(
+            f"Timed out waiting for {label} ({limit}); "
+            f"frame_complete={self.grid.frame_complete}, alternate={self.grid.alternate}, "
+            f"cursor=({self.grid.row}, {self.grid.col}), visible={self.grid.cursor_visible}, "
+            f"pending={self.grid.pending!r}\n{self.dump()}")
 
     def expect(self, text, mark=0):
         self.until(lambda: text in self.text(mark), repr(text))

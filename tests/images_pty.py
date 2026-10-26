@@ -29,6 +29,11 @@ def tiff_rgb(width=1, height=1):
     return b'II*\x00' + struct.pack('<I', 8) + struct.pack('<H', count) + b''.join(struct.pack('<HHII', *tag) for tag in tags) + struct.pack('<IHHH', 0, 8, 8, 8) + b'\xff\x00\x00' * min(width * height, 1000)
 
 
+def paste_prompt(terminal, text):
+    # Long absolute paths are one paste, not hundreds of key events and redraws.
+    terminal.send('\x1b[200~'+text+'\x1b[201~\r')
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_): pass
     def do_POST(self):
@@ -85,10 +90,10 @@ def main(binary):
                 mark = len(server.requests)
                 terminal = ConnectTerminal(binary, project, home, [])
                 try:
-                    terminal.until(terminal.editor_ready, 'image composer')
+                    terminal.until(terminal.editor_ready, f'{kind}/{extension} image composer')
                     # A terminal can paste an absolute filename, including spaces, as one input.
                     reply = next_reply()
-                    terminal.send('\x1b[200~'+str(image)+(' что тут нарисовано?' if extension == 'tiff' else '')+'\x1b[201~\r')
+                    paste_prompt(terminal, str(image)+(' что тут нарисовано?' if extension == 'tiff' else ''))
                     terminal.editor_after(reply)
                     terminal.expect_body('Изображение: '+name)
                     session_path = next((home/'sessions').glob('*/session.json'))
@@ -104,16 +109,16 @@ def main(binary):
                     # Two copies in a single prompt must retain the caption; Giga gets one per message.
                     response_mark = terminal.mark()
                     reply = next_reply()
-                    terminal.send('/attach "'+str(image)+'" "'+str(image)+'" Объясни ошибку\r')
+                    paste_prompt(terminal, '/attach "'+str(image)+'" "'+str(image)+'" Объясни ошибку')
                     terminal.editor_after(reply, response_mark)
                     terminal.until(lambda: sum(p == '/v1/chat/completions' for p,_,_ in server.requests[mark:]) == 2, 'second image request')
                     count = len(server.requests)
                     broken = root/'broken.tiff'; broken.write_bytes(b'II*\x00bad')
                     error_mark = terminal.mark()
-                    terminal.send(str(broken)+' что тут нарисовано?\r')
+                    paste_prompt(terminal, str(broken)+' что тут нарисовано?')
                     terminal.editor_after('Не удалось прочитать TIFF', error_mark)
                     assert len(server.requests) == count
-                    terminal.send('/attach /definitely-missing.png\r')
+                    paste_prompt(terminal, '/attach /definitely-missing.png')
                     terminal.editor_after('Не удалось прочитать изображение')
                     assert len(server.requests) == count
                     terminal.command('/export images.md', 'Диалог сохранён')
@@ -124,11 +129,11 @@ def main(binary):
                 image.unlink()
                 restored = ConnectTerminal(binary, project, home, ['--resume', saved['id']])
                 try:
-                    restored.until(restored.editor_ready, 'resumed image')
+                    restored.until(restored.editor_ready, f'resumed {kind}/{extension} image')
                     restored.expect_body('Изображение: '+name)
                     new_mark = restored.mark()
                     reply = next_reply()
-                    restored.send('Что видно на предыдущем скрине?\r')
+                    paste_prompt(restored, 'Что видно на предыдущем скрине?')
                     restored.editor_after(reply, new_mark)
                     restored.send('/exit\r'); restored.finished()
                 finally: restored.close()
