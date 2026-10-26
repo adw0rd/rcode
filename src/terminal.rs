@@ -881,7 +881,7 @@ fn editor_layout(
     if footer_rows > 2 {
         view.push(
             format!(
-                "{} · / команды · Alt+Enter новая строка · Ctrl+P/N история",
+                "{} · / команды · Shift/Alt+Enter · Ctrl+J новая строка · Ctrl+P/N история",
                 ellipsis(&flat(&footer.workspace), width / 3)
             ),
             RowStyle::Subtle,

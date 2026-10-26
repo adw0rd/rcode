@@ -447,6 +447,7 @@ def main(binary):
             assert "↑0 ↓0" in terminal.grid.rows()[-1], terminal.dump()
             assert sum(not row for row in terminal.grid.rows()[:20]) >= 10, terminal.dump()
             terminal.capture("initial")
+            assert terminal.grid.keyboard_stack[-1] & 1, "Shift+Enter requires keyboard protocol opt-in"
 
             # Slash suggestions and Tab must complete a real command.
             mark = terminal.mark()
@@ -525,6 +526,32 @@ def main(binary):
             terminal.resize(140, 28)
             terminal.until(terminal.editor_ready, "full-height composer after final resize")
             phase("resize and paste complete")
+
+            # Ghostty/kitty distinguish Shift+Enter only after protocol opt-in.
+            # A modified Enter inserts a line; only bare Enter sends the request.
+            before_multiline = len(fixture.recorded())
+            mark = terminal.mark()
+            terminal.send("SHIFT_Привет\x1b[13;2uвторая\x1b\rтретья\x0aчетвёртая"
+                          "\x1b[13;3uпятая\x1b[106;5uшестая")
+            terminal.until(lambda: terminal.grid.cursor_visible
+                           and terminal.grid.col == 2 + len("шестая")
+                           and any("SHIFT_Привет" in row for row in terminal.grid.rows()),
+                           "multiline draft after Shift+Enter, Alt+Enter and Ctrl+J")
+            assert len(fixture.recorded()) == before_multiline, "Modified Enter submitted the draft"
+            terminal.send("\r")
+            terminal.editor_after("READY_CUSTOM", mark)
+            assert len(fixture.recorded()) == before_multiline + 1
+            assert fixture.recorded()[-1]["messages"][-1]["content"] == "SHIFT_Привет\nвторая\nтретья\nчетвёртая\nпятая\nшестая"
+            assert terminal.grid.keyboard_stack[-1] & 1
+
+            # Legacy password/line forms temporarily leave Screen's keyboard mode.
+            terminal.send("/connect custom\r")
+            terminal.expect("Адрес API")
+            assert not terminal.grid.alternate
+            assert terminal.grid.keyboard_stack == [0]
+            terminal.send("\x03")
+            terminal.until(terminal.editor_ready, "editor after cancelled connection form")
+            assert terminal.grid.keyboard_stack == [0, 1], "Keyboard mode was not restored after suspend"
 
             terminal.command("HISTORY_REQUEST", "LATEST_HISTORY_VISIBLE")
             terminal.expect_body("LATEST_HISTORY_VISIBLE")
@@ -708,6 +735,8 @@ def main(binary):
             assert terminal.grid.cursor_visible, "Cursor not restored on exit"
             assert not terminal.grid.bracketed_paste, "Bracketed paste not disabled on exit"
             assert not terminal.grid.mouse_modes, "Mouse reporting not disabled on exit"
+            assert terminal.grid.keyboard_stack == [0], "Keyboard protocol leaked after exit"
+            assert terminal.grid.keyboard_stacks[True] == [0], "Alternate keyboard stack leaked after exit"
             restored = termios.tcgetattr(terminal.master)
             assert restored == terminal.initial_termios, "termios not restored on exit"
             phase("child exited and terminal restored")

@@ -20,6 +20,7 @@ class Viewport:
         self.left_alternate = False
         self.cursor_visible = True
         self.bracketed_paste = False
+        self.keyboard_stacks = {False: [0], True: [0]}
         self.mouse_modes = set()
         self.clipboard_writes = []
         self.queried_cursor = False
@@ -35,6 +36,10 @@ class Viewport:
 
     def rows(self):
         return ["".join(row).rstrip() for row in self.cells]
+
+    @property
+    def keyboard_stack(self):
+        return self.keyboard_stacks[self.alternate]
 
     @property
     def frame_complete(self):
@@ -131,6 +136,16 @@ class Viewport:
         self.col += size
 
     def csi(self, parameters, command):
+        if command == "u" and parameters.startswith((">", "<", "=")):
+            flag = int(parameters[1:] or "1")
+            if parameters.startswith(">"):
+                self.keyboard_stack.append(flag)
+            elif parameters.startswith("<"):
+                for _ in range(min(flag, len(self.keyboard_stack) - 1)):
+                    self.keyboard_stack.pop()
+            else:
+                self.keyboard_stack[-1] = flag
+            return
         private = parameters.startswith("?")
         raw = parameters.lstrip("?")
         args = [int(part or "0") for part in raw.split(";") if part.isdigit() or not part]
@@ -215,6 +230,17 @@ def verify_viewport():
     assert not getattr(view, "frame_complete", True), "CursorShow before synchronized-update end is not a completed frame"
     view.feed(b"\x1b[?2026l")
     assert view.frame_complete and view.completed_frames == 1
+    view.feed(b"\x1b[>1u\x1b[>3u")
+    assert view.keyboard_stack == [0, 1, 3]
+    view.feed(b"\x1b[?1049h")
+    assert view.keyboard_stack == [0]
+    view.feed(b"\x1b[>1u\x1b[?1049l")
+    assert view.keyboard_stack == [0, 1, 3]
+    view.feed(b"\x1b[?1049h\x1b[<1u\x1b[?1049l")
+    assert view.keyboard_stacks[True] == [0]
+    assert view.keyboard_stack == [0, 1, 3]
+    view.feed(b"\x1b[<1u\x1b[<1u")
+    assert view.keyboard_stack == [0]
 
 
 if __name__ == "__main__":

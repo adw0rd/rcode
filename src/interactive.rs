@@ -473,7 +473,7 @@ fn help() {
         "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать"
     );
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Alt+Enter новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -575,7 +575,9 @@ pub async fn run(
     let mut runtime = cli.clone();
     let mut plan = cli.plan;
     let mut composer = terminal::Editor::new();
-    let mut plain = ui::editor()?;
+    // An unused readline editor still installs signal handlers. Keep it out of
+    // Screen's lifecycle so temporary connection forms can restore its handlers.
+    let mut plain = if rich { None } else { Some(ui::editor()?) };
     let mut input_history =
         match crate::input_history::InputHistory::load(store, &session.root, |text| {
             events.redact(text)
@@ -583,7 +585,9 @@ pub async fn run(
             Ok((history, entries)) => {
                 for entry in entries {
                     composer.add_history(&entry);
-                    let _ = plain.add_history_entry(entry.as_str());
+                    if let Some(editor) = &mut plain {
+                        let _ = editor.add_history_entry(entry.as_str());
+                    }
                 }
                 Some(history)
             }
@@ -624,7 +628,7 @@ pub async fn run(
         } else if rich {
             composer.read(&footer(session, &runtime, plan))?
         } else {
-            match plain.readline(if plan {
+            match plain.as_mut().expect("plain editor").readline(if plan {
                 "rcode [план] › "
             } else if runtime.permissions() == ApprovalMode::FullAccess {
                 "rcode [полный доступ] › "
@@ -661,7 +665,9 @@ pub async fn run(
         }
         let redacted = events.redact(input);
         composer.add_history(&redacted);
-        let _ = plain.add_history_entry(redacted.as_str());
+        if let Some(editor) = &mut plain {
+            let _ = editor.add_history_entry(redacted.as_str());
+        }
         if let Some(history) = &input_history
             && let Err(error) = history.record(&redacted, |text| events.redact(text))
         {

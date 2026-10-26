@@ -34,6 +34,22 @@ use tokio_util::sync::CancellationToken;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+// Unix terminals need an opt-in to distinguish Shift+Enter from bare Enter.
+// Windows console input already reports modifiers; crossterm's kitty commands
+// are unsupported by its legacy Windows backend.
+#[cfg(unix)]
+const ENABLE_EXTENDED_KEYS: crossterm::event::PushKeyboardEnhancementFlags =
+    crossterm::event::PushKeyboardEnhancementFlags(
+        crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+    );
+#[cfg(unix)]
+const DISABLE_EXTENDED_KEYS: crossterm::event::PopKeyboardEnhancementFlags =
+    crossterm::event::PopKeyboardEnhancementFlags;
+#[cfg(not(unix))]
+const ENABLE_EXTENDED_KEYS: Print<&str> = Print("");
+#[cfg(not(unix))]
+const DISABLE_EXTENDED_KEYS: Print<&str> = Print("");
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Paint {
     #[default]
@@ -1097,6 +1113,7 @@ pub fn start(footer: Footer) -> Result<SessionGuard> {
     if let Err(e) = execute!(
         io::stdout(),
         EnterAlternateScreen,
+        ENABLE_EXTENDED_KEYS,
         EnableBracketedPaste,
         EnableMouseCapture,
         Hide,
@@ -1107,6 +1124,7 @@ pub fn start(footer: Footer) -> Result<SessionGuard> {
             io::stdout(),
             DisableMouseCapture,
             DisableBracketedPaste,
+            DISABLE_EXTENDED_KEYS,
             Show,
             LeaveAlternateScreen
         );
@@ -1117,6 +1135,11 @@ pub fn start(footer: Footer) -> Result<SessionGuard> {
         screen: screen.clone(),
         workers: vec![],
     };
+    // Initialize the shared event source before a temporary readline form can
+    // install its own signal handlers. Poll preserves any pending raw input;
+    // the guard restores the terminal if initialization fails.
+    #[cfg(unix)]
+    event::poll(Duration::ZERO)?;
     let draw = screen.clone();
     guard.workers.push(
         thread::Builder::new()
@@ -1247,7 +1270,9 @@ pub fn start(footer: Footer) -> Result<SessionGuard> {
 }
 impl Drop for SessionGuard {
     fn drop(&mut self) {
+        let mut was_suspended = false;
         self.screen.change(|s| {
+            was_suspended = s.suspended > 0;
             s.stop = true;
             s.cancel.cancel();
         });
@@ -1256,6 +1281,9 @@ impl Drop for SessionGuard {
         }
         let _io = self.screen.io.lock().unwrap_or_else(|e| e.into_inner());
         *active().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if !was_suspended {
+            let _ = execute!(io::stdout(), DISABLE_EXTENDED_KEYS);
+        }
         let _ = execute!(
             io::stdout(),
             EndSynchronizedUpdate,
@@ -1283,6 +1311,7 @@ pub fn suspend() -> Result<Suspended> {
                     io::stdout(),
                     DisableMouseCapture,
                     DisableBracketedPaste,
+                    DISABLE_EXTENDED_KEYS,
                     ResetColor,
                     Show,
                     LeaveAlternateScreen
@@ -1295,6 +1324,7 @@ pub fn suspend() -> Result<Suspended> {
                 let _ = execute!(
                     io::stdout(),
                     EnterAlternateScreen,
+                    ENABLE_EXTENDED_KEYS,
                     EnableBracketedPaste,
                     EnableMouseCapture,
                     Hide
@@ -1320,6 +1350,7 @@ impl Drop for Suspended {
                 let _ = execute!(
                     io::stdout(),
                     EnterAlternateScreen,
+                    ENABLE_EXTENDED_KEYS,
                     EnableBracketedPaste,
                     EnableMouseCapture,
                     Hide,
