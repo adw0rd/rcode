@@ -11,7 +11,7 @@ import zipfile
 
 def main(target, ref):
     root = pathlib.Path(__file__).resolve().parent.parent
-    version = re.search(r'^version = "([^"]+)"', (root / 'Cargo.toml').read_text(), re.M).group(1)
+    version = re.search(r'^version = "([^"]+)"', (root / 'Cargo.toml').read_text(encoding='utf-8'), re.M).group(1)
     if ref.startswith('refs/tags/') and ref != 'refs/tags/v' + version:
         raise SystemExit('Тег не совпадает с версией Cargo.toml')
     filename = 'rcode.exe' if 'windows' in target else 'rcode'
