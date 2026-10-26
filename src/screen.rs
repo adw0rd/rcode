@@ -1,22 +1,31 @@
 //! Один владелец viewport, терминального вывода и очереди клавиатуры.
-use crate::{terminal::Footer, ui};
+use crate::{
+    markdown,
+    selection::{Point, Selection},
+    terminal::Footer,
+    ui,
+};
 use anyhow::{Result, bail};
 use crossterm::{
+    clipboard::CopyToClipboard,
     cursor::{Hide, MoveTo, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute, queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{
         self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
         EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Write},
+    ops::Range,
     sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
@@ -33,6 +42,7 @@ pub enum Paint {
     Muted,
     Selected,
     Error,
+    ShellInput(usize),
     Success,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,9 +60,25 @@ pub struct Panel {
     pub cursor: Option<(usize, usize)>,
     pub mode: Mode,
 }
+enum History {
+    Plain(String),
+    Markdown(markdown::Markdown),
+}
+impl History {
+    fn source(&self) -> &str {
+        match self {
+            Self::Plain(text) => text,
+            Self::Markdown(doc) => doc.source(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.source().is_empty()
+    }
+}
 struct State {
     footer: Footer,
-    history: VecDeque<String>,
+    history: VecDeque<History>,
+    markdown_active: Option<usize>,
     bytes: usize,
     panel: Option<Panel>,
     mode: Mode,
@@ -66,11 +92,30 @@ struct State {
     input_epoch: u64,
     picker_cancelled: bool,
     editor_events: VecDeque<Event>,
+    selection: Option<TextSelection>,
+    copy_hint: Option<String>,
+}
+struct TextSelection {
+    value: Selection,
+    snapshot: Frame,
+    size: (u16, u16),
 }
 struct Inbound {
     event: Event,
     mode: Mode,
     epoch: u64,
+}
+impl State {
+    fn trim_history(&mut self) {
+        while (self.bytes > 2 * 1024 * 1024 || self.history.len() > 10_000)
+            && self.history.len() > 1
+        {
+            if let Some(old) = self.history.pop_front() {
+                self.bytes = self.bytes.saturating_sub(old.source().len());
+                self.markdown_active = self.markdown_active.and_then(|index| index.checked_sub(1));
+            }
+        }
+    }
 }
 pub struct Screen {
     state: Mutex<State>,
@@ -78,6 +123,8 @@ pub struct Screen {
     io: Mutex<()>,
     rx: Mutex<mpsc::Receiver<io::Result<Inbound>>>,
     tx: mpsc::Sender<io::Result<Inbound>>,
+    clipboard_tx: mpsc::SyncSender<String>,
+    clipboard_rx: Mutex<Option<mpsc::Receiver<String>>>,
 }
 pub struct SessionGuard {
     screen: Arc<Screen>,
@@ -118,10 +165,12 @@ pub fn panel_height(height: u16) -> u16 {
 impl Screen {
     fn new(footer: Footer) -> Arc<Self> {
         let (tx, rx) = mpsc::channel();
+        let (clipboard_tx, clipboard_rx) = mpsc::sync_channel(2);
         Arc::new(Self {
             state: Mutex::new(State {
                 footer,
-                history: VecDeque::from([String::new()]),
+                history: VecDeque::from([History::Plain(String::new())]),
+                markdown_active: None,
                 bytes: 0,
                 panel: None,
                 mode: Mode::Busy,
@@ -135,11 +184,15 @@ impl Screen {
                 input_epoch: 0,
                 picker_cancelled: false,
                 editor_events: VecDeque::new(),
+                selection: None,
+                copy_hint: None,
             }),
             wake: Condvar::new(),
             io: Mutex::new(()),
             rx: Mutex::new(rx),
             tx,
+            clipboard_tx,
+            clipboard_rx: Mutex::new(Some(clipboard_rx)),
         })
     }
     fn change(&self, f: impl FnOnce(&mut State)) {
@@ -208,14 +261,16 @@ impl Screen {
         let text = ui::safe(text);
         self.change(|s| {
             for part in text.split_inclusive('\n') {
-                if s.history.is_empty() {
-                    s.history.push_back(String::new());
+                if !matches!(s.history.back(), Some(History::Plain(_))) {
+                    s.history.push_back(History::Plain(String::new()));
                 }
                 let content = part.strip_suffix('\n').unwrap_or(part);
-                s.history.back_mut().unwrap().push_str(content);
+                let Some(History::Plain(last)) = s.history.back_mut() else {
+                    unreachable!()
+                };
+                last.push_str(content);
                 s.bytes = s.bytes.saturating_add(content.len());
-                if s.history.back().is_some_and(|line| line.len() > 131_072) {
-                    let last = s.history.back_mut().unwrap();
+                if last.len() > 131_072 {
                     let mut at = last.len() - 65_536;
                     while !last.is_char_boundary(at) {
                         at += 1;
@@ -225,15 +280,38 @@ impl Screen {
                     s.bytes = s.bytes.saturating_sub(at);
                 }
                 if part.ends_with('\n') {
-                    s.history.push_back(String::new());
+                    s.history.push_back(History::Plain(String::new()));
                 }
             }
-            while (s.bytes > 2 * 1024 * 1024 || s.history.len() > 10_000) && s.history.len() > 1 {
-                if let Some(old) = s.history.pop_front() {
-                    s.bytes = s.bytes.saturating_sub(old.len());
-                }
-            }
+            s.trim_history();
         });
+    }
+    /// Only assistant replies use Markdown; model data never supplies terminal controls.
+    pub fn append_markdown(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.change(|s| {
+            if s.markdown_active.is_none() {
+                // An empty tail is the position for the next transcript entry.
+                if s.history.back().is_some_and(History::is_empty) {
+                    s.history.pop_back();
+                }
+                s.history
+                    .push_back(History::Markdown(markdown::Markdown::new()));
+                s.markdown_active = Some(s.history.len() - 1);
+            }
+            let Some(History::Markdown(doc)) = s.history.get_mut(s.markdown_active.unwrap()) else {
+                unreachable!()
+            };
+            let before = doc.source().len();
+            doc.append(text);
+            s.bytes = s.bytes.saturating_add(doc.source().len() - before);
+            s.trim_history();
+        });
+    }
+    pub fn finish_markdown(&self) {
+        self.change(|s| s.markdown_active = None);
     }
     pub fn line(&self, text: &str) {
         self.append(&format!("{text}\n"));
@@ -253,10 +331,13 @@ impl Screen {
     }
     pub fn clear_history(&self) {
         self.change(|s| {
-            s.history = VecDeque::from([String::new()]);
+            s.history = VecDeque::from([History::Plain(String::new())]);
+            s.markdown_active = None;
             s.bytes = 0;
             s.scroll = 0;
             s.anchor = None;
+            s.selection = None;
+            s.copy_hint = None;
         });
     }
     pub fn usage(&self, input: u64, output: u64) {
@@ -354,7 +435,10 @@ impl Screen {
             .unwrap_or_else(|e| e.into_inner())
             .history
             .iter()
-            .cloned()
+            .map(|entry| match entry {
+                History::Plain(text) => text.as_str(),
+                History::Markdown(doc) => doc.source().trim_end_matches('\n'),
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -400,7 +484,12 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 fn num(n: u64) -> String {
     crate::presentation::number(n)
 }
-fn status(footer: &Footer, width: usize, scroll: usize) -> Vec<(String, Paint)> {
+fn status(
+    footer: &Footer,
+    width: usize,
+    scroll: usize,
+    first_width: usize,
+) -> Vec<(String, Paint)> {
     let permission = &footer.permissions;
     let mode = if footer.plan {
         "ПЛАН"
@@ -413,14 +502,14 @@ fn status(footer: &Footer, width: usize, scroll: usize) -> Vec<(String, Paint)> 
     );
     let model = clip(
         &flat(&footer.model),
-        width.saturating_sub(UnicodeWidthStr::width(tail.as_str()) + mode.len() + 3),
+        first_width.saturating_sub(UnicodeWidthStr::width(tail.as_str()) + mode.len() + 3),
     );
-    let first = if width >= 54 {
+    let first = if first_width >= 54 {
         format!("{model}{tail} · {mode}")
     } else {
         format!(
             "{} · {} · {} · {}",
-            clip(&flat(&footer.model), width.saturating_sub(24)),
+            clip(&flat(&footer.model), first_width.saturating_sub(24)),
             footer.effort,
             permission,
             mode
@@ -448,14 +537,40 @@ fn status(footer: &Footer, width: usize, scroll: usize) -> Vec<(String, Paint)> 
         )
     };
     vec![
-        (clip(&flat(&first), width), Paint::Normal),
+        (clip(&flat(&first), first_width), Paint::Normal),
         (clip(&second, width), Paint::Muted),
     ]
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Frame {
     rows: Vec<(String, Paint)>,
+    rich_rows: BTreeMap<usize, markdown::Row>,
+    selection_ranges: BTreeMap<usize, Range<usize>>,
+    body_count: usize,
     cursor: Option<(usize, usize)>,
+}
+fn transcript(s: &State, width: usize) -> Vec<(String, Option<markdown::Row>)> {
+    let mut rows = Vec::new();
+    for entry in &s.history {
+        match entry {
+            History::Plain(text) => {
+                rows.extend(wrap(text, width).into_iter().map(|text| (text, None)))
+            }
+            History::Markdown(doc) => rows.extend(
+                doc.rows(width)
+                    .iter()
+                    .map(|row| (row.text(), Some(row.clone()))),
+            ),
+        }
+    }
+    if rows
+        .last()
+        .is_some_and(|(text, style)| text.is_empty() && style.is_none())
+        && rows.len() > 1
+    {
+        rows.pop();
+    }
+    rows
 }
 fn compose(s: &State, width: u16, height: u16) -> Frame {
     let width = usize::from(width.saturating_sub(1));
@@ -511,25 +626,27 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
     let panel_offset = panel.rows.len().saturating_sub(panel_count);
     let body_count = available.saturating_sub(panel_count);
     let mut rows = vec![(String::new(), Paint::Normal); height];
-    let mut history = Vec::new();
-    for line in &s.history {
-        history.extend(wrap(line, width));
-    }
-    // A trailing open line is a cursor position, not another transcript row.
-    if history.last().is_some_and(String::is_empty) && history.len() > 1 {
-        history.pop();
-    }
+    let history = transcript(s, width);
+    let mut rich_rows = BTreeMap::new();
+    let mut selection_ranges = BTreeMap::new();
     let maximum = history.len().saturating_sub(body_count);
     let start = s
         .anchor
         .map(|a| a.min(maximum))
         .unwrap_or_else(|| maximum.saturating_sub(s.scroll.min(maximum)));
     let scroll = maximum.saturating_sub(start);
-    for (i, line) in history.into_iter().skip(start).take(body_count).enumerate() {
+    for (i, (line, rich_row)) in history.into_iter().skip(start).take(body_count).enumerate() {
+        if let Some(row) = rich_row {
+            rich_rows.insert(i, row);
+            rows[i] = (line, Paint::Normal);
+            continue;
+        }
         let paint =
             if line.starts_with("❯") || line.starts_with("✦") || line.trim_start().starts_with('●')
             {
                 Paint::Border
+            } else if line.starts_with("! ") {
+                Paint::ShellInput(0)
             } else if line.starts_with("✗") || line.starts_with("Ошибка") {
                 Paint::Error
             } else if line.starts_with('✓') || line.starts_with('+') {
@@ -555,12 +672,50 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
                 .unwrap_or_default(),
         );
     }
-    let status = status(&s.footer, width, scroll);
+    let version = if width >= 54 {
+        format!("rcode {}", env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("v{}", env!("CARGO_PKG_VERSION"))
+    };
+    let version_width = UnicodeWidthStr::width(version.as_str());
+    let first_width = width
+        .checked_sub(version_width)
+        .map_or(width, |remaining| remaining.saturating_sub(2));
+    let status = status(&s.footer, width, scroll, first_width);
     if footer_count == 2 {
         rows[height - 2] = status[0].clone();
         rows[height - 1] = status[1].clone();
     } else if footer_count == 1 {
         rows[height - 1] = status[0].clone();
+    }
+    if let Some(selection) = &s.selection
+        && selection.size == ((width + 1) as u16, height as u16)
+    {
+        for (i, row) in rows
+            .iter_mut()
+            .take(body_count.min(selection.snapshot.body_count))
+            .enumerate()
+        {
+            *row = selection.snapshot.rows[i].clone();
+            rich_rows.remove(&i);
+            if let Some(rich) = selection.snapshot.rich_rows.get(&i) {
+                rich_rows.insert(i, rich.clone());
+            }
+            if let Some(range) = selection.value.range(i) {
+                selection_ranges.insert(i, range);
+            }
+        }
+    }
+    if let Some(hint) = &s.copy_hint
+        && footer_count == 2
+    {
+        rows[height - 2].0 = clip(&format!("{hint} · {}", rows[height - 2].0), width);
+    }
+    if footer_count > 0 && version_width <= width {
+        let row = &mut rows[height - footer_count].0;
+        let left = clip(row, first_width);
+        let padding = width - UnicodeWidthStr::width(left.as_str()) - version_width;
+        *row = format!("{left}{}{version}", " ".repeat(padding));
     }
     let cursor = panel.cursor.and_then(|(row, col)| {
         if row < panel_offset || row >= panel_offset + panel_count || width == 0 {
@@ -572,18 +727,111 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
             ))
         }
     });
-    Frame { rows, cursor }
+    Frame {
+        rows,
+        rich_rows,
+        selection_ranges,
+        body_count,
+        cursor,
+    }
+}
+fn print_selected(
+    out: &mut impl Write,
+    text: &str,
+    range: Option<&Range<usize>>,
+    column: &mut usize,
+) -> io::Result<()> {
+    let Some(range) = range else {
+        *column += UnicodeWidthStr::width(text);
+        return queue!(out, Print(text));
+    };
+    let mut reversed = false;
+    let mut run = String::new();
+    for g in text.graphemes(true) {
+        let size = UnicodeWidthStr::width(g);
+        let selected = *column < range.end && *column + size > range.start;
+        if selected != reversed {
+            queue!(
+                out,
+                Print(&run),
+                SetAttribute(if selected {
+                    Attribute::Reverse
+                } else {
+                    Attribute::NoReverse
+                })
+            )?;
+            run.clear();
+            reversed = selected;
+        }
+        run.push_str(g);
+        *column += size;
+    }
+    queue!(out, Print(run), SetAttribute(Attribute::NoReverse))
+}
+pub(crate) fn print_shell_input(
+    out: &mut impl Write,
+    text: &str,
+    marker: usize,
+    selection: Option<&Range<usize>>,
+    column: &mut usize,
+) -> io::Result<()> {
+    let Some(command) = text.get(marker..).and_then(|tail| tail.strip_prefix('!')) else {
+        return print_selected(out, text, selection, column);
+    };
+    print_selected(out, &text[..marker], selection, column)?;
+    queue!(out, SetForegroundColor(Color::Red))?;
+    print_selected(out, "!", selection, column)?;
+    queue!(out, ResetColor)?;
+    print_selected(out, command, selection, column)
 }
 fn render(frame: &Frame) -> io::Result<()> {
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate, Hide)?;
     for (row, (text, paint)) in frame.rows.iter().enumerate() {
+        let selection = frame.selection_ranges.get(&row);
+        let mut column = 0;
         queue!(
             out,
             MoveTo(0, row as u16),
+            SetAttribute(Attribute::Reset),
             ResetColor,
             Clear(ClearType::CurrentLine)
         )?;
+        if let Some(rich_row) = frame.rich_rows.get(&row) {
+            let color = std::env::var_os("NO_COLOR").is_none();
+            for span in &rich_row.spans {
+                queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+                if color {
+                    if rich_row.code {
+                        queue!(
+                            out,
+                            SetBackgroundColor(Color::AnsiValue(236)),
+                            SetForegroundColor(Color::White)
+                        )?;
+                    }
+                    match span.style.tone {
+                        markdown::Tone::Accent | markdown::Tone::InlineCode => {
+                            queue!(out, SetForegroundColor(Color::Cyan))?
+                        }
+                        markdown::Tone::Muted => queue!(out, SetForegroundColor(Color::Grey))?,
+                        markdown::Tone::Normal => {}
+                    }
+                }
+                for (enabled, attribute) in [
+                    (span.style.bold, Attribute::Bold),
+                    (span.style.italic, Attribute::Italic),
+                    (span.style.underline, Attribute::Underlined),
+                    (span.style.strike, Attribute::CrossedOut),
+                ] {
+                    if enabled {
+                        queue!(out, SetAttribute(attribute))?;
+                    }
+                }
+                print_selected(&mut out, &span.text, selection, &mut column)?;
+            }
+            queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+            continue;
+        }
         match paint {
             Paint::Border => queue!(out, SetForegroundColor(Color::Cyan))?,
             Paint::Muted => queue!(out, SetForegroundColor(Color::Grey))?,
@@ -594,9 +842,14 @@ fn render(frame: &Frame) -> io::Result<()> {
             )?,
             Paint::Error => queue!(out, SetForegroundColor(Color::Red))?,
             Paint::Success => queue!(out, SetForegroundColor(Color::Green))?,
+            Paint::ShellInput(marker) => {
+                print_shell_input(&mut out, text, *marker, selection, &mut column)?;
+                continue;
+            }
             Paint::Normal => {}
         }
-        queue!(out, Print(text), ResetColor)?;
+        print_selected(&mut out, text, selection, &mut column)?;
+        queue!(out, ResetColor)?;
     }
     if let Some((row, col)) = frame.cursor {
         queue!(out, MoveTo(col as u16, row as u16), Show)?;
@@ -613,14 +866,42 @@ fn maximum_scroll(s: &State, width: u16, height: u16) -> usize {
     let mut lines = s
         .history
         .iter()
-        .map(|line| wrap(line, width).len())
+        .map(|entry| match entry {
+            History::Plain(text) => wrap(text, width).len(),
+            History::Markdown(doc) => doc.rows(width).len(),
+        })
         .sum::<usize>();
-    if s.history.back().is_some_and(String::is_empty) && lines > 1 {
+    if s.history.back().is_some_and(History::is_empty) && lines > 1 {
         lines -= 1;
     }
     lines.saturating_sub(body)
 }
+fn request_copy(screen: &Screen, state: &mut State) {
+    let Some(selection) = &state.selection else {
+        return;
+    };
+    let text = selection.value.text();
+    if text.is_empty() {
+        return;
+    }
+    state.copy_hint = Some(if text.len() > 128 * 1024 {
+        "Слишком большое выделение: выберите меньший фрагмент".into()
+    } else if screen.clipboard_tx.try_send(text).is_ok() {
+        "Копирую выделение…".into()
+    } else {
+        "Копирование занято; повторите Ctrl+C".into()
+    });
+}
+fn has_selected_text(state: &State) -> bool {
+    state
+        .selection
+        .as_ref()
+        .is_some_and(|selection| !selection.value.text().is_empty())
+}
 fn route(screen: &Screen, event: Event) {
+    if matches!(&event, Event::Mouse(m) if m.kind == MouseEventKind::Moved) {
+        return;
+    }
     let mut deliver = true;
     let target;
     let epoch;
@@ -628,6 +909,7 @@ fn route(screen: &Screen, event: Event) {
         let mut s = screen.state.lock().unwrap_or_else(|e| e.into_inner());
         let defer_to_editor = s.mode == Mode::Picker && s.picker_cancelled;
         if s.mode == Mode::Picker
+            && !matches!(&event, Event::Key(k) if (k.code==KeyCode::Esc && s.selection.is_some()) || (k.code==KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) && has_selected_text(&s)))
             && matches!(&event,Event::Key(k)if k.kind!=KeyEventKind::Release&&(k.code==KeyCode::Esc||(k.code==KeyCode::Char('c')&&k.modifiers.contains(KeyModifiers::CONTROL))))
         {
             s.picker_cancelled = true;
@@ -639,8 +921,10 @@ fn route(screen: &Screen, event: Event) {
             .unwrap_or((80, 24));
         let is_scroll = matches!(
             &event,
-            Event::Mouse(_)
-                | Event::Resize(_, _)
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollUp | MouseEventKind::ScrollDown,
+                ..
+            }) | Event::Resize(_, _)
                 | Event::Key(KeyEvent {
                     code: KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End,
                     ..
@@ -656,37 +940,122 @@ fn route(screen: &Screen, event: Event) {
         let step = usize::from(height / 2).max(1);
         match &event {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
-                if s.mode == Mode::Busy
-                    && (k.code == KeyCode::Esc
-                        || (k.code == KeyCode::Char('c')
-                            && k.modifiers.contains(KeyModifiers::CONTROL)))
-                {
-                    s.cancel.cancel();
-                    s.phase = Some(("Прерываю…".into(), Instant::now()));
+                let copy = has_selected_text(&s)
+                    && k.code == KeyCode::Char('c')
+                    && k.modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+                if copy {
+                    request_copy(screen, &mut s);
                     deliver = false;
-                } else if s.mode != Mode::Picker && k.code == KeyCode::PageUp {
-                    s.scroll = s.scroll.saturating_add(step).min(100_000);
+                } else if s.selection.is_some() && k.code == KeyCode::Esc {
+                    s.selection = None;
+                    s.copy_hint = None;
                     deliver = false;
-                } else if s.mode != Mode::Picker && k.code == KeyCode::PageDown {
-                    s.scroll = s.scroll.saturating_sub(step);
-                    deliver = false;
-                } else if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::End {
-                    s.scroll = 0;
-                    deliver = false;
-                } else if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Home {
-                    s.scroll = 100_000;
-                    deliver = false;
-                } else if s.mode == Mode::Busy {
-                    deliver = false;
+                } else {
+                    s.selection = None;
+                    s.copy_hint = None;
+                    if s.mode == Mode::Busy
+                        && (k.code == KeyCode::Esc
+                            || (k.code == KeyCode::Char('c')
+                                && k.modifiers.contains(KeyModifiers::CONTROL)))
+                    {
+                        s.cancel.cancel();
+                        s.phase = Some(("Прерываю…".into(), Instant::now()));
+                        deliver = false;
+                    } else if s.mode != Mode::Picker && k.code == KeyCode::PageUp {
+                        s.scroll = s.scroll.saturating_add(step).min(100_000);
+                        deliver = false;
+                    } else if s.mode != Mode::Picker && k.code == KeyCode::PageDown {
+                        s.scroll = s.scroll.saturating_sub(step);
+                        deliver = false;
+                    } else if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::End
+                    {
+                        s.scroll = 0;
+                        deliver = false;
+                    } else if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Home
+                    {
+                        s.scroll = 100_000;
+                        deliver = false;
+                    } else if s.mode == Mode::Busy {
+                        deliver = false;
+                    }
                 }
             }
             Event::Mouse(m) => {
                 match m.kind {
-                    MouseEventKind::ScrollUp => s.scroll = s.scroll.saturating_add(3).min(100_000),
-                    MouseEventKind::ScrollDown => s.scroll = s.scroll.saturating_sub(3),
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        s.selection = None;
+                        s.copy_hint = None;
+                        if s.mode == Mode::Picker {
+                            let code = if m.kind == MouseEventKind::ScrollUp {
+                                KeyCode::Up
+                            } else {
+                                KeyCode::Down
+                            };
+                            let _ = screen.tx.send(Ok(Inbound {
+                                event: Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                                mode: s.mode,
+                                epoch: s.input_epoch,
+                            }));
+                        } else if m.kind == MouseEventKind::ScrollUp {
+                            s.scroll = s.scroll.saturating_add(3).min(100_000);
+                        } else {
+                            s.scroll = s.scroll.saturating_sub(3);
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        s.selection = None;
+                        s.copy_hint = None;
+                        let frame = compose(&s, width, height);
+                        if usize::from(m.row) < frame.body_count
+                            && !m.modifiers.contains(KeyModifiers::SHIFT)
+                        {
+                            let rows = frame
+                                .rows
+                                .iter()
+                                .take(frame.body_count)
+                                .map(|r| r.0.clone())
+                                .collect();
+                            s.selection = Some(TextSelection {
+                                value: Selection::new(
+                                    rows,
+                                    Point {
+                                        row: m.row as usize,
+                                        column: m.column as usize,
+                                    },
+                                ),
+                                snapshot: frame,
+                                size: (width, height),
+                            });
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some(selection) = &mut s.selection
+                            && selection.value.dragging
+                        {
+                            selection.value.end = Point {
+                                row: usize::from(m.row)
+                                    .min(selection.snapshot.body_count.saturating_sub(1)),
+                                column: usize::from(m.column).min(width.saturating_sub(1) as usize),
+                            };
+                            if m.kind == MouseEventKind::Up(MouseButton::Left) {
+                                selection.value.dragging = false;
+                                if selection.value.text().is_empty() {
+                                    s.selection = None;
+                                } else {
+                                    request_copy(screen, &mut s);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 deliver = false;
+            }
+            Event::Resize(_, _) | Event::Paste(_) => {
+                s.selection = None;
+                s.copy_hint = None;
             }
             _ => {}
         }
@@ -784,6 +1153,55 @@ pub fn start(footer: Footer) -> Result<SessionGuard> {
                         }
                         tick = Instant::now();
                     }
+                }
+            })?,
+    );
+    let clipboard = screen.clone();
+    let receiver = screen
+        .clipboard_rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("clipboard receiver");
+    guard.workers.push(
+        thread::Builder::new()
+            .name("rcode-clipboard".into())
+            .spawn(move || {
+                loop {
+                    if clipboard
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .stop
+                    {
+                        break;
+                    }
+                    let text = match receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(text) => text,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let native = crate::clipboard::copy_local(&text);
+                    let _io = clipboard.io.lock().unwrap_or_else(|e| e.into_inner());
+                    {
+                        let s = clipboard.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if s.stop {
+                            break;
+                        }
+                        if s.suspended > 0 {
+                            continue;
+                        }
+                    }
+                    let hint = if native {
+                        "Скопировано"
+                    } else if execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text))
+                        .is_ok()
+                    {
+                        "Выделение передано в буфер терминала"
+                    } else {
+                        "Не удалось скопировать; используйте Shift + выделение"
+                    };
+                    clipboard.change(|s| s.copy_hint = Some(hint.into()));
                 }
             })?,
     );
@@ -914,6 +1332,49 @@ impl Drop for Suspended {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_input_colors_only_its_marker_and_preserves_selection_columns() {
+        let text = "│   !printf '🦀 !' │";
+        let marker = text.find('!').unwrap();
+        let mut output = Vec::new();
+        let mut column = 0;
+        print_shell_input(&mut output, text, marker, None, &mut column).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "│   {}!{}printf '🦀 !' │",
+                SetForegroundColor(Color::Red),
+                ResetColor
+            )
+        );
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert!(output.contains("\u{1b}[38;5;9m!\u{1b}[0m"));
+        }
+        assert_eq!(column, UnicodeWidthStr::width(text));
+
+        let mut output = Vec::new();
+        let mut column = 0;
+        print_shell_input(&mut output, text, marker, Some(&(4..11)), &mut column).unwrap();
+        assert_eq!(column, UnicodeWidthStr::width(text));
+        assert!(String::from_utf8(output).unwrap().contains("printf"));
+    }
+
+    #[test]
+    fn manual_shell_transcript_marks_the_prefix_without_coloring_other_output() {
+        let screen = Screen::test_screen();
+        screen.line("! printf 'привет'");
+        screen.line("обычный вывод ! внутри строки");
+        let state = screen.state.lock().unwrap();
+        let frame = compose(&state, 80, 24);
+        assert!(frame.rows.iter().any(|(line, paint)| {
+            line == "! printf 'привет'" && *paint == Paint::ShellInput(0)
+        }));
+        assert!(frame.rows.iter().any(|(line, paint)| {
+            line == "обычный вывод ! внутри строки" && *paint == Paint::Normal
+        }));
+    }
+
     fn editor() -> Panel {
         Panel {
             rows: vec!["╭ rcode".into(), "│ ".into(), "╰────".into()],
@@ -921,6 +1382,132 @@ mod tests {
             cursor: Some((1, 2)),
             mode: Mode::Editor,
         }
+    }
+    #[test]
+    fn clearing_selection_inside_a_picker_does_not_consume_future_picker_input() {
+        let screen = Screen::test_screen();
+        screen.line("History text");
+        screen.set_panel(Panel {
+            mode: Mode::Picker,
+            ..editor()
+        });
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 0),
+            (MouseEventKind::Drag(MouseButton::Left), 7),
+        ] {
+            route(
+                &screen,
+                Event::Mouse(crossterm::event::MouseEvent {
+                    kind,
+                    column,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+        }
+        route(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        let state = screen.state.lock().unwrap();
+        assert!(state.selection.is_none());
+        assert!(
+            !state.picker_cancelled,
+            "Esc cleared selection, so the picker must remain live"
+        );
+        drop(state);
+        route(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(matches!(screen.event().unwrap(), Event::Key(k) if k.code==KeyCode::Enter));
+    }
+    #[test]
+    fn an_empty_mouse_gesture_does_not_block_control_c_cancellation() {
+        for release in [false, true] {
+            let screen = Screen::test_screen();
+            screen.line("abc");
+            screen.busy("Waiting");
+            let token = CancellationToken::new();
+            screen.bind_cancel(token.clone());
+            let mouse = |kind, column| {
+                route(
+                    &screen,
+                    Event::Mouse(crossterm::event::MouseEvent {
+                        kind,
+                        column,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                )
+            };
+            mouse(MouseEventKind::Down(MouseButton::Left), 15);
+            if release {
+                mouse(MouseEventKind::Drag(MouseButton::Left), 30);
+                mouse(MouseEventKind::Up(MouseButton::Left), 30);
+            }
+            route(
+                &screen,
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            );
+            assert!(
+                token.is_cancelled(),
+                "empty gesture (release={release}) must not intercept Ctrl+C"
+            );
+        }
+    }
+    #[test]
+    fn selected_response_stays_stable_while_streaming_and_footer_keeps_updating() {
+        let screen = Screen::test_screen();
+        screen.set_panel(editor());
+        screen.append_markdown("```rust\nlet value = 1;\n```\n");
+        route(
+            &screen,
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        route(
+            &screen,
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 16,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        let before = compose(&screen.state.lock().unwrap(), 80, 24).rows;
+        screen.append_markdown("\nNEW_STREAM_CONTENT");
+        screen.usage(321, 45);
+        let during = compose(&screen.state.lock().unwrap(), 80, 24);
+        assert_eq!(before[..19], during.rows[..19]);
+        assert!(during.rows[23].0.contains("↑321 ↓45"));
+        assert_eq!(
+            screen
+                .state
+                .lock()
+                .unwrap()
+                .selection
+                .as_ref()
+                .unwrap()
+                .value
+                .text(),
+            "let value = 1;"
+        );
+        route(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+        let after = compose(&screen.state.lock().unwrap(), 80, 24);
+        assert!(
+            after
+                .rows
+                .iter()
+                .any(|row| row.0.contains("NEW_STREAM_CONTENT"))
+        );
     }
     #[test]
     fn footer_is_on_last_rows_and_editor_cursor_above_it() {
@@ -933,8 +1520,24 @@ mod tests {
             assert_eq!(frame.rows.len(), h as usize);
             assert!(frame.rows[h as usize - 1].0.contains("Контекст"));
             assert!(frame.rows[h as usize - 2].0.contains("ask"));
+            let version = if w >= 55 {
+                format!("rcode {}", env!("CARGO_PKG_VERSION"))
+            } else {
+                format!("v{}", env!("CARGO_PKG_VERSION"))
+            };
+            assert!(frame.rows[h as usize - 2].0.ends_with(&version));
+            assert_eq!(
+                UnicodeWidthStr::width(frame.rows[h as usize - 2].0.as_str()),
+                w as usize - 1
+            );
             assert_eq!(frame.cursor.unwrap().0, h as usize - 4);
             assert_eq!(frame.rows[0].0, "Welcome");
+            drop(s);
+            screen.change(|s| {
+                s.copy_hint = Some("Скопировано · очень длинное уведомление".repeat(10))
+            });
+            let frame = compose(&screen.state.lock().unwrap(), w, h);
+            assert!(frame.rows[h as usize - 2].0.ends_with(&version));
         }
     }
     #[test]

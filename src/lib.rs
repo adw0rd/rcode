@@ -10,10 +10,16 @@ pub mod app;
 pub mod cli;
 pub mod ui;
 
+mod clipboard;
+mod export;
+mod markdown;
 pub mod presentation;
+mod selection;
 
 pub mod terminal;
 
+pub mod images;
+mod input_history;
 pub mod interactive;
 
 pub mod screen;

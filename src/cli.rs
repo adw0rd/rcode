@@ -1,5 +1,6 @@
+pub use crate::config::ApprovalMode;
 use crate::config::{Effort, ProviderKind};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
@@ -12,6 +13,13 @@ use std::path::PathBuf;
 pub struct Cli {
     #[arg(short = 'C', long = "directory", global = true, default_value = ".")]
     pub directory: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        value_name = "КАТАЛОГ",
+        help = "Разрешить файловым инструментам дополнительный каталог; можно повторять"
+    )]
+    pub add_dir: Vec<PathBuf>,
     #[arg(long, global = true)]
     pub provider: Option<ProviderKind>,
     #[arg(long, global = true)]
@@ -38,8 +46,13 @@ pub struct Cli {
         help = "Явно сократить историю перед новым запросом"
     )]
     pub compact: bool,
-    #[arg(long, global = true, value_enum, default_value = "ask")]
-    pub approval_mode: ApprovalMode,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        help = "Режим разрешений; по умолчанию — сохранённый для проекта или ask"
+    )]
+    pub approval_mode: Option<ApprovalMode>,
     #[arg(
         long,
         global = true,
@@ -54,17 +67,34 @@ pub struct Cli {
     pub plan: bool,
     #[arg(long, global = true, help = "Версионированные события JSONL в stdout")]
     pub json: bool,
-    #[arg(long, global=true, default_value_t=32, value_parser=clap::value_parser!(u32).range(1..=256))]
+    #[arg(long, global=true, default_value_t=32, value_parser=clap::value_parser!(u32).range(1..=256), help="Предел запросов к модели за один ход (1–256); новый запрос начинает новый ход")]
     pub max_steps: u32,
     #[command(subcommand)]
     pub command: Option<Command>,
     #[arg(help = "Начальный запрос для интерактивной сессии")]
     pub prompt: Option<String>,
 }
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-pub enum ApprovalMode {
-    Ask,
-    AutoEdit,
+impl Cli {
+    pub fn permissions(&self) -> ApprovalMode {
+        self.approval_mode.unwrap_or_default()
+    }
+
+    pub fn file_edits_allowed(&self) -> bool {
+        matches!(
+            self.permissions(),
+            ApprovalMode::AutoEdit | ApprovalMode::FullAccess
+        )
+    }
+
+    pub fn shell_allowed(&self) -> bool {
+        self.allow_shell || self.permissions() == ApprovalMode::FullAccess
+    }
+
+    pub fn for_project(&self, saved: ApprovalMode) -> Self {
+        let mut resolved = self.clone();
+        resolved.approval_mode = Some(self.approval_mode.unwrap_or(saved));
+        resolved
+    }
 }
 #[derive(Debug, Subcommand, Clone)]
 pub enum Command {

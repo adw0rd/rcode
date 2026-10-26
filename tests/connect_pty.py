@@ -21,7 +21,7 @@ from viewport_vt import Viewport
 
 
 class ConnectTerminal(Terminal):
-    def __init__(self, binary, workspace, home, args):
+    def __init__(self, binary, workspace, home, args, extra_env=None):
         self.buffer = bytearray()
         self.offset = 0
         self.status = None
@@ -37,6 +37,7 @@ class ConnectTerminal(Terminal):
                 os.environ.clear()
                 os.environ.update({"PATH": "/usr/bin:/bin", "TERM": "xterm-256color",
                                    "LANG": "C.UTF-8", "RCODE_HOME": str(home)})
+                os.environ.update(extra_env or {})
                 os.execv(binary, [binary, "-C", str(workspace), *args])
             finally:
                 os._exit(127)

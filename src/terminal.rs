@@ -16,9 +16,9 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const MAX_INPUT: usize = 65_536;
+pub(crate) const MAX_INPUT: usize = 65_536;
 const CONTEXT_BUDGET: usize = 180_000;
-const MAX_HISTORY: usize = 1_000;
+pub(crate) const MAX_HISTORY: usize = 1_000;
 
 #[derive(Clone, Debug)]
 pub struct Footer {
@@ -90,6 +90,14 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/compact",
         description: "Сжать историю диалога",
+    },
+    CommandSpec {
+        name: "/export",
+        description: "Сохранить диалог в Markdown",
+    },
+    CommandSpec {
+        name: "/attach",
+        description: "Приложить изображение PNG/JPEG/TIFF",
     },
     CommandSpec {
         name: "/clear",
@@ -634,6 +642,8 @@ struct View {
 enum RowStyle {
     Normal,
     Border,
+    Error,
+    ShellInput(usize),
     Subtle,
     Selected,
     Disabled,
@@ -693,6 +703,7 @@ fn editor_layout(
     } else {
         (height - 1).min(2)
     };
+    let shell_mode = state.buffer.text.trim_start().starts_with('!');
     let commands = state.commands();
     let menu_rows = if framed && !commands.is_empty() {
         let overhead = if inline_footer { 7 } else { 4 };
@@ -714,19 +725,41 @@ fn editor_layout(
     let inner_width =
         width.saturating_sub(UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix));
     let input = wrapped_input(&state.buffer, inner_width);
+    let shell_marker = shell_mode
+        .then(|| {
+            input.rows.iter().enumerate().find_map(|(index, row)| {
+                let trimmed = row.trim_start();
+                trimmed
+                    .starts_with('!')
+                    .then_some((index, prefix.len() + row.len() - trimmed.len()))
+            })
+        })
+        .flatten();
     let end = (input.cursor_row + 1).max(input_rows).min(input.rows.len());
     let start = end.saturating_sub(input_rows);
     let mut view = View::new();
     if framed {
-        let label = if start > 0 {
+        let label = if shell_mode && start > 0 {
+            " rcode · shell · ↑ ещё строки "
+        } else if shell_mode {
+            " rcode · shell "
+        } else if start > 0 {
             " rcode · ↑ ещё строки "
         } else {
             " rcode "
         };
-        view.push(border(label, width, true), RowStyle::Border, width);
+        view.push(
+            border(label, width, true),
+            if shell_mode {
+                RowStyle::Error
+            } else {
+                RowStyle::Border
+            },
+            width,
+        );
     }
     let input_start = view.rows.len();
-    for row in &input.rows[start..end] {
+    for (index, row) in input.rows.iter().enumerate().take(end).skip(start) {
         let padding = if framed {
             " ".repeat(inner_width.saturating_sub(UnicodeWidthStr::width(row.as_str())))
         } else {
@@ -734,7 +767,10 @@ fn editor_layout(
         };
         view.push(
             format!("{prefix}{row}{padding}{suffix}"),
-            RowStyle::Normal,
+            match shell_marker {
+                Some((marker_row, offset)) if marker_row == index => RowStyle::ShellInput(offset),
+                _ => RowStyle::Normal,
+            },
             width,
         );
     }
@@ -742,7 +778,23 @@ fn editor_layout(
     view.cursor_col =
         (UnicodeWidthStr::width(prefix) + input.cursor_col).min(width.saturating_sub(1));
     if framed {
-        view.push(border("", width, false), RowStyle::Border, width);
+        view.push(
+            border(
+                if shell_mode {
+                    " Enter — выполнить локально "
+                } else {
+                    ""
+                },
+                width,
+                false,
+            ),
+            if shell_mode {
+                RowStyle::Error
+            } else {
+                RowStyle::Border
+            },
+            width,
+        );
     }
     if menu_rows > 0 {
         view.push(
@@ -1105,6 +1157,8 @@ impl InlineFrame {
                     .map(|style| match style {
                         RowStyle::Normal => Paint::Normal,
                         RowStyle::Border => Paint::Border,
+                        RowStyle::Error => Paint::Error,
+                        RowStyle::ShellInput(marker) => Paint::ShellInput(*marker),
                         RowStyle::Subtle | RowStyle::Disabled => Paint::Muted,
                         RowStyle::Selected => Paint::Selected,
                     })
@@ -1126,6 +1180,7 @@ impl InlineFrame {
             queue!(self.output, Clear(ClearType::CurrentLine), ResetColor)?;
             match style {
                 RowStyle::Border => queue!(self.output, SetForegroundColor(Color::DarkCyan))?,
+                RowStyle::Error => queue!(self.output, SetForegroundColor(Color::Red))?,
                 RowStyle::Subtle | RowStyle::Disabled => {
                     queue!(self.output, SetForegroundColor(Color::DarkGrey))?
                 }
@@ -1134,9 +1189,21 @@ impl InlineFrame {
                     SetBackgroundColor(Color::DarkCyan),
                     SetForegroundColor(Color::White)
                 )?,
-                RowStyle::Normal => {}
+                RowStyle::Normal | RowStyle::ShellInput(_) => {}
             }
-            queue!(self.output, Print(row), ResetColor)?;
+            if let RowStyle::ShellInput(marker) = style {
+                let mut column = 0;
+                crate::screen::print_shell_input(
+                    &mut self.output,
+                    row,
+                    *marker,
+                    None,
+                    &mut column,
+                )?;
+            } else {
+                queue!(self.output, Print(row))?;
+            }
+            queue!(self.output, ResetColor)?;
             if index + 1 < view.rows.len() {
                 queue!(self.output, Print("\r\n"))?;
                 self.cursor_row = index + 1;
@@ -1519,6 +1586,77 @@ mod tests {
         assert!(!text.contains("Провайдер"));
         assert!(!text.contains("Контекст"));
         assert!(!text.contains("Alt+Enter"));
+    }
+
+    #[test]
+    fn shell_input_has_a_distinct_cue_and_ordinary_history_restores_the_prompt() {
+        let mut state = ReadState::default();
+        state.buffer.insert("  !printf 'привет'\n!echo ещё");
+        let view = viewport_editor_view(&state, &footer(), 100, 24);
+        assert!(view.rows[0].starts_with("╭ rcode · shell"));
+        assert!(
+            view.rows
+                .iter()
+                .any(|row| row.contains("Enter — выполнить локально"))
+        );
+        assert!(state.commands().is_empty());
+        assert!(!view.rows.iter().any(|row| row.contains("Tab дополнить")));
+
+        state.buffer = Buffer::default();
+        state.buffer.insert("!");
+        state.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &[]);
+        let view = viewport_editor_view(&state, &footer(), 100, 24);
+        assert!(!view.rows.join("\n").contains("shell"));
+
+        state.buffer.insert("!pwd");
+        state.history(&["обычный запрос".into()], true);
+        let view = viewport_editor_view(&state, &footer(), 100, 24);
+        assert!(view.rows[0].starts_with("╭ rcode "));
+        assert!(!view.rows.join("\n").contains("shell"));
+        assert!(!view.rows.join("\n").contains("выполнить локально"));
+    }
+
+    #[test]
+    fn bare_shell_marker_shows_the_local_execution_hint() {
+        let mut state = ReadState::default();
+        state.buffer.insert("!");
+        for view in [
+            editor_view(&state, &footer(), 100, 24),
+            viewport_editor_view(&state, &footer(), 100, 24),
+        ] {
+            assert!(view.rows[0].contains("shell"));
+            assert!(view.rows.join("\n").contains("Enter — выполнить локально"));
+        }
+    }
+
+    #[test]
+    fn shell_marker_style_follows_wrapping_and_leaves_other_bangs_unstyled() {
+        let mut state = ReadState::default();
+        state.buffer.insert("           !a\n!b");
+        let view = viewport_editor_view(&state, &footer(), 12, 24);
+        let markers: Vec<_> = view
+            .rows
+            .iter()
+            .zip(&view.styles)
+            .filter_map(|(row, style)| match style {
+                RowStyle::ShellInput(offset) => Some((row, *offset)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 1);
+        let (row, offset) = markers[0];
+        assert!(row[offset..].starts_with("!a"));
+        assert_eq!(UnicodeWidthStr::width(&row[..offset]), 6);
+        assert!(matches!(view.styles[0], RowStyle::Error));
+        assert!(matches!(view.styles.last(), Some(RowStyle::Error)));
+
+        for (width, height) in [(1, 1), (3, 4), (12, 6), (80, 24)] {
+            let view = viewport_editor_view(&state, &footer(), width, height);
+            assert_eq!(view.rows.len(), view.styles.len());
+            assert!(view.cursor_row < view.rows.len());
+            assert!(view.cursor_col < usize::from(width));
+            assert!(!view.rows.join("\n").contains('\u{1b}'));
+        }
     }
 
     #[test]

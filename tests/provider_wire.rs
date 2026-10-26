@@ -19,7 +19,9 @@ struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
     pieces: Vec<Vec<u8>>,
+    header_delay: Duration,
     delay: Duration,
+    pause_after_first: Duration,
 }
 impl Reply {
     fn json(value: Value) -> Self {
@@ -30,7 +32,9 @@ impl Reply {
             status,
             headers: vec![("Content-Type".into(), content_type.into())],
             pieces: vec![body],
+            header_delay: Duration::ZERO,
             delay: Duration::ZERO,
+            pause_after_first: Duration::ZERO,
         }
     }
     fn sse(body: &str) -> Self {
@@ -38,7 +42,9 @@ impl Reply {
             status: 200,
             headers: vec![("Content-Type".into(), "text/event-stream".into())],
             pieces: body.as_bytes().chunks(1).map(|b| b.to_vec()).collect(),
+            header_delay: Duration::ZERO,
             delay: Duration::ZERO,
+            pause_after_first: Duration::ZERO,
         }
     }
 }
@@ -54,6 +60,12 @@ impl Request {
     }
 }
 async fn server(replies: Vec<Reply>) -> (String, JoinHandle<Vec<Request>>) {
+    server_checking_retries(replies, false).await
+}
+async fn server_checking_retries(
+    replies: Vec<Reply>,
+    reject_extra_requests: bool,
+) -> (String, JoinHandle<Vec<Request>>) {
     let listener = timeout(SOCKET_TIMEOUT, TcpListener::bind("127.0.0.1:0"))
         .await
         .expect("fixture bind timed out")
@@ -120,11 +132,18 @@ async fn server(replies: Vec<Reply>) -> (String, JoinHandle<Vec<Request>>) {
                     header.push_str(&format!("{key}: {value}\r\n"));
                 }
                 header.push_str("\r\n");
-                timeout(SOCKET_TIMEOUT, socket.write_all(header.as_bytes()))
+                tokio::time::sleep(reply.header_delay).await;
+                if timeout(SOCKET_TIMEOUT, socket.write_all(header.as_bytes()))
                     .await
                     .expect("fixture response headers write timed out")
-                    .unwrap();
-                for piece in reply.pieces {
+                    .is_err()
+                {
+                    continue;
+                }
+                for (index, piece) in reply.pieces.into_iter().enumerate() {
+                    if index == 1 {
+                        tokio::time::sleep(reply.pause_after_first).await;
+                    }
                     if !reply.delay.is_zero() {
                         tokio::time::sleep(reply.delay).await;
                     }
@@ -137,6 +156,14 @@ async fn server(replies: Vec<Reply>) -> (String, JoinHandle<Vec<Request>>) {
                     }
                     tokio::task::yield_now().await;
                 }
+            }
+            if reject_extra_requests {
+                assert!(
+                    timeout(Duration::from_millis(200), listener.accept())
+                        .await
+                        .is_err(),
+                    "timed out or cancelled generation was unexpectedly retried"
+                );
             }
             requests
         })
@@ -166,11 +193,199 @@ fn settings(kind: ProviderKind, url: &str, stream: bool) -> ProviderSettings {
         ca_file: None,
         stream,
         max_output_tokens: 1024,
+        request_timeout_secs: 1,
         idle_timeout_secs: 1,
     }
 }
 fn completion() -> Value {
     json!({"choices":[{"message":{"role":"assistant","content":"готово"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.001},"model":"wire-model"})
+}
+
+fn image_message() -> Message {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("wire.png");
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\nwire-image").unwrap();
+    rcode::images::user_message(
+        &format!("/attach '{}' Explain the screenshot", path.display()),
+        temp.path(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn images_use_compatible_content_parts_for_each_compatible_provider() {
+    for kind in [
+        ProviderKind::Custom,
+        ProviderKind::OpenRouter,
+        ProviderKind::Yandex,
+    ] {
+        let (url, task) = server(vec![Reply::json(completion())]).await;
+        let mut client =
+            ProviderClient::new(settings(kind, &url, false), "image-key".into()).unwrap();
+        client
+            .complete(&[image_message()], &[tool()], &mut |_| {})
+            .await
+            .unwrap();
+        let requests = finish_fixture(task).await;
+        assert_eq!(requests.len(), 1);
+        let body = requests[0].json();
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "Explain the screenshot");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(body["messages"][0].get("images").is_none());
+        assert!(body.get("tools").is_some());
+    }
+}
+
+#[tokio::test]
+async fn giga_image_upload_refreshes_auth_and_reuses_ids_in_following_requests() {
+    let (url, task) = server(vec![
+        Reply::json(json!({"access_token":"first-token","expires_at":4102444800u64})),
+        Reply::body(401, "application/json", b"{}".to_vec()),
+        Reply::json(json!({"access_token":"new-token","expires_at":4102444800u64})),
+        Reply::json(json!({"id":"image-id"})),
+        Reply::json(completion()),
+        Reply::json(completion()),
+    ])
+    .await;
+    let mut client = ProviderClient::new(
+        settings(ProviderKind::GigaChat, &url, false),
+        "upload-key".into(),
+    )
+    .unwrap();
+    let mut message = image_message();
+    message.images.push(message.images[0].clone());
+    client
+        .complete(&[message.clone()], &[tool()], &mut |_| {})
+        .await
+        .unwrap();
+    client
+        .complete(&[message], &[tool()], &mut |_| {})
+        .await
+        .unwrap();
+    let requests = finish_fixture(task).await;
+    assert_eq!(requests.len(), 6);
+    assert_eq!(requests[1].path, "/v1/files");
+    assert_eq!(requests[1].body, requests[3].body);
+    assert_eq!(requests[3].headers["authorization"], "Bearer new-token");
+    for request in &requests[4..] {
+        let body = request.json();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .all(|m| m["attachments"] == json!(["image-id"]))
+        );
+        assert_eq!(messages[0]["content"], "Explain the screenshot");
+        assert!(body.get("functions").is_some());
+    }
+}
+
+#[tokio::test]
+async fn image_api_errors_preserve_context_failures_and_http_status() {
+    for (upstream, expected) in [
+        ("maximum context length exceeded", FailureKind::Context),
+        ("image input unsupported", FailureKind::Protocol),
+    ] {
+        let (url, task) = server(vec![Reply::body(
+            400,
+            "application/json",
+            json!({"error":{"message":upstream}})
+                .to_string()
+                .into_bytes(),
+        )])
+        .await;
+        let mut client = ProviderClient::new(
+            settings(ProviderKind::Custom, &url, false),
+            "image-key".into(),
+        )
+        .unwrap();
+        let error = client
+            .complete(&[image_message()], &[], &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(failure(&error).kind, expected);
+        assert_eq!(failure(&error).status, Some(400));
+        assert_eq!(finish_fixture(task).await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn real_agent_tools_use_an_optional_string_hash_for_native_giga_schema() {
+    let (url, task) = server(vec![
+        Reply::json(json!({"access_token":"schema-token","expires_at":4102444800u64})),
+        Reply::json(completion()),
+    ])
+    .await;
+    let mut client =
+        ProviderClient::new(settings(ProviderKind::GigaChat, &url, false), "key".into()).unwrap();
+    let definitions = rcode::tools::Tools::definitions()
+        .into_iter()
+        .chain(rcode::agents::definitions())
+        .collect::<Vec<_>>();
+    client
+        .complete(&[Message::user("Create a file")], &definitions, &mut |_| {})
+        .await
+        .unwrap();
+    let requests = finish_fixture(task).await;
+    let body = requests.last().unwrap().json();
+    let write = body["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "write_file")
+        .unwrap();
+    assert_eq!(
+        write["parameters"]["properties"]["expected_sha256"]["type"],
+        "string"
+    );
+    assert!(
+        !write["parameters"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("expected_sha256"))
+    );
+}
+
+#[tokio::test]
+async fn giga_schema_errors_are_not_blames_on_images_or_echoed_upstream_text() {
+    let secret = "must-not-echo-upstream-secret";
+    let upstream = format!(
+        "Field 'properties.expected_sha256.type' is of a wrong type. Expected: stringValue, actual: arrayValue {secret}"
+    );
+    for with_image in [false, true] {
+        let (url, task) = server(vec![Reply::body(
+            422,
+            "application/json",
+            json!({"status":422,"message":upstream})
+                .to_string()
+                .into_bytes(),
+        )])
+        .await;
+        let mut client =
+            ProviderClient::new(settings(ProviderKind::Custom, &url, false), "key".into()).unwrap();
+        let message = if with_image {
+            image_message()
+        } else {
+            Message::user("hello")
+        };
+        let error = client
+            .complete(&[message], &rcode::tools::Tools::definitions(), &mut |_| {})
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("схему параметров инструмента"), "{text}");
+        assert!(!text.contains("изображением") && !text.contains("PNG") && !text.contains(secret));
+        assert_eq!(failure(&error).status, Some(422));
+        assert_eq!(finish_fixture(task).await.len(), 1);
+    }
 }
 fn tool() -> ToolDefinition {
     ToolDefinition {
@@ -183,6 +398,226 @@ fn failure(error: &anyhow::Error) -> &ProviderFailure {
     error
         .downcast_ref::<ProviderFailure>()
         .expect("structured provider failure")
+}
+
+fn with_timeouts(mut settings: ProviderSettings, request: u64, idle: u64) -> ProviderSettings {
+    settings.request_timeout_secs = request;
+    settings.idle_timeout_secs = idle;
+    settings
+}
+
+#[test]
+fn zero_timeouts_are_rejected_when_creating_the_provider_client() {
+    for (request, idle) in [(0, 1), (1, 0)] {
+        let error = ProviderClient::new(
+            with_timeouts(
+                settings(ProviderKind::Custom, "http://127.0.0.1:1", false),
+                request,
+                idle,
+            ),
+            "key".into(),
+        )
+        .err()
+        .expect("zero timeout must not disable the deadline");
+        assert_eq!(failure(&error).kind, FailureKind::Protocol);
+    }
+}
+
+#[tokio::test]
+async fn delayed_gigachat_headers_use_request_timeout_instead_of_stream_idle() {
+    let event = json!({"choices":[{"delta":{"function_call":{"name":"read_file","arguments":{"path":"a.rs"}}},"finish_reason":"function_call"}]});
+    let mut reply = Reply::body(
+        200,
+        "text/event-stream",
+        format!("data: {event}\n\ndata: [DONE]\n\n").into_bytes(),
+    );
+    reply.header_delay = Duration::from_millis(1400);
+    let (url, task) = server_checking_retries(
+        vec![
+            Reply::json(json!({"access_token":"token","expires_at":4102444800000u64})),
+            reply,
+        ],
+        true,
+    )
+    .await;
+    let mut client = ProviderClient::new(
+        with_timeouts(settings(ProviderKind::GigaChat, &url, true), 3, 1),
+        "key".into(),
+    )
+    .unwrap();
+    let completion = client.complete(&[], &[tool()], &mut |_| {}).await.unwrap();
+    assert_eq!(completion.tool_calls.len(), 1);
+    assert_eq!(
+        completion.tool_calls[0].function.arguments,
+        "{\"path\":\"a.rs\"}"
+    );
+    assert_eq!(finish_fixture(task).await.len(), 2);
+}
+
+#[tokio::test]
+async fn explicitly_short_request_timeout_is_honored_without_retrying_generation() {
+    let mut reply = Reply::json(completion());
+    reply.header_delay = Duration::from_millis(1400);
+    let (url, task) = server_checking_retries(vec![reply], true).await;
+    let mut client = ProviderClient::new(
+        with_timeouts(settings(ProviderKind::Custom, &url, false), 1, 3),
+        "key".into(),
+    )
+    .unwrap();
+    let error = client.complete(&[], &[], &mut |_| {}).await.unwrap_err();
+    assert_eq!(failure(&error).kind, FailureKind::Transport);
+    let message = error.to_string();
+    assert!(message.contains("1 с"), "{message}");
+    assert!(message.contains("request_timeout_secs"), "{message}");
+    assert!(message.contains("Ctrl+C"), "{message}");
+    assert_eq!(finish_fixture(task).await.len(), 1);
+}
+
+#[tokio::test]
+async fn stalled_stream_discards_partial_tools_and_keeps_its_idle_timeout() {
+    let partial = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"partial","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]});
+    let mut reply = Reply::body(200, "text/event-stream", vec![]);
+    reply.pieces = vec![
+        format!("data: {partial}\n\n").into_bytes(),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    reply.pause_after_first = Duration::from_millis(1400);
+    let (url, task) = server_checking_retries(vec![reply], true).await;
+    let mut client = ProviderClient::new(
+        with_timeouts(settings(ProviderKind::Custom, &url, true), 3, 1),
+        "key".into(),
+    )
+    .unwrap();
+    let mut emitted = String::new();
+    let error = client
+        .complete(&[], &[tool()], &mut |text| emitted.push_str(text))
+        .await
+        .unwrap_err();
+    assert_eq!(failure(&error).kind, FailureKind::Transport);
+    assert!(error.to_string().contains("idle timeout"));
+    assert!(error.to_string().contains("1 с"));
+    assert!(emitted.is_empty());
+    assert_eq!(finish_fixture(task).await.len(), 1);
+}
+
+#[tokio::test]
+async fn json_body_uses_idle_timeout_after_headers() {
+    let mut reply = Reply::json(completion());
+    reply.delay = Duration::from_millis(1400);
+    let (url, task) = server_checking_retries(vec![reply], true).await;
+    let mut client = ProviderClient::new(
+        with_timeouts(settings(ProviderKind::Custom, &url, false), 3, 1),
+        "key".into(),
+    )
+    .unwrap();
+    let error = client.complete(&[], &[], &mut |_| {}).await.unwrap_err();
+    assert_eq!(failure(&error).kind, FailureKind::Transport);
+    assert!(error.to_string().contains("idle timeout"));
+    assert!(error.to_string().contains("1 с"));
+    assert_eq!(finish_fixture(task).await.len(), 1);
+}
+
+#[tokio::test]
+async fn active_stream_can_outlive_the_request_timeout() {
+    let mut reply = Reply::body(200, "text/event-stream", vec![]);
+    reply.pieces = vec![
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n".to_vec(),
+        b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+        b"data: [DONE]\n\n".to_vec(),
+    ];
+    reply.delay = Duration::from_millis(600);
+    let (url, task) = server(vec![reply]).await;
+    let mut client = ProviderClient::new(
+        with_timeouts(settings(ProviderKind::Custom, &url, true), 1, 2),
+        "key".into(),
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .complete(&[], &[], &mut |_| {})
+            .await
+            .unwrap()
+            .content,
+        "a"
+    );
+    assert_eq!(finish_fixture(task).await.len(), 1);
+}
+
+#[tokio::test]
+async fn models_and_oauth_keep_the_shorter_non_generation_wait() {
+    for oauth in [false, true] {
+        let mut reply = Reply::json(if oauth {
+            json!({"access_token":"token","expires_at":4102444800000u64})
+        } else {
+            json!({"data":[]})
+        });
+        reply.header_delay = Duration::from_millis(1400);
+        let (url, task) = server_checking_retries(vec![reply], true).await;
+        let mut client = ProviderClient::new(
+            with_timeouts(
+                settings(
+                    if oauth {
+                        ProviderKind::GigaChat
+                    } else {
+                        ProviderKind::Custom
+                    },
+                    &url,
+                    false,
+                ),
+                3,
+                1,
+            ),
+            "key".into(),
+        )
+        .unwrap();
+        let error = if oauth {
+            client.complete(&[], &[], &mut |_| {}).await.unwrap_err()
+        } else {
+            client.models().await.unwrap_err()
+        };
+        assert_eq!(failure(&error).kind, FailureKind::Transport);
+        assert!(error.to_string().contains("1 с"));
+        let requests = finish_fixture(task).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            if oauth { "/oauth" } else { "/v1/models" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelling_header_and_body_waits_does_not_return_tools_or_replay_the_request() {
+    for waiting_for_headers in [true, false] {
+        let partial = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"partial","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]});
+        let mut reply = Reply::body(200, "text/event-stream", vec![]);
+        reply.pieces = vec![
+            format!("data: {partial}\n\n").into_bytes(),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        if waiting_for_headers {
+            reply.header_delay = Duration::from_millis(1400);
+        } else {
+            reply.pause_after_first = Duration::from_millis(1400);
+        }
+        let (url, task) = server_checking_retries(vec![reply], true).await;
+        let mut client = ProviderClient::new(
+            with_timeouts(settings(ProviderKind::Custom, &url, true), 3, 3),
+            "key".into(),
+        )
+        .unwrap();
+        let mut emitted = String::new();
+        assert!(
+            timeout(
+                Duration::from_millis(150),
+                client.complete(&[], &[tool()], &mut |text| emitted.push_str(text)),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(finish_fixture(task).await.len(), 1);
+        assert!(emitted.is_empty());
+    }
 }
 
 #[tokio::test]

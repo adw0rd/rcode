@@ -56,6 +56,8 @@ struct Turn {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Change {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<PathBuf>,
     path: PathBuf,
     before: Option<Vec<u8>>,
     mode: Option<u32>,
@@ -69,6 +71,7 @@ struct Snapshot {
 }
 
 struct Prepared {
+    root: Option<PathBuf>,
     path: PathBuf,
     parent: Dir,
     name: OsString,
@@ -79,9 +82,14 @@ struct Prepared {
 pub struct Tools {
     root: PathBuf,
     dir: Dir,
+    extra_dirs: BTreeMap<PathBuf, Dir>,
+    checkpoint_path: PathBuf,
     checkpoint_dir: Dir,
     checkpoints: Checkpoints,
     active_turn: Option<usize>,
+    // Host observations are ephemeral and private to each model context. A
+    // worker cannot inherit another worker's or the coordinator's file reads.
+    read_snapshots: HashMap<(Option<String>, PathBuf), String>,
 }
 
 impl Tools {
@@ -100,7 +108,7 @@ impl Tools {
             "Checkpoint должен храниться вне рабочего проекта"
         );
         let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority())?;
-        let checkpoint_dir = Dir::open_ambient_dir(checkpoint_path, cap_std::ambient_authority())?;
+        let checkpoint_dir = Dir::open_ambient_dir(&checkpoint_path, cap_std::ambient_authority())?;
         #[cfg(unix)]
         {
             use cap_std::fs::PermissionsExt;
@@ -135,7 +143,32 @@ impl Tools {
                             normalized_path(&change.path, false)? == change.path,
                             "Некорректный путь в checkpoint"
                         );
-                        ensure!(seen.insert(&change.path), "Повтор пути в checkpoint");
+                        if let Some(extra_root) = &change.root {
+                            validate_external_root(extra_root, &checkpoint_path)?;
+                            match std::fs::canonicalize(extra_root) {
+                                Ok(canonical) => ensure!(
+                                    canonical == *extra_root,
+                                    "Неканонический корень checkpoint"
+                                ),
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            ensure!(
+                                !extra_root.join(&change.path).starts_with(&root),
+                                "Внешний корень checkpoint находится внутри проекта"
+                            );
+                        }
+                        ensure!(
+                            !change
+                                .path
+                                .components()
+                                .any(|c| secret_component(c.as_os_str())),
+                            "Секретный путь в checkpoint"
+                        );
+                        ensure!(
+                            seen.insert(change.root.as_deref().unwrap_or(&root).join(&change.path)),
+                            "Повтор пути в checkpoint"
+                        );
                         ensure!(
                             change
                                 .before
@@ -165,9 +198,12 @@ impl Tools {
         Ok(Self {
             root,
             dir,
+            extra_dirs: BTreeMap::new(),
+            checkpoint_path,
             checkpoint_dir,
             checkpoints,
             active_turn: None,
+            read_snapshots: HashMap::new(),
         })
     }
 
@@ -175,35 +211,129 @@ impl Tools {
         &self.root
     }
 
+    /// Host-only grant. Tool arguments never modify the capability set, and
+    /// these grants are deliberately absent from the persisted session.
+    pub fn add_directory(&mut self, path: &Path) -> Result<()> {
+        let absolute = std::path::absolute(path)?;
+        safe_external_path(&absolute, false)?;
+        let root = std::fs::canonicalize(&absolute)?;
+        validate_external_root(&root, &self.checkpoint_path)?;
+        ensure!(root.is_dir(), "Дополнительный путь должен быть каталогом");
+        if root.starts_with(&self.root) || self.extra_dirs.keys().any(|r| root.starts_with(r)) {
+            return Ok(());
+        }
+        let dir = open_external_directory(&root)?;
+        // A broader explicit grant supersedes narrower roots so their ignore
+        // rules cannot be bypassed by selecting a nested capability.
+        self.extra_dirs.retain(|r, _| !r.starts_with(&root));
+        self.extra_dirs.insert(root, dir);
+        Ok(())
+    }
+
+    pub fn extra_directory_for(&self, name: &str, args: &Value) -> Result<Option<PathBuf>> {
+        if !file_tool(name) {
+            return Ok(None);
+        }
+        validate_args(name, args)?;
+        let Some(path) = args.get("path").and_then(Value::as_str).map(Path::new) else {
+            return Ok(None);
+        };
+        if !path.is_absolute() {
+            return Ok(None);
+        }
+        validate_absolute_path(path)?;
+        if let Some((dir, root, relative)) =
+            self.location(path, matches!(name, "list_files" | "search"))?
+        {
+            Policy::new(dir, root).check(&relative, name == "write_file")?;
+            return Ok(None);
+        }
+        safe_external_path(path, name == "write_file")?;
+        let candidate = if matches!(name, "list_files" | "search") {
+            ensure!(path.is_dir(), "Для доступа нужен существующий каталог");
+            path
+        } else {
+            path.parent().context("Требуется родительский каталог")?
+        };
+        let root =
+            std::fs::canonicalize(candidate).context("Родительский каталог должен существовать")?;
+        validate_external_root(&root, &self.checkpoint_path)?;
+        let dir = open_external_directory(&root)?;
+        let relative = if matches!(name, "list_files" | "search") {
+            Path::new(".")
+        } else {
+            Path::new(path.file_name().context("Требуется путь к файлу")?)
+        };
+        Policy::new(&dir, &root).check(relative, name == "write_file")?;
+        Ok(Some(root))
+    }
+
+    pub fn extra_directories(&self) -> Vec<PathBuf> {
+        self.extra_dirs.keys().cloned().collect()
+    }
+
+    fn location(&self, path: &Path, allow_root: bool) -> Result<Option<(&Dir, &Path, PathBuf)>> {
+        if !path.is_absolute() {
+            return Ok(Some((
+                &self.dir,
+                &self.root,
+                normalized_path(path, allow_root)?,
+            )));
+        }
+        validate_absolute_path(path)?;
+        // Most calls already carry a canonical root. Check all direct prefixes
+        // before resolving aliases, especially during a large external search.
+        for (root, dir) in std::iter::once((&self.root, &self.dir)).chain(self.extra_dirs.iter()) {
+            if let Ok(relative) = path.strip_prefix(root) {
+                return Ok(Some((dir, root, normalized_path(relative, allow_root)?)));
+            }
+        }
+        for (root, dir) in std::iter::once((&self.root, &self.dir)).chain(self.extra_dirs.iter()) {
+            if let Some(prefix) = root_prefix(path, root) {
+                return Ok(Some((
+                    dir,
+                    root,
+                    normalized_path(path.strip_prefix(prefix)?, allow_root)?,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn required_location(&self, path: &Path, allow_root: bool) -> Result<(&Dir, &Path, PathBuf)> {
+        self.location(path, allow_root)?
+            .context("Путь вне разрешённых рабочих каталогов")
+    }
+
     pub fn definitions() -> Vec<ToolDefinition> {
         let defs = [
             (
                 "read_file",
-                "Прочитать UTF-8 файл: SHA-256 полного файла, номера строк и пагинация. Не более 1 MiB на файл; пути относительно проекта, symlink и исключённые файлы недоступны.",
+                "Прочитать UTF-8 файл: SHA-256 полного файла, номера строк и пагинация. Не более 1 MiB на файл. Относительные пути — внутри проекта; внешние абсолютные пути требуют разрешения host на каталог. Symlink, секретные и исключённые файлы недоступны.",
                 json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1,"maximum":500}}),
                 vec!["path"],
             ),
             (
                 "list_files",
-                "Список разрешённых файлов проекта с рекурсией и ограничением обхода. Не показывает исключённые, секретные файлы и symlink.",
+                "Список разрешённых файлов проекта или внешнего каталога, явно разрешённого host, с рекурсией и ограничением обхода. Для внешнего каталога укажите абсолютный путь. Не показывает исключённые, секретные файлы и symlink.",
                 json!({"path":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000},"offset":{"type":"integer","minimum":0,"maximum":10000}}),
                 vec![],
             ),
             (
                 "search",
-                "Поиск Rust regex в UTF-8 файлах. Ограничены regex, размер файлов, общий объём сканирования и результаты. Бинарные файлы пропускаются.",
+                "Поиск Rust regex в UTF-8 файлах проекта или внешнего каталога, явно разрешённого host. Для внешнего каталога укажите абсолютный путь. Ограничены regex, размер файлов, общий объём сканирования и результаты. Бинарные файлы пропускаются.",
                 json!({"pattern":{"type":"string","maxLength":4096},"path":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":1000},"case_sensitive":{"type":"boolean"}}),
                 vec!["pattern"],
             ),
             (
                 "write_file",
-                "Атомарно записать UTF-8 файл внутри проекта. Путь относительно рабочего каталога; абсолютный путь разрешён только внутри него. Для внешнего проекта, например /tmp/game, используйте run_command с подтверждением host: mkdir и quoted heredoc. Для существующего файла обязателен expected_sha256 из read_file; для нового не указывайте hash. Родительский каталог должен существовать.",
-                json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}),
+                "Атомарно записать UTF-8 файл в проекте или внешнем каталоге, явно разрешённом host. Путь относительно проекта или абсолютный; разрешение внешнего каталога запрашивает приложение. Перед перезаписью прочитайте файл через read_file: host проверяет, что файл не изменился после вашего чтения. Можно явно передать expected_sha256 из read_file; неверный hash отклоняется. Для нового файла не указывайте hash. Родительский каталог должен существовать. Запись отслеживается undo.",
+                json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string"}}),
                 vec!["path", "content"],
             ),
             (
                 "edit_file",
-                "Заменить точное непустое old_text в UTF-8 файле внутри проекта. Для пользовательского внешнего каталога используйте run_command после разрешения host. Совпадение должно быть единственным, кроме явно указанного replace_all=true. Проверка повторяется перед записью.",
+                "Заменить точное непустое old_text в UTF-8 файле проекта или внешнего каталога, явно разрешённого host. Внешний путь должен быть абсолютным. Совпадение должно быть единственным, кроме явно указанного replace_all=true. Проверка повторяется перед записью; правка отслеживается undo.",
                 json!({"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}),
                 vec!["path", "old_text", "new_text"],
             ),
@@ -221,12 +351,21 @@ impl Tools {
     }
 
     pub fn preview(&self, name: &str, args: &Value) -> Result<Option<String>> {
+        self.preview_for(name, args, None)
+    }
+
+    pub(crate) fn preview_for(
+        &self,
+        name: &str,
+        args: &Value,
+        actor: Option<&str>,
+    ) -> Result<Option<String>> {
         validate_args(name, args)?;
         let args = self.workspace_args(name, args)?;
         let args = args.as_ref();
         match name {
             "write_file" | "edit_file" => {
-                let prepared = self.prepare(name, args)?;
+                let prepared = self.prepare(name, args, actor)?;
                 let before = prepared
                     .before
                     .as_ref()
@@ -234,7 +373,11 @@ impl Tools {
                     .transpose()?
                     .unwrap_or("");
                 let after = std::str::from_utf8(&prepared.after)?;
-                Ok(Some(unified_diff(&prepared.path, before, after)))
+                Ok(Some(unified_diff(
+                    &display_path(prepared.root.as_deref(), &prepared.path),
+                    before,
+                    after,
+                )))
             }
             "run_command" => {
                 command_args(args)?;
@@ -277,26 +420,15 @@ impl Tools {
             path.components().count() <= 64 && path.as_os_str().len() <= 4096,
             "Слишком длинный путь"
         );
-        // Resolve only the workspace prefix, never its children. In particular,
-        // macOS /tmp and /var aliases must preserve ignore and symlink checks.
-        let mut workspace_prefix = path
-            .strip_prefix(&self.root)
-            .ok()
-            .map(|_| self.root.as_path());
-        if workspace_prefix.is_none() {
-            let ancestors = path.ancestors().collect::<Vec<_>>();
-            for ancestor in ancestors.into_iter().rev() {
-                if std::fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == self.root) {
-                    workspace_prefix = Some(ancestor);
-                    break;
-                }
-            }
-        }
-        if let Some(prefix) = workspace_prefix {
-            let relative = path.strip_prefix(prefix)?;
-            let relative = normalized_path(relative, matches!(name, "list_files" | "search"))?;
+        if let Some((_, root, relative)) =
+            self.location(path, matches!(name, "list_files" | "search"))?
+        {
             let mut normalized = args.clone();
-            normalized["path"] = json!(relative);
+            normalized["path"] = if root == self.root {
+                json!(relative)
+            } else {
+                json!(root.join(relative))
+            };
             return Ok(Cow::Owned(normalized));
         }
         ensure!(
@@ -318,16 +450,26 @@ impl Tools {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<ToolOutcome> {
+        self.execute_for(name, args, cancel, None).await
+    }
+
+    pub(crate) async fn execute_for(
+        &mut self,
+        name: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+        actor: Option<&str>,
+    ) -> Result<ToolOutcome> {
         let result = async {
             validate_args(name, args)?;
             check_cancel(cancel)?;
             let args = self.workspace_args(name, args)?;
             let args = args.as_ref();
             match name {
-                "read_file" => self.read_file(args, cancel),
+                "read_file" => self.read_file(args, cancel, actor),
                 "list_files" => self.list_files(args, cancel).await,
                 "search" => self.search(args, cancel).await,
-                "write_file" | "edit_file" => self.write(name, args, cancel),
+                "write_file" | "edit_file" => self.write(name, args, cancel, actor),
                 "run_command" => self.run_command(args, cancel).await,
                 _ => bail!("Неизвестный инструмент: {name}"),
             }
@@ -355,6 +497,7 @@ impl Tools {
             return Err(error);
         }
         self.active_turn = Some(self.checkpoints.turns.len() - 1);
+        self.read_snapshots.clear();
         Ok(())
     }
 
@@ -371,17 +514,19 @@ impl Tools {
         // Check every entry before touching any file. A conflict keeps the
         // complete journal and all current user bytes unchanged.
         let mut batch = Vec::new();
-        let mut policy = Policy::new(&self.dir, &self.root);
         for change in &turn.entries {
-            let path = policy.check(&change.path, false)?;
-            let (parent, name) = parent_handle(&self.dir, &path)?;
+            let dir = self.change_directory(change)?;
+            let root = change.root.as_deref().unwrap_or(&self.root);
+            let path = Policy::new(&dir, root).check(&change.path, false)?;
+            let displayed_path = display_path(change.root.as_deref(), &path);
+            let (parent, name) = parent_handle(&dir, &path)?;
             let current = snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)?;
             ensure!(
                 current
                     .as_ref()
                     .is_some_and(|s| sha256(&s.bytes) == change.after_sha256),
                 "Конфликт undo: {} изменён или удалён после правки. {SHELL_NOTE}",
-                path.display()
+                displayed_path.display()
             );
             let current = current.unwrap();
             if change.before.is_some() {
@@ -389,7 +534,7 @@ impl Tools {
                     permission_mode(&current.permissions) == change.mode
                         && current.permissions.readonly() == change.readonly,
                     "Конфликт undo: права {} изменены после правки",
-                    path.display()
+                    displayed_path.display()
                 );
             }
             batch.push((change, parent, name, current));
@@ -421,27 +566,35 @@ impl Tools {
     }
 
     pub fn diff(&self) -> Result<String> {
-        let mut changes = BTreeMap::<&Path, &Change>::new();
+        let mut changes = BTreeMap::<(Option<&Path>, &Path), &Change>::new();
         let mut shell_used = false;
         for turn in &self.checkpoints.turns {
             shell_used |= turn.shell_used;
             for change in &turn.entries {
-                changes.entry(&change.path).or_insert(change);
+                changes
+                    .entry((change.root.as_deref(), &change.path))
+                    .or_insert(change);
             }
         }
         let mut out = String::new();
-        for (path, change) in changes {
+        for ((root, relative), change) in changes {
             if out.len() >= MAX_OUTPUT_BYTES {
                 break;
             }
-            let current = self.allowed_snapshot(path, true);
+            let path = display_path(root, relative);
+            let current = self.change_directory(change).and_then(|dir| {
+                let root = change.root.as_deref().unwrap_or(&self.root);
+                let relative = Policy::new(&dir, root).check(relative, true)?;
+                let (parent, name) = parent_handle(&dir, &relative)?;
+                snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)
+            });
             match current {
                 Ok(current) => {
                     let old = String::from_utf8_lossy(change.before.as_deref().unwrap_or_default());
                     let new = String::from_utf8_lossy(
                         current.as_ref().map_or(&[], |s| s.bytes.as_slice()),
                     );
-                    out.push_str(&unified_diff(path, &old, &new));
+                    out.push_str(&unified_diff(&path, &old, &new));
                 }
                 Err(error) => out.push_str(&format!("{}: {error}\n", path.display())),
             }
@@ -454,6 +607,23 @@ impl Tools {
             out.push('\n');
         }
         Ok(bounded(&out, MAX_OUTPUT_BYTES))
+    }
+
+    // Explicit /undo and /diff can access only journaled paths. Opening this
+    // root never adds a capability for subsequent model tool calls.
+    fn change_directory(&self, change: &Change) -> Result<Dir> {
+        match &change.root {
+            None => Ok(self.dir.try_clone()?),
+            Some(root) => {
+                validate_external_root(root, &self.checkpoint_path)?;
+                safe_external_path(root, false)?;
+                ensure!(
+                    std::fs::canonicalize(root)? == *root,
+                    "Корень checkpoint изменён"
+                );
+                open_external_directory(root)
+            }
+        }
     }
 
     fn persist(&self) -> Result<()> {
@@ -487,15 +657,21 @@ impl Tools {
     }
 
     fn allowed_snapshot(&self, path: &Path, allow_missing: bool) -> Result<Option<Snapshot>> {
-        let path = Policy::new(&self.dir, &self.root).check(path, allow_missing)?;
-        let (parent, name) = parent_handle(&self.dir, &path)?;
+        let (dir, root, path) = self.required_location(path, false)?;
+        let path = Policy::new(dir, root).check(&path, allow_missing)?;
+        let (parent, name) = parent_handle(dir, &path)?;
         snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)
     }
 
-    fn read_file(&self, args: &Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
-        let path = normalized_path(Path::new(string_arg(args, "path")?), false)?;
+    fn read_file(
+        &mut self,
+        args: &Value,
+        cancel: &CancellationToken,
+        actor: Option<&str>,
+    ) -> Result<ToolOutcome> {
+        let path = Path::new(string_arg(args, "path")?);
         let file = self
-            .allowed_snapshot(&path, false)?
+            .allowed_snapshot(path, false)?
             .context("Файл не найден")?;
         let text = std::str::from_utf8(&file.bytes)
             .context("Файл не является UTF-8; бинарные файлы недоступны")?;
@@ -527,7 +703,13 @@ impl Tools {
         } else {
             None
         };
-        Ok(ToolOutcome::success(json!({"path":path,"sha256":sha256(&file.bytes),"start_line":start,"total_lines":total_lines,"next_line":next,"ends_with_newline":text.ends_with('\n'),"content":content}).to_string()))
+        check_cancel(cancel)?;
+        let hash = sha256(&file.bytes);
+        let outcome = ToolOutcome::success(json!({"path":path,"sha256":hash,"start_line":start,"total_lines":total_lines,"next_line":next,"ends_with_newline":text.ends_with('\n'),"content":content}).to_string());
+        let (_, root, relative) = self.required_location(path, false)?;
+        let key = (actor.map(str::to_owned), root.join(relative));
+        self.read_snapshots.insert(key, hash);
+        Ok(outcome)
     }
 
     async fn list_files(&self, args: &Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -572,7 +754,10 @@ impl Tools {
                 break;
             }
             scanned_files += 1;
-            let (parent, name) = match parent_handle(&self.dir, &path) {
+            let (parent, name) = match self
+                .required_location(&path, false)
+                .and_then(|(dir, _, path)| parent_handle(dir, &path))
+            {
                 Ok(x) => x,
                 Err(_) => continue,
             };
@@ -636,11 +821,12 @@ impl Tools {
         let path = args
             .get("path")
             .map_or(Ok("."), |v| v.as_str().context("path должен быть строкой"))?;
-        let path = normalized_path(Path::new(path), true)?;
-        let mut policy = Policy::new(&self.dir, &self.root);
+        let (dir, root, path) = self.required_location(Path::new(path), true)?;
+        let external_root = (root != self.root).then_some(root);
+        let mut policy = Policy::new(dir, root);
         policy.check(&path, false)?;
-        if self.dir.symlink_metadata(&path)?.is_file() {
-            return Ok((vec![path], false));
+        if dir.symlink_metadata(&path)?.is_file() {
+            return Ok((vec![display_path(external_root, &path)], false));
         }
         let mut stack = vec![path];
         let mut files = vec![];
@@ -649,7 +835,7 @@ impl Tools {
         while let Some(path) = stack.pop() {
             tokio::task::yield_now().await;
             check_cancel(cancel)?;
-            let directory = open_directory(&self.dir, &path)?;
+            let directory = open_directory(dir, &path)?;
             let mut entries = Vec::new();
             for entry in directory.entries()? {
                 if seen % 32 == 0 {
@@ -688,13 +874,20 @@ impl Tools {
         }
         files.sort();
         files.truncate(MAX_SCAN_FILES);
-        Ok((files, limited))
+        Ok((
+            files
+                .into_iter()
+                .map(|p| display_path(external_root, &p))
+                .collect(),
+            limited,
+        ))
     }
 
-    fn prepare(&self, name: &str, args: &Value) -> Result<Prepared> {
-        let path = Policy::new(&self.dir, &self.root)
-            .check(Path::new(string_arg(args, "path")?), name == "write_file")?;
-        let (parent, file_name) = parent_handle(&self.dir, &path)?;
+    fn prepare(&self, name: &str, args: &Value, actor: Option<&str>) -> Result<Prepared> {
+        let (dir, root, path) =
+            self.required_location(Path::new(string_arg(args, "path")?), false)?;
+        let path = Policy::new(dir, root).check(&path, name == "write_file")?;
+        let (parent, file_name) = parent_handle(dir, &path)?;
         let before = snapshot(&parent, Path::new(&file_name), MAX_FILE_BYTES)?;
         if let Some(file) = &before {
             std::str::from_utf8(&file.bytes)
@@ -704,6 +897,10 @@ impl Tools {
             "write_file" => {
                 let content = string_arg(args, "content")?;
                 let expected = match args.get("expected_sha256") {
+                    None | Some(Value::Null) if before.is_some() => self
+                        .read_snapshots
+                        .get(&(actor.map(str::to_owned), root.join(&path)))
+                        .map(String::as_str),
                     None | Some(Value::Null) => None,
                     Some(Value::String(s)) => Some(s.as_str()),
                     _ => bail!("expected_sha256 должен быть строкой"),
@@ -711,7 +908,7 @@ impl Tools {
                 match &before {
                     Some(file) => ensure!(
                         expected == Some(sha256(&file.bytes).as_str()),
-                        "Для существующего файла требуется актуальный expected_sha256 из read_file; файл изменён или hash отсутствует"
+                        "Файл не прочитан в этом контексте или изменён после чтения, либо expected_sha256 неверен. Перечитайте файл через read_file и подготовьте правку по актуальному содержимому; не повторяйте прежнюю запись без проверки"
                     ),
                     None => ensure!(
                         expected.is_none(),
@@ -766,6 +963,7 @@ impl Tools {
         };
         ensure!(after.len() <= MAX_FILE_BYTES, "Файл превышает лимит 1 MiB");
         Ok(Prepared {
+            root: (root != self.root).then(|| root.to_path_buf()),
             path,
             parent,
             name: file_name,
@@ -779,8 +977,9 @@ impl Tools {
         name: &str,
         args: &Value,
         cancel: &CancellationToken,
+        actor: Option<&str>,
     ) -> Result<ToolOutcome> {
-        let prepared = self.prepare(name, args)?;
+        let prepared = self.prepare(name, args, actor)?;
         check_cancel(cancel)?;
         if prepared
             .before
@@ -795,8 +994,18 @@ impl Tools {
         let old_state = self.checkpoints.clone();
         let current_hash = prepared.before.as_ref().map(|s| sha256(&s.bytes));
         let after_hash = sha256(&prepared.after);
+        let primary_root = &self.root;
+        let absolute = prepared
+            .root
+            .as_deref()
+            .unwrap_or(primary_root)
+            .join(&prepared.path);
         let turn = &mut self.checkpoints.turns[turn_index];
-        if let Some(change) = turn.entries.iter_mut().find(|c| c.path == prepared.path) {
+        if let Some(change) = turn
+            .entries
+            .iter_mut()
+            .find(|c| c.root.as_deref().unwrap_or(primary_root).join(&c.path) == absolute)
+        {
             ensure!(
                 current_hash.as_ref() == Some(&change.after_sha256),
                 "Конфликт: файл изменён вне файловых инструментов в этом ходе; исходные пользовательские правки сохранены"
@@ -812,6 +1021,7 @@ impl Tools {
             change.after_sha256 = after_hash.clone();
         } else {
             turn.entries.push(Change {
+                root: prepared.root.clone(),
                 path: prepared.path.clone(),
                 before: prepared.before.as_ref().map(|s| s.bytes.clone()),
                 mode: prepared
@@ -851,11 +1061,12 @@ impl Tools {
             self.persist()?;
             return Err(error);
         }
+        let display_path = display_path(prepared.root.as_deref(), &prepared.path);
         Ok(ToolOutcome {
             is_error: false,
-            content: json!({"path":prepared.path,"sha256":after_hash,"bytes":prepared.after.len()})
+            content: json!({"path":display_path,"sha256":after_hash,"bytes":prepared.after.len()})
                 .to_string(),
-            changed_paths: vec![prepared.path.to_string_lossy().into_owned()],
+            changed_paths: vec![display_path.to_string_lossy().into_owned()],
         })
     }
 
@@ -952,6 +1163,140 @@ impl Tools {
             changed_paths: vec![],
         })
     }
+}
+
+fn file_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file" | "write_file" | "edit_file" | "list_files" | "search"
+    )
+}
+
+fn display_path(root: Option<&Path>, path: &Path) -> PathBuf {
+    root.map_or_else(|| path.to_path_buf(), |r| r.join(path))
+}
+
+fn validate_absolute_path(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_absolute() && path.to_str().is_some(),
+        "Требуется абсолютный UTF-8 путь"
+    );
+    ensure!(
+        !path.components().any(|c| matches!(c, Component::ParentDir))
+            && !path.as_os_str().to_string_lossy().contains('\0'),
+        "Путь с .. или NUL запрещён"
+    );
+    ensure!(
+        path.components().count() <= 64 && path.as_os_str().len() <= 4096,
+        "Слишком длинный путь"
+    );
+    Ok(())
+}
+
+// Canonicalize only prefixes that resolve to an already granted root. Child
+// components stay lexical so ignore rules and symlink denial remain effective.
+fn root_prefix<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    if path.starts_with(root) {
+        return path.ancestors().find(|p| *p == root);
+    }
+    path.ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .find(|p| std::fs::canonicalize(p).is_ok_and(|canonical| canonical == root))
+}
+
+fn validate_external_root(root: &Path, checkpoint: &Path) -> Result<()> {
+    validate_absolute_path(root)?;
+    ensure!(
+        root.components().count() > 1
+            && !root.components().any(|c| secret_component(c.as_os_str())),
+        "Доступ к секретным файлам и служебным каталогам запрещён"
+    );
+    ensure!(
+        !checkpoint.starts_with(root) && !root.starts_with(checkpoint),
+        "Дополнительный каталог не должен содержать checkpoint или находиться внутри него"
+    );
+    for service in [
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/etc",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/run",
+        "/boot",
+        "/System",
+        "/Library",
+        "/Applications",
+        "/private/etc",
+        "/var/run",
+        "/private/var/run",
+        "/var/log",
+        "/private/var/log",
+    ] {
+        ensure!(
+            !root.starts_with(service),
+            "Системный или служебный каталог недоступен"
+        );
+    }
+    for broad in [
+        "/tmp",
+        "/private/tmp",
+        "/var",
+        "/private/var",
+        "/home",
+        "/Users",
+        "/private",
+    ] {
+        ensure!(
+            root != Path::new(broad),
+            "Выберите отдельный каталог проекта"
+        );
+    }
+    Ok(())
+}
+
+fn safe_external_path(path: &Path, allow_missing_file: bool) -> Result<()> {
+    validate_absolute_path(path)?;
+    ensure!(
+        !path.components().any(|c| secret_component(c.as_os_str())),
+        "Доступ к секретным файлам и служебным каталогам запрещён"
+    );
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    // macOS public temporary directory aliases are the only
+                    // implicit symlink exceptions for a new grant.
+                    let system_alias = cfg!(target_os = "macos")
+                        && ["/tmp", "/var"].iter().any(|p| prefix == Path::new(p))
+                        && std::fs::canonicalize(&prefix).is_ok_and(|p| {
+                            p == Path::new("/private").join(prefix.strip_prefix("/").unwrap())
+                        });
+                    ensure!(system_alias, "Symlink недоступен файловым инструментам");
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && allow_missing_file
+                    && prefix == path => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn open_external_directory(root: &Path) -> Result<Dir> {
+    let filesystem_root = root
+        .ancestors()
+        .last()
+        .context("Некорректный корень каталога")?;
+    let dir = Dir::open_ambient_dir(filesystem_root, cap_std::ambient_authority())?;
+    open_directory(&dir, root.strip_prefix(filesystem_root)?)
 }
 
 fn normalized_path(path: &Path, allow_root: bool) -> Result<PathBuf> {
@@ -1538,6 +1883,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approved_external_directory_supports_all_file_tools_and_shared_undo() {
+        let mut f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let file = external.join("same.txt");
+        fs::write(&file, "external original").unwrap();
+        f.file("same.txt", "primary original");
+        assert!(f.call("read_file", json!({"path":file})).await.is_error);
+        assert_eq!(
+            f.tools
+                .extra_directory_for("write_file", &json!({"path":file,"content":"x"}))
+                .unwrap(),
+            Some(fs::canonicalize(&external).unwrap())
+        );
+        f.tools.add_directory(&external).unwrap();
+        f.tools.begin_turn().unwrap();
+        let args = json!({"path":file,"content":"external changed","expected_sha256":hash(b"external original")});
+        assert!(
+            f.tools
+                .preview("write_file", &args)
+                .unwrap()
+                .unwrap()
+                .contains("same.txt")
+        );
+        let out = f.call("write_file", args).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.changed_paths,
+            vec![fs::canonicalize(&file).unwrap().to_string_lossy()]
+        );
+        assert!(!f.write("same.txt", "primary changed").await.is_error);
+        let out = f
+            .call(
+                "edit_file",
+                json!({"path":file,"old_text":"changed","new_text":"edited"}),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let out = f.call("read_file", json!({"path":file})).await;
+        assert!(
+            !out.is_error && out.content.contains("external edited"),
+            "{}",
+            out.content
+        );
+        for (tool, args) in [
+            ("list_files", json!({"path":external})),
+            (
+                "search",
+                json!({"path":external,"pattern":"external edited"}),
+            ),
+        ] {
+            let out = f.call(tool, args).await;
+            assert!(
+                !out.is_error && out.content.contains("same.txt"),
+                "{}",
+                out.content
+            );
+        }
+        let diff = f.tools.diff().unwrap();
+        assert!(
+            diff.contains("external original") && diff.contains("primary original"),
+            "{diff}"
+        );
+        f.tools.undo().unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "external original");
+        assert_eq!(
+            fs::read_to_string(f.root.join("same.txt")).unwrap(),
+            "primary original"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_external_changes_allow_exact_undo_without_restoring_grants() {
+        let mut f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let file = external.join("new.txt");
+        f.tools.add_directory(&external).unwrap();
+        let out = f
+            .call("write_file", json!({"path":file,"content":"created"}))
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        f.tools = Tools::new(&f.root, &f.state).unwrap();
+        assert!(f.tools.extra_directories().is_empty());
+        assert!(f.call("read_file", json!({"path":file})).await.is_error);
+        assert!(f.tools.diff().unwrap().contains("created"));
+        f.tools.undo().unwrap();
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn external_grants_preserve_policy_and_reject_protected_roots() {
+        let mut f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(external.join("ignored.txt"), "hidden").unwrap();
+        fs::write(external.join(".env"), "secret").unwrap();
+        assert!(f.tools.add_directory(&f.state).is_err());
+        assert!(f.tools.add_directory(f._temp.path()).is_err());
+        assert!(f.tools.add_directory(Path::new("/")).is_err());
+        assert!(
+            f.tools
+                .extra_directory_for("read_file", &json!({"path":external.join(".env")}))
+                .is_err()
+        );
+        assert!(
+            f.tools
+                .extra_directory_for("read_file", &json!({"path":external.join("ignored.txt")}))
+                .is_err()
+        );
+        assert!(
+            f.tools
+                .extra_directory_for(
+                    "write_file",
+                    &json!({"path":external.join("../oops"),"content":"x"})
+                )
+                .is_err()
+        );
+        f.tools.add_directory(&external).unwrap();
+        for name in ["ignored.txt", ".env"] {
+            assert!(
+                f.call("read_file", json!({"path":external.join(name)}))
+                    .await
+                    .is_error
+            );
+            assert!(
+                f.call(
+                    "write_file",
+                    json!({"path":external.join(name),"content":"x"})
+                )
+                .await
+                .is_error
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&f.state, external.join("link")).unwrap();
+            assert!(
+                f.call(
+                    "read_file",
+                    json!({"path":external.join("link/checkpoints.json")})
+                )
+                .await
+                .is_error
+            );
+            assert!(
+                f.tools
+                    .extra_directory_for(
+                        "read_file",
+                        &json!({"path":external.join("link/checkpoints.json")})
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_external_undo_preflights_every_root_before_restoring() {
+        let mut f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        f.tools.add_directory(&external).unwrap();
+        f.file("a.txt", "primary original");
+        fs::write(external.join("a.txt"), "external original").unwrap();
+        assert!(!f.write("a.txt", "primary changed").await.is_error);
+        let out = f.call("write_file", json!({"path":external.join("a.txt"),"content":"external changed","expected_sha256":hash(b"external original")})).await;
+        assert!(!out.is_error, "{}", out.content);
+        fs::write(external.join("a.txt"), "user edit").unwrap();
+        assert!(f.tools.undo().is_err());
+        assert_eq!(
+            fs::read_to_string(f.root.join("a.txt")).unwrap(),
+            "primary changed"
+        );
+        assert_eq!(
+            fs::read_to_string(external.join("a.txt")).unwrap(),
+            "user edit"
+        );
+        fs::write(external.join("a.txt"), "external changed").unwrap();
+        f.tools.undo().unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("a.txt")).unwrap(),
+            "primary original"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_external_alias_duplicates_and_state_roots() {
+        let mut f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir_all(external.join("nested")).unwrap();
+        f.tools.add_directory(&external).unwrap();
+        let out = f
+            .call(
+                "write_file",
+                json!({"path":external.join("nested/new.txt"),"content":"created"}),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let journal = f.state.join(CHECKPOINT_FILE);
+        let saved: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+        let mut altered = saved.clone();
+        let mut duplicate = altered["turns"][0]["entries"][0].clone();
+        duplicate["root"] = json!(fs::canonicalize(external.join("nested")).unwrap());
+        duplicate["path"] = json!("new.txt");
+        altered["turns"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        fs::write(&journal, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(
+            Tools::new(&f.root, &f.state).is_err(),
+            "Duplicate effective path accepted"
+        );
+        for invalid in [
+            f.state.clone(),
+            f._temp.path().to_path_buf(),
+            external.join(".."),
+            external.join(".ssh"),
+        ] {
+            let mut altered = saved.clone();
+            altered["turns"][0]["entries"][0]["root"] = json!(invalid);
+            fs::write(&journal, serde_json::to_vec(&altered).unwrap()).unwrap();
+            assert!(Tools::new(&f.root, &f.state).is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn absolute_workspace_paths_work_and_external_paths_explain_the_supported_tool() {
         let mut f = Fixture::new();
         let root = f.tools.root().to_path_buf();
@@ -1721,6 +2294,96 @@ mod tests {
             f.call("read_file", json!({"path":"alias.rs"}))
                 .await
                 .is_error
+        );
+    }
+
+    #[tokio::test]
+    async fn write_without_model_hash_uses_successful_read_snapshot_and_preserves_undo() {
+        let mut f = Fixture::new();
+        f.file("a.rs", "user original\n");
+        f.tools.begin_turn().unwrap();
+        let read = f.call("read_file", json!({"path":"a.rs"})).await;
+        assert!(!read.is_error, "{}", read.content);
+        let args = json!({"path":f.root.join("a.rs"),"content":"agent change\n"});
+        assert!(f.tools.preview("write_file", &args).is_ok());
+        let out = f.call("write_file", args).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(f.root.join("a.rs")).unwrap(),
+            "agent change\n"
+        );
+        f.tools.undo().unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("a.rs")).unwrap(),
+            "user original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_never_overrides_explicit_hash_or_changes_after_read() {
+        let mut f = Fixture::new();
+        f.file("a.rs", "old");
+        assert!(!f.call("read_file", json!({"path":"a.rs"})).await.is_error);
+        let bad_hash = f
+            .call(
+                "write_file",
+                json!({"path":"a.rs","content":"bad","expected_sha256":hash(b"wrong")}),
+            )
+            .await;
+        assert!(bad_hash.is_error);
+        let args = json!({"path":"a.rs","content":"agent"});
+        assert!(f.tools.preview("write_file", &args).is_ok());
+        f.file("a.rs", "user changed after preview");
+        assert!(f.call("write_file", args).await.is_error);
+        assert_eq!(
+            fs::read_to_string(f.root.join("a.rs")).unwrap(),
+            "user changed after preview"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_read_snapshot_matches_aliases_but_not_same_named_workspace_files() {
+        let mut f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("same.txt"), "external").unwrap();
+        f.file("same.txt", "workspace");
+        f.tools.add_directory(&external).unwrap();
+        assert!(
+            !f.call("read_file", json!({"path":external.join("same.txt")}))
+                .await
+                .is_error
+        );
+        assert!(
+            f.call(
+                "write_file",
+                json!({"path":"same.txt","content":"must fail"})
+            )
+            .await
+            .is_error
+        );
+        let out = f.call("write_file", json!({"path":external.join("same.txt"),"content":"changed","expected_sha256":null})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(f.root.join("same.txt")).unwrap(),
+            "workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_is_not_reused_across_turns_or_restored_from_disk() {
+        let mut f = Fixture::new();
+        f.file("a.rs", "user original");
+        assert!(!f.call("read_file", json!({"path":"a.rs"})).await.is_error);
+        f.tools.begin_turn().unwrap();
+        let args = json!({"path":"a.rs","content":"must fail"});
+        assert!(f.call("write_file", args.clone()).await.is_error);
+        assert!(!f.call("read_file", json!({"path":"a.rs"})).await.is_error);
+        f.tools = Tools::new(&f.root, &f.state).unwrap();
+        assert!(f.call("write_file", args).await.is_error);
+        assert_eq!(
+            fs::read_to_string(f.root.join("a.rs")).unwrap(),
+            "user original"
         );
     }
 

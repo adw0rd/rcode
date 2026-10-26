@@ -4,6 +4,7 @@
 последовательности меняют сетку, а не удаляются из накопленного текста.
 """
 
+import base64
 import codecs
 import unicodedata
 
@@ -20,6 +21,7 @@ class Viewport:
         self.cursor_visible = True
         self.bracketed_paste = False
         self.mouse_modes = set()
+        self.clipboard_writes = []
         self.queried_cursor = False
         self.synchronized_update = False
         self.completed_frames = 0
@@ -78,6 +80,9 @@ class Viewport:
                     if end == len(value):
                         self.pending = value[start:]
                         break
+                    command = value[index + 1:end]
+                    if command.startswith('52;c;'):
+                        self.clipboard_writes.append(base64.b64decode(command[5:], validate=True).decode('utf-8'))
                     index = end + (1 if value[end] == "\x07" else 2)
                     continue
                 if value[index] == "7":

@@ -1,11 +1,11 @@
 use crate::{
-    app::{Events, turn},
+    app::{Events, configured_tools, prepare_context, turn, user_shell},
     cli::{ApprovalMode, Cli},
     config::{ConfigStore, Effort, ProviderKind, ProviderSettings, Settings},
     presentation,
-    protocol::{Message, ModelInfo},
+    protocol::{Message, ModelInfo, ProviderMeta},
     provider::ProviderClient,
-    state::Session,
+    state::{AUTO_COMPACT_THRESHOLD, CONTEXT_LIMIT, Session},
     terminal::{self, Choice, Footer, Input},
     tools::Tools,
     ui,
@@ -310,13 +310,15 @@ fn footer(session: &Session, runtime: &Cli, plan: bool) -> Footer {
         model: session.provider.model.clone(),
         provider: session.provider.kind.to_string(),
         effort: session.provider.effort.to_string(),
-        permissions: if runtime.allow_shell {
-            if runtime.approval_mode == ApprovalMode::AutoEdit {
+        permissions: if runtime.permissions() == ApprovalMode::FullAccess {
+            "full-access".into()
+        } else if runtime.allow_shell {
+            if runtime.permissions() == ApprovalMode::AutoEdit {
                 "auto-edit + shell".into()
             } else {
                 "ask + shell".into()
             }
-        } else if runtime.approval_mode == ApprovalMode::AutoEdit {
+        } else if runtime.permissions() == ApprovalMode::AutoEdit {
             "auto-edit".into()
         } else {
             "ask".into()
@@ -341,12 +343,16 @@ fn status(session: &Session, runtime: &Cli, plan: bool, models: &[ModelInfo]) {
         session.provider.effort,
         if plan {
             "план (только чтение)"
-        } else if runtime.approval_mode == ApprovalMode::AutoEdit {
+        } else if runtime.permissions() == ApprovalMode::FullAccess {
+            "full-access (без подтверждений)"
+        } else if runtime.permissions() == ApprovalMode::AutoEdit {
             "auto-edit"
         } else {
             "подтверждения"
         },
-        if runtime.allow_shell {
+        if plan {
+            "запрещён в плане"
+        } else if runtime.shell_allowed() {
             "разрешён явно"
         } else {
             "по подтверждению"
@@ -358,8 +364,9 @@ fn status(session: &Session, runtime: &Cli, plan: bool, models: &[ModelInfo]) {
 }
 fn context(session: &Session, models: &[ModelInfo]) {
     notice!(
-        "Контекст     {} / 180000 символов — локальный бюджет CLI",
-        session.context_chars()
+        "Контекст     {} / {} символов — локальный бюджет CLI",
+        session.context_chars(),
+        CONTEXT_LIMIT
     );
     if let Some(m) = models.iter().find(|m| m.id == session.provider.model)
         && let Some(window) = m.context_length
@@ -370,7 +377,9 @@ fn context(session: &Session, models: &[ModelInfo]) {
             session.last_usage.input_tokens
         );
     }
-    notice!("/compact сокращает историю, /clear создаёт новую сессию.");
+    notice!(
+        "При {AUTO_COMPACT_THRESHOLD} символах история сокращается автоматически перед запросом к API. /compact сокращает её вручную, /clear создаёт новую сессию."
+    );
 }
 fn cost(session: &Session) {
     notice!(
@@ -461,8 +470,91 @@ fn help() {
         notice!("  {:15} {}", c.name, c.description);
     }
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit]\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Alt+Enter новая строка\nCtrl+C отменить · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; shell требует отдельного разрешения."
+        "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать"
     );
+    notice!(
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Alt+Enter новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+    );
+}
+
+fn permissions_choice(
+    args: &[&str],
+    rich: bool,
+    current: ApprovalMode,
+) -> Result<Option<ApprovalMode>> {
+    if args.len() > 1 {
+        bail!("/permissions [ask|auto-edit|full-access]");
+    }
+    if let Some(mode) = args.first() {
+        return Ok(Some(match *mode {
+            "ask" => ApprovalMode::Ask,
+            "auto-edit" => ApprovalMode::AutoEdit,
+            "full-access" => ApprovalMode::FullAccess,
+            _ => bail!("Доступны ask, auto-edit и full-access"),
+        }));
+    }
+    let modes = [
+        ApprovalMode::Ask,
+        ApprovalMode::AutoEdit,
+        ApprovalMode::FullAccess,
+    ];
+    let choices = [
+        Choice {
+            label: "ask".into(),
+            detail: "подтверждать изменения файлов, внешние каталоги и shell".into(),
+            enabled: true,
+        },
+        Choice {
+            label: "auto-edit".into(),
+            detail: "файловые правки автоматически; внешние каталоги и shell по подтверждению"
+                .into(),
+            enabled: true,
+        },
+        Choice {
+            label: "full-access · Полный доступ".into(),
+            detail: "без подтверждений: файлы, внешние каталоги и shell с вашими правами".into(),
+            enabled: true,
+        },
+    ];
+    let selected = choose(
+        "Разрешения · выбор сохраняется для этого проекта",
+        &choices,
+        modes.iter().position(|m| *m == current).unwrap_or_default(),
+        rich,
+    )?;
+    Ok(selected.map(|i| modes[i]))
+}
+
+fn apply_permissions(
+    mode: ApprovalMode,
+    store: &ConfigStore,
+    session: &Session,
+    runtime: &mut Cli,
+    tools: &mut Tools,
+) -> Result<()> {
+    let mut next = runtime.clone();
+    next.approval_mode = Some(mode);
+    next.allow_shell = false;
+    // Drop directory grants from the prior mode, retaining checkpoints and
+    // directories explicitly supplied by the operator with --add-dir.
+    let next_tools = configured_tools(
+        &session.root,
+        &session.dir(store).join("checkpoints"),
+        &next,
+    )?;
+    store.save_permissions(&session.root, mode)?;
+    *runtime = next;
+    *tools = next_tools;
+    notice!(
+        "✓ Разрешения: {} · {} · сохранено для этого проекта",
+        mode.as_str(),
+        if mode == ApprovalMode::FullAccess {
+            "без подтверждений"
+        } else {
+            "shell по подтверждению"
+        }
+    );
+    Ok(())
 }
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -484,6 +576,25 @@ pub async fn run(
     let mut plan = cli.plan;
     let mut composer = terminal::Editor::new();
     let mut plain = ui::editor()?;
+    let mut input_history =
+        match crate::input_history::InputHistory::load(store, &session.root, |text| {
+            events.redact(text)
+        }) {
+            Ok((history, entries)) => {
+                for entry in entries {
+                    composer.add_history(&entry);
+                    let _ = plain.add_history_entry(entry.as_str());
+                }
+                Some(history)
+            }
+            Err(error) => {
+                notice!(
+                    "Не удалось загрузить историю ввода: {}",
+                    events.redact(&format!("{error:#}"))
+                );
+                None
+            }
+        };
     let mut models = Vec::<ModelInfo>::new();
     let mut first = cli.prompt.clone();
     let mut interrupted: Option<Instant> = None;
@@ -493,7 +604,17 @@ pub async fn run(
         &session.provider.model,
         rich,
     );
+    let restored_context = if cli.resume.is_some() {
+        // Compact before hydration, then announce below the restored conversation.
+        // An oversized protected task remains available for /compact or /new.
+        Some(prepare_context(session, store, 0)?)
+    } else {
+        None
+    };
     hydrate(session, events);
+    if let Some(context) = restored_context {
+        context.report(events);
+    }
     loop {
         if let Some(screen) = crate::screen::current() {
             screen.set_footer(footer(session, &runtime, plan));
@@ -505,6 +626,8 @@ pub async fn run(
         } else {
             match plain.readline(if plan {
                 "rcode [план] › "
+            } else if runtime.permissions() == ApprovalMode::FullAccess {
+                "rcode [полный доступ] › "
             } else {
                 "rcode › "
             }) {
@@ -539,7 +662,32 @@ pub async fn run(
         let redacted = events.redact(input);
         composer.add_history(&redacted);
         let _ = plain.add_history_entry(redacted.as_str());
-        if input.starts_with('/') {
+        if let Some(history) = &input_history
+            && let Err(error) = history.record(&redacted, |text| events.redact(text))
+        {
+            notice!(
+                "Не удалось сохранить историю ввода: {}. В этом запуске история останется в памяти.",
+                events.redact(&format!("{error:#}"))
+            );
+            input_history = None;
+        }
+        if let Some(command) = input.strip_prefix('!') {
+            if let Err(error) = user_shell(session, store, tools, events, command).await {
+                events.emit(
+                    "error",
+                    json!({"message":events.redact(&format!("{error:#}"))}),
+                );
+            }
+            events.pause();
+            continue;
+        }
+        let first_word = input.split_whitespace().next().unwrap_or_default();
+        // /var/folders/.../screen.png is a user path, not a slash command.
+        // /attach is parsed with the user prompt so its images reach the same turn.
+        if input.starts_with('/')
+            && first_word != "/attach"
+            && !first_word[1..].contains(['/', '\\', '.'])
+        {
             let mut words = input.split_whitespace();
             let command = words.next().unwrap_or_default();
             let args = words.collect::<Vec<_>>();
@@ -553,11 +701,9 @@ pub async fn run(
                 "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
                 "/connect"|"/login"=>{let kind=args.first().map(|s|s.parse::<ProviderKind>()).transpose()?;let next=ui::connect(store,settings,kind,rich,None).await?;commit_provider(store,settings,session,client,events,next)?;models.clear();Ok(())},
                 "/permissions"=>{
-                    let mode=if let Some(mode)=args.first(){match *mode{"ask"=>Some(ApprovalMode::Ask),"auto-edit"=>Some(ApprovalMode::AutoEdit),_=>bail!("Доступны ask и auto-edit; shell разрешается отдельно")}}else{
-                        let choices=vec![Choice{label:"ask".into(),detail:"подтверждать файловые изменения и shell".into(),enabled:true},Choice{label:"auto-edit".into(),detail:"разрешить файловые правки; shell по подтверждению".into(),enabled:true}];
-                        choose("Разрешения",&choices,usize::from(runtime.approval_mode==ApprovalMode::AutoEdit),rich)?.map(|i|if i==0{ApprovalMode::Ask}else{ApprovalMode::AutoEdit})
-                    };
-                    if let Some(mode)=mode{runtime.approval_mode=mode;runtime.allow_shell=false;notice!("✓ Разрешения: {} · shell по подтверждению",if mode==ApprovalMode::Ask{"ask"}else{"auto-edit"});}Ok(())
+                    if let Some(mode)=permissions_choice(&args,rich,runtime.permissions())? {
+                        apply_permissions(mode,store,session,&mut runtime,tools)?;
+                    }Ok(())
                 },
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
                 "/status"=>{status(session,&runtime,plan,&models);Ok(())},
@@ -569,11 +715,16 @@ pub async fn run(
                     Ok(())
                 },
                 "/context"=>{context(session,&models);Ok(())},
+                "/export"=>{
+                    let path=crate::export::write(session,input.strip_prefix(command).unwrap_or_default(),|text|events.redact(text))?;
+                    notice!("✓ Диалог сохранён: {}",ui::safe(&events.redact(&path.to_string_lossy())));
+                    Ok(())
+                },
                 "/cost"=>{cost(session);Ok(())},
                 "/diff"=>{notice!("{}",ui::safe(&tools.diff()?));Ok(())},
-                "/undo"=>{let text=tools.undo()?;notice!("{}",ui::safe(&text));session.messages.push(Message::user(format!("Пользователь выполнил /undo: {text}. Перечитай файлы перед изменениями.")));session.save(store)},
+                "/undo"=>{let text=tools.undo()?;notice!("{}",ui::safe(&text));let mut message=Message::user(format!("Пользователь выполнил /undo: {text}. Перечитай файлы перед изменениями."));message.provider_meta=Some(ProviderMeta{kind:"rcode_runtime".into(),data:json!({"undo":true})});session.messages.push(message);session.save(store)},
                 "/compact"=>{let saved=session.compact()?;session.save(store)?;notice!("✓ История сокращена на {saved} символов");Ok(())},
-                "/clear"|"/new"=>{*session=Session::new(&session.root,session.provider.clone())?;session.save(store)?;*tools=Tools::new(&session.root,&session.dir(store).join("checkpoints"))?;notice!("✓ Новая сессия: {}",session.id);Ok(())},
+                "/clear"|"/new"=>{*session=Session::new(&session.root,session.provider.clone())?;session.save(store)?;*tools=configured_tools(&session.root,&session.dir(store).join("checkpoints"),&runtime)?;notice!("✓ Новая сессия: {}",session.id);Ok(())},
                 "/resume"=>{
                     let id=if let Some(id)=args.first(){Some((*id).to_owned())}else{
                         let saved=Session::list(store)?.into_iter().filter(|s|s.root==session.root).collect::<Vec<_>>();
@@ -584,8 +735,8 @@ pub async fn run(
                     if let Some(id)=id{
                         let mut restored=Session::load(store,&id,&session.root)?;let key=store.credential(restored.provider.kind)?.context("Нет ключа провайдера сохранённой сессии")?;
                         let next=ProviderClient::new(restored.provider.clone(),key.value.clone())?;
-                        let next_tools=Tools::new(&restored.root,&restored.dir(store).join("checkpoints"))?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;events.remember(key.value);models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}hydrate(session,events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
+                        *session=restored;*client=next;*tools=next_tools;events.remember(key.value);models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _=>bail!("Неизвестная команда. / открывает меню, /help — справку"),
@@ -624,15 +775,48 @@ fn hydrate(session: &Session, events: &Events) {
         if message
             .provider_meta
             .as_ref()
+            .is_some_and(|meta| meta.kind == "rcode_user_shell")
+        {
+            for call in &message.tool_calls {
+                if let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments) {
+                    events.emit(
+                        "shell_start",
+                        json!({"command":args["command"].as_str().unwrap_or_default()}),
+                    );
+                }
+                if let Some(result) = session.messages.iter().find(|m| {
+                    m.role == "tool" && m.tool_call_id.as_deref() == Some(call.id.as_str())
+                }) {
+                    events.emit("shell_result",json!({"content":result.content.as_deref().unwrap_or_default(),"restored":true}));
+                }
+            }
+            continue;
+        }
+        if message
+            .provider_meta
+            .as_ref()
+            .is_some_and(|meta| meta.kind == "rcode_compaction")
+        {
+            screen.line("Часть предыдущей истории сокращена; показаны сохранённые сообщения.");
+            continue;
+        }
+        if message
+            .provider_meta
+            .as_ref()
             .is_none_or(|meta| meta.kind != "rcode_runtime")
             && matches!(message.role.as_str(), "user" | "assistant")
             && let Some(text) = message.content.as_deref().filter(|t| !t.is_empty())
         {
-            screen.line(&format!(
-                "\n{} {}",
-                if message.role == "user" { "❯" } else { "✦" },
-                events.redact(text)
-            ));
+            if message.role == "assistant" {
+                screen.line("\n✦ rcode");
+                screen.append_markdown(&events.redact(text));
+                screen.finish_markdown();
+            } else {
+                screen.line(&format!("\n❯ {}", events.redact(text)));
+                for image in &message.images {
+                    screen.line(&format!("  {}", ui::safe(&events.redact(&image.label()))));
+                }
+            }
         }
     }
 }

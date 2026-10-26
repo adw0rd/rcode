@@ -397,7 +397,10 @@ impl rustyline::completion::Completer for CommandHelper {
     }
 }
 pub fn editor() -> Result<rustyline::Editor<CommandHelper, rustyline::history::DefaultHistory>> {
-    let mut editor = rustyline::Editor::new()?;
+    let config = rustyline::Config::builder()
+        .max_history_size(crate::terminal::MAX_HISTORY)?
+        .build();
+    let mut editor = rustyline::Editor::with_config(config)?;
     editor.set_helper(Some(CommandHelper));
     Ok(editor)
 }

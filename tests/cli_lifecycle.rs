@@ -754,7 +754,7 @@ fn truncated_http_body_exits_four() {
 }
 
 #[test]
-fn context_overflow_does_not_append_request_and_explicit_compact_recovers() {
+fn context_overflow_compacts_automatically_and_explicit_compact_remains_available() {
     use rcode::{
         config::{ConfigStore, ProviderKind, ProviderSettings},
         protocol::Message,
@@ -772,13 +772,32 @@ fn context_overflow_does_not_append_request_and_explicit_compact_recovers() {
         .messages
         .push(Message::text("assistant", "x".repeat(180_001)));
     session.save(&store).unwrap();
+    let server = Server::start(vec![final_reply("AUTO_RECOVERED")]);
     let output = fixture.run(
-        "http://127.0.0.1:1/v1",
+        &server.url,
         &["--resume", &session.id, "exec", "--json", "new request"],
     );
-    events(&output, 1);
+    let automatic_events = events(&output, 0);
+    assert!(
+        automatic_events
+            .iter()
+            .any(|event| event["type"] == "context_compacted" && event["automatic"] == true)
+    );
+    assert_eq!(server.finish().len(), 1);
     let saved = read_json(&fixture.session_path(&session.id));
-    assert_eq!(saved["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        saved["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == "new request")
+    );
+    assert!(
+        Session::load(&store, &session.id, &fixture.project)
+            .unwrap()
+            .context_chars()
+            < 150_000
+    );
     let server = Server::start(vec![final_reply("RECOVERED")]);
     let output = fixture.run(
         &server.url,

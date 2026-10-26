@@ -215,7 +215,9 @@ impl Human {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.text_open {
             if let Some(screen) = screen {
-                screen.append("\n");
+                if !self.rich {
+                    screen.append("\n");
+                }
             } else {
                 println!();
             }
@@ -246,15 +248,80 @@ impl Human {
             };
         }
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if kind != "text"
+            && !matches!(kind, "usage" | "agent_update")
+            && data["agent_id"].is_null()
+            && let Some(screen) = screen
+        {
+            screen.finish_markdown();
+        }
         if kind != "text" && s.text_open {
             if let Some(screen) = screen {
-                screen.append("\n");
+                if !self.rich {
+                    screen.append("\n");
+                }
             } else {
                 println!();
             }
             s.text_open = false;
         }
         match kind {
+            "image" => {
+                line!(
+                    "  Изображение: {} · {:.1} КиБ",
+                    ui::safe(data["name"].as_str().unwrap_or_default()),
+                    data["bytes"].as_u64().unwrap_or_default() as f64 / 1024.0
+                );
+            }
+            "shell_start" => {
+                line!(
+                    "\n{} {}",
+                    tone("!", "31", rich),
+                    ui::safe(data["command"].as_str().unwrap_or_default())
+                );
+            }
+            "shell_result" => {
+                let content = data["content"].as_str().unwrap_or_default();
+                if let Ok(result) = serde_json::from_str::<Value>(content) {
+                    for key in ["stdout", "stderr"] {
+                        let text = result[key]
+                            .as_str()
+                            .unwrap_or_default()
+                            .trim_end_matches('\n');
+                        if !text.is_empty() {
+                            line!("{}", ui::safe(text));
+                        }
+                    }
+                    let summary = match result["reason"]
+                        .as_str()
+                        .or_else(|| result["error"].as_str())
+                    {
+                        Some("cancelled") => "↳ прервано".to_owned(),
+                        Some("timeout") => "↳ превышено время выполнения".to_owned(),
+                        Some("output_limit") => "↳ достигнут лимит вывода".to_owned(),
+                        Some("interrupted") => {
+                            "↳ выполнение прервано; результат неизвестен".to_owned()
+                        }
+                        Some(error) => format!("↳ {}", ui::safe(error)),
+                        None => result["exit_code"]
+                            .as_i64()
+                            .map(|code| format!("↳ exit {code}"))
+                            .unwrap_or_else(|| "↳ процесс завершён сигналом".into()),
+                    };
+                    let elapsed = data["elapsed_secs"]
+                        .as_f64()
+                        .map(|seconds| format!(" · {seconds:.1}s"))
+                        .unwrap_or_default();
+                    let error = data["is_error"] == true || result["exit_code"].as_i64() != Some(0);
+                    line!(
+                        "{}{}",
+                        tone(&summary, if error { "31" } else { "2" }, rich),
+                        elapsed
+                    );
+                } else {
+                    line!("{}", tone(&ui::safe(content), "31", rich));
+                }
+            }
             "start" => {
                 s.started = Some(Instant::now());
                 s.tools = 0;
@@ -265,7 +332,11 @@ impl Human {
             "text" => {
                 let text = ui::safe(data["text"].as_str().unwrap_or_default());
                 if let Some(screen) = screen {
-                    screen.append(&text);
+                    if self.rich {
+                        screen.append_markdown(&text);
+                    } else {
+                        screen.append(&text);
+                    }
                 } else {
                     print!("{text}");
                     let _ = io::stdout().flush();
@@ -346,6 +417,21 @@ impl Human {
                 tone("✗", "31", rich),
                 ui::safe(data["message"].as_str().unwrap_or_default())
             ),
+            "context_compacted" => {
+                line!(
+                    "↻ Автокомпакт: {} → {} символов",
+                    number(data["before_chars"].as_u64().unwrap_or_default()),
+                    number(data["after_chars"].as_u64().unwrap_or_default())
+                );
+                line!(
+                    "{}",
+                    ui::safe(
+                        data["message"]
+                            .as_str()
+                            .unwrap_or("Контекст автоматически сжат")
+                    )
+                );
+            }
             "usage" => {
                 if let Some(screen) = screen {
                     screen.usage(
@@ -480,6 +566,47 @@ fn welcome_to(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn automatic_compaction_notice_reports_actual_char_counts_without_fake_usage() {
+        let screen = crate::screen::Screen::test_screen();
+        let human = Human::new(true);
+        human.emit_to("context_compacted", &json!({"automatic":true,"before_chars":171000,"after_chars":109000,"saved_chars":62000,"message":"Текущий запрос сохранён"}), Some(&screen));
+        let history = screen.history_text();
+        assert!(history.contains("Автокомпакт: 171.0k → 109.0k символов"));
+        assert!(history.contains("Текущий запрос сохранён"));
+        assert_eq!(human.state.lock().unwrap().tools, 0);
+        assert!(!history.contains("токенов"));
+    }
+    #[test]
+    fn background_agent_events_do_not_split_the_parent_markdown_stream() {
+        let screen = crate::screen::Screen::test_screen();
+        let human = Human::new(true);
+        human.emit_to("text", &json!({"text":"```python\nprint("}), Some(&screen));
+        human.emit_to(
+            "tool_start",
+            &json!({"agent_id":"worker", "name":"read_file"}),
+            Some(&screen),
+        );
+        human.busy_to("Субагент читает файл", Some(&screen));
+        human.emit_to(
+            "tool_result",
+            &json!({"agent_id":"worker", "name":"read_file", "content":"{}"}),
+            Some(&screen),
+        );
+        human.emit_to(
+            "usage",
+            &json!({"input_tokens":1,"output_tokens":1}),
+            Some(&screen),
+        );
+        human.emit_to("text", &json!({"text":"'ok')\n```"}), Some(&screen));
+        human.emit_to("done", &json!({}), Some(&screen));
+        let history = screen.history_text();
+        assert!(
+            history.contains("```python\nprint('ok')\n```"),
+            "{history:?}"
+        );
+        assert!(history.contains("● read_file"));
+    }
     #[test]
     fn agent_updates_stay_in_history_without_injecting_terminal_controls() {
         let screen = crate::screen::Screen::test_screen();

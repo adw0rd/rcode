@@ -132,14 +132,21 @@ class Terminal:
         self.until(lambda: self.grid.frame_complete, "completed synchronized update after drain")
 
     def assert_footer(self, *expected):
+        def version_is_right():
+            match = re.search(r'(?:rcode |v)\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$', self.grid.rows()[-2])
+            return (match is not None and self.grid.cells[-2][-2] == match.group()[-1]
+                    and self.grid.cells[-2][-1] == ' ')
         self.until(lambda: "Контекст" in self.grid.rows()[-1]
-                   and all(value in self.grid.rows()[-2] for value in expected),
+                   and all(value in self.grid.rows()[-2] for value in expected)
+                   and version_is_right(),
                    f"footer in last two rows ({', '.join(expected)})")
         rows = self.grid.rows()
         assert "Контекст" in rows[-1], f"Footer must occupy last row:\n{self.dump()}"
+        assert version_is_right(), f"Version must stay aligned to the right:\n{self.dump()}"
         for value in expected:
             assert value in rows[-2], f"{value!r} absent from penultimate row:\n{self.dump()}"
         assert all("Контекст [" not in row for row in rows[:-1]), f"Stale footer above last row:\n{self.dump()}"
+        assert {1002, 1006}.issubset(self.grid.mouse_modes), "Wheel and drag capture must stay enabled"
 
     def dump(self):
         return "\n".join(f"{index + 1:02d}|{row}" for index, row in enumerate(self.grid.rows()))
@@ -411,7 +418,9 @@ def main(binary):
             terminal.assert_footer("alpha-one", "custom", "auto", "ask")
             terminal.capture("palette")
             terminal.send("\t\r")
-            terminal.editor_after("Команды rcode", mark)
+            # The renderer may coalesce the whole help into one frame. Its
+            # heading can already be above the viewport; assert a lasting row.
+            terminal.editor_after("Изменения файлов — через diff/подтверждение", mark)
             terminal.command("/agents", "субагенты ещё не запускались")
 
             terminal.command("/model", "Модель · custom")

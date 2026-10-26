@@ -51,7 +51,11 @@ impl Fixture {
             "Live-тест ожидает официальный endpoint провайдера"
         );
         provider.max_output_tokens = 4096;
-        provider.idle_timeout_secs = 30;
+        provider.idle_timeout_secs = if kind == ProviderKind::GigaChat {
+            90
+        } else {
+            30
+        };
         provider.validate().unwrap();
         settings.active = kind;
         settings.providers.clear();
@@ -80,6 +84,10 @@ impl Fixture {
     }
 
     fn run(&self, prompt: &str) -> Vec<Value> {
+        self.run_with_directories(prompt, &[])
+    }
+
+    fn run_with_directories(&self, prompt: &str, directories: &[&Path]) -> Vec<Value> {
         let binary = std::env::var_os("RCODE_LIVE_BINARY")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_rcode").into());
         let mut command = Command::new(binary);
@@ -115,6 +123,9 @@ impl Fixture {
                 command.env(name, value);
             }
         }
+        for directory in directories {
+            command.arg("--add-dir").arg(directory);
+        }
         let output = output_with_deadline(&mut command, Duration::from_secs(180));
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -132,6 +143,8 @@ impl Fixture {
                 self.kind,
                 if prompt.contains("Godot") {
                     "godot"
+                } else if prompt.contains("tkinter") {
+                    "python"
                 } else {
                     "workers"
                 }
@@ -164,6 +177,109 @@ impl Fixture {
         );
         events
     }
+}
+
+#[test]
+#[ignore = "Живой GigaChat API и установленный Python; запускать явно с --ignored"]
+fn gigachat_rewrites_existing_python_file_with_host_read_snapshot() {
+    let fixture = Fixture::for_provider(ProviderKind::GigaChat);
+    let target = fixture.directory.path().join("rewrite");
+    fs::create_dir(&target).unwrap();
+    let file = target.join("main.py");
+    fs::write(&file, "def greeting():\n    return 'before'\n\nif __name__ == '__main__':\n    print(greeting())\n").unwrap();
+    let prompt = format!(
+        "В файле {} измени greeting() так, чтобы она возвращала строку after. Сначала прочитай файл через read_file, затем перезапиши полный файл через write_file, сохранив остальную логику. expected_sha256 не передавай: host использует snapshot успешного чтения и отклонит запись, если файл изменился. Проверь файл запуском python3 без графических окон. Работай самостоятельно без субагентов, других файлов и изменений вне этой папки.",
+        file.display()
+    );
+    let events = fixture.run_with_directories(&prompt, &[&target]);
+    let call_ids: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "tool_start" && e["name"] == "write_file")
+        .filter(|e| {
+            serde_json::from_str::<Value>(e["arguments"].as_str().unwrap_or("")).is_ok_and(|a| {
+                a["path"].as_str().is_some_and(|p| {
+                    Path::new(p).file_name() == Some(std::ffi::OsStr::new("main.py"))
+                }) && a.get("expected_sha256").is_none_or(Value::is_null)
+            })
+        })
+        .map(|e| e["id"].clone())
+        .collect();
+    assert!(
+        events.iter().any(|e| e["type"] == "tool_result"
+            && e["name"] == "write_file"
+            && e["is_error"] == false
+            && call_ids.contains(&e["id"])),
+        "Модель должна перезаписать существующий файл через host read snapshot"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["type"] == "tool_result" && e["is_error"] == true),
+        "В коротком read→write сценарии не должно быть ошибок инструментов"
+    );
+    let output = output_with_deadline(
+        Command::new("python3").arg("-I").arg(&file),
+        Duration::from_secs(15),
+    );
+    assert!(
+        output.status.success(),
+        "Python oracle завершился с ошибкой"
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "after");
+    println!(
+        "PASS: GigaChat rewrote an existing external Python file after read_file without expected_sha256; independent Python execution returned after; GUI not launched"
+    );
+}
+
+#[test]
+#[ignore = "Живой GigaChat API и установленный Python; запускать явно с --ignored"]
+fn gigachat_writes_python_game_in_explicit_external_directory() {
+    let fixture = Fixture::for_provider(ProviderKind::GigaChat);
+    let target = fixture.directory.path().join("saper");
+    fs::create_dir(&target).unwrap();
+    let prompt = format!(
+        "Напиши простую игру «Сапёр» на Python с tkinter в существующей папке {}. Один файл main.py, поле 9×9 с 10 минами, открытие клеток и флаги. Проверь синтаксис без запуска графического окна.",
+        target.display()
+    );
+    let events = fixture.run_with_directories(&prompt, &[&target]);
+    let file = target.join("main.py");
+    assert!(file.is_file(), "Игра не создана во внешнем каталоге");
+    let source = fs::read_to_string(&file).unwrap();
+    assert!(source.contains("tkinter"), "Нет запрошенного tkinter");
+    assert!(
+        events.iter().any(|e| e["type"] == "tool_result"
+            && e["name"] == "write_file"
+            && e["is_error"] == false
+            && e["changed_paths"]
+                .as_array()
+                .is_some_and(
+                    |paths| paths.iter().any(|p| p.as_str().is_some_and(|p| Path::new(p)
+                        .file_name()
+                        == Some(std::ffi::OsStr::new("main.py"))))
+                )),
+        "Файл должен быть записан обычным write_file"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "tool_result"
+            && e["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("outside_workspace"))),
+        "Лишний цикл ошибки внешнего пути"
+    );
+    let output = output_with_deadline(
+        Command::new("python3")
+            .args(["-I", "-m", "py_compile"])
+            .arg(&file),
+        Duration::from_secs(15),
+    );
+    assert!(
+        output.status.success(),
+        "Независимый Python oracle: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!(
+        "PASS: GigaChat wrote external tkinter game using file tools; independent Python syntax validation passed; GUI not launched"
+    );
 }
 
 fn output_with_deadline(command: &mut Command, duration: Duration) -> Output {

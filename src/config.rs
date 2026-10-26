@@ -139,6 +139,9 @@ pub struct ProviderSettings {
     pub stream: bool,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
+    /// Ожидание HTTP-ответа генерации до получения заголовков.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 }
@@ -148,6 +151,9 @@ const fn default_stream() -> bool {
 }
 const fn default_max_output_tokens() -> u32 {
     4096
+}
+const fn default_request_timeout_secs() -> u64 {
+    300
 }
 const fn default_idle_timeout_secs() -> u64 {
     90
@@ -175,6 +181,7 @@ impl ProviderSettings {
             ca_file: None,
             stream: default_stream(),
             max_output_tokens: default_max_output_tokens(),
+            request_timeout_secs: default_request_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
         }
     }
@@ -184,8 +191,11 @@ impl ProviderSettings {
         if self.model.trim().is_empty() || self.model.chars().any(char::is_control) {
             bail!("Укажите непустое имя модели без управляющих символов");
         }
-        if self.max_output_tokens == 0 || self.idle_timeout_secs == 0 {
-            bail!("Лимит выходных токенов и таймаут должны быть больше нуля");
+        if self.max_output_tokens == 0
+            || self.request_timeout_secs == 0
+            || self.idle_timeout_secs == 0
+        {
+            bail!("Лимит выходных токенов и таймауты должны быть больше нуля");
         }
         for endpoint in [&self.base_url, &self.auth_url].into_iter().flatten() {
             validate_endpoint(endpoint)?;
@@ -267,6 +277,25 @@ fn validate_endpoint(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    #[default]
+    Ask,
+    AutoEdit,
+    FullAccess,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto-edit",
+            Self::FullAccess => "full-access",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
@@ -293,6 +322,21 @@ impl Settings {
             .get(kind.as_str())
             .cloned()
             .unwrap_or_else(|| ProviderSettings::new(kind))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProjectPermissions {
+    version: u32,
+    projects: BTreeMap<PathBuf, ApprovalMode>,
+}
+
+impl Default for ProjectPermissions {
+    fn default() -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            projects: BTreeMap::new(),
+        }
     }
 }
 
@@ -382,6 +426,32 @@ impl ConfigStore {
 
     pub fn exists(&self) -> bool {
         self.root.join("config.json").exists()
+    }
+
+    pub fn permissions_for(&self, root: &Path) -> Result<ApprovalMode> {
+        let root = root.canonicalize()?;
+        Ok(self
+            .load_permissions()?
+            .projects
+            .get(&root)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    pub fn save_permissions(&self, root: &Path, mode: ApprovalMode) -> Result<()> {
+        let root = root.canonicalize()?;
+        let _lock = lock_state_file(&self.root.join("permissions.lock"))?;
+        let mut permissions = self.load_permissions()?;
+        permissions.projects.insert(root, mode);
+        write_private_json(&self.root.join("permissions.json"), &permissions)
+    }
+
+    fn load_permissions(&self) -> Result<ProjectPermissions> {
+        let permissions =
+            read_json::<ProjectPermissions>(&self.root.join("permissions.json"), "разрешений")?
+                .unwrap_or_default();
+        check_version(permissions.version, "разрешений")?;
+        Ok(permissions)
     }
 
     pub fn load(&self) -> Result<Settings> {
@@ -529,6 +599,41 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     }
 }
 
+pub(crate) fn lock_state_file(path: &Path) -> Result<fs::File> {
+    ensure_private_directory(path.parent().context("Нет каталога файла состояния")?)?;
+    check_file(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .context("Не удалось открыть блокировку файла состояния")?;
+    if !file.metadata()?.is_file() {
+        bail!("Блокировка должна быть обычным файлом");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error)
+                if error.kind() == fs2::lock_contended_error().kind()
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(error).context("Файл состояния занят другим процессом или недоступен");
+            }
+        }
+    }
+}
+
 pub(crate) fn check_file(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -614,6 +719,58 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     #[test]
+    fn project_permissions_round_trip_and_legacy_defaults_do_not_enable_full_access_globally() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let store = ConfigStore::at(temp.path().join("state")).unwrap();
+        let settings: Settings = serde_json::from_value(
+            serde_json::json!({"version":1,"active":"custom","providers":{}}),
+        )
+        .unwrap();
+        store.save(&settings).unwrap();
+        assert_eq!(store.permissions_for(&first).unwrap(), ApprovalMode::Ask);
+        store
+            .save_permissions(&first, ApprovalMode::FullAccess)
+            .unwrap();
+        let loaded = ConfigStore::at(store.root()).unwrap();
+        assert_eq!(
+            loaded.permissions_for(&first).unwrap(),
+            ApprovalMode::FullAccess
+        );
+        assert_eq!(loaded.permissions_for(&second).unwrap(), ApprovalMode::Ask);
+        use clap::Parser;
+        let default = crate::cli::Cli::parse_from(["rcode"]);
+        assert_eq!(
+            default.for_project(ApprovalMode::FullAccess).permissions(),
+            ApprovalMode::FullAccess
+        );
+        let explicit = crate::cli::Cli::parse_from(["rcode", "--approval-mode", "ask"]);
+        assert_eq!(
+            explicit.for_project(ApprovalMode::FullAccess).permissions(),
+            ApprovalMode::Ask
+        );
+    }
+
+    #[test]
+    fn saving_an_older_provider_snapshot_does_not_restore_revoked_full_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let store = ConfigStore::at(temp.path().join("state")).unwrap();
+        store.save(&Settings::default()).unwrap();
+        store
+            .save_permissions(&root, ApprovalMode::FullAccess)
+            .unwrap();
+        let stale = store.load().unwrap();
+        store.save_permissions(&root, ApprovalMode::Ask).unwrap();
+        store.save(&stale).unwrap();
+        assert_eq!(store.permissions_for(&root).unwrap(), ApprovalMode::Ask);
+    }
+
+    #[test]
     fn explicit_effort_survives_config_round_trip_and_defaults_are_omitted() {
         let settings: ProviderSettings = serde_json::from_value(serde_json::json!({
             "kind": "openrouter", "model": "reasoning-model", "effort": "high"
@@ -686,6 +843,7 @@ mod tests {
             assert_eq!(settings.kind, kind);
             assert!(settings.stream);
             assert_eq!(settings.max_output_tokens, 4096);
+            assert_eq!(settings.request_timeout_secs, 300);
             assert_eq!(settings.idle_timeout_secs, 90);
         }
         assert!("unknown".parse::<ProviderKind>().is_err());
@@ -773,6 +931,10 @@ mod tests {
         assert!(settings.stream);
         assert_eq!(settings.max_output_tokens, 4096);
         assert_eq!(settings.idle_timeout_secs, 90);
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["request_timeout_secs"],
+            300
+        );
         let mut settings = Settings::default();
         assert_eq!(settings.version, 1);
         assert_eq!(settings.active, ProviderKind::Yandex);
@@ -782,6 +944,27 @@ mod tests {
             settings.provider(ProviderKind::OpenRouter).kind,
             ProviderKind::OpenRouter
         );
+    }
+
+    #[test]
+    fn request_timeout_defaults_are_backward_compatible_and_explicit_limits_are_validated() {
+        let legacy: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "kind":"gigachat", "model":"GigaChat-3-Ultra", "idle_timeout_secs":90
+        }))
+        .unwrap();
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(value["request_timeout_secs"], 300);
+        assert_eq!(value["idle_timeout_secs"], 90);
+        for seconds in [0, 1, 7] {
+            let mut value = value.clone();
+            value["request_timeout_secs"] = serde_json::json!(seconds);
+            let settings: ProviderSettings = serde_json::from_value(value).unwrap();
+            assert_eq!(settings.validate().is_ok(), seconds > 0);
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap()["request_timeout_secs"],
+                seconds
+            );
+        }
     }
 
     #[test]

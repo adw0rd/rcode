@@ -7,6 +7,7 @@ use crate::{
     },
 };
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt;
 use reqwest::{
     Client, Method, Request, Response, Url,
@@ -25,6 +26,11 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 const MAX_CALLS: usize = 128;
 const MAX_RETRIES: usize = 2;
 
+enum RequestPayload<'a> {
+    Json(&'a Value),
+    Multipart(&'a [u8], &'a str),
+}
+
 #[derive(Clone)]
 pub struct ProviderClient {
     settings: ProviderSettings,
@@ -36,6 +42,7 @@ pub struct ProviderClient {
     credential: String,
     token: Option<AccessToken>,
     generation_slots: Arc<Semaphore>,
+    image_uploads: Arc<tokio::sync::Mutex<BTreeMap<String, String>>>,
 }
 #[derive(Clone)]
 struct AccessToken {
@@ -72,12 +79,13 @@ impl ProviderClient {
         }
         if settings.model.trim().is_empty()
             || settings.max_output_tokens == 0
+            || settings.request_timeout_secs == 0
             || settings.idle_timeout_secs == 0
         {
             return Err(fail(
                 FailureKind::Protocol,
                 None,
-                "Модель, лимит токенов и idle timeout должны быть заданы",
+                "Модель, лимит токенов, request timeout и idle timeout должны быть заданы",
             ));
         }
         let mut builder = client_builder();
@@ -125,6 +133,7 @@ impl ProviderClient {
             credential,
             token: None,
             generation_slots,
+            image_uploads: Default::default(),
         })
     }
 
@@ -142,7 +151,8 @@ impl ProviderClient {
             .acquire_owned()
             .await
             .map_err(|_| transport("Очередь модельных запросов закрыта"))?;
-        let body = self.completion_body(messages, tools)?;
+        let uploaded = self.prepare_images(messages).await?;
+        let body = self.completion_body(messages, tools, &uploaded)?;
         let response = self
             .authorized_request(Method::POST, "chat/completions", Some(&body))
             .await?;
@@ -264,10 +274,15 @@ impl ProviderClient {
         Ok(format!("gpt://{folder}/{}", self.settings.model))
     }
 
-    fn completion_body(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Value> {
+    fn completion_body(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        uploaded: &BTreeMap<String, String>,
+    ) -> Result<Value> {
         let giga = self.settings.kind == ProviderKind::GigaChat;
         let messages = if giga {
-            giga_messages(messages)?
+            giga_messages(messages, uploaded)?
         } else {
             compatible_messages(messages)?
         };
@@ -302,6 +317,74 @@ impl ProviderClient {
         method: Method,
         path: &str,
         body: Option<&Value>,
+    ) -> Result<Response> {
+        self.authorized_payload(method, path, body.map(RequestPayload::Json))
+            .await
+    }
+
+    async fn prepare_images(&mut self, messages: &[Message]) -> Result<BTreeMap<String, String>> {
+        let images = messages
+            .iter()
+            .flat_map(|message| &message.images)
+            .collect::<Vec<_>>();
+        if images.len() > crate::images::MAX_IMAGES {
+            return Err(protocol(
+                "В истории больше 10 изображений; выполните /compact или /new перед отправкой",
+            ));
+        }
+        for message in messages {
+            if !message.images.is_empty() && message.role != "user" {
+                return Err(protocol(
+                    "Изображения допустимы только в пользовательских сообщениях",
+                ));
+            }
+            for image in &message.images {
+                image.validate()?;
+            }
+        }
+        if self.settings.kind != ProviderKind::GigaChat || images.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let cache = self.image_uploads.clone();
+        let mut cache = cache.lock().await;
+        for image in images {
+            if cache.contains_key(&image.sha256) {
+                continue;
+            }
+            let boundary = format!("rcode-{}", uuid::Uuid::new_v4().simple());
+            let extension = if image.mime_type == "image/png" {
+                "png"
+            } else {
+                "jpg"
+            };
+            // A replayable byte body uses the same bounded retry/auth/TLS path as JSON.
+            // Filenames in MIME headers are generated, never taken from user text.
+            let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\ngeneral\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"image.{extension}\"\r\nContent-Type: {}\r\n\r\n", image.mime_type).into_bytes();
+            body.extend_from_slice(&image.data);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            let content_type = format!("multipart/form-data; boundary={boundary}");
+            let response = self
+                .authorized_payload(
+                    Method::POST,
+                    "files",
+                    Some(RequestPayload::Multipart(&body, &content_type)),
+                )
+                .await?;
+            let result = read_json(response, self.idle()).await?;
+            let id = result["id"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .ok_or_else(|| protocol("Files API не вернул идентификатор изображения"))?;
+            cache.insert(image.sha256.clone(), id.to_owned());
+        }
+        Ok(cache.clone())
+    }
+
+    async fn authorized_payload(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<RequestPayload<'_>>,
     ) -> Result<Response> {
         if self.gigachat_client.is_none()
             && crate::certificates::automatic_gigachat_ca(
@@ -361,13 +444,23 @@ impl ProviderClient {
             if self.settings.kind == ProviderKind::OpenRouter {
                 request = request.header("X-Title", "rcode");
             }
-            if let Some(body) = body {
-                request = request.json(body);
+            if let Some(body) = &body {
+                request = match body {
+                    RequestPayload::Json(value) => request.json(value),
+                    RequestPayload::Multipart(bytes, content_type) => request
+                        .header(reqwest::header::CONTENT_TYPE, *content_type)
+                        .body(bytes.to_vec()),
+                };
             }
             let request = request
                 .build()
                 .map_err(|_| protocol("Не удалось сформировать HTTP-запрос"))?;
-            let response = self.send_with_retry(request).await?;
+            let response = self
+                .send_with_retry(
+                    request,
+                    method == Method::POST && path == "chat/completions",
+                )
+                .await?;
             if giga && response.status() == reqwest::StatusCode::UNAUTHORIZED && auth_attempt == 0 {
                 drop(response);
                 self.token = None;
@@ -403,7 +496,7 @@ impl ProviderClient {
             )])
             .build()
             .map_err(|_| protocol("Не удалось сформировать OAuth-запрос"))?;
-        let response = self.send_with_retry(request).await?;
+        let response = self.send_with_retry(request, false).await?;
         let response = self.check_status(response).await?;
         let value = read_json(response, self.idle()).await?;
         let token = value
@@ -436,7 +529,14 @@ impl ProviderClient {
         Ok(())
     }
 
-    async fn send_with_retry(&self, request: Request) -> Result<Response> {
+    async fn send_with_retry(&self, request: Request, generation: bool) -> Result<Response> {
+        // This deadline stops at response headers. A total reqwest timeout would
+        // also cut off an active SSE stream; body reads have their own idle timer.
+        let (seconds, setting) = if generation {
+            (self.settings.request_timeout_secs, "request_timeout_secs")
+        } else {
+            (self.settings.idle_timeout_secs, "idle_timeout_secs")
+        };
         for attempt in 0..=MAX_RETRIES {
             let next = request
                 .try_clone()
@@ -448,9 +548,13 @@ impl ProviderClient {
             } else {
                 &self.client
             };
-            let response = tokio::time::timeout(self.idle(), client.execute(next))
+            let response = tokio::time::timeout(Duration::from_secs(seconds), client.execute(next))
                 .await
-                .map_err(|_| transport("Превышено время ожидания ответа API"))?
+                .map_err(|_| {
+                    transport(&format!(
+                        "Превышено время ожидания ответа API: {seconds} с ({setting}). После таймаута запрос автоматически не повторяется. При необходимости увеличьте {setting} и повторите вручную; ожидание можно прервать Ctrl+C."
+                    ))
+                })?
                 .map_err(|error| {
                     transport(if error.is_connect() {
                         "Не удалось подключиться к API; проверьте сеть и CA-сертификат"
@@ -519,6 +623,14 @@ impl ProviderClient {
             (
                 FailureKind::Context,
                 "Контекст превышает лимит модели; используйте /compact",
+            )
+        } else if matches!(code, 400 | 422)
+            && text.contains("field 'properties.")
+            && text.contains("expected: stringvalue, actual: arrayvalue")
+        {
+            (
+                FailureKind::Protocol,
+                "API отклонил схему параметров инструмента: провайдер ожидает один тип параметра, а не список типов",
             )
         } else if status.is_server_error() {
             (FailureKind::Transport, "Сервер API временно недоступен")
@@ -675,12 +787,25 @@ fn protocol(message: &str) -> anyhow::Error {
 fn transport(message: &str) -> anyhow::Error {
     fail(FailureKind::Transport, None, message)
 }
+fn idle_timeout(idle: Duration) -> anyhow::Error {
+    transport(&format!(
+        "API не передаёт данные: idle timeout {} с (idle_timeout_secs). После таймаута запрос автоматически не повторяется; повторите вручную при необходимости. Ожидание можно прервать Ctrl+C.",
+        idle.as_secs()
+    ))
+}
 
 fn compatible_messages(messages: &[Message]) -> Result<Vec<Value>> {
     messages
         .iter()
         .map(|message| {
             let mut value = json!({"role":message.role,"content":message.content});
+            if !message.images.is_empty() {
+                let mut parts = vec![json!({"type":"text","text":message.content.as_deref().unwrap_or_default()})];
+                for image in &message.images {
+                    parts.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}", image.mime_type, BASE64.encode(&*image.data))}}));
+                }
+                value["content"] = Value::Array(parts);
+            }
             if !message.tool_calls.is_empty() {
                 value["tool_calls"] = serde_json::to_value(&message.tool_calls)
                     .map_err(|_| protocol("Не удалось сериализовать вызов инструмента"))?;
@@ -696,7 +821,7 @@ fn compatible_messages(messages: &[Message]) -> Result<Vec<Value>> {
         .collect()
 }
 
-fn giga_messages(messages: &[Message]) -> Result<Vec<Value>> {
+fn giga_messages(messages: &[Message], uploaded: &BTreeMap<String, String>) -> Result<Vec<Value>> {
     let mut output = vec![];
     let mut index = 0;
     while index < messages.len() {
@@ -754,7 +879,23 @@ fn giga_messages(messages: &[Message]) -> Result<Vec<Value>> {
             if message.role == "assistant" {
                 giga_metadata(message, &mut value);
             }
-            output.push(value);
+            if !message.images.is_empty() {
+                // GigaChat permits one image per message, ten per request.
+                for (position, image) in message.images.iter().enumerate() {
+                    let mut part = value.clone();
+                    if position > 0 {
+                        part["content"] =
+                            json!("Ещё одно изображение к тому же запросу пользователя.");
+                    }
+                    let id = uploaded
+                        .get(&image.sha256)
+                        .ok_or_else(|| protocol("Изображение не загружено в Files API"))?;
+                    part["attachments"] = json!([id]);
+                    output.push(part);
+                }
+            } else {
+                output.push(value);
+            }
             index += 1;
         }
     }
@@ -780,7 +921,7 @@ async fn read_bytes(response: Response, idle: Duration) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     while let Some(chunk) = tokio::time::timeout(idle, stream.next())
         .await
-        .map_err(|_| transport("API не передаёт данные: idle timeout"))?
+        .map_err(|_| idle_timeout(idle))?
     {
         let chunk =
             chunk.map_err(|_| transport("Соединение API оборвалось во время чтения ответа"))?;
@@ -1080,7 +1221,7 @@ async fn read_sse(
     };
     while let Some(chunk) = tokio::time::timeout(idle, stream.next())
         .await
-        .map_err(|_| transport("API не передаёт данные: idle timeout"))?
+        .map_err(|_| idle_timeout(idle))?
     {
         let chunk = chunk
             .map_err(|_| transport("SSE-соединение оборвалось; частичный ответ не сохранён"))?;
