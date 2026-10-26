@@ -902,6 +902,13 @@ fn route(screen: &Screen, event: Event) {
     if matches!(&event, Event::Mouse(m) if m.kind == MouseEventKind::Moved) {
         return;
     }
+    let size = terminal::size()
+        .ok()
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .unwrap_or((80, 24));
+    route_at_size(screen, event, size);
+}
+fn route_at_size(screen: &Screen, event: Event, (width, height): (u16, u16)) {
     let mut deliver = true;
     let target;
     let epoch;
@@ -915,10 +922,6 @@ fn route(screen: &Screen, event: Event) {
             s.picker_cancelled = true;
         }
 
-        let (width, height) = terminal::size()
-            .ok()
-            .filter(|(w, h)| *w > 0 && *h > 0)
-            .unwrap_or((80, 24));
         let is_scroll = matches!(
             &event,
             Event::Mouse(crossterm::event::MouseEvent {
@@ -1332,6 +1335,12 @@ impl Drop for Suspended {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route(screen: &Screen, event: Event) {
+        // Match compose's test viewport instead of reading the host console size.
+        route_at_size(screen, event, (80, 24));
+    }
+
     #[test]
     fn shell_input_colors_only_its_marker_and_preserves_selection_columns() {
         let text = "│   !printf '🦀 !' │";

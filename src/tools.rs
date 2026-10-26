@@ -1209,7 +1209,7 @@ fn root_prefix<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
 fn validate_external_root(root: &Path, checkpoint: &Path) -> Result<()> {
     validate_absolute_path(root)?;
     ensure!(
-        root.components().count() > 1
+        root.components().any(|c| matches!(c, Component::Normal(_)))
             && !root.components().any(|c| secret_component(c.as_os_str())),
         "Доступ к секретным файлам и служебным каталогам запрещён"
     );
@@ -1267,6 +1267,11 @@ fn safe_external_path(path: &Path, allow_missing_file: bool) -> Result<()> {
     let mut prefix = PathBuf::new();
     for component in path.components() {
         prefix.push(component.as_os_str());
+        // A Windows prefix such as `C:` or `\\?\C:` is not the filesystem
+        // root yet. Only inspect it after RootDir has made it a complete path.
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         match std::fs::symlink_metadata(&prefix) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
@@ -1973,6 +1978,39 @@ mod tests {
         assert!(f.tools.diff().unwrap().contains("created"));
         f.tools.undo().unwrap();
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn external_path_checks_accept_canonical_directories() {
+        let f = Fixture::new();
+        let external = f._temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("existing.txt"), "original").unwrap();
+        let root = fs::canonicalize(&external).unwrap();
+        safe_external_path(&root, false).unwrap();
+        safe_external_path(&root.join("existing.txt"), false).unwrap();
+        assert!(safe_external_path(&root.join("missing.txt"), false).is_err());
+        safe_external_path(&root.join("missing.txt"), true).unwrap();
+        assert!(safe_external_path(&root.join("missing/child.txt"), true).is_err());
+        let dir = open_external_directory(&root).unwrap();
+        assert_eq!(dir.read("existing.txt").unwrap(), b"original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_grants_reject_disk_and_unc_roots() {
+        let checkpoint = Path::new(r"Y:\state");
+        for root in [
+            r"Z:\",
+            r"\\?\Z:\",
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+        ] {
+            assert!(
+                validate_external_root(Path::new(root), checkpoint).is_err(),
+                "filesystem root accepted: {root}"
+            );
+        }
     }
 
     #[tokio::test]

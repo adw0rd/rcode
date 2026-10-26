@@ -617,7 +617,8 @@ pub(crate) fn lock_state_file(path: &Path) -> Result<fs::File> {
     if !file.metadata()?.is_file() {
         bail!("Блокировка должна быть обычным файлом");
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    // Several rcode processes may serialize durable writes on a busy disk.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => return Ok(file),
@@ -718,6 +719,30 @@ mod tests {
     use super::*;
     use std::{collections::BTreeMap, fs};
 
+    #[test]
+    fn state_lock_waits_for_a_slow_writer_without_losing_exclusion() {
+        use std::{sync::mpsc, time::Duration};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.lock");
+        let first = lock_state_file(&path).unwrap();
+        let (started, ready) = mpsc::channel();
+        let (finished, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let lock = lock_state_file(&path);
+            finished.send(lock.is_ok()).unwrap();
+            lock.unwrap()
+        });
+        ready.recv().unwrap();
+        // A competing process can spend more than 500 ms flushing its state.
+        assert!(matches!(
+            result.recv_timeout(Duration::from_millis(650)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        assert!(result.recv_timeout(Duration::from_secs(3)).unwrap());
+        drop(worker.join().unwrap());
+    }
     #[test]
     fn project_permissions_round_trip_and_legacy_defaults_do_not_enable_full_access_globally() {
         let temp = tempfile::tempdir().unwrap();
