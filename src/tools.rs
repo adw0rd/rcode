@@ -640,10 +640,10 @@ impl Tools {
                 Some(0o600),
                 None,
             )?;
-            self.checkpoint_dir
-                .try_clone()?
-                .into_std_file()
-                .sync_all()?;
+            // cap-std directory handles may use O_PATH on Linux, which cannot be
+            // fsynced. Open the same directory for reading through the capability.
+            #[cfg(unix)]
+            self.checkpoint_dir.open(".")?.sync_all()?;
             Ok(())
         })();
         result.map_err(|e| CheckpointFailure(format!("{e:#}")).into())
@@ -1616,6 +1616,8 @@ fn atomic_write_checked(
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(not(unix))]
+        let _ = mode;
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt;

@@ -10,7 +10,7 @@ homepage = "https://github.com/adw0rd/rcode"
 readme = "README.md"
 keywords = ["cli", "coding-agent", "gigachat", "yandexgpt", "llm"]
 categories = ["command-line-utilities", "development-tools"]
-include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "CHANGELOG.md"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/LICENSE", "/README.md", "/CHANGELOG.md"]
 
 [lib]
 name = "rcode"
@@ -35,7 +35,7 @@ libc = "0.2"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 rpassword = "7"
-rustyline = "19"
+rustyline = "17.0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
