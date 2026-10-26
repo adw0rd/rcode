@@ -11,6 +11,7 @@ import pty
 import re
 import select
 import signal
+import socketserver
 import struct
 import sys
 import tempfile
@@ -218,7 +219,16 @@ class Terminal:
             assert self.status is not None, "Failed to reap PTY child after SIGKILL and master close"
 
 
-class Fixture(http.server.ThreadingHTTPServer):
+class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer asks getfqdn() for metadata after binding. Loopback tests
+        # need no reverse DNS, which can block for tens of seconds on macOS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
+class Fixture(LoopbackHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
@@ -384,9 +394,29 @@ def session_provider(home):
     return session and session["provider"]
 
 
+def verify_fixture_bind():
+    from unittest.mock import patch
+    with patch("socket.getfqdn", side_effect=AssertionError("Loopback fixture must not query DNS")):
+        with Fixture() as fixture:
+            assert fixture.server_address[0] == "127.0.0.1"
+            assert fixture.server_port > 0
+
+
 def main(binary):
+    started = previous = time.monotonic()
+
+    def phase(label):
+        nonlocal previous
+        now = time.monotonic()
+        print(f"PTY phase {label}: total={now-started:.3f}s, delta={now-previous:.3f}s", flush=True)
+        previous = now
+
+    phase("start")
     verify_viewport()
+    verify_fixture_bind()
+    phase("viewport and DNS independence verified")
     fixture = Fixture()
+    phase("fixture bound")
     worker = threading.Thread(target=fixture.serve_forever, kwargs={"poll_interval": 0.025}, daemon=True)
     worker.start()
     terminal = None
@@ -409,7 +439,9 @@ def main(binary):
             }))
             config_path.chmod(0o600)
             terminal = Terminal(binary, workspace, home)
+            phase("child forked")
             terminal.until(terminal.editor_ready, "full-height editor with footer in last two rows")
+            phase("first editor ready")
             assert terminal.grid.completed_frames > 0, "Viewport never completed a synchronized update"
             terminal.assert_footer("alpha-one", "custom", "auto", "ask")
             assert "↑0 ↓0" in terminal.grid.rows()[-1], terminal.dump()
@@ -459,6 +491,7 @@ def main(binary):
             assert session_provider(home) == before_provider, "Escape changed session"
             terminal.command("/context", "локальный бюджет CLI")
             terminal.command("/cost", "Токены API за сессию")
+            phase("menus complete")
 
             # Resize+paste arrive together in an already raw composer. Do not
             # wait for the resized frame: that could conceal dropped input.
@@ -491,6 +524,7 @@ def main(binary):
                 print(f"Resize+paste {index}: raw ICANON=0 ISIG=0, {width}x{height}, immediate Enter={immediate_enter}, HTTP text preserved")
             terminal.resize(140, 28)
             terminal.until(terminal.editor_ready, "full-height composer after final resize")
+            phase("resize and paste complete")
 
             terminal.command("HISTORY_REQUEST", "LATEST_HISTORY_VISIBLE")
             terminal.expect_body("LATEST_HISTORY_VISIBLE")
@@ -507,6 +541,7 @@ def main(binary):
             terminal.until(lambda: "PgUp/PgDn история" in terminal.grid.rows()[-1],
                            "Ctrl+End resets history scroll offset")
             terminal.assert_footer()
+            phase("history complete")
 
             mark = terminal.mark()
             terminal.send("STREAM_REQUEST\r")
@@ -532,6 +567,7 @@ def main(binary):
             fixture.release_stream_second.set()
             terminal.editor_after("STREAM_SECOND", mark)
             terminal.expect_body("STREAM_SECOND")
+            phase("stream complete")
 
             mark = terminal.mark()
             terminal.send("CANCEL_REQUEST\r")
@@ -547,6 +583,7 @@ def main(binary):
             fixture.release_cancel.set()
             terminal.command("AFTER_CANCEL", "READY_RECOVERED")
             assert "CANCELLED_RESPONSE_MUST_NOT_APPEAR" not in terminal.text(mark)
+            phase("cancellation and recovery complete")
 
             # Provider arrows must lead to the provider's real wire format.
             terminal.command("/provider", "Провайдер")
@@ -570,6 +607,7 @@ def main(binary):
             request = fixture.recorded()[-1]
             assert request["reasoning"] == {"effort": "high"}
             assert "reasoning_effort" not in request
+            phase("provider complete")
 
             # Enter denies by default; an explicit Y permits only this action.
             for prompt, answer, filename in [("APPROVAL_DENY", "\r", "denied.txt"),
@@ -590,6 +628,7 @@ def main(binary):
                     assert (workspace / filename).read_text() == "approved via PTY\n"
                 terminal.assert_footer("alpha-one", "openrouter", "high", "ask")
 
+            phase("approvals complete")
             # A real child API request stays pending while agent_update renders
             # in the viewport. Worker output must never displace the footer.
             mark = terminal.mark()
@@ -652,6 +691,7 @@ def main(binary):
             terminal.command("/agents a11c", "Префикс ID неоднозначен")
             terminal.assert_footer("alpha-one", "openrouter", "high", "ask")
             assert len(fixture.recorded()) == before_resume_requests, "Reading/resuming agent records restarted an API task"
+            phase("agents and resume complete")
 
             terminal.command("/permissions", "Разрешения")
             mark = terminal.mark()
@@ -670,6 +710,7 @@ def main(binary):
             assert not terminal.grid.mouse_modes, "Mouse reporting not disabled on exit"
             restored = termios.tcgetattr(terminal.master)
             assert restored == terminal.initial_termios, "termios not restored on exit"
+            phase("child exited and terminal restored")
             print("PTY OK: viewport coordinates, menus, persistence, effort payloads, streaming, history, approvals, subagents, resumed records, paste, resize, Ctrl+C, Ctrl+D, terminal restoration")
     except BaseException:
         if terminal is not None:
@@ -677,6 +718,7 @@ def main(binary):
             print("PTY transcript tail:\n" + terminal.text()[-18000:], file=sys.stderr)
         raise
     finally:
+        phase("cleanup start")
         fixture.release_cancel.set()
         fixture.release_stream_first.set()
         fixture.release_stream_second.set()
@@ -690,9 +732,11 @@ def main(binary):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(terminal.snapshots, ensure_ascii=False, indent=2))
             terminal.close()
+        phase("child closed")
         fixture.shutdown()
         fixture.server_close()
         worker.join(timeout=1)
+        phase("cleanup complete")
 
 
 def interrupted(signum, _frame):

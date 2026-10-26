@@ -12,7 +12,7 @@ import traceback
 
 sys.dont_write_bytecode = True
 from connect_pty import ConnectTerminal
-from terminal_pty import interrupted
+from terminal_pty import LoopbackHTTPServer, interrupted
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -26,7 +26,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main(binary):
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
     server.daemon_threads = True; server.requests = []
     worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
     try:

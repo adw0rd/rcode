@@ -16,7 +16,7 @@ import time
 import traceback
 
 sys.dont_write_bytecode = True
-from terminal_pty import Terminal, interrupted
+from terminal_pty import LoopbackHTTPServer, Terminal, interrupted
 from viewport_vt import Viewport
 
 
@@ -81,7 +81,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main(binary):
-    fixture = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    fixture = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
     fixture.daemon_threads = True
     fixture.requests, fixture.reject = [], False
     fixture.projects = []
