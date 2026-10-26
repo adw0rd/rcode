@@ -68,10 +68,23 @@ mod tests {
     fn clipboard_writer_passes_unicode_as_stdin_and_hides_parent_environment() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("copy");
-        let script = "import os,pathlib,sys; assert set(os.environ)<= {'PATH','LC_CTYPE','SDKROOT','CPATH','LIBRARY_PATH','MANPATH','__CF_USER_TEXT_ENCODING'}; pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())";
+        let script = r#"
+            /usr/bin/env | while IFS='=' read -r name value; do
+                case "$name" in
+                    PATH|LC_CTYPE|PWD|SHLVL|_|SDKROOT|CPATH|LIBRARY_PATH|MANPATH|__CF_USER_TEXT_ENCODING) ;;
+                    *) exit 1 ;;
+                esac
+            done || exit 1
+            /bin/cat > "$1"
+        "#;
         assert!(write_to_program(
-            OsStr::new("python3"),
-            &[OsStr::new("-c"), OsStr::new(script), output.as_os_str()],
+            OsStr::new("/bin/sh"),
+            &[
+                OsStr::new("-c"),
+                OsStr::new(script),
+                OsStr::new("rcode-clipboard-test"),
+                output.as_os_str(),
+            ],
             "Привет 世界\n'$(echo no)'\n"
         ));
         assert_eq!(
@@ -83,8 +96,8 @@ mod tests {
     fn clipboard_helper_timeout_is_bounded_and_reaped() {
         let start = Instant::now();
         assert!(!write_to_program(
-            OsStr::new("python3"),
-            &[OsStr::new("-c"), OsStr::new("import time; time.sleep(5)")],
+            OsStr::new("/bin/sleep"),
+            &[OsStr::new("5")],
             "value"
         ));
         assert!(start.elapsed() < Duration::from_secs(3));
