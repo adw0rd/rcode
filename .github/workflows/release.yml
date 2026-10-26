@@ -1,0 +1,50 @@
+name: Release archives
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package and check version
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          REF: ${{ github.ref }}
+        run: |
+          python scripts/package-release.py "$TARGET" "$REF"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rcode-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
