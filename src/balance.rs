@@ -1,10 +1,58 @@
-//! Данные баланса остаются в интерфейсе, отдельно от модельной истории.
+//! Фоновый баланс локален; явный инструмент возвращает модели снимок текущего провайдера.
 use crate::{config::ProviderKind, presentation, ui};
-use crate::{provider::ProviderClient, screen::Screen};
+use crate::{
+    protocol::{ToolDefinition, ToolOutcome},
+    provider::ProviderClient,
+    screen::Screen,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+pub(crate) const TOOL_NAME: &str = "get_provider_balance";
+
+pub(crate) struct BalanceTool {
+    client: ProviderClient,
+    model: String,
+}
+
+impl BalanceTool {
+    pub(crate) fn new(client: ProviderClient, model: String) -> Self {
+        Self { client, model }
+    }
+
+    pub(crate) fn definition() -> ToolDefinition {
+        ToolDefinition {
+            name: TOOL_NAME.into(),
+            description: "Узнать свежий баланс текущего провайдера по вопросу пользователя: остаток USD OpenRouter или токенов пакета выбранной модели GigaChat. Только чтение, без shell и доступа к ключам. Недоступные данные не означают нулевой баланс. Аргументов нет; другого провайдера выбрать нельзя.".into(),
+            parameters: json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
+        }
+    }
+
+    pub(crate) async fn execute(
+        &mut self,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> ToolOutcome {
+        if !args.as_object().is_some_and(|args| args.is_empty()) {
+            return ToolOutcome::error(
+                "get_provider_balance принимает только {}; провайдер и модель берутся из текущей сессии",
+            );
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return ToolOutcome::error("Запрос баланса отменён; свежие данные не получены"),
+            result = fetch(&mut self.client) => result,
+        };
+        match result {
+            Ok(report) => ToolOutcome::success(report.model_snapshot(&self.model).to_string()),
+            Err(error) => ToolOutcome::error(format!("Не удалось получить свежий баланс: {error}")),
+        }
+    }
+}
 
 pub(crate) async fn fetch(client: &mut ProviderClient) -> anyhow::Result<BalanceReport> {
     tokio::time::timeout(Duration::from_secs(8), client.balance())
@@ -124,6 +172,21 @@ impl BalanceReport {
             })
     }
 
+    fn model_snapshot(&self, model: &str) -> Value {
+        let tokens = self.selected_tokens(model);
+        json!({
+            "provider": self.provider,
+            "model": model,
+            "checked_at": self.checked_at,
+            "available": self.remaining_usd.is_some() || self.key_remaining_usd.is_some() || tokens.is_some(),
+            "remaining_usd": self.remaining_usd,
+            "key_remaining_usd": self.key_remaining_usd,
+            "key_limit_usd": self.key_limit_usd,
+            "selected_token_balance": tokens,
+            "note": self.note,
+        })
+    }
+
     pub fn footer(&self, model: &str) -> String {
         if let Some(value) = self.remaining_usd {
             let mut label = format!("Баланс ${value:.2}");
@@ -213,5 +276,44 @@ mod tests {
         ];
         assert_eq!(report.footer("GigaChat-3-Ultra"), "Остаток 40 ток.");
         assert_eq!(report.footer("unknown"), "Токены: /balance");
+        let snapshot = report.model_snapshot("GigaChat-3-Ultra");
+        assert_eq!(snapshot["selected_token_balance"]["value"], 40);
+        assert!(
+            snapshot.get("token_balances").is_none(),
+            "Other model pools must not be included"
+        );
+        assert_eq!(report.model_snapshot("unknown")["available"], false);
+    }
+
+    #[tokio::test]
+    async fn cancelled_balance_tool_drops_its_pending_http_request() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut settings = crate::config::ProviderSettings::new(ProviderKind::OpenRouter);
+        settings.base_url = Some(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let client = ProviderClient::new(settings, "cancel-balance-fixture".into()).unwrap();
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..n]).starts_with("GET /v1/key "));
+            signal.cancel();
+            let n = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(n, 0, "Cancelled metadata future must close the socket");
+        });
+        let mut tool = BalanceTool::new(client, "test".into());
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(3), tool.execute(&json!({}), &cancel))
+                .await
+                .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("отменён"));
+        assert!(!outcome.content.contains("cancel-balance-fixture"));
+        server.await.unwrap();
     }
 }

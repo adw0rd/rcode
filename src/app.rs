@@ -406,7 +406,7 @@ fn system_prompt(session: &Session, cli: &Cli, plan: bool) -> String {
         prompt.push_str(&json!({"AGENTS.md": text}).to_string());
         prompt.push_str("\n</rcode_repository_context>\n");
     }
-    prompt.push_str("\nThe rcode interface provides /balance to check the current provider's account balance or token package and refresh the footer. When asked about available provider credits, suggest /balance. Account balances are displayed locally and are not included in your model context; never invent an amount.\n");
+    prompt.push_str("\nWhen the user asks about provider balance or remaining credits/tokens, the main agent must call get_provider_balance and answer using its fresh receipt. This capability supersedes older assistant claims that balances cannot be accessed. It queries only the current provider; credentials stay in the host. Distinguish remaining_usd (account money), key_remaining_usd (remaining key limit) and selected_token_balance (tokens for the selected model's family). Do not add token pools or convert tokens to money. A null field, available=false or an error is not a zero balance; explain the actual limitation without inventing a safety restriction. Background footer balances are local and not automatically in your context; an explicit get_provider_balance receipt is included in the conversation. Subagents do not have this tool; refer balance questions to the main agent. /balance is an interface slash command, not a shell executable: never pass it to run_command.\n");
     let runtime = json!({
         "harness": "rcode",
         "version": env!("CARGO_PKG_VERSION"),
@@ -442,6 +442,7 @@ struct ToolExecutor<'a> {
     plan: bool,
     denied: bool,
     last_error: bool,
+    balance: Option<crate::balance::BalanceTool>,
 }
 
 #[derive(Default)]
@@ -497,6 +498,17 @@ impl ToolExecutor<'_> {
         });
         let outcome = match args {
             Err(_) => ToolOutcome::error("Некорректный JSON аргументов; исправь вызов"),
+            Ok(args) if name == crate::balance::TOOL_NAME => {
+                if actor.is_some() {
+                    ToolOutcome::error(
+                        "Баланс доступен только основному агенту по вопросу пользователя",
+                    )
+                } else if let Some(balance) = self.balance.as_mut() {
+                    balance.execute(&args, cancel).await
+                } else {
+                    ToolOutcome::error("Провайдер для запроса баланса не подключён")
+                }
+            }
             Ok(args) => {
                 let read_only =
                     self.plan || actor.is_some_and(|request| request.role != AgentRole::Worker);
@@ -959,6 +971,7 @@ pub(crate) async fn turn(
         plan,
         denied: false,
         last_error: false,
+        balance: None,
     };
     // All return/? paths from this block run the common worker finalizer below.
     let result = async {
@@ -967,7 +980,7 @@ pub(crate) async fn turn(
         let mut file_failures = FileFailureLoop::default();
         let definitions: Vec<_> = Tools::definitions().into_iter()
             .filter(|tool| !plan || matches!(tool.name.as_str(), "read_file" | "list_files" | "search"))
-            .chain(AgentPool::definitions()).collect();
+            .chain(AgentPool::definitions()).chain([crate::balance::BalanceTool::definition()]).collect();
         for step in 0..cli.max_steps {
             if !prepare_context(session, store, 0)?.report(events) {
                 return Ok(1);
@@ -1039,6 +1052,9 @@ pub(crate) async fn turn(
                     events.emit("tool_result",json!({"id":call.id,"name":name,"is_error":outcome.is_error,"content":outcome.content,"changed_paths":outcome.changed_paths}));
                     outcome
                 } else {
+                    if name == crate::balance::TOOL_NAME {
+                        executor.balance = Some(crate::balance::BalanceTool::new(client.clone(), session.provider.model.clone()));
+                    }
                     executor.execute(call, None).await?
                 };
                 outside_path_failed |= outcome.is_error && serde_json::from_str::<Value>(&outcome.content)
@@ -1269,6 +1285,8 @@ mod tests {
         cli.approval_mode = Some(ApprovalMode::AutoEdit);
         let events = Events::new(true);
         let cancel = CancellationToken::new();
+        let mut provider = crate::config::ProviderSettings::new(ProviderKind::Custom);
+        provider.base_url = Some("http://127.0.0.1:1/v1".into());
         let mut executor = ToolExecutor {
             tools: &mut tools,
             events: &events,
@@ -1277,11 +1295,21 @@ mod tests {
             plan: false,
             denied: false,
             last_error: false,
+            balance: Some(crate::balance::BalanceTool::new(
+                ProviderClient::new(provider, "worker-balance-fixture".into()).unwrap(),
+                "test".into(),
+            )),
         };
         let read = ToolCall::new("read_file", json!({"path":"a.txt"}));
         assert!(!executor.execute(&read, None).await.unwrap().is_error);
         for (id, role, call, expected_error) in [
             ("reviewer", AgentRole::Reviewer, read.clone(), false),
+            (
+                "worker",
+                AgentRole::Worker,
+                ToolCall::new(crate::balance::TOOL_NAME, json!({})),
+                true,
+            ),
             (
                 "worker-a",
                 AgentRole::Worker,
@@ -1358,6 +1386,7 @@ mod tests {
                 plan,
                 denied: false,
                 last_error: false,
+                balance: None,
             };
             for call in [
                 ToolCall::new(
@@ -1368,6 +1397,7 @@ mod tests {
                     "run_command",
                     json!({"command":"printf blocked > blocked.txt"}),
                 ),
+                ToolCall::new(crate::balance::TOOL_NAME, json!({})),
             ] {
                 let (reply, _receiver) = oneshot::channel();
                 let request = AgentRequest {
@@ -1409,6 +1439,7 @@ mod tests {
             plan: false,
             denied: false,
             last_error: false,
+            balance: None,
         };
         for closed_reply in [false, true] {
             let child_cancel = cancel.child_token();
@@ -1459,6 +1490,7 @@ mod tests {
             plan: false,
             denied: false,
             last_error: false,
+            balance: None,
         };
         executor
             .serve(AgentRequest {

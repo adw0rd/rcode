@@ -77,16 +77,17 @@ fn server(replies: Vec<Value>) -> (String, thread::JoinHandle<Vec<Value>>) {
                 bytes.extend_from_slice(&b[..n]);
             }
             let body = &bytes[split..split + length];
-            requests.push(
-                if header
-                    .to_ascii_lowercase()
-                    .contains("application/x-www-form-urlencoded")
-                {
-                    json!({"oauth_form":std::str::from_utf8(body).unwrap()})
-                } else {
-                    serde_json::from_slice(body).unwrap()
-                },
-            );
+            requests.push(if body.is_empty() {
+                let mut words = header.split_whitespace();
+                json!({"method":words.next().unwrap(),"path":words.next().unwrap()})
+            } else if header
+                .to_ascii_lowercase()
+                .contains("application/x-www-form-urlencoded")
+            {
+                json!({"oauth_form":std::str::from_utf8(body).unwrap()})
+            } else {
+                serde_json::from_slice(body).unwrap()
+            });
             let body = reply.to_string();
             write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
         }
@@ -239,6 +240,187 @@ fn gigachat_can_rewrite_a_read_external_file_without_copying_its_hash() {
             .map(|s| serde_json::from_str::<Value>(s).unwrap())
             .any(|e| e["type"] == "tool_result" && e["is_error"] == true)
     );
+}
+
+#[test]
+fn agent_can_check_gigachat_balance_without_shell_or_approval() {
+    use rcode::config::{ConfigStore, ProviderKind, ProviderSettings};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let (url, handle) = server(vec![
+        json!({"access_token":"balance-fixture-access","expires_at":4102444800000u64}),
+        json!({"choices":[{"message":{"role":"assistant","content":"","function_call":{"name":"get_provider_balance","arguments":{}}},"finish_reason":"function_call"}]}),
+        json!({"balance":[{"usage":"GigaChat-Ultra","value":1234567},{"usage":"GigaChat-Max","value":9000000}]}),
+        final_reply("BALANCE_FROM_TOOL"),
+    ]);
+    let home = tmp.path().join("state");
+    let store = ConfigStore::at(&home).unwrap();
+    let mut settings = store.load().unwrap();
+    let mut provider = ProviderSettings::new(ProviderKind::GigaChat);
+    provider.model = "GigaChat-3-Ultra".into();
+    provider.stream = false;
+    provider.base_url = Some(url.clone());
+    provider.auth_url = Some(url.replace("/v1", "/oauth"));
+    settings.providers.insert("gigachat".into(), provider);
+    store.save(&settings).unwrap();
+    let output = output_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_rcode"))
+            .args([
+                "-C",
+                root.to_str().unwrap(),
+                "--provider",
+                "gigachat",
+                "--json",
+                "--max-steps",
+                "2",
+                "exec",
+                "Какой сейчас баланс токенов?",
+            ])
+            .env("RCODE_HOME", &home)
+            .env("RCODE_GIGACHAT_AUTH_KEY", "balance-fixture-auth"),
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    let requests = handle.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2], json!({"method":"GET","path":"/v1/balance"}));
+    assert!(
+        requests[1]["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["name"] == "get_provider_balance")
+    );
+    let receipt = requests[3]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "function")
+        .unwrap();
+    let data: Value = serde_json::from_str(receipt["content"].as_str().unwrap()).unwrap();
+    assert_eq!(data["provider"], "gigachat");
+    assert_eq!(data["model"], "GigaChat-3-Ultra");
+    assert_eq!(data["selected_token_balance"]["value"], 1234567);
+    assert!(data["remaining_usd"].is_null());
+    assert!(data["checked_at"].as_u64().unwrap() > 0);
+    assert!(!text.contains("balance-fixture-auth"));
+    assert!(!text.contains("balance-fixture-access"));
+    assert!(!text.contains("run_command"));
+    assert!(text.contains("BALANCE_FROM_TOOL"));
+}
+
+#[test]
+fn agent_receives_openrouter_account_balance_separately_from_key_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir(&root).unwrap();
+    let (url, handle) = server(vec![
+        tool_reply("get_provider_balance", json!({})),
+        json!({"data":{"limit":20.0,"limit_remaining":4.0,"usage":16.0}}),
+        json!({"data":{"total_credits":100.0,"total_usage":9.0}}),
+        final_reply("ACCOUNT_BALANCE_FROM_TOOL"),
+    ]);
+    let output = output_with_deadline(
+        Command::new(env!("CARGO_BIN_EXE_rcode"))
+            .args([
+                "-C",
+                root.to_str().unwrap(),
+                "--provider",
+                "openrouter",
+                "--base-url",
+                &url,
+                "--model",
+                "test",
+                "--json",
+                "--max-steps",
+                "2",
+                "exec",
+                "А сейчас знаешь мой баланс?",
+            ])
+            .env("RCODE_HOME", tmp.path().join("state"))
+            .env("RCODE_OPENROUTER_API_KEY", "balance-router-fixture"),
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    let requests = handle.join().unwrap();
+    assert_eq!(requests[1], json!({"method":"GET","path":"/v1/key"}));
+    assert_eq!(requests[2], json!({"method":"GET","path":"/v1/credits"}));
+    let receipt = requests[3]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    let data: Value = serde_json::from_str(receipt["content"].as_str().unwrap()).unwrap();
+    assert_eq!(data["remaining_usd"], 91.0);
+    assert_eq!(data["key_remaining_usd"], 4.0);
+    assert_eq!(data["key_limit_usd"], 20.0);
+    assert!(data["selected_token_balance"].is_null());
+    assert_eq!(data["available"], true);
+    assert!(!text.contains("run_command"));
+    assert!(!text.contains("balance-router-fixture"));
+}
+
+#[test]
+fn agent_balance_cannot_switch_provider_and_unsupported_data_is_not_zero() {
+    for args in [json!({}), json!({"provider":"openrouter"})] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let (url, handle) = server(vec![
+            tool_reply("get_provider_balance", args.clone()),
+            final_reply("BALANCE_CAPABILITY_CHECKED"),
+        ]);
+        let output = run(
+            &root,
+            &tmp.path().join("state"),
+            &url,
+            &[
+                "--json",
+                "--max-steps",
+                "2",
+                "exec",
+                "Check my provider balance",
+            ],
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if args.as_object().unwrap().is_empty() {
+                0
+            } else {
+                1
+            }),
+            "{text}"
+        );
+        let requests = handle.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "Unsupported/invalid balance must not issue metadata requests"
+        );
+        let receipt = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        if args.as_object().unwrap().is_empty() {
+            let data: Value = serde_json::from_str(receipt["content"].as_str().unwrap()).unwrap();
+            assert_eq!(data["available"], false);
+            assert!(data["remaining_usd"].is_null());
+            assert!(data["selected_token_balance"].is_null());
+            assert!(data["note"].as_str().unwrap().contains("нет стандартного"));
+        } else {
+            assert!(
+                receipt["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("принимает только")
+            );
+        }
+    }
 }
 
 #[test]
