@@ -67,25 +67,74 @@ fn choose(title: &str, choices: &[Choice], current: usize, rich: bool) -> Result
     let index = answer.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
     Ok(index.filter(|i| choices.get(*i).is_some_and(|c| c.enabled)))
 }
-fn provider_choice(
+async fn provider_choice(
     store: &ConfigStore,
-    current: ProviderKind,
+    settings: &Settings,
+    active: &ProviderSettings,
     rich: bool,
 ) -> Result<Option<ProviderKind>> {
     let kinds = ProviderKind::all();
-    let choices = kinds
-        .iter()
-        .map(|k| Choice {
-            label: k.to_string(),
-            detail: match store.credential(*k) {
-                Ok(Some(_)) => "ключ подключён".into(),
-                _ => "настроить ключ доступа".into(),
-            },
+    let (send, updates) = std::sync::mpsc::channel();
+    // The menu owns all requests: leaving it aborts the JoinSet's tasks.
+    let mut pending = tokio::task::JoinSet::new();
+    let mut choices = Vec::new();
+    for (index, kind) in kinds.iter().copied().enumerate() {
+        let credential = store.credential(kind).ok().flatten();
+        let detail = match credential {
+            None => "настроить ключ доступа".into(),
+            Some(_) if kind == ProviderKind::Yandex => "ключ подключён (баланс в кабинете)".into(),
+            Some(_) if kind == ProviderKind::Custom => {
+                "ключ подключён (баланс API недоступен)".into()
+            }
+            Some(key) => {
+                let provider = if kind == active.kind {
+                    active.clone()
+                } else {
+                    settings.provider(kind)
+                };
+                let send = send.clone();
+                pending.spawn(async move {
+                    // Never forward a key through a copied or inconsistent provider entry.
+                    let label = if provider.kind != kind {
+                        "Баланс: недоступен".into()
+                    } else {
+                        match ProviderClient::new(provider.clone(), key.value) {
+                            Ok(mut client) => match crate::balance::fetch(&mut client).await {
+                                Ok(report) => report.footer(&provider.model),
+                                Err(_) => "Баланс: недоступен".into(),
+                            },
+                            Err(_) => "Баланс: недоступен".into(),
+                        }
+                    };
+                    let _ = send.send((index, format!("ключ подключён ({label})")));
+                });
+                "ключ подключён (баланс: …)".into()
+            }
+        };
+        choices.push(Choice {
+            label: kind.to_string(),
+            detail,
             enabled: true,
-        })
-        .collect::<Vec<_>>();
-    let current = kinds.iter().position(|k| *k == current).unwrap_or_default();
-    Ok(choose("Провайдер", &choices, current, rich)?.map(|i| kinds[i]))
+        });
+    }
+    drop(send);
+    let current = kinds
+        .iter()
+        .position(|k| *k == active.kind)
+        .unwrap_or_default();
+    let selected = if rich {
+        terminal::select_with_updates("Провайдер", &choices, current, Some(&updates))?
+    } else {
+        tokio::select! {
+            _ = async { while pending.join_next().await.is_some() {} } => {},
+            _ = tokio::signal::ctrl_c() => return Ok(None),
+        }
+        for (index, detail) in updates.try_iter() {
+            choices[index].detail = detail;
+        }
+        choose("Провайдер", &choices, current, false)?
+    };
+    Ok(selected.map(|i| kinds[i]))
 }
 async fn catalog(client: &mut ProviderClient, events: &Events) -> Result<Option<Vec<ModelInfo>>> {
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -142,7 +191,7 @@ async fn select_model(
     let (kind, model) = if force_provider {
         let selected = match args.first() {
             Some(s) => Some(s.parse::<ProviderKind>()?),
-            None => provider_choice(store, session.provider.kind, rich)?,
+            None => provider_choice(store, settings, &session.provider, rich).await?,
         };
         let Some(kind) = selected else {
             return Ok(());
@@ -177,7 +226,11 @@ async fn select_model(
     let Some(mut fetched) = catalog(&mut candidate_client, events).await? else {
         return Ok(());
     };
-    fetched.sort_by(|a, b| a.id.cmp(&b.id));
+    fetched.sort_by(|a, b| {
+        (a.id != next.model)
+            .cmp(&(b.id != next.model))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     if !fetched.iter().any(|m| m.id == next.model) {
         fetched.insert(
             0,

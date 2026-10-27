@@ -262,21 +262,38 @@ impl Screen {
         });
     }
     pub fn event(&self) -> io::Result<Event> {
+        self.read_event(None)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
+    }
+    pub(crate) fn event_timeout(&self, timeout: Duration) -> io::Result<Option<Event>> {
+        self.read_event(Some(timeout))
+    }
+    fn read_event(&self, timeout: Option<Duration>) -> io::Result<Option<Event>> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
             {
                 let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if s.mode == Mode::Editor
                     && let Some(event) = s.editor_events.pop_front()
                 {
-                    return Ok(event);
+                    return Ok(Some(event));
                 }
             }
-            let input = self
-                .rx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .recv()
-                .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))??;
+            let input = {
+                let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(deadline) = deadline {
+                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(input) => input?,
+                        Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"));
+                        }
+                    }
+                } else {
+                    rx.recv()
+                        .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))??
+                }
+            };
             let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if input.mode == Mode::Editor && s.mode != Mode::Editor {
                 if s.editor_events.len() < 65_536 {
@@ -286,7 +303,7 @@ impl Screen {
             }
             if input.mode == s.mode && (input.mode == Mode::Editor || input.epoch == s.input_epoch)
             {
-                return Ok(input.event);
+                return Ok(Some(input.event));
             }
         }
     }
@@ -1787,8 +1804,8 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
         );
         assert_eq!(
-            screen.event().unwrap(),
-            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            screen.event_timeout(Duration::from_millis(10)).unwrap(),
+            Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
         );
         screen.clear_panel();
         screen.set_panel(editor());
@@ -1799,6 +1816,17 @@ mod tests {
         assert_eq!(
             screen.event().unwrap(),
             Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+        );
+        assert_eq!(
+            screen.event_timeout(Duration::ZERO).unwrap(),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE
+            )))
+        );
+        assert_eq!(
+            screen.event_timeout(Duration::from_millis(1)).unwrap(),
+            None
         );
     }
 }

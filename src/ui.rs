@@ -255,7 +255,9 @@ fn connection_models(fetched: Vec<ModelInfo>, current: &str, key: &str) -> Vec<M
         models.insert(model.id.clone(), model);
     }
     let mut models = models.into_values().collect::<Vec<_>>();
-    if !models.iter().any(|m| m.id == current) {
+    if let Some(index) = models.iter().position(|m| m.id == current) {
+        models[..=index].rotate_right(1);
+    } else {
         models.insert(
             0,
             ModelInfo {
@@ -516,4 +518,24 @@ pub fn shell_preview(root: &std::path::Path, args: &serde_json::Value) -> Result
         safe(&serde_json::to_string(&root.display().to_string())?),
         quoted
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_catalog_starts_with_the_saved_model() {
+        let models = ["alpha", "omega", "beta"].map(|id| ModelInfo {
+            id: id.into(),
+            ..ModelInfo::default()
+        });
+        let sorted = connection_models(models.to_vec(), "omega", "private-key");
+        assert_eq!(
+            sorted.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["omega", "alpha", "beta"]
+        );
+        let missing = connection_models(models.to_vec(), "missing", "private-key");
+        assert_eq!(missing[0].id, "missing");
+    }
 }

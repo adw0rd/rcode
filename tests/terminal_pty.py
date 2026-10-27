@@ -50,6 +50,7 @@ class Terminal:
                     "RCODE_HOME": str(home),
                     "RCODE_CUSTOM_API_KEY": "pty-custom-fixture",
                     "RCODE_OPENROUTER_API_KEY": "pty-router-fixture",
+                    "RCODE_GIGACHAT_AUTH_KEY": "pty-giga-fixture",
                 })
                 os.execv(binary, [binary, "-C", str(workspace), *args])
             finally:
@@ -235,6 +236,7 @@ class Fixture(LoopbackHTTPServer):
     def __init__(self):
         self.requests = []
         self.balance_requests = []
+        self.oauth_credentials = []
         self.fail_balance = False
         self.balance_started = threading.Event()
         self.release_balance = threading.Event()
@@ -276,6 +278,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass  # A cancelled request deliberately closes the HTTP connection.
 
     def do_GET(self):
+        if self.path == "/giga/v1/balance":
+            assert self.headers["Authorization"] == "Bearer pty-giga-token"
+            self.reply({"balance": [{"usage": "GigaChat-Ultra", "value": 1234567},
+                                    {"usage": "GigaChat-Max", "value": 9000000}]})
+            return
         if self.path in ["/v1/key", "/v1/credits"]:
             self.server.balance_requests.append(self.path)
             if self.server.fail_balance:
@@ -303,6 +310,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ]})
 
     def do_POST(self):
+        if self.path == "/giga/oauth":
+            self.server.oauth_credentials.append(self.headers["Authorization"])
+            assert self.headers["Authorization"] == "Basic pty-giga-fixture"
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.reply({"access_token": "pty-giga-token", "expires_at": int(time.time() + 3600) * 1000})
+            return
         assert self.path == "/v1/chat/completions", self.path
         length = int(self.headers.get("Content-Length", "0"))
         assert 0 < length <= 512 * 1024, "Unexpected fixture request size"
@@ -456,6 +469,13 @@ def main(binary):
                 },
             }))
             config_path.chmod(0o600)
+            config = load_json(config_path)
+            config["providers"]["gigachat"] = {
+                "kind": "gigachat", "model": "GigaChat-3-Ultra",
+                "base_url": f"http://127.0.0.1:{fixture.server_port}/giga/v1",
+                "auth_url": f"http://127.0.0.1:{fixture.server_port}/giga/oauth",
+            }
+            config_path.write_text(json.dumps(config))
             terminal = Terminal(binary, workspace, home)
             phase("child forked")
             terminal.until(terminal.editor_ready, "full-height editor with footer in last two rows")
@@ -502,6 +522,14 @@ def main(binary):
             # Escape closes the picker without mutating either persisted source.
             before_config = load_json(config_path)
             before_provider = session_provider(home)
+            terminal.command("/model", "Модель · custom")
+            rows = terminal.grid.rows()
+            search_row = next(i for i, row in enumerate(rows) if row.startswith("Поиск:"))
+            assert rows[search_row + 1].startswith("› Gamma choice"), "Saved model must be first and selected: " + terminal.dump()
+            terminal.send("\r")
+            terminal.until(terminal.editor_ready, "Enter accepts the saved model")
+            assert load_json(config_path) == before_config, "Accepting saved model changed settings"
+            assert session_provider(home) == before_provider, "Accepting saved model reset effort"
             terminal.command("/model", "Модель · custom")
             mark = terminal.mark()
             terminal.send("\x1b[B\x1b")
@@ -629,6 +657,39 @@ def main(binary):
             terminal.command("AFTER_CANCEL", "READY_RECOVERED")
             assert "CANCELLED_RESPONSE_MUST_NOT_APPEAR" not in terminal.text(mark)
             phase("cancellation and recovery complete")
+
+            # Metadata must arrive without a keypress, preserving typed search
+            # and the highlighted provider. Cancelling never switches accounts.
+            before_config = load_json(config_path)
+            before_provider = session_provider(home)
+            before_models = len(fixture.recorded())
+            fixture.balance_started.clear()
+            fixture.release_balance.clear()
+            terminal.command("/provider", "Провайдер")
+            terminal.send("openrouter")
+            terminal.until(lambda: any(row.startswith("Поиск: openrouter") for row in terminal.grid.rows()),
+                           "search while provider balances are pending")
+            terminal.until(fixture.balance_started.is_set, "provider menu requests real metadata")
+            fixture.release_balance.set()
+            terminal.until(lambda: any(row.startswith("› openrouter") and "(Баланс $20.00)" in row
+                                       for row in terminal.grid.rows()), "OpenRouter balance updates selected row")
+            assert any(row.startswith("Поиск: openrouter") for row in terminal.grid.rows()), "Balance refresh lost search"
+            terminal.send("\x15")
+            terminal.until(lambda: any("gigachat" in row and "(Остаток 1.2m ток.)" in row
+                                       for row in terminal.grid.rows()), "GigaChat balance uses saved Ultra pool")
+            terminal.send("\x1b")
+            terminal.until(terminal.editor_ready, "provider menu cancellation")
+            assert load_json(config_path) == before_config, "Balance menu changed config"
+            assert session_provider(home) == before_provider, "Balance menu switched provider"
+            assert len(fixture.recorded()) == before_models, "Balance menu called a model"
+            fixture.fail_balance = True
+            mark = terminal.command("/provider", "Провайдер")
+            terminal.until(lambda: any("openrouter" in row and "(Баланс: недоступен)" in row
+                                       for row in terminal.grid.rows()), "provider balance error is local to row")
+            assert "upstream-balance-secret" not in terminal.text(mark)
+            terminal.send("\x1b")
+            terminal.until(terminal.editor_ready, "provider menu after balance error")
+            fixture.fail_balance = False
 
             # Provider arrows must lead to the provider's real wire format.
             fixture.release_balance.clear()
@@ -822,6 +883,29 @@ def main(binary):
             finally:
                 fixture.release_balance.set()
                 direct.close()
+            # A copied provider entry must never forward another account's key
+            # merely because its row is visible in the provider menu.
+            config = load_json(config_path)
+            config["active"] = "custom"
+            config["providers"]["openrouter"] = config["providers"]["gigachat"].copy()
+            config_path.write_text(json.dumps(config))
+            oauth_before = len(fixture.oauth_credentials)
+            mismatch = Terminal(binary, workspace, home)
+            try:
+                mismatch.until(mismatch.editor_ready, "composer with inactive mismatched provider config")
+                mismatch.command("/provider", "Провайдер")
+                mismatch.until(lambda: any("openrouter" in row and "(Баланс: недоступен)" in row
+                                          for row in mismatch.grid.rows()) and
+                                      any("gigachat" in row and "(Остаток 1.2m ток.)" in row
+                                          for row in mismatch.grid.rows()), "mismatched provider metadata rejected")
+                assert "Basic pty-router-fixture" not in fixture.oauth_credentials[oauth_before:], "Menu forwarded another provider's credential"
+                mismatch.send("\x1b")
+                mismatch.until(mismatch.editor_ready, "cancel mismatched provider menu")
+                mismatch.send("\x04")
+                mismatch.until(lambda: mismatch.status is not None, "mismatch fixture exit")
+                assert mismatch.status == 0
+            finally:
+                mismatch.close()
             print("PTY OK: viewport coordinates, menus, persistence, effort payloads, streaming, history, approvals, subagents, resumed records, paste, resize, Ctrl+C, Ctrl+D, terminal restoration")
     except BaseException:
         if terminal is not None:

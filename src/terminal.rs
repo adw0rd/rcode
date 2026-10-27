@@ -11,8 +11,10 @@ use crossterm::{
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -200,6 +202,7 @@ impl Editor {
     }
 }
 
+#[derive(Clone)]
 pub struct Choice {
     pub label: String,
     pub detail: String,
@@ -214,6 +217,15 @@ pub fn supported() -> bool {
 }
 
 pub fn select(title: &str, choices: &[Choice], current: usize) -> Result<Option<usize>> {
+    select_with_updates(title, choices, current, None)
+}
+
+pub(crate) fn select_with_updates(
+    title: &str,
+    choices: &[Choice],
+    current: usize,
+    updates: Option<&mpsc::Receiver<(usize, String)>>,
+) -> Result<Option<usize>> {
     if !supported() {
         bail!("Меню выбора требует интерактивный терминал");
     }
@@ -223,16 +235,33 @@ pub fn select(title: &str, choices: &[Choice], current: usize) -> Result<Option<
     let _guard = TerminalGuard::enter()?;
     let mut frame = InlineFrame::new(crate::screen::Mode::Picker);
     let mut picker = Picker::new(choices, current);
+    let mut dirty = true;
     loop {
+        if let Some(updates) = updates {
+            for (index, detail) in updates.try_iter() {
+                picker.update_detail(index, detail);
+                dirty = true;
+            }
+        }
         let (width, height) = terminal::size()?;
-        let view = if frame.fullscreen() {
-            viewport_picker_view(title, &picker, width, height)
+        if dirty {
+            let view = if frame.fullscreen() {
+                viewport_picker_view(title, &picker, width, height)
+            } else {
+                picker_view(title, &picker, width, height)
+            };
+            frame.draw(&view, width)?;
+            dirty = false;
+        }
+        let input = if updates.is_some() {
+            frame.event_timeout(Duration::from_millis(100))?
         } else {
-            picker_view(title, &picker, width, height)
+            Some(frame.event()?)
         };
-        frame.draw(&view, width)?;
+        let Some(input) = input else { continue };
+        dirty = true;
         let page = picker_page(frame.panel_height(height));
-        match frame.event()? {
+        match input {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let control = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
@@ -570,7 +599,7 @@ impl ReadState {
 }
 
 struct Picker<'a> {
-    choices: &'a [Choice],
+    choices: Cow<'a, [Choice]>,
     query: Buffer,
     filtered: Vec<usize>,
     selected: Option<usize>,
@@ -579,7 +608,7 @@ struct Picker<'a> {
 impl<'a> Picker<'a> {
     fn new(choices: &'a [Choice], current: usize) -> Self {
         let mut picker = Self {
-            choices,
+            choices: Cow::Borrowed(choices),
             query: Buffer::default(),
             filtered: (0..choices.len()).collect(),
             selected: choices
@@ -594,6 +623,14 @@ impl<'a> Picker<'a> {
                 .position(|&index| choices[index].enabled);
         }
         picker
+    }
+
+    fn update_detail(&mut self, index: usize, detail: String) {
+        if index < self.choices.len() {
+            self.choices.to_mut()[index].detail = detail;
+            // Metadata must not change search results or move the user's cursor.
+            // Filtering resumes when the user edits the query.
+        }
     }
 
     fn filter(&mut self) {
@@ -1165,6 +1202,14 @@ impl InlineFrame {
         }
     }
 
+    fn event_timeout(&self, timeout: Duration) -> io::Result<Option<Event>> {
+        match &self.screen {
+            Some(screen) => screen.event_timeout(timeout),
+            None if event::poll(timeout)? => event::read().map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn draw(&mut self, view: &View, width: u16) -> io::Result<()> {
         if let Some(screen) = &self.screen {
             use crate::screen::{Paint, Panel};
@@ -1477,6 +1522,30 @@ mod tests {
         picker.query.insert("router");
         picker.filter();
         assert_eq!(picker.choice(), Some(2));
+    }
+
+    #[test]
+    fn balance_updates_keep_search_results_and_selection_stable() {
+        let choices = ["openrouter", "gigachat"].map(|label| Choice {
+            label: label.into(),
+            detail: "ключ подключён (баланс: …)".into(),
+            enabled: true,
+        });
+        let mut picker = Picker::new(&choices, 1);
+        picker.query.insert("баланс");
+        picker.filter();
+        picker.update_detail(1, "ключ подключён (Остаток 1.2m ток.)".into());
+        assert_eq!(picker.query.text, "баланс");
+        assert_eq!(picker.filtered, [0, 1]);
+        assert_eq!(picker.choice(), Some(1));
+        assert!(
+            picker_view("Провайдер", &picker, 140, 10)
+                .rows
+                .iter()
+                .any(|row| {
+                    row.starts_with("› gigachat") && row.contains("Остаток 1.2m ток.")
+                })
+        );
     }
 
     #[test]
