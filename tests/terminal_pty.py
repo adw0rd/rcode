@@ -29,7 +29,7 @@ ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
 
 class Terminal:
-    def __init__(self, binary, workspace, home):
+    def __init__(self, binary, workspace, home, args=()):
         self.buffer = bytearray()
         self.offset = 0
         self.status = None
@@ -51,7 +51,7 @@ class Terminal:
                     "RCODE_CUSTOM_API_KEY": "pty-custom-fixture",
                     "RCODE_OPENROUTER_API_KEY": "pty-router-fixture",
                 })
-                os.execv(binary, [binary, "-C", str(workspace)])
+                os.execv(binary, [binary, "-C", str(workspace), *args])
             finally:
                 os._exit(127)
         self.initial_termios = termios.tcgetattr(self.master)
@@ -234,6 +234,11 @@ class Fixture(LoopbackHTTPServer):
 
     def __init__(self):
         self.requests = []
+        self.balance_requests = []
+        self.fail_balance = False
+        self.balance_started = threading.Event()
+        self.release_balance = threading.Event()
+        self.release_balance.set()
         self.lock = threading.Lock()
         self.cancel_started = threading.Event()
         self.release_cancel = threading.Event()
@@ -271,6 +276,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass  # A cancelled request deliberately closes the HTTP connection.
 
     def do_GET(self):
+        if self.path in ["/v1/key", "/v1/credits"]:
+            self.server.balance_requests.append(self.path)
+            if self.server.fail_balance:
+                data=b'{"error":"upstream-balance-secret-must-not-appear"}'
+                self.send_response(401);self.send_header("Content-Length",str(len(data)))
+                self.end_headers();self.wfile.write(data)
+                return
+            if self.path.endswith("/credits"):
+                self.server.balance_started.set()
+                self.server.release_balance.wait(timeout=3)
+            self.reply({"data": {"limit": None, "limit_remaining": None, "usage": 5.0}
+                        if self.path.endswith("/key") else {"total_credits": 25.0, "total_usage": 5.0}})
+            return
         assert self.path == "/v1/models", self.path
         self.reply({"data": [
             {"id": model, "name": name, "context_length": 32768,
@@ -613,6 +631,7 @@ def main(binary):
             phase("cancellation and recovery complete")
 
             # Provider arrows must lead to the provider's real wire format.
+            fixture.release_balance.clear()
             terminal.command("/provider", "Провайдер")
             mark = terminal.mark()
             terminal.send("\x1b[A\r")  # custom -> openrouter
@@ -623,6 +642,15 @@ def main(binary):
             terminal.until(lambda: (session_provider(home) or {}).get("kind") == "openrouter",
                            "provider persisted in session")
             terminal.expect("alpha-one · openrouter · auto · ask", mark)
+            terminal.until(terminal.editor_ready, "composer while metadata is pending")
+            terminal.send("BALANCE_DRAFT")
+            terminal.until(lambda: "BALANCE_DRAFT" in terminal.grid.rows()[-4], "draft while balance request is pending")
+            terminal.until(fixture.balance_started.is_set, "background balance request")
+            fixture.release_balance.set()
+            terminal.until(lambda: "Баланс $20.00" in terminal.grid.rows()[-1], "balance arrives while draft is open")
+            assert "BALANCE_DRAFT" in terminal.grid.rows()[-4], "Balance refresh lost pending input"
+            terminal.send("\x03")
+            terminal.until(terminal.editor_ready, "composer after clearing balance test draft")
             terminal.command("/effort", "Глубина рассуждений")
             mark = terminal.mark()
             terminal.send("\x1b[B\x1b[B\r")
@@ -630,6 +658,20 @@ def main(binary):
                            "OpenRouter effort persisted")
             assert load_json(config_path)["providers"]["openrouter"]["effort"] == "high"
             terminal.expect("alpha-one · openrouter · high · ask", mark)
+            terminal.until(lambda: "Баланс $20.00" in terminal.grid.rows()[-1], "live OpenRouter balance in footer")
+            before_balance = len(fixture.recorded())
+            terminal.command("/balance", "Счёт OpenRouter: $20.0000")
+            assert len(fixture.recorded()) == before_balance, "/balance must not invoke the model"
+            assert fixture.balance_requests.count("/v1/credits") >= 2
+            terminal.assert_footer("openrouter", "high")
+            fixture.fail_balance = True
+            error_mark = terminal.command("/balance", "API отклонил авторизацию")
+            assert "Баланс $20.00" in terminal.grid.rows()[-1] and "устар." in terminal.grid.rows()[-1]
+            assert "upstream-balance-secret" not in terminal.text(error_mark)
+            fixture.fail_balance = False
+            terminal.command("/balance", "Счёт OpenRouter: $20.0000")
+            terminal.until(lambda: "устар." not in terminal.grid.rows()[-1] and terminal.editor_ready(),
+                           "fresh balance after transient failure")
             terminal.command("ROUTER_REQUEST", "READY_ROUTER")
             request = fixture.recorded()[-1]
             assert request["reasoning"] == {"effort": "high"}
@@ -740,6 +782,46 @@ def main(binary):
             restored = termios.tcgetattr(terminal.master)
             assert restored == terminal.initial_termios, "termios not restored on exit"
             phase("child exited and terminal restored")
+            # The legacy readline handler must not swallow SIGINT during API I/O.
+            plain = Terminal(binary, workspace, home, args=("--plain",))
+            try:
+                plain.expect("rcode ›")
+                plain_mark=plain.mark()
+                plain.send("PLAIN_HISTORY_ENTRY\r")
+                plain.expect("READY_CUSTOM",plain_mark)
+                plain.expect("rcode ›",plain_mark)
+                fixture.balance_started.clear()
+                fixture.release_balance.clear()
+                plain_mark=plain.mark()
+                plain.send("/balance\r")
+                plain.until(fixture.balance_started.is_set,"plain balance request")
+                plain.send("\x03")
+                plain.until(lambda:"Обновление баланса отменено" in plain.text(plain_mark),
+                            "Ctrl+C cancels plain balance",seconds=2)
+                fixture.release_balance.set()
+                plain.expect("rcode ›",plain_mark)
+                plain_mark=plain.mark()
+                plain.send("\x1b[A\x1b[A\r")
+                plain.expect("READY_CUSTOM",plain_mark)
+                assert fixture.recorded()[-1]["messages"][-1]["content"] == "PLAIN_HISTORY_ENTRY"
+                plain.send("/exit\r")
+                plain.until(lambda:plain.status is not None,"plain exit")
+                assert plain.status == 0
+            finally:
+                fixture.release_balance.set()
+                plain.close()
+            fixture.balance_started.clear()
+            fixture.release_balance.clear()
+            direct=Terminal(binary,workspace,home,args=("balance","--json"))
+            try:
+                direct.until(fixture.balance_started.is_set,"standalone balance request")
+                direct.send("\x03")
+                direct.until(lambda:direct.status is not None,"SIGINT stops balance CLI",seconds=2)
+                assert direct.status == 130
+                assert '"type":"cancelled"' in direct.text()
+            finally:
+                fixture.release_balance.set()
+                direct.close()
             print("PTY OK: viewport coordinates, menus, persistence, effort payloads, streaming, history, approvals, subagents, resumed records, paste, resize, Ctrl+C, Ctrl+D, terminal restoration")
     except BaseException:
         if terminal is not None:
@@ -752,6 +834,7 @@ def main(binary):
         fixture.release_stream_first.set()
         fixture.release_stream_second.set()
         fixture.release_agent.set()
+        fixture.release_balance.set()
         if terminal is not None:
             capture_path = os.environ.get("RCODE_PTY_DUMP_GRID")
             if capture_path:

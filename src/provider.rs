@@ -1,5 +1,6 @@
 //! Provider-specific wire formats stay here; sessions contain only the common protocol.
 use crate::{
+    balance::{BalanceReport, TokenBalance},
     config::{Effort, ProviderKind, ProviderSettings},
     protocol::{
         Completion, FailureKind, FunctionCall, Message, ModelInfo, ProviderFailure, ProviderMeta,
@@ -17,7 +18,10 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
     net::IpAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
@@ -43,6 +47,7 @@ pub struct ProviderClient {
     token: Option<AccessToken>,
     generation_slots: Arc<Semaphore>,
     image_uploads: Arc<tokio::sync::Mutex<BTreeMap<String, String>>>,
+    credits_forbidden: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 struct AccessToken {
@@ -134,7 +139,63 @@ impl ProviderClient {
             token: None,
             generation_slots,
             image_uploads: Default::default(),
+            credits_forbidden: Default::default(),
         })
+    }
+
+    pub async fn balance(&mut self) -> Result<BalanceReport> {
+        let mut report = BalanceReport::empty(self.settings.kind);
+        match self.settings.kind {
+            ProviderKind::OpenRouter => {
+                #[derive(serde::Deserialize)]
+                struct Key { limit: Option<f64>, limit_remaining: Option<f64>, usage: f64 }
+                #[derive(serde::Deserialize)]
+                struct Credits { total_credits: f64, total_usage: f64 }
+                let response = self.authorized_request(Method::GET, "key", None).await?;
+                let value = read_json(response, self.idle()).await?;
+                let key: Key = serde_json::from_value(value["data"].clone()).map_err(|_|protocol("API ключа не вернул корректные данные о лимите и расходе"))?;
+                if value["data"].get("limit").is_none() || value["data"].get("limit_remaining").is_none() {
+                    return Err(protocol("API ключа не сообщил, задан ли лимит"));
+                }
+                report.key_remaining_usd = key.limit_remaining;
+                report.key_limit_usd = key.limit;
+                report.key_usage_usd = Some(key.usage);
+                if !self.credits_forbidden.load(Ordering::Relaxed) {
+                    match self.authorized_request(Method::GET, "credits", None).await {
+                        Ok(response) => {
+                            let value=read_json(response,self.idle()).await?;
+                            let credits: Credits=serde_json::from_value(value["data"].clone()).map_err(|_|protocol("API баланса не вернул total_credits и total_usage"))?;
+                            let remaining=credits.total_credits-credits.total_usage;
+                            if !remaining.is_finite() { return Err(protocol("API вернул некорректный баланс")); }
+                            report.remaining_usd=Some(remaining);
+                        },
+                        Err(error) if error.downcast_ref::<ProviderFailure>().is_some_and(|e|matches!(e.status,Some(401|403))) => {
+                            self.credits_forbidden.store(true,Ordering::Relaxed);
+                        },
+                        Err(error) => return Err(error),
+                    }
+                }
+                if self.credits_forbidden.load(Ordering::Relaxed) {
+                    report.note=Some("API не разрешил посмотреть баланс счёта этим ключом; может потребоваться отдельный management key. Лимит ключа не является балансом счёта.".into());
+                }
+            },
+            ProviderKind::GigaChat => {
+                match self.authorized_request(Method::GET,"balance",None).await {
+                    Ok(response) => {
+                        let value=read_json(response,self.idle()).await?;
+                        report.token_balances=serde_json::from_value::<Vec<TokenBalance>>(value["balance"].clone()).map_err(|_|protocol("API баланса не вернул корректные остатки токенов"))?;
+                        if report.token_balances.len()>128 || report.token_balances.iter().any(|p|p.usage.is_empty() || p.usage.len()>128) { return Err(protocol("API баланса вернул некорректный список пакетов")); }
+                        report.note=Some("Остатки оплаченных пакетов в токенах; денежный баланс API не сообщает.".into());
+                    },
+                    Err(error) if error.downcast_ref::<ProviderFailure>().is_some_and(|e|matches!(e.status,Some(403..=405))) => report.note=Some("Баланс токенов недоступен этому ключу или тарифу. При pay-as-you-go GigaChat не предоставляет этот API.".into()),
+                    Err(error) => return Err(error),
+                }
+            },
+            ProviderKind::Yandex => report.note=Some("Ключ AI Studio не даёт доступ к балансу Yandex Cloud Billing. Для Billing API нужна отдельная IAM-авторизация; баланс доступен в кабинете.".into()),
+            ProviderKind::Custom => report.note=Some("У OpenAI-совместимого API нет стандартного метода баланса. Проверьте кабинет своего провайдера.".into()),
+        }
+        report.checked_at = epoch_seconds();
+        Ok(report)
     }
 
     pub async fn complete(

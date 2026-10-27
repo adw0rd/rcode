@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod balance;
 mod certificates;
 pub mod config;
 pub mod protocol;

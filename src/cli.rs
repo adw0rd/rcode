@@ -107,6 +107,8 @@ pub enum Command {
     Connect { provider: Option<ProviderKind> },
     #[command(about = "Список моделей выбранного провайдера")]
     Models,
+    #[command(about = "Баланс провайдера и доступные лимиты API")]
+    Balance,
     #[command(about = "Сохранённые локальные сессии")]
     Sessions,
     #[command(about = "Проверить настройки; --check проверяет доступ к API")]

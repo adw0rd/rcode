@@ -197,6 +197,111 @@ fn settings(kind: ProviderKind, url: &str, stream: bool) -> ProviderSettings {
         idle_timeout_secs: 1,
     }
 }
+
+#[tokio::test]
+async fn balance_distinguishes_openrouter_account_from_key_limit() {
+    let (url, task) = server(vec![
+        Reply::json(json!({"data":{"limit":50,"limit_remaining":7.5,"usage":42.5}})),
+        Reply::json(json!({"data":{"total_credits":100,"total_usage":82.25}})),
+    ])
+    .await;
+    let mut client = ProviderClient::new(
+        settings(ProviderKind::OpenRouter, &url, false),
+        "balance-secret".into(),
+    )
+    .unwrap();
+    let report = client.balance().await.unwrap();
+    assert_eq!(report.remaining_usd, Some(17.75));
+    assert_eq!(report.key_remaining_usd, Some(7.5));
+    let requests = task.await.unwrap();
+    assert_eq!(
+        requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+        ["/v1/key", "/v1/credits"]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.body.is_empty() && r.headers["authorization"] == "Bearer balance-secret")
+    );
+}
+
+#[tokio::test]
+async fn balance_unlimited_key_is_not_zero_and_forbidden_credits_are_not_repolled() {
+    let key = json!({"data":{"limit":null,"limit_remaining":null,"usage":2.0}});
+    let (url, task) = server(vec![
+        Reply::json(key.clone()),
+        Reply::body(
+            403,
+            "application/json",
+            b"secret echoed by upstream".to_vec(),
+        ),
+        Reply::json(key),
+    ])
+    .await;
+    let mut client = ProviderClient::new(
+        settings(ProviderKind::OpenRouter, &url, false),
+        "secret".into(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let report = client.balance().await.unwrap();
+        assert_eq!(report.remaining_usd, None);
+        assert_eq!(report.key_remaining_usd, None);
+        assert!(report.details("any").contains("не задан"));
+        assert!(!report.details("any").contains("secret"));
+    }
+    assert_eq!(task.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn balance_gigachat_uses_oauth_and_returns_token_pools() {
+    let (url, task) = server(vec![
+        Reply::json(json!({"access_token":"access-balance","expires_at":4102444800000_u64})),
+        Reply::json(json!({"balance":[{"usage":"GigaChat-Ultra","value":123456},{"usage":"GigaChat","value":0}]})),
+    ]).await;
+    let mut client = ProviderClient::new(
+        settings(ProviderKind::GigaChat, &url, false),
+        "auth-key".into(),
+    )
+    .unwrap();
+    let report = client.balance().await.unwrap();
+    assert_eq!(report.token_balances[0].value, 123456);
+    assert!(report.footer("GigaChat-3-Ultra").contains("123.5k"));
+    let requests = task.await.unwrap();
+    assert_eq!(requests[1].path, "/v1/balance");
+    assert_eq!(
+        requests[1].headers["authorization"],
+        "Bearer access-balance"
+    );
+}
+
+#[tokio::test]
+async fn balance_unsupported_providers_make_no_network_request() {
+    for kind in [ProviderKind::Yandex, ProviderKind::Custom] {
+        let mut client =
+            ProviderClient::new(settings(kind, "http://127.0.0.1:1", false), "secret".into())
+                .unwrap();
+        let report = client.balance().await.unwrap();
+        assert!(report.remaining_usd.is_none());
+        assert!(report.note.is_some());
+    }
+}
+
+#[tokio::test]
+async fn balance_missing_fields_are_not_reported_as_zero() {
+    let (url, task) = server(vec![Reply::json(json!({"data":{}}))]).await;
+    let mut client = ProviderClient::new(
+        settings(ProviderKind::OpenRouter, &url, false),
+        "secret".into(),
+    )
+    .unwrap();
+    let error = client.balance().await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<ProviderFailure>().unwrap().kind,
+        FailureKind::Protocol
+    );
+    task.await.unwrap();
+}
 fn completion() -> Value {
     json!({"choices":[{"message":{"role":"assistant","content":"готово"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"cost":0.001},"model":"wire-model"})
 }

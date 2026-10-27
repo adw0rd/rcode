@@ -727,3 +727,27 @@ fn missing_credentials_is_config_error_without_network() {
     let error: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(error["type"], "error");
 }
+
+#[test]
+fn balance_command_is_local_metadata_and_does_not_create_a_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let home = tmp.path().join("state");
+    let out = run(
+        &project,
+        &home,
+        "http://127.0.0.1:1/v1",
+        &["balance", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["type"], "balance");
+    assert!(report["remaining_usd"].is_null());
+    assert!(report["note"].as_str().unwrap().contains("стандартного"));
+    assert_eq!(std::fs::read_dir(home.join("sessions")).unwrap().count(), 0);
+}

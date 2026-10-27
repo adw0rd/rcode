@@ -72,6 +72,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Расход токенов и стоимость",
     },
     CommandSpec {
+        name: "/balance",
+        description: "Баланс провайдера и лимиты ключа",
+    },
+    CommandSpec {
         name: "/status",
         description: "Модель, настройки и сессия",
     },
@@ -132,6 +136,21 @@ pub struct Editor {
 impl Editor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn read_plain(&self, prompt: &str) -> Result<Input> {
+        // Readline owns Unix signal handlers while alive. Drop it before any
+        // API wait so Ctrl+C reaches Tokio; the shared input history lives here.
+        let mut editor = crate::ui::editor()?;
+        for entry in &self.history {
+            let _ = editor.add_history_entry(entry.as_str());
+        }
+        match editor.readline(prompt) {
+            Ok(text) => Ok(Input::Submit(text)),
+            Err(rustyline::error::ReadlineError::Interrupted) => Ok(Input::Interrupt),
+            Err(rustyline::error::ReadlineError::Eof) => Ok(Input::Eof),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn read(&mut self, footer: &Footer) -> Result<Input> {

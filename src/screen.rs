@@ -93,6 +93,8 @@ impl History {
 }
 struct State {
     footer: Footer,
+    balance_id: u64,
+    balance_label: String,
     history: VecDeque<History>,
     markdown_active: Option<usize>,
     bytes: usize,
@@ -185,6 +187,8 @@ impl Screen {
         Arc::new(Self {
             state: Mutex::new(State {
                 footer,
+                balance_id: 0,
+                balance_label: String::new(),
                 history: VecDeque::from([History::Plain(String::new())]),
                 markdown_active: None,
                 bytes: 0,
@@ -216,6 +220,22 @@ impl Screen {
         f(&mut s);
         s.generation = s.generation.wrapping_add(1);
         self.wake.notify_all();
+    }
+    pub fn begin_balance(&self) -> u64 {
+        let mut id = 0;
+        self.change(|s| {
+            s.balance_id = s.balance_id.wrapping_add(1);
+            s.balance_label = "Баланс: …".into();
+            id = s.balance_id;
+        });
+        id
+    }
+    pub fn set_balance(&self, id: u64, label: String) {
+        self.change(|s| {
+            if !s.stop && s.balance_id == id {
+                s.balance_label = label;
+            }
+        });
     }
     pub fn set_panel(&self, panel: Panel) {
         self.change(|s| {
@@ -502,6 +522,7 @@ fn num(n: u64) -> String {
 }
 fn status(
     footer: &Footer,
+    balance: &str,
     width: usize,
     scroll: usize,
     first_width: usize,
@@ -551,6 +572,11 @@ fn status(
             num(footer.input_tokens),
             num(footer.output_tokens)
         )
+    };
+    let second = if !balance.is_empty() && width >= 60 {
+        format!("{balance} · {second}")
+    } else {
+        second
     };
     vec![
         (clip(&flat(&first), first_width), Paint::Normal),
@@ -697,7 +723,7 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
     let first_width = width
         .checked_sub(version_width)
         .map_or(width, |remaining| remaining.saturating_sub(2));
-    let status = status(&s.footer, width, scroll, first_width);
+    let status = status(&s.footer, &s.balance_label, width, scroll, first_width);
     if footer_count == 2 {
         rows[height - 2] = status[0].clone();
         rows[height - 1] = status[1].clone();
@@ -1578,6 +1604,25 @@ mod tests {
             });
             let frame = compose(&screen.state.lock().unwrap(), w, h);
             assert!(frame.rows[h as usize - 2].0.ends_with(&version));
+        }
+    }
+
+    #[test]
+    fn balance_updates_preserve_input_and_reject_previous_provider_results() {
+        let screen = Screen::test_screen();
+        screen.set_panel(editor());
+        let old = screen.begin_balance();
+        let current = screen.begin_balance();
+        screen.set_balance(current, "Баланс $12.34".into());
+        screen.set_balance(old, "Баланс $999.00".into());
+        let s = screen.state.lock().unwrap();
+        for width in [80, 140] {
+            let frame = compose(&s, width, 28);
+            assert!(frame.rows[27].0.contains("Баланс $12.34"));
+            assert!(frame.rows[27].0.contains("Контекст"));
+            assert!(!frame.rows.iter().any(|row| row.0.contains("999.00")));
+            assert_eq!(frame.cursor.unwrap().0, 24);
+            assert!(frame.rows[26].0.ends_with(env!("CARGO_PKG_VERSION")));
         }
     }
     #[test]

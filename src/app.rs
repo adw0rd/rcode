@@ -280,6 +280,24 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     session.provider.validate()?;
     events.remember(credential.value.clone());
     let mut client = ProviderClient::new(session.provider.clone(), credential.value)?;
+    if matches!(cli.command, Some(Command::Balance)) {
+        let report = tokio::select! {
+            result=crate::balance::fetch(&mut client)=>result?,
+            _=tokio::signal::ctrl_c()=>{
+                events.emit("cancelled",json!({"message":"Обновление баланса отменено"}));
+                return Ok(130);
+            }
+        };
+        if cli.json {
+            events.emit("balance", serde_json::to_value(&report)?);
+        } else {
+            println!(
+                "{}",
+                events.redact(&report.details(&session.provider.model))
+            );
+        }
+        return Ok(0);
+    }
     if matches!(
         cli.command,
         Some(Command::Models) | Some(Command::Doctor { check: true })
@@ -388,6 +406,7 @@ fn system_prompt(session: &Session, cli: &Cli, plan: bool) -> String {
         prompt.push_str(&json!({"AGENTS.md": text}).to_string());
         prompt.push_str("\n</rcode_repository_context>\n");
     }
+    prompt.push_str("\nThe rcode interface provides /balance to check the current provider's account balance or token package and refresh the footer. When asked about available provider credits, suggest /balance. Account balances are displayed locally and are not included in your model context; never invent an amount.\n");
     let runtime = json!({
         "harness": "rcode",
         "version": env!("CARGO_PKG_VERSION"),

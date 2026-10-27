@@ -1,5 +1,6 @@
 use crate::{
     app::{Events, configured_tools, prepare_context, turn, user_shell},
+    balance::BalanceMonitor,
     cli::{ApprovalMode, Cli},
     config::{ConfigStore, Effort, ProviderKind, ProviderSettings, Settings},
     presentation,
@@ -573,11 +574,11 @@ pub async fn run(
         None
     };
     let mut runtime = cli.clone();
+    let mut balance_monitor = crate::screen::current().map(|screen| {
+        BalanceMonitor::start(client.clone(), session.provider.model.clone(), screen)
+    });
     let mut plan = cli.plan;
     let mut composer = terminal::Editor::new();
-    // An unused readline editor still installs signal handlers. Keep it out of
-    // Screen's lifecycle so temporary connection forms can restore its handlers.
-    let mut plain = if rich { None } else { Some(ui::editor()?) };
     let mut input_history =
         match crate::input_history::InputHistory::load(store, &session.root, |text| {
             events.redact(text)
@@ -585,9 +586,6 @@ pub async fn run(
             Ok((history, entries)) => {
                 for entry in entries {
                     composer.add_history(&entry);
-                    if let Some(editor) = &mut plain {
-                        let _ = editor.add_history_entry(entry.as_str());
-                    }
                 }
                 Some(history)
             }
@@ -628,18 +626,13 @@ pub async fn run(
         } else if rich {
             composer.read(&footer(session, &runtime, plan))?
         } else {
-            match plain.as_mut().expect("plain editor").readline(if plan {
+            composer.read_plain(if plan {
                 "rcode [план] › "
             } else if runtime.permissions() == ApprovalMode::FullAccess {
                 "rcode [полный доступ] › "
             } else {
                 "rcode › "
-            }) {
-                Ok(s) => Input::Submit(s),
-                Err(rustyline::error::ReadlineError::Interrupted) => Input::Interrupt,
-                Err(rustyline::error::ReadlineError::Eof) => Input::Eof,
-                Err(e) => return Err(e.into()),
-            }
+            })?
         };
         let input = match input {
             Input::Submit(s) => {
@@ -665,9 +658,6 @@ pub async fn run(
         }
         let redacted = events.redact(input);
         composer.add_history(&redacted);
-        if let Some(editor) = &mut plain {
-            let _ = editor.add_history_entry(redacted.as_str());
-        }
         if let Some(history) = &input_history
             && let Err(error) = history.record(&redacted, |text| events.redact(text))
         {
@@ -713,6 +703,18 @@ pub async fn run(
                 },
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
                 "/status"=>{status(session,&runtime,plan,&models);Ok(())},
+                "/balance"=>{
+                    if !args.is_empty(){bail!("/balance — баланс текущего провайдера; сменить провайдера: /provider");}
+                    let cancel=tokio_util::sync::CancellationToken::new();
+                    if let Some(screen)=crate::screen::current(){screen.bind_cancel(cancel.clone());}
+                    events.busy("Обновляю баланс…");
+                    let fetch=async {
+                        if let Some(monitor)=&balance_monitor{monitor.refresh().await}
+                        else{crate::balance::fetch(client).await}
+                    };
+                    let report=tokio::select!{result=fetch=>result?,_=cancel.cancelled()=>bail!("Обновление баланса отменено"),_=tokio::signal::ctrl_c()=>bail!("Обновление баланса отменено")};
+                    notice!("{}",events.redact(&report.details(&session.provider.model)));Ok(())
+                },
                 "/agents"=>{
                     if args.len()>1{bail!("/agents [ID или однозначный префикс]");}
                     let records=serde_json::to_value(&session.agents)?;
@@ -747,6 +749,15 @@ pub async fn run(
                 },
                 _=>bail!("Неизвестная команда. / открывает меню, /help — справку"),
             }}.await;
+            if matches!(
+                command,
+                "/model" | "/models" | "/provider" | "/connect" | "/login" | "/effort" | "/resume"
+            ) {
+                drop(balance_monitor.take());
+                balance_monitor = crate::screen::current().map(|screen| {
+                    BalanceMonitor::start(client.clone(), session.provider.model.clone(), screen)
+                });
+            }
             events.pause();
             if let Err(e) = result {
                 events.emit("error", json!({"message":format!("{e:#}")}));
