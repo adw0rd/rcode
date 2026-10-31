@@ -1,5 +1,8 @@
 use crate::{
-    app::{Events, configured_tools, context_budget, prepare_context, turn, user_shell},
+    app::{
+        Events, configured_tools, context_budget, discover_skills, prepare_context, turn,
+        user_shell,
+    },
     balance::BalanceMonitor,
     cli::{ApprovalMode, Cli},
     config::{ConfigStore, Effort, ProviderKind, ProviderSettings, Settings},
@@ -7,6 +10,7 @@ use crate::{
     local_app, presentation,
     protocol::{Message, ModelInfo, ProviderMeta},
     provider::ProviderClient,
+    skills::{SkillCatalog, SkillProblem},
     state::{AUTO_COMPACT_THRESHOLD, CONTEXT_LIMIT, Session},
     terminal::{self, Choice, Footer, Input},
     tools::Tools,
@@ -715,8 +719,19 @@ fn apply_permissions(
     );
     Ok(())
 }
+/// Discovery warnings, at most ten lines; shown again only when the set changes.
+fn skill_problems(problems: &[SkillProblem], events: &Events) {
+    const SHOWN: usize = 10;
+    for problem in problems.iter().take(SHOWN) {
+        notice!("! {}", ui::safe(&events.redact(&problem.warning())));
+    }
+    if problems.len() > SHOWN {
+        notice!("! Скиллы: ещё предупреждений — {}", problems.len() - SHOWN);
+    }
+}
+/// `skills`: the snapshot `dispatch` discovered; later inputs rediscover.
 #[allow(clippy::too_many_arguments)]
-pub async fn run(
+pub(crate) async fn run(
     cli: &Cli,
     store: &ConfigStore,
     settings: &mut Settings,
@@ -724,6 +739,7 @@ pub async fn run(
     tools: &mut Tools,
     client: &mut ProviderClient,
     events: &mut Events,
+    skills: SkillCatalog,
 ) -> Result<i32> {
     let rich = events.display.is_rich();
     let _screen = if rich {
@@ -731,7 +747,7 @@ pub async fn run(
             session,
             cli,
             cli.plan,
-            &context_budget(client, session, cli, cli.plan),
+            &context_budget(client, session, cli, cli.plan, &skills),
         ))?)
     } else {
         None
@@ -774,7 +790,7 @@ pub async fn run(
             session,
             store,
             0,
-            &context_budget(client, session, cli, plan),
+            &context_budget(client, session, cli, plan, &skills),
         )?)
     } else {
         None
@@ -783,8 +799,19 @@ pub async fn run(
     if let Some(context) = restored_context {
         context.report(events);
     }
+    let mut shown_problems = Vec::new();
+    let mut snapshot = Some(skills);
     loop {
-        let budget = context_budget(client, session, &runtime, plan);
+        // New and changed skills are picked up without a restart; one turn
+        // keeps one snapshot (DESIGN §6.1).
+        let skills = snapshot
+            .take()
+            .unwrap_or_else(|| discover_skills(store, &session.root));
+        if skills.problems != shown_problems {
+            skill_problems(&skills.problems, events);
+            shown_problems = skills.problems.clone();
+        }
+        let budget = context_budget(client, session, &runtime, plan, &skills);
         if let Some(screen) = crate::screen::current() {
             screen.set_footer(footer(session, &runtime, plan, &budget));
         }
@@ -912,7 +939,7 @@ pub async fn run(
                         let mut restored=Session::load(store,&id,&session.root)?;
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        *session=restored;*client=next;*tools=next_tools;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _=>bail!("Неизвестная команда. / открывает меню, /help — справку"),
@@ -937,7 +964,11 @@ pub async fn run(
                 ui::safe(&redacted)
             );
         }
-        if let Err(e) = turn(session, store, tools, client, events, &runtime, input, plan).await {
+        if let Err(e) = turn(
+            session, store, tools, client, events, &runtime, input, plan, &skills,
+        )
+        .await
+        {
             events.emit("error", json!({"message":format!("{e:#}")}));
         }
         events.pause();

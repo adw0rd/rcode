@@ -41,7 +41,7 @@ impl ContextSource {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ContextBudget {
     pub unit: ContextUnit,
     /// Whole input allowance of one request, including `overhead`.
@@ -125,6 +125,17 @@ impl ContextBudget {
         }
     }
 
+    /// Cloud budget whose history shares the character limit with a fixed
+    /// request overhead (the skill catalog and the `load_skill` schema). The
+    /// rest of the system prompt and tools stay uncounted, as before; with a
+    /// zero overhead every number equals `cloud()`.
+    pub fn cloud_with_overhead(overhead: usize) -> Self {
+        Self {
+            overhead,
+            ..Self::cloud()
+        }
+    }
+
     /// `runtime_context`: context reported by the running server, if any.
     pub fn for_provider(
         settings: &ProviderSettings,
@@ -189,14 +200,14 @@ impl ContextBudget {
 
     pub fn threshold(&self) -> usize {
         match self.unit {
-            ContextUnit::Chars => AUTO_COMPACT_THRESHOLD,
+            ContextUnit::Chars => AUTO_COMPACT_THRESHOLD.saturating_sub(self.scaled_overhead()),
             ContextUnit::EstimatedTokens => self.history_limit() * 5 / 6,
         }
     }
 
     pub fn target(&self) -> usize {
         match self.unit {
-            ContextUnit::Chars => 110_000,
+            ContextUnit::Chars => 110_000usize.saturating_sub(self.scaled_overhead()),
             ContextUnit::EstimatedTokens => self.history_limit() * 11 / 18,
         }
     }
@@ -285,6 +296,8 @@ const ESSENTIAL: &[&str] = &[
     "ends_with_newline",
     "truncated",
     "next_offset",
+    "skill",
+    "partial_line",
 ];
 const ESSENTIAL_CHARS: usize = 400;
 /// Head of a non-JSON result kept by the last-resort receipt.
@@ -294,6 +307,9 @@ fn truncation_hint(tool: &str) -> &'static str {
     match tool {
         "read_file" => {
             "Host shortened this read to fit the local model context; see rcode_truncated.fields.content. With complete_lines, every shown line is whole: continue with read_file start_line=next_line and a smaller max_lines. With partial_line, that single line is longer than the context allows and its omitted part cannot be obtained by paging (next_line, if any, is the following line): use search for the exact text you need. Do not re-read the same range."
+        }
+        "load_skill" => {
+            "Host shortened this skill page to fit the local model context; see rcode_truncated.fields.content. With complete_lines, every shown line is whole: continue with load_skill with the same name and file and start_line=next_line. With partial_line, that single line is longer than the context allows and its omitted part cannot be obtained by paging (next_line, if any, is the following line). Do not reload the same range."
         }
         "run_command" => {
             "Host shortened this output to fit the local model context; the command ran once and was not repeated. Do not re-run it to see the omitted lines: for a file use read_file with start_line/max_lines or search; otherwise use a narrower side-effect-free command (grep -n, sed -n 'A,Bp')."
@@ -339,6 +355,11 @@ fn bound_essential(text: &str, budget: usize) -> (String, Value) {
     cut_middle(text, budget.max(ESSENTIAL_CHARS).min(length))
 }
 
+/// Results whose `content` is a page of whole lines continued by `start_line`.
+fn line_paged(tool: &str) -> bool {
+    matches!(tool, "read_file" | "load_skill")
+}
+
 fn shrink_object(
     tool: &str,
     mut object: Map<String, Value>,
@@ -370,7 +391,7 @@ fn shrink_object(
         }
         match object[&key].clone() {
             Value::String(text)
-                if tool == "read_file"
+                if line_paged(tool)
                     && key == "content"
                     && text
                         .split_inclusive('\n')
@@ -399,7 +420,7 @@ fn shrink_object(
                     json!({"complete_lines": true, "shown_lines": [start, start + lines - 1], "next_line": start + lines}),
                 );
             }
-            Value::String(text) if tool == "read_file" && key == "content" => {
+            Value::String(text) if line_paged(tool) && key == "content" => {
                 // The first line alone is longer than the budget (for example a
                 // minified file): show its head and tail and say so. Paging
                 // cannot return the omitted middle of a line.
@@ -975,5 +996,88 @@ mod tests {
             assert_eq!(budget.history_limit(), 180_000);
             assert_eq!(budget.measure(&Message::user("абв")), 3);
         }
+    }
+
+    #[test]
+    fn cloud_with_overhead_shrinks_history_threshold_and_target() {
+        assert_eq!(
+            ContextBudget::cloud_with_overhead(0),
+            ContextBudget::cloud()
+        );
+        let budget = ContextBudget::cloud_with_overhead(12_000);
+        assert_eq!(budget.unit, ContextUnit::Chars);
+        assert_eq!(budget.limit, 180_000);
+        assert_eq!(budget.history_limit(), 168_000);
+        assert_eq!(budget.threshold(), 138_000);
+        assert_eq!(budget.target(), 98_000);
+        assert_eq!(budget.manual_target(), 20_000);
+        assert_eq!(budget.reserve(), 4000);
+        assert_eq!(budget.receipt_limit(), None);
+        assert_eq!(budget.request_used(&[Message::user("абв")]), 12_003);
+        let cloud = ContextBudget::cloud();
+        assert_eq!(
+            (cloud.history_limit(), cloud.threshold(), cloud.target()),
+            (180_000, 150_000, 110_000)
+        );
+    }
+
+    #[test]
+    fn local_overhead_grows_by_the_catalog_block_and_schema() {
+        let system = "s".repeat(3000);
+        let tools = crate::tools::Tools::definitions();
+        let without = estimate_overhead(&system, &tools);
+        let block = "\nSkills are listed below as JSON {id: description}.\n<rcode_skills>\n{\"review\":\"Проверить изменения перед коммитом\"}\n</rcode_skills>\n";
+        let with_block = estimate_overhead(&format!("{system}{block}"), &tools);
+        let tokens = estimate_text_tokens(block);
+        // Rounding of the two terms can differ by at most a few tokens.
+        assert!(with_block + 3 >= without + tokens && with_block <= without + tokens + 3);
+        let mut offered = tools.clone();
+        offered.push(crate::skill_tool::definition());
+        let with_schema = estimate_overhead(&system, &offered);
+        assert!(with_schema > without + 100);
+        let budget = ContextBudget::for_provider(&local(), None, 1.0, with_block);
+        assert_eq!(budget.history_limit(), 25_396 - with_block);
+    }
+
+    #[test]
+    fn load_skill_receipts_keep_whole_lines_and_continue_with_load_skill() {
+        let budget = ContextBudget::for_provider(&local(), None, 1.0, 9000);
+        let limit = budget.receipt_limit().unwrap() / 3;
+        let cost = |text: &str| budget.measure(&Message::text("tool", text));
+        let lines: String = (1..=600)
+            .map(|line| format!("Step {line}: follow the workflow and verify the result.\n"))
+            .collect();
+        let page = json!({"skill":"pack:debugging","scope":"source","source":"pack","path":"SKILL.md","skill_dir":"/skills/debugging","sha256":"abc","start_line":41,"total_lines":900,"next_line":641,"content":lines,"resources":["references/a.md"],"ignored_fields":["allowed-tools"],"note":"data"}).to_string();
+        let bounded = bound_receipt(&budget, "load_skill", &page, limit, false);
+        assert!(cost(&bounded) <= limit);
+        let value: Value = serde_json::from_str(&bounded).unwrap();
+        let shown = value["content"].as_str().unwrap();
+        let next = value["next_line"].as_u64().unwrap();
+        assert!(shown.ends_with('\n') && next > 41 && next < 641, "{next}");
+        assert_eq!(shown.lines().count() as u64, next - 41);
+        assert!(lines.starts_with(shown));
+        assert!(
+            shown
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with(&format!("Step {}:", next - 41))
+        );
+        assert_eq!(value["skill"], "pack:debugging");
+        assert_eq!(value["path"], "SKILL.md");
+        assert_eq!(value["sha256"], "abc");
+        assert_eq!(value["start_line"], 41);
+        assert_eq!(value["total_lines"], 900);
+        let fields = &value["rcode_truncated"]["fields"]["content"];
+        assert_eq!(fields["complete_lines"], true);
+        assert_eq!(fields["shown_lines"], json!([41, next - 1]));
+        let hint = value["rcode_truncated"]["hint"].as_str().unwrap();
+        assert!(hint.contains("load_skill") && hint.contains("start_line=next_line"));
+        // The last-resort receipt keeps the identity of the skill page.
+        let tiny = bound_receipt(&budget, "load_skill", &page, 30, false);
+        let value: Value = serde_json::from_str(&tiny).unwrap();
+        assert_eq!(value["skill"], "pack:debugging");
+        assert_eq!(value["next_line"], 641);
+        assert_eq!(value["is_error"], false);
     }
 }

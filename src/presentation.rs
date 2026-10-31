@@ -26,6 +26,22 @@ fn tool_heading(name: &str) -> String {
     let name = ui::safe(name).replace('\n', "\\n").replace('\t', "\\t");
     format!("  ● {}", clip(&name, 80))
 }
+/// Argument shown next to the tool name: the path or pattern, and for
+/// `load_skill` the skill id with an optional supporting file.
+fn tool_detail(name: &str, args: &Value) -> String {
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    if name == "load_skill" {
+        let skill = text("name").unwrap_or_default();
+        return match text("file") {
+            Some(file) if !file.is_empty() => format!("{skill} · {file}"),
+            _ => skill.to_owned(),
+        };
+    }
+    text("path")
+        .or_else(|| text("pattern"))
+        .unwrap_or_default()
+        .to_owned()
+}
 fn output_excerpt(text: &str, max: usize) -> Vec<String> {
     let mut lines: Vec<String> = text.lines().take(max).map(|s| clip(s, 200)).collect();
     let rest = text.lines().count().saturating_sub(max);
@@ -350,15 +366,11 @@ impl Human {
                 let name = data["name"].as_str().unwrap_or("tool");
                 let args: Value = serde_json::from_str(data["arguments"].as_str().unwrap_or("{}"))
                     .unwrap_or_default();
-                let detail = args
-                    .get("path")
-                    .or_else(|| args.get("pattern"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let detail = tool_detail(name, &args);
                 line!(
                     "{} {}",
                     tone(&tool_heading(name), "38;5;110", rich),
-                    clip(detail, 100)
+                    clip(&detail, 100)
                 );
             }
             "tool_result" => {
@@ -755,5 +767,35 @@ mod tests {
             let text = clip("Привет 世界 👩‍💻", width);
             assert!(unicode_width::UnicodeWidthStr::width(text.as_str()) <= width);
         }
+    }
+
+    #[test]
+    fn load_skill_start_shows_the_skill_and_file() {
+        let screen = crate::screen::Screen::test_screen();
+        let human = Human::new(true);
+        human.emit_to(
+            "tool_start",
+            &json!({"name":"load_skill","arguments":r#"{"name":"superpowers:brainstorming"}"#}),
+            Some(&screen),
+        );
+        human.emit_to(
+            "tool_start",
+            &json!({"name":"load_skill","arguments":r#"{"name":"debug","file":"references/x.md\u001b[2J","start_line":3}"#}),
+            Some(&screen),
+        );
+        let history = screen.history_text();
+        assert!(
+            history.contains("  ● load_skill superpowers:brainstorming\n"),
+            "{history:?}"
+        );
+        assert!(
+            history.contains("  ● load_skill debug · references/x.md[2J\n"),
+            "{history:?}"
+        );
+        assert!(!history.contains('\x1b'));
+        // Other tools keep path/pattern; a name argument is not shown for them.
+        assert_eq!(tool_detail("spawn_agent", &json!({"name":"worker"})), "");
+        assert_eq!(tool_detail("read_file", &json!({"path":"a.rs"})), "a.rs");
+        assert_eq!(tool_detail("search", &json!({"pattern":"fn"})), "fn");
     }
 }

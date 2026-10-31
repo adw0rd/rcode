@@ -11,6 +11,7 @@ pub mod local_runtime;
 mod local_ui;
 pub mod protocol;
 pub mod provider;
+pub(crate) mod skill_tool;
 pub(crate) mod skills;
 pub mod state;
 mod think;
