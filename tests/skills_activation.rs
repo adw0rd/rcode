@@ -400,7 +400,11 @@ fn catalog_reaches_prompt_and_load_skill_returns_body() {
         );
     }
     assert_eq!(
-        tool_names(first).last().map(String::as_str),
+        tool_names(first)
+            .iter()
+            .rev()
+            .find(|name| name.as_str() != "web_fetch")
+            .map(String::as_str),
         Some("load_skill")
     );
 
@@ -1066,7 +1070,7 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
         .into_iter()
         .chain(AgentPool::definitions())
         .map(|tool| tool.name)
-        .chain(["get_provider_balance".to_owned()])
+        .chain(["get_provider_balance".to_owned(), "web_fetch".to_owned()])
         .collect();
     assert_eq!(tool_names(without), expected);
 
@@ -1089,6 +1093,8 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
         .unwrap();
     assert_eq!(after.replacen(&block, "", 1), before);
     let mut with_skill = expected.clone();
+    let web_fetch = with_skill.pop().unwrap();
     with_skill.push("load_skill".into());
+    with_skill.push(web_fetch);
     assert_eq!(tool_names(&generations[1]), with_skill);
 }

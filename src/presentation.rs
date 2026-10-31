@@ -37,6 +37,9 @@ fn tool_detail(name: &str, args: &Value) -> String {
             _ => skill.to_owned(),
         };
     }
+    if name == crate::web_fetch::TOOL_NAME {
+        return text("url").unwrap_or_default().to_owned();
+    }
     text("path")
         .or_else(|| text("pattern"))
         .unwrap_or_default()

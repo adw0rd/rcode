@@ -549,6 +549,7 @@ fn turn_definitions(plan: bool, local: bool, skills: bool) -> Vec<ToolDefinition
         .chain(AgentPool::definitions())
         .chain((!local).then(crate::balance::BalanceTool::definition))
         .chain(skills.then(crate::skill_tool::definition))
+        .chain(std::iter::once(crate::web_fetch::definition()))
         .collect()
 }
 
@@ -666,6 +667,7 @@ impl RepeatedResults {
         // and do not clear the map, so alternating them cannot hide a read loop.
         let counted = match name {
             "read_file" | "list_files" | "search" | crate::skill_tool::TOOL_NAME => true,
+            "web_fetch" => true,
             "run_command" => serde_json::from_str::<Value>(&call.function.arguments)
                 .is_ok_and(|args| read_only_shell(&args)),
             _ => false,
@@ -788,10 +790,20 @@ impl ToolExecutor<'_> {
                     crate::skill_tool::execute(self.skills, &args, &self.skill_page)
                 }
             }
+            // Read-only network GET without approvals: no Tools, no directory
+            // grants, so plan mode and read-only roles keep it.
+            Ok(args) if name == crate::web_fetch::TOOL_NAME => {
+                crate::web_fetch::execute(&args, cancel).await
+            }
             Ok(args) => {
                 let read_only =
                     self.plan || actor.is_some_and(|request| request.role != AgentRole::Worker);
-                if read_only && !matches!(name, "read_file" | "list_files" | "search") {
+                if read_only
+                    && !matches!(
+                        name,
+                        "read_file" | "list_files" | "search" | crate::web_fetch::TOOL_NAME
+                    )
+                {
                     self.denied = true;
                     ToolOutcome::error(
                         "{\"error\":\"denied\",\"message\":\"Read-only role or plan mode: action was not executed\"}",
@@ -2187,6 +2199,7 @@ mod tests {
             .into_iter()
             .chain(AgentPool::definitions())
             .chain(std::iter::once(crate::balance::BalanceTool::definition()))
+            .chain(std::iter::once(crate::web_fetch::definition()))
             .map(|definition| definition.name)
             .collect();
         assert_eq!(
@@ -2208,7 +2221,12 @@ mod tests {
         assert!(
             !plan.contains(&"write_file".to_owned()) && !plan.contains(&"run_command".to_owned())
         );
-        assert_eq!(plan.last().unwrap(), crate::skill_tool::TOOL_NAME);
+        assert_eq!(
+            plan.iter()
+                .rev()
+                .find(|name| name.as_str() != crate::web_fetch::TOOL_NAME),
+            Some(&crate::skill_tool::TOOL_NAME.to_owned())
+        );
         // An empty catalog still declares the tool while history holds its calls.
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
         session.messages.push(Message::user("Загрузи скилл"));

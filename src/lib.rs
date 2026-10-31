@@ -19,6 +19,7 @@ pub(crate) mod skills_cli;
 pub mod state;
 mod think;
 pub mod tools;
+pub mod web_fetch;
 
 pub mod app;
 pub mod cli;

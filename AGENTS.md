@@ -66,6 +66,8 @@
 
 ## Скиллы и команды
 
+- `web_fetch` (`web_fetch.rs`) — read-only GET http/https в контекст модели: без ключей rcode, без разрешений (как `search`), редиректы ≤5 с проверкой схемы, тело ≤2 МиБ, текст ≤50 тыс. символов, HTML→текст без исполнения скриптов. Доступен в plan mode и read-only ролям; повторяющиеся одинаковые загрузки останавливаются как read-наблюдения. Проверка: `cargo test --lib -- web_fetch:: app::`.
+
 - `frontmatter.rs` — минимальный парсер frontmatter SKILL.md/команд (§ только скаляры и имена вложенных структур); `skills.rs` — обнаружение каталога (`RCODE_HOME/skills`, `.rcode/skills`, `skill-sources/МЕТКА`, подключённые `linked`) и рендер блока `<rcode_skills>`; `skill_tool.rs` — инструмент `load_skill` (страницы целыми строками, `next_line`/`sha256`/`resources`); `skill_sources.rs` — манифест `skills.json`, git-раннер и `tree_sha256`; `skills_cli.rs` — `rcode skills|commands …`; `commands.rs` — пользовательские команды и подстановка `$ARGUMENTS`/`$N`.
 - Скилл — данные: каталог и текст скилла не расширяют права; `allowed-tools`/`hooks`/`trusted` игнорируются, учитывается только `disable-model-invocation`. Субагенты не получают каталог и `load_skill`; пользовательские команды не раскрываются в `rcode exec` (v1).
 - Сеть для наборов — только по подтверждению (`--yes` без терминала), git с `env_clear`, `http.sslVerify=true`, без hooks набора; `http://`, `git://`, `ext::`, userinfo и пути внутри `RCODE_HOME`/проекта отклоняются. `RCODE_MODEL_SHELL=1` в окружении shell модели заставляет `install/update/remove/link/unlink` отказываться.
