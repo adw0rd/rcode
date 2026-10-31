@@ -2,7 +2,7 @@ use crate::{
     agents::{AgentPool, AgentRequest, AgentRole},
     cli::{ApprovalMode, Cli, Command},
     config::{ConfigStore, ProviderKind},
-    context::ContextBudget,
+    context::{ContextBudget, bound_receipt},
     local_app,
     protocol::{
         FailureKind, Message, ProviderFailure, ProviderMeta, ToolCall, ToolDefinition, ToolOutcome,
@@ -15,6 +15,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     future::Future,
     io::{self, Read, Write},
     path::Path,
@@ -547,6 +548,112 @@ impl FileFailureLoop {
     }
 }
 
+/// Successful read-only calls that returned exactly the result already received
+/// in this turn. Detection follows each real execution and never replaces it.
+#[derive(Default)]
+struct RepeatedResults(HashMap<String, ([u8; 32], u8)>);
+
+impl RepeatedResults {
+    fn observe(&mut self, call: &ToolCall, outcome: &ToolOutcome) -> u8 {
+        use sha2::{Digest, Sha256};
+        let name = call.function.name.as_str();
+        // A real file change makes earlier reads stale. Reads around failed
+        // writes belong to that diagnosis, bounded by FileFailureLoop.
+        if !outcome.changed_paths.is_empty()
+            || (outcome.is_error && matches!(name, "write_file" | "edit_file"))
+        {
+            self.0.clear();
+            return 0;
+        }
+        if outcome.is_error {
+            return 0;
+        }
+        // Only plain read-only shell observations are comparable. Commands with
+        // side effects or shell syntax (appends, polling, pipes) are never counted
+        // and do not clear the map, so alternating them cannot hide a read loop.
+        let counted = match name {
+            "read_file" | "list_files" | "search" => true,
+            "run_command" => serde_json::from_str::<Value>(&call.function.arguments)
+                .is_ok_and(|args| read_only_shell(&args)),
+            _ => false,
+        };
+        if !counted {
+            return 0;
+        }
+        // Call IDs differ on every step; arguments are compared as normalized JSON.
+        let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+            .map_or_else(|_| call.function.arguments.clone(), |args| args.to_string());
+        let digest: [u8; 32] = Sha256::digest(outcome.content.as_bytes()).into();
+        let entry = self
+            .0
+            .entry(format!("{name}\n{arguments}"))
+            .or_insert((digest, 0));
+        if entry.0 != digest {
+            *entry = (digest, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1
+    }
+}
+
+/// Conservative: a single plain read command (`cat`, `head`, `tail`, `ls`, `wc`,
+/// `stat`) whose words contain no shell syntax. Anything else is not classified.
+fn read_only_shell(arguments: &Value) -> bool {
+    let Some(command) = arguments.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    // Allowlist of characters: no redirection, pipes, separators, substitution,
+    // quoting, escapes, globs or newlines.
+    if !command.chars().all(|c| {
+        c.is_alphanumeric()
+            || matches!(
+                c,
+                ' ' | '-' | '_' | '.' | '/' | ',' | ':' | '=' | '+' | '@' | '%'
+            )
+    }) {
+        return false;
+    }
+    let mut words = command.split(' ').filter(|word| !word.is_empty());
+    let Some(program) = words.next() else {
+        return false;
+    };
+    match program {
+        "cat" | "head" | "ls" | "wc" | "stat" => true,
+        // `tail -f`/`-F`/`--follow` waits for new data: a polling observation.
+        "tail" => !words.any(|word| {
+            word.starts_with("--f")
+                || (word.starts_with('-') && !word.starts_with("--") && word.contains(['f', 'F']))
+        }),
+        _ => false,
+    }
+}
+
+/// Local history gets a bounded receipt with the omitted range; the user is told.
+fn history_receipt(
+    budget: &ContextBudget,
+    limit: Option<usize>,
+    name: &str,
+    content: String,
+    is_error: bool,
+    events: &Events,
+) -> String {
+    let Some(limit) = limit else {
+        return content;
+    };
+    let bounded = bound_receipt(budget, name, &content, limit, is_error);
+    if bounded != content {
+        let tokens = |text: &str| budget.measure(&Message::text("tool", text));
+        events.emit("warning", json!({"message": format!(
+            "Результат {name} не помещается в контекст local: модели передана сокращённая версия (~{} из ~{} оценочных токенов) с указанием пропущенного фрагмента.",
+            tokens(&bounded),
+            tokens(&content)
+        )}));
+    }
+    bounded
+}
+
+const REPEATED_RESULT_FEEDBACK: &str = "[rcode runtime feedback, not a new user permission] The same call with the same arguments returned exactly the same result again in this turn; repeating it adds no information and only fills the limited context. Use the result you already received and continue the user's current request. If a part is missing (for example, marked by rcode_truncated), get only that part: read_file with start_line/max_lines, search for a specific term, or a different, narrower argument. If you have enough information, finish the task or report what remains. Further identical repeats stop the turn.";
+
 impl ToolExecutor<'_> {
     async fn execute(
         &mut self,
@@ -847,9 +954,15 @@ pub(crate) async fn user_shell(
     match result {
         Ok(mut outcome) => {
             outcome.content = events.redact(&outcome.content);
-            session
-                .messages
-                .push(Message::tool(&call, outcome.content.clone()));
+            let receipt = history_receipt(
+                budget,
+                budget.receipt_limit(),
+                "run_command",
+                outcome.content.clone(),
+                outcome.is_error,
+                events,
+            );
+            session.messages.push(Message::tool(&call, receipt));
             session.save(store)?;
             events.emit("shell_result",json!({"content":outcome.content,"is_error":outcome.is_error,"elapsed_secs":since.elapsed().as_secs_f64()}));
             // Manual commands consume no API tokens but their receipts share
@@ -1057,6 +1170,8 @@ pub(crate) async fn turn(
         let mut recovery_used = false;
         let mut outside_failure_steps = 0u8;
         let mut file_failures = FileFailureLoop::default();
+        let mut repeated = RepeatedResults::default();
+        let mut repeated_feedback = 0u8;
         let definitions = turn_definitions(plan, client.is_local());
         for step in 0..cli.max_steps {
             let budget = context_budget(client, session, cli, plan);
@@ -1127,6 +1242,12 @@ pub(crate) async fn turn(
             let mut made_progress = false;
             let mut repeat_warning = None;
             let mut repeat_stop = None;
+            let mut repeated_warning = false;
+            let mut repeated_stop = None;
+            // One step's receipts share the local allowance; cloud stays unbounded.
+            let receipt_limit = budget
+                .receipt_limit()
+                .map(|limit| limit / completion.tool_calls.len().max(1));
             for call in &completion.tool_calls {
                 let name = call.function.name.as_str();
                 let outcome = if AgentPool::is_tool(name) {
@@ -1159,7 +1280,20 @@ pub(crate) async fn turn(
                         repeat_stop = Some(format!("Повторяется ошибка записи: {name} четыре раза вернул одну и ту же ошибку без успешной записи. Ход остановлен; результат не подтверждён. Причина: {} Продолжите новым запросом после устранения причины.", outcome.content));
                     }
                 }
-                session.messages.push(Message::tool(call, outcome.content));
+                match repeated.observe(call, &outcome) {
+                    2 => repeated_warning = true,
+                    count if count >= 4 => repeated_stop = Some(format!("Модель {count} раза за ход повторила {name} с теми же аргументами и получила тот же успешный результат, игнорируя подсказку rcode. Ход остановлен досрочно, сессия сохранена; результат не подтверждён. Уточните задачу или продолжите новым запросом в этой сессии.")),
+                    _ => {}
+                }
+                let receipt = history_receipt(
+                    &budget,
+                    receipt_limit,
+                    name,
+                    outcome.content,
+                    outcome.is_error,
+                    events,
+                );
+                session.messages.push(Message::tool(call, receipt));
                 sync_agents(session, &mut agents, events)?;
                 session.save(store)?;
                 if cancel.is_cancelled() {
@@ -1171,11 +1305,24 @@ pub(crate) async fn turn(
                 events.emit("error", json!({"message":message,"exit_code":1}));
                 return Ok(1);
             }
+            if let Some(message) = repeated_stop {
+                events.emit("error", json!({"message":message,"exit_code":1}));
+                return Ok(1);
+            }
             if let Some(message) = repeat_warning {
                 let mut feedback = Message::user(message);
                 feedback.provider_meta = Some(ProviderMeta {kind:"rcode_runtime".into(),data:json!({"repeated_file_error":true})});
                 session.messages.push(feedback);
                 session.save(store)?;
+            }
+            // Protected until the task ends, so at most a few per turn.
+            if repeated_warning && repeated_feedback < 3 {
+                repeated_feedback += 1;
+                let mut feedback = Message::user(REPEATED_RESULT_FEEDBACK);
+                feedback.provider_meta = Some(ProviderMeta {kind:"rcode_runtime".into(),data:json!({"repeated_result":true})});
+                session.messages.push(feedback);
+                session.save(store)?;
+                events.busy("Модель повторила вызов с тем же результатом; напоминаю о задаче");
             }
             outside_failure_steps = if outside_path_failed && !made_progress { outside_failure_steps + 1 } else { 0 };
             if outside_failure_steps >= 3 {
@@ -1366,6 +1513,107 @@ mod tests {
             json!({"path":"b.txt","old_text":"missing","new_text":"change"}),
         );
         assert_eq!(failures.observe(&other, &failed), Some(1));
+    }
+
+    #[test]
+    fn repeated_results_ignore_call_ids_and_reset_only_on_real_changes() {
+        let mut repeated = RepeatedResults::default();
+        let read = |arguments: &str| {
+            let mut call = ToolCall::new("read_file", json!({}));
+            call.function.arguments = arguments.into();
+            call
+        };
+        let same = ToolOutcome::success("contents v1");
+        // New call IDs and a different key order are the same call.
+        assert_eq!(
+            repeated.observe(&read(r#"{"path":"a.txt","max_lines":50}"#), &same),
+            1
+        );
+        assert_eq!(
+            repeated.observe(&read(r#"{"max_lines":50,"path":"a.txt"}"#), &same),
+            2
+        );
+        // A different argument or a different result is new information.
+        assert_eq!(repeated.observe(&read(r#"{"path":"b.txt"}"#), &same), 1);
+        let changed = ToolOutcome::success("contents v2");
+        assert_eq!(
+            repeated.observe(&read(r#"{"path":"a.txt","max_lines":50}"#), &changed),
+            1
+        );
+        assert_eq!(
+            repeated.observe(&read(r#"{"path":"a.txt","max_lines":50}"#), &changed),
+            2
+        );
+        // Failed reads and unchanged writes do not reset or count.
+        assert_eq!(
+            repeated.observe(
+                &read(r#"{"path":"missing"}"#),
+                &ToolOutcome::error("Файл не найден")
+            ),
+            0
+        );
+        let write = ToolCall::new("write_file", json!({"path":"a.txt","content":"x"}));
+        assert_eq!(
+            repeated.observe(
+                &write,
+                &ToolOutcome::success("Содержимое уже совпадает; файл не изменён")
+            ),
+            0
+        );
+        assert_eq!(
+            repeated.observe(&read(r#"{"path":"a.txt","max_lines":50}"#), &changed),
+            3
+        );
+        // A real change makes the earlier reads stale.
+        let mut written = ToolOutcome::success("written");
+        written.changed_paths = vec!["a.txt".into()];
+        assert_eq!(repeated.observe(&write, &written), 0);
+        assert_eq!(
+            repeated.observe(&read(r#"{"path":"a.txt","max_lines":50}"#), &changed),
+            1
+        );
+        // Plain read-only shell output repeats are counted too; execution
+        // happened each time.
+        let shell = ToolCall::new("run_command", json!({"command":"cat README.md"}));
+        let output = ToolOutcome::success(r#"{"exit_code":0,"stdout":"readme"}"#);
+        assert_eq!(repeated.observe(&shell, &output), 1);
+        assert_eq!(repeated.observe(&shell.clone(), &output), 2);
+        // Side effects, polling and any shell syntax are never classified and do
+        // not reset the count of the plain read.
+        let quiet = ToolOutcome::success(r#"{"exit_code":0,"stdout":""}"#);
+        for command in [
+            "printf x >> events.txt",
+            "printf x >> runs.log; cat README.md",
+            "cat README.md > copy.md",
+            "cat README.md | tee copy.md",
+            "test -f done.flag || echo waiting",
+            "sleep 5; cat status.txt",
+            "cat $(echo README.md)",
+            "cat `echo README.md`",
+            "cat README.md\nrm -rf x",
+            "cat 'README.md'",
+            "tail -f log.txt",
+            "tail -n 5 --follow log.txt",
+            "sed -n 1,5p README.md",
+            "rg --pre sh x",
+            "touch README.md",
+        ] {
+            let call = ToolCall::new("run_command", json!({ "command": command }));
+            assert_eq!(repeated.observe(&call, &quiet), 0, "{command}");
+            assert_eq!(repeated.observe(&call, &quiet), 0, "{command}");
+        }
+        assert_eq!(repeated.observe(&shell, &output), 3);
+        for command in [
+            "head -n 20 src/main.rs",
+            "ls -la src",
+            "wc -l README.md",
+            "stat README.md",
+            "tail -n 5 log.txt",
+        ] {
+            let call = ToolCall::new("run_command", json!({ "command": command }));
+            assert_eq!(repeated.observe(&call, &quiet), 1, "{command}");
+            assert_eq!(repeated.observe(&call, &quiet), 2, "{command}");
+        }
     }
 
     #[tokio::test]

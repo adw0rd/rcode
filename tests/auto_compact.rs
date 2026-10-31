@@ -173,10 +173,12 @@ fn long_tool_turn_compacts_without_replaying_actions_or_forgetting_denials() {
         "",
     )];
     for index in 1..9 {
+        // Distinct arguments: identical calls with identical results are a
+        // no-progress loop that the turn stops early (see tests/local_loop.rs).
         replies.push(tool_reply(
             index,
             "list_files",
-            json!({}),
+            json!({"max_results": index}),
             &format!("Результаты анализа {index}: {}", "x".repeat(50_000)),
         ));
     }
