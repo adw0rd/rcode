@@ -456,7 +456,7 @@ const BALANCE_GUIDANCE: &str = "\nWhen the user asks about provider balance or r
 
 /// Unit and size of the catalog block. Local: the profile's history limit of
 /// an empty request, so the prompt stays stable across the steps of a turn.
-fn catalog_unit(session: &Session) -> CatalogUnit {
+pub(crate) fn catalog_unit(session: &Session) -> CatalogUnit {
     let budget = ContextBudget::for_provider(&session.provider, None, 1.0, 0);
     if budget.is_tokens() {
         CatalogUnit::EstimatedTokens {
@@ -467,7 +467,7 @@ fn catalog_unit(session: &Session) -> CatalogUnit {
     }
 }
 
-fn skill_catalog(
+pub(crate) fn skill_catalog(
     session: &Session,
     skills: &SkillCatalog,
 ) -> Option<crate::skills::RenderedCatalog> {

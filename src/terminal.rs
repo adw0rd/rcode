@@ -78,6 +78,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Субагенты: задачи, результаты и токены",
     },
     CommandSpec {
+        name: "/skill",
+        description: "Выбрать скилл явно: /skill ID [запрос]",
+    },
+    CommandSpec {
+        name: "/skills",
+        description: "Скиллы: каталог, статус и стоимость",
+    },
+    CommandSpec {
         name: "/context",
         description: "Использование контекста",
     },

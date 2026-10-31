@@ -1,7 +1,7 @@
 use crate::{
     app::{
-        Events, configured_tools, context_budget, discover_skills, prepare_context, turn,
-        user_shell,
+        Events, catalog_unit, configured_tools, context_budget, discover_skills, prepare_context,
+        skill_catalog, turn, user_shell,
     },
     balance::BalanceMonitor,
     cli::{ApprovalMode, Cli},
@@ -10,8 +10,8 @@ use crate::{
     local_app, presentation,
     protocol::{Message, ModelInfo, ProviderMeta},
     provider::ProviderClient,
-    skills::{SkillCatalog, SkillProblem},
-    state::{AUTO_COMPACT_THRESHOLD, CONTEXT_LIMIT, Session},
+    skills::{CatalogEntry, CatalogUnit, LookupError, RenderedCatalog, SkillCatalog, SkillProblem},
+    state::Session,
     terminal::{self, Choice, Footer, Input},
     tools::Tools,
     ui,
@@ -472,6 +472,7 @@ fn status(
     plan: bool,
     models: &[ModelInfo],
     budget: &ContextBudget,
+    skills: &str,
 ) {
     notice!(
         "\nМодель       {} / {}\nEffort       {}\nРежим        {} · shell {}\nПапка        {}\nСессия       {}",
@@ -504,9 +505,10 @@ fn status(
             ui::safe(session.provider.base_url.as_deref().unwrap_or_default())
         );
     }
-    context(session, models, budget);
+    context(session, models, budget, skills);
 }
-fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget) {
+/// `skills`: the catalog line of `catalog_summary`.
+fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget, skills: &str) {
     if budget.is_tokens() {
         // Local: estimated tokens against the server context; nothing is invented.
         notice!(
@@ -521,16 +523,25 @@ fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget) {
                 session.last_usage.input_tokens
             );
         }
+        notice!("{skills}");
         notice!(
             "История сокращается автоматически перед запросом, когда приближается к лимиту. /compact сокращает её вручную, /clear создаёт новую сессию."
         );
         return;
     }
+    // Cloud: history plus the fixed overhead (skill catalog and load_skill
+    // schema) against the request limit, as in the footer.
     notice!(
         "Контекст     {} / {} символов — локальный бюджет CLI",
-        session.context_chars(),
-        CONTEXT_LIMIT
+        budget.request_used(&session.messages),
+        budget.limit
     );
+    if budget.overhead > 0 {
+        notice!(
+            "             из них ~{} — каталог скиллов и схема load_skill в каждом запросе",
+            budget.overhead
+        );
+    }
     if let Some(m) = models.iter().find(|m| m.id == session.provider.model)
         && let Some(window) = m.context_length
     {
@@ -540,9 +551,225 @@ fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget) {
             session.last_usage.input_tokens
         );
     }
+    notice!("{skills}");
     notice!(
-        "При {AUTO_COMPACT_THRESHOLD} символах история сокращается автоматически перед запросом к API. /compact сокращает её вручную, /clear создаёт новую сессию."
+        "При {} символах история сокращается автоматически перед запросом к API. /compact сокращает её вручную, /clear создаёт новую сессию.",
+        budget.threshold()
     );
+}
+fn unit_label(unit: CatalogUnit) -> &'static str {
+    match unit {
+        CatalogUnit::Chars => "символов",
+        CatalogUnit::EstimatedTokens { .. } => "оценочных токенов",
+    }
+}
+/// The skills line of `/context` and `/status` (DESIGN §9.1).
+fn catalog_summary(
+    catalog: &SkillCatalog,
+    rendered: Option<&RenderedCatalog>,
+    unit: CatalogUnit,
+) -> String {
+    let listed = catalog
+        .skills
+        .iter()
+        .filter(|skill| skill.in_catalog)
+        .count();
+    let mut line = match rendered {
+        Some(rendered) => {
+            let mut line = format!(
+                "Скиллы       {} в каталоге, ~{} {}",
+                rendered.entries + rendered.omitted_ids.len(),
+                rendered.cost,
+                unit_label(unit)
+            );
+            if !rendered.omitted_ids.is_empty() {
+                line.push_str(&format!(" · без описаний {}", rendered.omitted_ids.len()));
+            }
+            if rendered.omitted_count > 0 {
+                line.push_str(&format!(" · не вошли {}", rendered.omitted_count));
+            }
+            line
+        }
+        None if listed > 0 => format!(
+            "Скиллы       каталог из {listed} не помещается в бюджет и модели не отправляется"
+        ),
+        None if catalog.skills.is_empty() => "Скиллы       не найдены".into(),
+        None => format!(
+            "Скиллы       в каталоге нет; найдено {}",
+            catalog.skills.len()
+        ),
+    };
+    line.push_str(" · /skills — подробности");
+    line
+}
+fn size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} Б")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} КиБ", bytes as f64 / 1024.)
+    } else {
+        format!("{:.1} МиБ", bytes as f64 / (1024. * 1024.))
+    }
+}
+/// Pads `text` to `width` characters; longer text is clipped with `…`.
+fn cell(text: &str, width: usize) -> String {
+    let mut clipped: String = text.chars().take(width).collect();
+    if text.chars().count() > width {
+        clipped.pop();
+        clipped.push('…');
+    }
+    format!("{clipped:<width$}")
+}
+/// `/skills`: id, scope, status, size and catalog cost of every skill of the
+/// snapshot, then discovery errors (DESIGN §6.5). Terminal-safe; the caller
+/// redacts known secrets.
+fn skills_view(
+    catalog: &SkillCatalog,
+    unit: CatalogUnit,
+    rendered: Option<&RenderedCatalog>,
+) -> String {
+    const SHOWN_PROBLEMS: usize = 10;
+    // Shadowed skills are rows of the table with their winner.
+    let problems: Vec<&SkillProblem> = catalog
+        .problems
+        .iter()
+        .filter(|problem| problem.code != "shadowed")
+        .collect();
+    if catalog.skills.is_empty() && problems.is_empty() {
+        return "Скиллы не найдены. rcode читает каталоги <имя>/SKILL.md из RCODE_HOME/skills и .rcode/skills проекта.".into();
+    }
+    let label = unit_label(unit);
+    let mut output = match rendered {
+        Some(rendered) => format!(
+            "Скиллы · {} · в каталоге {} · блок ~{} из {} {label}",
+            catalog.skills.len(),
+            rendered.entries + rendered.omitted_ids.len(),
+            rendered.cost,
+            catalog.limits.max_cost(unit)
+        ),
+        None if catalog.skills.iter().any(|skill| skill.in_catalog) => format!(
+            "Скиллы · {} · каталог не помещается в бюджет ({} {label}) и модели не отправляется",
+            catalog.skills.len(),
+            catalog.limits.max_cost(unit)
+        ),
+        None => format!(
+            "Скиллы · {} · каталог пуст: модель видит скиллы только по /skill",
+            catalog.skills.len()
+        ),
+    };
+    if !catalog.skills.is_empty() {
+        let entries = catalog.entries(&catalog.limits, unit, rendered);
+        let rows: Vec<[String; 5]> = catalog
+            .skills
+            .iter()
+            .zip(entries)
+            .map(|(skill, entry)| {
+                let status = match (&skill.shadowed_by, entry) {
+                    (Some(winner), _) => format!("перекрыт: {winner}"),
+                    _ if skill.disabled => "отключён".into(),
+                    _ if skill.disable_model_invocation => "только /skill".into(),
+                    (_, CatalogEntry::Described(_)) => "в каталоге".into(),
+                    (_, CatalogEntry::IdOnly(_)) => "только id".into(),
+                    (_, CatalogEntry::Counted | CatalogEntry::Absent) => "не вошёл".into(),
+                };
+                let cost = match entry {
+                    CatalogEntry::Described(cost) | CatalogEntry::IdOnly(cost) => {
+                        format!("~{cost}")
+                    }
+                    CatalogEntry::Counted | CatalogEntry::Absent => "—".into(),
+                };
+                [
+                    ui::safe(&skill.id),
+                    skill.scope.as_str().into(),
+                    ui::safe(&status),
+                    size(skill.bytes),
+                    cost,
+                ]
+            })
+            .collect();
+        let width = |column: usize, minimum: usize, maximum: usize| {
+            rows.iter()
+                .map(|row| row[column].chars().count())
+                .max()
+                .unwrap_or_default()
+                .clamp(minimum, maximum)
+        };
+        let (id, scope, status) = (width(0, 2, 48), width(1, 7, 7), width(2, 6, 32));
+        output.push_str(&format!(
+            "\n  {} {} {} {:>9} {:>7}",
+            cell("ID", id),
+            cell("Область", scope),
+            cell("Статус", status),
+            "Размер",
+            "Каталог"
+        ));
+        for row in &rows {
+            output.push_str(&format!(
+                "\n  {} {} {} {:>9} {:>7}",
+                cell(&row[0], id),
+                cell(&row[1], scope),
+                cell(&row[2], status),
+                row[3],
+                row[4]
+            ));
+        }
+    }
+    if !problems.is_empty() {
+        output.push_str(&format!(
+            "\nОшибки ({}) — эти скиллы не загружаются:",
+            problems.len()
+        ));
+        for problem in problems.iter().take(SHOWN_PROBLEMS) {
+            output.push_str(&format!("\n  ! {}", ui::safe(&problem.warning())));
+        }
+        if problems.len() > SHOWN_PROBLEMS {
+            output.push_str(&format!("\n  … ещё {}", problems.len() - SHOWN_PROBLEMS));
+        }
+    }
+    output.push_str(&format!(
+        "\n«Каталог» — сколько {label} скилл занимает в блоке каталога. /skill ID [запрос] — явно выбрать скилл, в том числе отключённый или «только /skill»."
+    ));
+    output
+}
+/// `/skill ID [запрос]` (DESIGN §6.5): the user request for a skill the
+/// snapshot can load. The skill text is not inlined: the model loads it with
+/// load_skill. Unknown and ambiguous ids fail here, without a model request.
+fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<String> {
+    let rest = rest.trim();
+    let (id, request) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(id, request)| (id, request.trim()));
+    let shown = || ui::safe(&presentation::inline(id, 80));
+    let skill = match catalog.find(id) {
+        Ok(skill) => skill,
+        Err(LookupError::Unknown { suggestions }) if suggestions.is_empty() => {
+            bail!(
+                "Скилл {} не найден: скиллов нет. /skills покажет, откуда они читаются",
+                shown()
+            )
+        }
+        Err(LookupError::Unknown { suggestions }) => bail!(
+            "Скилл {} не найден. Похожие: {}. /skills — список",
+            shown(),
+            suggestions.join(", ")
+        ),
+        Err(LookupError::Ambiguous { candidates }) => bail!(
+            "Имя {} есть у нескольких скиллов: {}. Укажите полный id",
+            shown(),
+            candidates.join(", ")
+        ),
+    };
+    let mut text = format!(
+        "Пользователь явно выбрал скилл {}. Загрузи его через load_skill и действуй по нему",
+        skill.id
+    );
+    if request.is_empty() {
+        text.push('.');
+    } else {
+        text.push_str(": ");
+        text.push_str(request);
+    }
+    Ok(text)
 }
 fn cost(session: &Session) {
     notice!(
@@ -636,7 +863,7 @@ fn help() {
         "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать"
     );
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -896,7 +1123,7 @@ pub(crate) async fn run(
                     }Ok(())
                 },
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
-                "/status"=>{status(session,&runtime,plan,&models,&budget);Ok(())},
+                "/status"=>{let rendered=skill_catalog(session,&skills);status(session,&runtime,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)));Ok(())},
                 "/balance"=>{
                     if !args.is_empty(){bail!("/balance — баланс текущего провайдера; сменить провайдера: /provider");}
                     let cancel=tokio_util::sync::CancellationToken::new();
@@ -916,7 +1143,26 @@ pub(crate) async fn run(
                     notice!("{}",events.redact(&agents_view(records,args.first().copied())?));
                     Ok(())
                 },
-                "/context"=>{context(session,&models,&budget);Ok(())},
+                "/context"=>{let rendered=skill_catalog(session,&skills);context(session,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)));Ok(())},
+                "/skills"=>{
+                    if !args.is_empty(){bail!("/skills — список скиллов; выбрать скилл: /skill ID [запрос]");}
+                    let rendered=skill_catalog(session,&skills);
+                    notice!("{}",events.redact(&skills_view(&skills,catalog_unit(session),rendered.as_ref())));
+                    Ok(())
+                },
+                "/skill"=>{
+                    let rest=input.strip_prefix(command).unwrap_or_default();
+                    if rest.trim().is_empty(){
+                        let rendered=skill_catalog(session,&skills);
+                        notice!("{}",events.redact(&skills_view(&skills,catalog_unit(session),rendered.as_ref())));
+                        notice!("Укажите скилл: /skill ID [запрос]");
+                        return Ok(());
+                    }
+                    // Checked locally first: an unknown id never reaches the model.
+                    let prompt=skill_request(&skills,rest)?;
+                    if rich{notice!("\n{} {}",presentation::tone("❯","1;38;5;110",true),ui::safe(&redacted));}
+                    turn(session,store,tools,client,events,&runtime,&prompt,plan,&skills).await.map(drop)
+                },
                 "/export"=>{
                     let path=crate::export::write(session,input.strip_prefix(command).unwrap_or_default(),|text|events.redact(text))?;
                     notice!("✓ Диалог сохранён: {}",ui::safe(&events.redact(&path.to_string_lossy())));
@@ -1047,6 +1293,219 @@ fn hydrate(session: &Session, events: &Events) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::{CatalogLimits, Skill, SkillScope};
+    use std::path::PathBuf;
+
+    fn skill(id: &str, scope: SkillScope) -> Skill {
+        let name = id.rsplit(':').next().unwrap().to_owned();
+        Skill {
+            id: id.into(),
+            source: id.split_once(':').map(|(label, _)| label.into()),
+            scope,
+            dir: PathBuf::from("/skills").join(&name),
+            file: PathBuf::from("/skills").join(&name).join("SKILL.md"),
+            description: format!("Use {name} for its workflow. {}", "w".repeat(200)),
+            name,
+            bytes: 2560,
+            in_catalog: true,
+            disabled: false,
+            disable_model_invocation: false,
+            shadowed_by: None,
+            fields: Default::default(),
+            ignored_fields: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn catalog(skills: Vec<Skill>) -> SkillCatalog {
+        SkillCatalog {
+            skills,
+            ..SkillCatalog::default()
+        }
+    }
+
+    #[test]
+    fn skills_view_shows_status_size_and_catalog_cost_safely() {
+        let mut disabled = skill("superpowers:debugging", SkillScope::Source);
+        disabled.disabled = true;
+        disabled.in_catalog = false;
+        let mut hidden = skill("careful", SkillScope::Project);
+        hidden.disable_model_invocation = true;
+        hidden.in_catalog = false;
+        // A same-root loser names the winner's directory, which is any text.
+        let mut shadowed = skill("review", SkillScope::Project);
+        shadowed.shadowed_by = Some("evil\x1b[2J\u{202e}dir".into());
+        shadowed.in_catalog = false;
+        let mut skills = vec![skill("brainstorming", SkillScope::User)];
+        skills.extend((0..30).map(|index| skill(&format!("guide-{index:02}"), SkillScope::User)));
+        skills.extend([disabled, hidden, shadowed]);
+        let mut catalog = catalog(skills);
+        catalog.limits = CatalogLimits {
+            cloud_chars: 4000,
+            ..CatalogLimits::default()
+        };
+        catalog.problems = vec![
+            SkillProblem {
+                path: PathBuf::from("/skills/bad\x1b]52;c;AAAA\x07\u{202e}/SKILL.md"),
+                code: "duplicate_key",
+                message: "Ошибка frontmatter: повтор ключа name в строке 3".into(),
+            },
+            SkillProblem {
+                path: PathBuf::from("/skills/review/SKILL.md"),
+                code: "shadowed",
+                message: "Скилл review перекрыт файлом /home/skills/review/SKILL.md".into(),
+            },
+        ];
+        let unit = CatalogUnit::Chars;
+        let rendered = catalog.render(&catalog.limits, unit).unwrap();
+        assert!(rendered.entries > 0 && !rendered.omitted_ids.is_empty());
+        let view = skills_view(&catalog, unit, Some(&rendered));
+        assert!(!view.contains('\x1b') && !view.contains('\u{202e}') && !view.contains('\x07'));
+        assert!(
+            view.contains("\\u{202e}"),
+            "bidi controls are shown escaped:\n{view}"
+        );
+        let named = rendered.entries + rendered.omitted_ids.len();
+        assert!(view.starts_with(&format!(
+            "Скиллы · 34 · в каталоге {named} · блок ~{} из 4000 символов",
+            rendered.cost
+        )));
+        let row = |id: &str| {
+            view.lines()
+                .find(|line| line.trim_start().starts_with(&format!("{id} ")))
+                .unwrap_or_else(|| panic!("no row {id}:\n{view}"))
+                .to_owned()
+        };
+        let entries = catalog.entries(&catalog.limits, unit, Some(&rendered));
+        let CatalogEntry::Described(cost) = entries[0] else {
+            panic!("{entries:?}");
+        };
+        let first = row("brainstorming");
+        assert!(
+            first.contains("user") && first.contains("в каталоге"),
+            "{first}"
+        );
+        assert!(
+            first.contains("2.5 КиБ") && first.ends_with(&format!("~{cost}")),
+            "{first}"
+        );
+        let last = rendered.omitted_ids.last().unwrap();
+        assert!(row(last).contains("только id"), "{}", row(last));
+        let disabled = row("superpowers:debugging");
+        assert!(
+            disabled.contains("source") && disabled.contains("отключён") && disabled.ends_with('—')
+        );
+        assert!(row("careful").contains("только /skill"));
+        assert!(row("review").contains("перекрыт: evil"));
+        // Discovery errors are listed; shadowing is already a table row.
+        assert!(view.contains("Ошибки (1)") && view.contains("(duplicate_key)"));
+        assert!(!view.contains("перекрыт файлом"));
+        assert!(view.contains("/skill ID [запрос]"));
+        // Without a block every catalog skill is reported as not sent.
+        let none = skills_view(&catalog, unit, None);
+        assert!(none.contains("не помещается в бюджет"));
+        assert!(row_in(&none, "brainstorming").contains("не вошёл"));
+        // Local units are named as such.
+        let local = CatalogUnit::EstimatedTokens {
+            history_limit: 25_396,
+        };
+        let rendered = catalog.render(&catalog.limits, local).unwrap();
+        assert!(
+            skills_view(&catalog, local, Some(&rendered)).contains("из 2539 оценочных токенов")
+        );
+        assert!(skills_view(&SkillCatalog::empty(), unit, None).starts_with("Скиллы не найдены"));
+    }
+
+    fn row_in(view: &str, id: &str) -> String {
+        view.lines()
+            .find(|line| line.trim_start().starts_with(&format!("{id} ")))
+            .unwrap_or_else(|| panic!("no row {id}:\n{view}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn skill_request_names_the_resolved_id_and_keeps_the_request() {
+        let mut disabled = skill("off", SkillScope::User);
+        disabled.disabled = true;
+        disabled.in_catalog = false;
+        let mut shadowed = skill("brainstorming", SkillScope::Project);
+        shadowed.shadowed_by = Some("user".into());
+        shadowed.in_catalog = false;
+        let catalog = catalog(vec![
+            skill("brainstorming", SkillScope::User),
+            disabled,
+            shadowed,
+            skill("superpowers:debugging", SkillScope::Source),
+            skill("gstack:review", SkillScope::Source),
+            skill("team:review", SkillScope::Source),
+        ]);
+        assert_eq!(
+            skill_request(&catalog, " brainstorming  новая\nкоманда /export ").unwrap(),
+            "Пользователь явно выбрал скилл brainstorming. Загрузи его через load_skill и действуй по нему: новая\nкоманда /export"
+        );
+        // A unique bare name resolves to the full id; no request — no colon.
+        assert_eq!(
+            skill_request(&catalog, "debugging").unwrap(),
+            "Пользователь явно выбрал скилл superpowers:debugging. Загрузи его через load_skill и действуй по нему."
+        );
+        // Explicit choice also works for skills outside the catalog.
+        assert!(
+            skill_request(&catalog, "off проверь")
+                .unwrap()
+                .contains("скилл off.")
+        );
+        let ambiguous = skill_request(&catalog, "review").unwrap_err().to_string();
+        assert!(
+            ambiguous.contains("gstack:review, team:review"),
+            "{ambiguous}"
+        );
+        let unknown = skill_request(&catalog, "brainstormin\x1b[2J идея")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("Похожие: brainstorming"), "{unknown}");
+        assert!(!unknown.contains('\x1b'), "{unknown}");
+        let none = skill_request(&SkillCatalog::empty(), "x")
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("скиллов нет"), "{none}");
+    }
+
+    #[test]
+    fn catalog_summary_reports_the_block_in_its_unit() {
+        let mut catalog = catalog(
+            (0..30)
+                .map(|index| skill(&format!("guide-{index:02}"), SkillScope::User))
+                .collect(),
+        );
+        let limits = CatalogLimits {
+            cloud_chars: 3000,
+            ..CatalogLimits::default()
+        };
+        let rendered = catalog.render(&limits, CatalogUnit::Chars).unwrap();
+        let line = catalog_summary(&catalog, Some(&rendered), CatalogUnit::Chars);
+        assert!(
+            line.starts_with(&format!(
+                "Скиллы       30 в каталоге, ~{} символов · без описаний {}",
+                rendered.cost,
+                rendered.omitted_ids.len()
+            )),
+            "{line}"
+        );
+        let local = CatalogUnit::EstimatedTokens {
+            history_limit: 25_396,
+        };
+        let rendered = catalog.render(&limits, local).unwrap();
+        assert!(catalog_summary(&catalog, Some(&rendered), local).contains("оценочных токенов"));
+        assert!(catalog_summary(&catalog, None, local).contains("не помещается"));
+        for skill in &mut catalog.skills {
+            skill.in_catalog = false;
+        }
+        assert!(catalog_summary(&catalog, None, local).contains("в каталоге нет; найдено 30"));
+        assert!(
+            catalog_summary(&SkillCatalog::empty(), None, local)
+                .starts_with("Скиллы       не найдены")
+        );
+    }
     #[test]
     fn agent_selection_requires_unique_prefix_and_prefers_exact_id() {
         let records = [
