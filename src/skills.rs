@@ -131,6 +131,46 @@ impl Default for SkillsConfig {
     }
 }
 
+impl SkillsConfig {
+    /// Manifest-backed configuration; a damaged manifest keeps the defaults
+    /// and reports the problem through the returned warnings.
+    pub(crate) fn load(rcode_home: &Path) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        match crate::skill_sources::Manifest::read(rcode_home) {
+            Ok(manifest) => {
+                let overrides = manifest.catalog_overrides().clone();
+                let mut default = Self::default();
+                if !manifest.project_roots().is_empty() {
+                    default.project_roots = manifest.project_roots().to_vec();
+                }
+                default.disabled = manifest.disabled().clone();
+                default.sources = manifest
+                    .sources()
+                    .iter()
+                    .map(|(label, record)| SourceRoot {
+                        label: label.clone(),
+                        skills_root: PathBuf::from(record.skills_root.as_str()),
+                    })
+                    .collect();
+                if let Some(description_chars) = overrides.description_chars {
+                    default.catalog.description_chars = description_chars;
+                }
+                if let Some(cloud_chars) = overrides.cloud_chars {
+                    default.catalog.cloud_chars = cloud_chars;
+                }
+                if let Some(local_share_percent) = overrides.local_share_percent {
+                    default.catalog.local_share_percent = local_share_percent;
+                }
+                (default, warnings)
+            }
+            Err(error) => {
+                warnings.push(format!("{error:#}"));
+                (Self::default(), warnings)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Skill {
     pub(crate) id: String,

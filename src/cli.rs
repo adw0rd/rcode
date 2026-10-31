@@ -132,6 +132,38 @@ pub enum Command {
         #[command(subcommand)]
         command: LocalCommand,
     },
+    #[command(
+        about = "Скиллы: каталог, источники, включённость",
+        after_help = "Установка наборов меняет файлы в RCODE_HOME и выполняет git; сеть используется только по подтверждению."
+    )]
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
+    #[command(about = "Пользовательские команды: файлы в RCODE_HOME/commands и .rcode/commands")]
+    Commands {
+        #[command(subcommand)]
+        command: CommandsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum SkillsCommand {
+    #[command(about = "Найденные скиллы и их статус")]
+    List {
+        #[arg(long)]
+        verbose: bool,
+    },
+    #[command(about = "Включить скиллы для каталога модели")]
+    Enable { ids: Vec<String> },
+    #[command(about = "Исключить скиллы из каталога модели")]
+    Disable { ids: Vec<String> },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum CommandsCommand {
+    #[command(about = "Найденные пользовательские команды")]
+    List,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

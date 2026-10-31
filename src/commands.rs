@@ -45,10 +45,6 @@ pub(crate) struct UserCommand {
     pub(crate) hint: Option<String>,
     pub(crate) template: String,
     pub(crate) unsupported: Vec<&'static str>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "список нужен в `rcode commands list` (T9)")
-    )]
     pub(crate) ignored_fields: Vec<String>,
     pub(crate) shadowed_by: Option<Shadow>,
 }

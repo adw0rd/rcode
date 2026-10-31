@@ -9,7 +9,7 @@ use crate::{
     },
     provider::ProviderClient,
     skill_tool::SkillPage,
-    skills::{CatalogUnit, SkillCatalog, SkillsConfig},
+    skills::{CatalogUnit, SkillCatalog, SkillProblem, SkillsConfig},
     state::Session,
     tools::Tools,
     ui,
@@ -179,6 +179,12 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     local_app::remember_keys(&store, &settings, events);
     if let Some(Command::Local { command }) = &cli.command {
         return crate::local_cli::run(command, cli, &store, events).await;
+    }
+    if let Some(Command::Skills { command }) = &cli.command {
+        return crate::skills_cli::run(command, cli, &store, events).await;
+    }
+    if let Some(Command::Commands { command }) = &cli.command {
+        return crate::skills_cli::run_commands(command, cli, &store, events).await;
     }
     if let Some(Command::Connect { provider }) = &cli.command {
         ui::connect(
@@ -416,7 +422,16 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
 
 /// Disk-only snapshot of the skills visible to this project (DESIGN §6.1).
 pub(crate) fn discover_skills(store: &ConfigStore, root: &Path) -> SkillCatalog {
-    SkillCatalog::discover(store.root(), root, &SkillsConfig::default())
+    let (config, warnings) = SkillsConfig::load(store.root());
+    let mut catalog = SkillCatalog::discover(store.root(), root, &config);
+    for warning in warnings {
+        catalog.problems.push(SkillProblem {
+            path: crate::skill_sources::Manifest::path(store.root()),
+            code: "manifest",
+            message: warning,
+        });
+    }
+    catalog
 }
 
 fn repository_instructions(root: &Path) -> Option<String> {
