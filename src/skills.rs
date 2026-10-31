@@ -117,7 +117,17 @@ pub(crate) struct SkillsConfig {
     pub(crate) project_roots: Vec<PathBuf>,
     pub(crate) disabled: BTreeSet<String>,
     pub(crate) sources: Vec<SourceRoot>,
+    pub(crate) linked: Vec<LinkedRoot>,
     pub(crate) catalog: CatalogLimits,
+}
+
+/// A user-registered foreign skills directory (DESIGN Q2): read-only, one or
+/// two levels deep, symlinks allowed, never modified by rcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedRoot {
+    pub(crate) label: String,
+    pub(crate) base: PathBuf,
+    pub(crate) relative: PathBuf,
 }
 
 impl Default for SkillsConfig {
@@ -126,6 +136,7 @@ impl Default for SkillsConfig {
             project_roots: vec![PathBuf::from(".rcode/skills")],
             disabled: BTreeSet::new(),
             sources: Vec::new(),
+            linked: Vec::new(),
             catalog: CatalogLimits::default(),
         }
     }
@@ -144,6 +155,30 @@ impl SkillsConfig {
                     default.project_roots = manifest.project_roots().to_vec();
                 }
                 default.disabled = manifest.disabled().clone();
+                default.linked = manifest
+                    .linked()
+                    .iter()
+                    .map(|(label, linked)| {
+                        let path = if linked.path.is_absolute() {
+                            linked.path.clone()
+                        } else {
+                            rcode_home.join(&linked.path)
+                        };
+                        let relative = path
+                            .file_name()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from(&linked.path));
+                        let base = path
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| PathBuf::from("/"));
+                        LinkedRoot {
+                            label: label.clone(),
+                            base,
+                            relative,
+                        }
+                    })
+                    .collect();
                 default.sources = manifest
                     .sources()
                     .iter()
@@ -239,6 +274,7 @@ impl SkillCatalog {
             base: rcode_home.to_path_buf(),
             relative: PathBuf::from("skills"),
             include_root: false,
+            allow_symlinks: false,
         }];
         for relative in &config.project_roots {
             roots.push(Root {
@@ -248,6 +284,7 @@ impl SkillCatalog {
                 base: project_root.to_path_buf(),
                 relative: relative.clone(),
                 include_root: false,
+                allow_symlinks: false,
             });
         }
         for (index, source) in config.sources.iter().enumerate() {
@@ -262,6 +299,18 @@ impl SkillCatalog {
                 base: rcode_home.to_path_buf(),
                 relative,
                 include_root: true,
+                allow_symlinks: false,
+            });
+        }
+        for (index, linked) in config.linked.iter().enumerate() {
+            roots.push(Root {
+                scope: SkillScope::Source,
+                source: Some(linked.label.clone()),
+                group: 100 + index,
+                base: linked.base.clone(),
+                relative: linked.relative.clone(),
+                include_root: true,
+                allow_symlinks: true,
             });
         }
         for (index, root) in roots.iter().enumerate() {
@@ -520,6 +569,7 @@ struct Root {
     base: PathBuf,
     relative: PathBuf,
     include_root: bool,
+    allow_symlinks: bool,
 }
 
 struct Found {
@@ -578,8 +628,18 @@ impl Discovery {
                     return None;
                 }
                 Ok(metadata) if metadata.file_type().is_symlink() => {
-                    self.problem(current, "symlink", "Символическая ссылка пропущена");
-                    return None;
+                    if !root.allow_symlinks {
+                        self.problem(current, "symlink", "Символическая ссылка пропущена");
+                        return None;
+                    }
+                    if !metadata.is_dir() {
+                        self.problem(
+                            current,
+                            "not_directory",
+                            "Корень скиллов не является каталогом",
+                        );
+                        return None;
+                    }
                 }
                 Ok(metadata) if !metadata.is_dir() => {
                     self.problem(
@@ -628,11 +688,15 @@ impl Discovery {
                         continue;
                     }
                     if kind.is_symlink() {
-                        self.problem(
-                            path.join(&name),
-                            "symlink",
-                            "Символическая ссылка пропущена",
-                        );
+                        if root.allow_symlinks {
+                            candidates.push(PathBuf::from(name));
+                        } else {
+                            self.problem(
+                                path.join(&name),
+                                "symlink",
+                                "Символическая ссылка пропущена",
+                            );
+                        }
                     } else if kind.is_dir() {
                         candidates.push(PathBuf::from(name));
                     }
@@ -642,7 +706,11 @@ impl Discovery {
         let mut count = 0;
         for relative in candidates {
             let file = path.join(&relative).join(SKILL_FILE);
-            let metadata = match dir.symlink_metadata(relative.join(SKILL_FILE)) {
+            let metadata = match if root.allow_symlinks {
+                std::fs::symlink_metadata(&file).map(cap_std::fs::Metadata::from_just_metadata)
+            } else {
+                dir.symlink_metadata(relative.join(SKILL_FILE))
+            } {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
                     self.problem(file, "io", format!("Ошибка чтения: {error}"));
@@ -685,7 +753,7 @@ impl Discovery {
     ) -> Result<(), (&'static str, String)> {
         let root_path = root.base.join(&root.relative);
         let skill_dir = if relative.as_os_str().is_empty() {
-            root_path
+            root_path.clone()
         } else {
             root_path.join(relative)
         };
@@ -698,25 +766,37 @@ impl Discovery {
                 "Путь скилла содержит секретный компонент".into(),
             ));
         }
-        check_file(&metadata)?;
+        check_file(&metadata, root.allow_symlinks)?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            options.custom_flags(if root.allow_symlinks {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_NOFOLLOW | libc::O_NONBLOCK
+            });
         }
         let io = |error: std::io::Error| ("io", format!("Ошибка чтения: {error}"));
-        let file = dir
-            .open_with(relative.join(SKILL_FILE), &options)
-            .map_err(io)?;
-        let metadata = file.metadata().map_err(io)?;
-        check_file(&metadata)?;
+        let (file, size) = if root.allow_symlinks {
+            let absolute = root_path.join(relative).join(SKILL_FILE);
+            let std_file = std::fs::File::open(&absolute).map_err(io)?;
+            let size = std_file.metadata().map_err(io)?.len();
+            (cap_std::fs::File::from_std(std_file), size)
+        } else {
+            let file = dir
+                .open_with(relative.join(SKILL_FILE), &options)
+                .map_err(io)?;
+            let metadata = file.metadata().map_err(io)?;
+            check_file(&metadata, false)?;
+            (file, metadata.len())
+        };
         let mut head = Vec::new();
         file.take(HEAD_BYTES as u64)
             .read_to_end(&mut head)
             .map_err(io)?;
-        let truncated = (head.len() as u64) < metadata.len();
+        let truncated = (head.len() as u64) < size;
         let text = match std::str::from_utf8(&head) {
             Ok(text) => text,
             Err(error) if truncated && error.error_len().is_none() => {
@@ -777,7 +857,7 @@ impl Discovery {
                 file: skill_dir.join(SKILL_FILE),
                 dir: skill_dir,
                 description,
-                bytes: metadata.len(),
+                bytes: size,
                 in_catalog: false,
                 disabled: false,
                 disable_model_invocation,
@@ -845,8 +925,11 @@ impl Discovery {
     }
 }
 
-fn check_file(metadata: &cap_std::fs::Metadata) -> Result<(), (&'static str, String)> {
-    if metadata.file_type().is_symlink() {
+fn check_file(
+    metadata: &cap_std::fs::Metadata,
+    allow_symlinks: bool,
+) -> Result<(), (&'static str, String)> {
+    if metadata.file_type().is_symlink() && !allow_symlinks {
         return Err(("symlink", "Символическая ссылка пропущена".into()));
     }
     if !metadata.is_file() {

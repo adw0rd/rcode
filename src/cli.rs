@@ -192,6 +192,16 @@ pub enum SkillsCommand {
         #[arg(long)]
         yes: bool,
     },
+    #[command(
+        about = "Подключить чужой каталог скиллов (например ~/.agents/skills) без копирования"
+    )]
+    Link {
+        path: String,
+        #[arg(long)]
+        name: String,
+    },
+    #[command(about = "Отключить подключённый каталог скиллов")]
+    Unlink { label: String },
     #[command(about = "Включить скиллы для каталога модели")]
     Enable { ids: Vec<String> },
     #[command(about = "Исключить скиллы из каталога модели")]

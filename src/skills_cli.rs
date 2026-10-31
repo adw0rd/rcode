@@ -83,6 +83,8 @@ pub async fn run(
         SkillsCommand::Remove { label, yes } => {
             remove(&root, store, label, *yes, cli, events).await
         }
+        SkillsCommand::Link { path, name } => link(&root, store, path, name, cli, events).await,
+        SkillsCommand::Unlink { label } => unlink(store, label, cli, events).await,
     }
 }
 
@@ -199,6 +201,18 @@ fn list(
             "version": 1,
             "label": source.label,
             "root": source.skills_root.display().to_string(),
+        });
+        if cli.json {
+            events.emit("skill_source", event);
+        } else {
+            println!("{}", plain(&event));
+        }
+    }
+    for linked in config.linked.iter() {
+        let event = json!({
+            "version": 1,
+            "label": linked.label,
+            "root": linked.base.join(&linked.relative).display().to_string(),
         });
         if cli.json {
             events.emit("skill_source", event);
@@ -1190,5 +1204,104 @@ async fn remove(
         println!("✓ Набор «{label}» удалён");
     }
     let _ = root;
+    Ok(0)
+}
+
+async fn link(
+    root: &Path,
+    store: &ConfigStore,
+    raw_path: &str,
+    name: &str,
+    cli: &Cli,
+    events: &mut Events,
+) -> Result<i32> {
+    model_shell_guard()?;
+    if !crate::skill_sources::valid_label(name) {
+        bail!("Недопустимая метка {name:?}; используйте строчные латинские буквы, цифры, _ и -");
+    }
+    let path = std::path::absolute(raw_path)
+        .with_context(|| format!("Не удалось разобрать путь {raw_path:?}"))?;
+    if !path.is_dir() {
+        bail!("Каталог скиллов {} не найден", path.display());
+    }
+    if path.starts_with(store.root()) || path.starts_with(root) {
+        bail!("Подключаемый каталог не может находиться внутри RCODE_HOME или рабочей папки");
+    }
+    let mut manifest = crate::skill_sources::Manifest::read(store.root())?;
+    if manifest.linked().contains_key(name) {
+        bail!("Метка «{name}» уже подключена; сначала rcode skills unlink {name}");
+    }
+    let relative = path
+        .file_name()
+        .map(std::path::PathBuf::from)
+        .context("Путь должен заканчиваться каталогом")?;
+    let base = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let probe = crate::skills::SkillsConfig {
+        linked: [crate::skills::LinkedRoot {
+            label: name.to_owned(),
+            base,
+            relative,
+        }]
+        .into(),
+        ..crate::skills::SkillsConfig::default()
+    };
+    let catalog = SkillCatalog::discover(store.root(), root, &probe);
+    let found = catalog
+        .skills
+        .iter()
+        .filter(|skill| skill.source.as_deref() == Some(name))
+        .count();
+    if found == 0 {
+        let problems: Vec<String> = catalog.problems.iter().map(|p| p.warning()).collect();
+        bail!(
+            "В {} нет скиллов (SKILL.md в корне или подкаталогах первого уровня). {}",
+            path.display(),
+            problems.first().map(String::as_str).unwrap_or("")
+        );
+    }
+    manifest
+        .linked_mut()
+        .insert(name.to_owned(), crate::skill_sources::LinkedRoot { path });
+    manifest.save(store.root())?;
+    events.emit(
+        "skill_source",
+        json!({"version": 1, "label": name, "status": "linked", "skills": found}),
+    );
+    if !cli.json {
+        println!(
+            "✓ Подключено {found} скиллов как {name}:<имя>; rcode читает каталог только для чтения"
+        );
+    }
+    Ok(0)
+}
+
+async fn unlink(store: &ConfigStore, label: &str, cli: &Cli, events: &mut Events) -> Result<i32> {
+    model_shell_guard()?;
+    let mut manifest = crate::skill_sources::Manifest::read(store.root())?;
+    if manifest.linked_mut().remove(label).is_none() {
+        bail!("Метка «{label}» не подключена; смотрите rcode skills list");
+    }
+    let mut disabled = manifest.disabled().clone();
+    for id in disabled
+        .clone()
+        .iter()
+        .filter(|id| id.starts_with(&format!("{label}:")))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        disabled.remove(&id);
+    }
+    manifest.set_disabled(disabled);
+    manifest.save(store.root())?;
+    events.emit(
+        "skill_source",
+        json!({"version": 1, "label": label, "status": "unlinked"}),
+    );
+    if !cli.json {
+        println!("✓ Подключение «{label}» отключено; файлы каталога не менялись");
+    }
     Ok(0)
 }

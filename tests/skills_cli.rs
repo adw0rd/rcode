@@ -923,3 +923,144 @@ fn git_head(repo: &Path) -> String {
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
+
+#[test]
+fn link_registers_a_foreign_skills_directory_read_only() {
+    let sandbox = Sandbox::new();
+    let foreign = sandbox._temp.path().join("agents-skills");
+    fs::create_dir_all(foreign.join("reviewer")).unwrap();
+    put(
+        &foreign.join("reviewer/SKILL.md"),
+        skill_text("reviewer", "Foreign reviewer"),
+    );
+    put(
+        &foreign.join("SKILL.md"),
+        skill_text("root-skill", "Root skill"),
+    );
+    let output = sandbox.run(&[
+        "skills",
+        "link",
+        &foreign.display().to_string(),
+        "--name",
+        "agents",
+        "--json",
+    ]);
+    assert_eq!(output.code, 0, "{} {}", output.stdout, output.stderr);
+    output.assert_clean_jsonl();
+    let events = output.events();
+    let linked = events.iter().find(|e| e["type"] == "skill_source").unwrap();
+    assert_eq!(linked["status"], "linked");
+    assert_eq!(linked["skills"], 2);
+    let listing = sandbox.run(&["skills", "list", "--json"]);
+    let events = listing.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["id"] == "agents:reviewer" && e["status"] == "active")
+    );
+    assert!(events.iter().any(|e| {
+        e["type"] == "skill_source"
+            && e["label"] == "agents"
+            && e["root"]
+                .as_str()
+                .map(|r| r.ends_with("agents-skills"))
+                .unwrap_or(false)
+    }));
+    assert!(
+        fs::read_to_string(foreign.join("reviewer/SKILL.md"))
+            .unwrap()
+            .contains("Foreign reviewer"),
+        "linked files must not be modified"
+    );
+}
+
+#[test]
+fn link_rejects_roots_inside_home_and_invalid_labels() {
+    let sandbox = Sandbox::new();
+    let inside = sandbox.home.join("skills");
+    fs::create_dir_all(&inside).unwrap();
+    let output = sandbox.run(&[
+        "skills",
+        "link",
+        &inside.display().to_string(),
+        "--name",
+        "inner",
+    ]);
+    assert_eq!(output.code, 2, "{} {}", output.stdout, output.stderr);
+    let bad = sandbox.run(&[
+        "skills",
+        "link",
+        &sandbox._temp.path().display().to_string(),
+        "--name",
+        "Bad!",
+    ]);
+    assert_eq!(bad.code, 2, "{} {}", bad.stdout, bad.stderr);
+}
+
+#[test]
+fn unlink_removes_the_entry_without_touching_files() {
+    let sandbox = Sandbox::new();
+    let foreign = sandbox._temp.path().join("agents-skills");
+    fs::create_dir_all(foreign.join("one")).unwrap();
+    put(&foreign.join("one/SKILL.md"), skill_text("one", "Foreign"));
+    assert_eq!(
+        sandbox
+            .run(&[
+                "skills",
+                "link",
+                &foreign.display().to_string(),
+                "--name",
+                "agents",
+                "--json"
+            ])
+            .code,
+        0
+    );
+    let output = sandbox.run(&["skills", "unlink", "agents", "--json"]);
+    assert_eq!(output.code, 0, "{} {}", output.stdout, output.stderr);
+    assert!(
+        output
+            .events()
+            .iter()
+            .any(|e| e["type"] == "skill_source" && e["status"] == "unlinked")
+    );
+    let listing = sandbox.run(&["skills", "list", "--json"]);
+    assert!(!listing.events().iter().any(|e| e["id"] == "agents:one"));
+    assert!(foreign.join("one/SKILL.md").is_file());
+}
+
+#[test]
+fn symlink_collections_in_linked_roots_are_visible() {
+    let sandbox = Sandbox::new();
+    let real = sandbox._temp.path().join("real-skills/real-one");
+    fs::create_dir_all(&real).unwrap();
+    put(&real.join("SKILL.md"), skill_text("real-one", "Real skill"));
+    let collection = sandbox._temp.path().join("collection");
+    fs::create_dir_all(&collection).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, collection.join("alias")).unwrap();
+    let output = sandbox.run(&[
+        "skills",
+        "link",
+        &collection.display().to_string(),
+        "--name",
+        "coll",
+        "--json",
+    ]);
+    #[cfg(unix)]
+    {
+        assert_eq!(output.code, 0, "{} {}", output.stdout, output.stderr);
+        assert_eq!(
+            output
+                .events()
+                .iter()
+                .find(|e| e["type"] == "skill_source")
+                .unwrap()["skills"],
+            1
+        );
+        let listing = sandbox.run(&["skills", "list", "--json"]);
+        assert!(listing.events().iter().any(|e| e["id"] == "coll:real-one"));
+    }
+    #[cfg(not(unix))]
+    assert_eq!(output.code, 2, "{} {}", output.stdout, output.stderr);
+}

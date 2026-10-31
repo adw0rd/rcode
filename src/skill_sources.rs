@@ -112,9 +112,12 @@ impl Manifest {
         &self.project_roots
     }
 
-    #[expect(dead_code, reason = "linked-корни подключает T12")]
     pub(crate) fn linked(&self) -> &BTreeMap<String, LinkedRoot> {
         &self.linked
+    }
+
+    pub(crate) fn linked_mut(&mut self) -> &mut BTreeMap<String, LinkedRoot> {
+        &mut self.linked
     }
 
     pub(crate) fn catalog_overrides(&self) -> &CatalogOverrides {
