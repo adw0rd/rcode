@@ -1334,7 +1334,7 @@ fn normalized_path(path: &Path, allow_root: bool) -> Result<PathBuf> {
     Ok(clean)
 }
 
-fn secret_component(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn secret_component(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy().to_ascii_lowercase();
     matches!(
         name.as_str(),
