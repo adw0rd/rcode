@@ -64,6 +64,14 @@
 - reasoning local не выводится, не сохраняется и не отправляется обратно. Effort для local всегда `auto`; `chat_template_kwargs.enable_thinking` — только по явному `--thinking`.
 - Проверка: `cargo test --test local_cli --test local_wire --test local_profiles_contract --test local_pty`. Это fixtures, не живой сервер.
 
+## Скиллы и команды
+
+- `frontmatter.rs` — минимальный парсер frontmatter SKILL.md/команд (§ только скаляры и имена вложенных структур); `skills.rs` — обнаружение каталога (`RCODE_HOME/skills`, `.rcode/skills`, `skill-sources/МЕТКА`, подключённые `linked`) и рендер блока `<rcode_skills>`; `skill_tool.rs` — инструмент `load_skill` (страницы целыми строками, `next_line`/`sha256`/`resources`); `skill_sources.rs` — манифест `skills.json`, git-раннер и `tree_sha256`; `skills_cli.rs` — `rcode skills|commands …`; `commands.rs` — пользовательские команды и подстановка `$ARGUMENTS`/`$N`.
+- Скилл — данные: каталог и текст скилла не расширяют права; `allowed-tools`/`hooks`/`trusted` игнорируются, учитывается только `disable-model-invocation`. Субагенты не получают каталог и `load_skill`; пользовательские команды не раскрываются в `rcode exec` (v1).
+- Сеть для наборов — только по подтверждению (`--yes` без терминала), git с `env_clear`, `http.sslVerify=true`, без hooks набора; `http://`, `git://`, `ext::`, userinfo и пути внутри `RCODE_HOME`/проекта отклоняются. `RCODE_MODEL_SHELL=1` в окружении shell модели заставляет `install/update/remove/link/unlink` отказываться.
+- Установка и обновление — staging + атомарный rename под `skills.lock`; локальные правки набора отказывают без `--force` и сохраняются в `МЕТКА.backup-…`. Манифест `skills.json` неизвестной версии — ошибка без перезаписи.
+- Проверки: `cargo test --lib -- skills:: commands:: skill_sources:: skill_tool::`, `cargo test --test skills_cli --test skills_activation` и PTY: `RCODE_REQUIRE_PTY_TEST=1 cargo test --test commands_pty --test terminal_pty`. Корпус реальных скиллов — ignored-тест с `RCODE_SKILLS_CORPUS`.
+
 ## Терминальный интерфейс
 
 - `screen.rs` единолично управляет полноэкранным viewport, очередью событий, историей и закреплённым футером. `terminal.rs` отвечает за ввод и меню; `interactive.rs` — за команды; `presentation.rs` — за форматирование сообщений.
