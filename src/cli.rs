@@ -154,6 +154,44 @@ pub enum SkillsCommand {
         #[arg(long)]
         verbose: bool,
     },
+    #[command(about = "Установить набор скиллов из git-репозитория или каталога")]
+    Install {
+        source: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long = "ref")]
+        reference: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    #[command(about = "Проверить обновления установленных наборов (сеть)")]
+    Check {
+        labels: Vec<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    #[command(about = "Обновить установленные наборы")]
+    Update {
+        labels: Vec<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    #[command(about = "Удалить установленный набор")]
+    Remove {
+        label: String,
+        #[arg(long)]
+        yes: bool,
+    },
     #[command(about = "Включить скиллы для каталога модели")]
     Enable { ids: Vec<String> },
     #[command(about = "Исключить скиллы из каталога модели")]

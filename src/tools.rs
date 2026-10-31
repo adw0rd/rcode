@@ -1109,6 +1109,7 @@ impl Tools {
             }
         }
         process.env("PWD", &self.root);
+        process.env("RCODE_MODEL_SHELL", "1");
         let mut child = process.spawn().context("Не удалось запустить shell")?;
         let mut group = ProcessGroup::new(child.id());
         let stdout = child.stdout.take().context("stdout pipe отсутствует")?;
@@ -2628,6 +2629,7 @@ mod tests {
                         | "PATHEXT"
                         | "PWD"
                         | "SHLVL"
+                        | "RCODE_MODEL_SHELL"
                         | "_"
                 ) || key.starts_with("LC_"),
                 "unexpected {key}"
