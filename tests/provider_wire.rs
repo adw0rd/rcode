@@ -195,6 +195,7 @@ fn settings(kind: ProviderKind, url: &str, stream: bool) -> ProviderSettings {
         max_output_tokens: 1024,
         request_timeout_secs: 1,
         idle_timeout_secs: 1,
+        local: None,
     }
 }
 
@@ -727,7 +728,11 @@ async fn cancelling_header_and_body_waits_does_not_return_tools_or_replay_the_re
 
 #[tokio::test]
 async fn explicit_effort_is_sent_in_each_providers_native_request_field() {
-    for kind in ProviderKind::all() {
+    // Local never sends effort (see tests/local_wire.rs); these are the cloud kinds.
+    for kind in ProviderKind::all()
+        .into_iter()
+        .filter(|kind| *kind != ProviderKind::Local)
+    {
         let mut replies = vec![];
         if kind == ProviderKind::GigaChat {
             replies.push(Reply::json(
@@ -760,7 +765,11 @@ async fn explicit_effort_is_sent_in_each_providers_native_request_field() {
 
 #[tokio::test]
 async fn automatic_effort_leaves_wire_requests_unchanged() {
-    for kind in ProviderKind::all() {
+    // Local never sends effort (see tests/local_wire.rs); these are the cloud kinds.
+    for kind in ProviderKind::all()
+        .into_iter()
+        .filter(|kind| *kind != ProviderKind::Local)
+    {
         let mut replies = vec![];
         if kind == ProviderKind::GigaChat {
             replies.push(Reply::json(

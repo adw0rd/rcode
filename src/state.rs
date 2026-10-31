@@ -1,5 +1,6 @@
 use crate::{
     config::{ConfigStore, ProviderSettings, write_private_json},
+    context::{ContextBudget, message_chars},
     protocol::{Message, ProviderMeta, ToolCall, Usage},
 };
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,6 @@ use std::{
 
 pub const CONTEXT_LIMIT: usize = 180_000;
 pub const AUTO_COMPACT_THRESHOLD: usize = 150_000;
-const AUTO_COMPACT_TARGET: usize = 110_000;
 const MEMORY_CHARS: usize = 12_000;
 const RESTRICTED_MEMORY_CHARS: usize = 8000;
 const RESTRICTED_RECEIPT_CHARS: usize = 1000;
@@ -42,16 +42,6 @@ fn excerpt(text: &str, limit: usize) -> String {
         .rev()
         .collect();
     format!("{head}\n[часть истории опущена]\n{tail}")
-}
-
-fn message_chars(message: &Message) -> usize {
-    message.content.as_ref().map_or(0, |s| s.chars().count())
-        + message.images.len() * crate::images::IMAGE_CONTEXT_CHARS
-        + message
-            .tool_calls
-            .iter()
-            .map(|call| call.function.arguments.len())
-            .sum::<usize>()
 }
 
 fn is_runtime(message: &Message) -> bool {
@@ -292,7 +282,20 @@ impl Session {
     /// `incoming_chars` reserves space for a user prompt not yet appended to history.
     /// Work on a candidate so failure cannot partially replace the saved conversation.
     pub fn auto_compact(&mut self, incoming_chars: usize) -> Result<usize> {
-        self.compact_history(incoming_chars, AUTO_COMPACT_TARGET, false)
+        self.auto_compact_within(incoming_chars, &ContextBudget::cloud())
+    }
+
+    /// Same as `auto_compact`, measured in the units of `budget`.
+    pub fn auto_compact_within(
+        &mut self,
+        incoming: usize,
+        budget: &ContextBudget,
+    ) -> Result<usize> {
+        self.compact_history(incoming, budget.target(), false, budget)
+    }
+
+    pub fn context_used(&self, budget: &ContextBudget) -> usize {
+        budget.used(&self.messages)
     }
 
     fn compact_history(
@@ -300,9 +303,13 @@ impl Session {
         incoming_chars: usize,
         target: usize,
         force: bool,
+        budget: &ContextBudget,
     ) -> Result<usize> {
-        let before = self.context_chars();
-        if !force && before.saturating_add(incoming_chars) <= AUTO_COMPACT_THRESHOLD {
+        let message_chars = |message: &Message| budget.measure(message);
+        let threshold = budget.threshold();
+        let unit = budget.unit_label();
+        let before = self.context_used(budget);
+        if !force && before.saturating_add(incoming_chars) <= threshold {
             return Ok(0);
         }
         let latest_user = (incoming_chars == 0)
@@ -437,8 +444,8 @@ impl Session {
             .sum::<usize>()
             .saturating_add(incoming_chars);
         let desired = target
-            .max(protected_chars.saturating_add(4000))
-            .min(AUTO_COMPACT_THRESHOLD);
+            .max(protected_chars.saturating_add(budget.reserve()))
+            .min(threshold);
         let mut summary = memory.message()?;
         while memory.facts.len() > 1
             && protected_chars.saturating_add(message_chars(&summary)) > desired
@@ -455,9 +462,10 @@ impl Session {
             summary = memory.message()?;
         }
         let required = protected_chars.saturating_add(message_chars(&summary));
-        if required > AUTO_COMPACT_THRESHOLD {
+        if required > threshold {
             bail!(
-                "Не удаётся безопасно сократить контекст: текущий запрос, незавершённые инструменты и обязательные сведения требуют {required} символов. Для ответа и результатов инструментов нужен резерв; сократите запрос или начните новую сессию. Локальный лимит — {CONTEXT_LIMIT} символов."
+                "Не удаётся безопасно сократить контекст: текущий запрос, незавершённые инструменты и обязательные сведения требуют {required} {unit}. Для ответа и результатов инструментов нужен резерв; сократите запрос или начните новую сессию. {}",
+                budget.limit_sentence()
             );
         }
         let target = target.max(required);
@@ -487,16 +495,28 @@ impl Session {
                 return Ok(0);
             }
             bail!(
-                "Контекст нельзя безопасно сократить автоматически. Сократите текущий запрос или начните новую сессию; локальный лимит — {CONTEXT_LIMIT} символов."
+                "Контекст нельзя безопасно сократить автоматически. Сократите текущий запрос или начните новую сессию; {}",
+                lowercase_first(&budget.limit_sentence())
             );
         }
         self.messages = messages;
         Ok(before - after)
     }
     pub fn compact(&mut self) -> Result<usize> {
-        self.repair_pending()?;
-        self.compact_history(0, 20_000, true)
+        self.compact_within(&ContextBudget::cloud())
     }
+
+    pub fn compact_within(&mut self, budget: &ContextBudget) -> Result<usize> {
+        self.repair_pending()?;
+        self.compact_history(0, budget.manual_target(), true, budget)
+    }
+}
+
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
 }
 
 #[cfg(test)]

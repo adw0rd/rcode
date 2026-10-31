@@ -1,5 +1,6 @@
 pub use crate::config::ApprovalMode;
 use crate::config::{Effort, ProviderKind};
+use crate::local::LocalRuntime;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -7,8 +8,8 @@ use std::path::PathBuf;
 #[command(
     name = "rcode",
     version,
-    about = "Агент разработки с Yandex AI Studio, GigaChat и OpenRouter",
-    after_help = "Без подкоманды открывает интерактивный терминал.\nПример: rcode --provider openrouter\n        rcode exec --approval-mode auto-edit 'Исправь ошибку и проверь тесты'"
+    about = "Агент разработки с Yandex AI Studio, GigaChat, OpenRouter и локальными моделями",
+    after_help = "Без подкоманды открывает интерактивный терминал.\nПример: rcode --provider openrouter\n        rcode exec --approval-mode auto-edit 'Исправь ошибку и проверь тесты'\n        rcode local add qwen --base-url http://127.0.0.1:11434/v1 --runtime ollama --activate\n        rcode exec --profile qwen 'Объясни структуру проекта'"
 )]
 pub struct Cli {
     #[arg(short = 'C', long = "directory", global = true, default_value = ".")]
@@ -22,6 +23,13 @@ pub struct Cli {
     pub add_dir: Vec<PathBuf>,
     #[arg(long, global = true)]
     pub provider: Option<ProviderKind>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "ИМЯ",
+        help = "Профиль локальной модели; подразумевает --provider local"
+    )]
+    pub profile: Option<String>,
     #[arg(long, global = true)]
     pub model: Option<String>,
     #[arg(
@@ -116,4 +124,69 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+    #[command(
+        about = "Профили локальных моделей (Ollama, llama.cpp, MLX, LM Studio)",
+        after_help = "Ключ никогда не передаётся аргументом: используйте --api-key-stdin или rcode local key ИМЯ --stdin.\nСервер запускаете вы сами на 127.0.0.1; rcode его не запускает и не меняет его контекст."
+    )]
+    Local {
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Toggle {
+    On,
+    Off,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum LocalCommand {
+    #[command(about = "Найти серверы на 127.0.0.1:11434, :8080 и :1234")]
+    Discover,
+    #[command(about = "Список профилей")]
+    List,
+    #[command(
+        about = "Добавить профиль: rcode local add ИМЯ --base-url URL [--model ID]",
+        after_help = "Без --model берётся первая модель из /models сервера. Если сервер не запущен, укажите --model: профиль сохранится."
+    )]
+    Add {
+        name: String,
+        #[arg(
+            long,
+            value_enum,
+            help = "Тип сервера; по умолчанию угадывается по порту"
+        )]
+        runtime: Option<LocalRuntime>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(2048..=1_048_576), help = "Контекст сервера в токенах (по умолчанию 32768)")]
+        context_tokens: Option<u32>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=8192), help = "Предел ответа (по умолчанию 4096, не больше четверти контекста)")]
+        max_output_tokens: Option<u32>,
+        #[arg(long, help = "Модель и сервер принимают изображения")]
+        vision: bool,
+        #[arg(
+            long,
+            value_enum,
+            help = "Явно передавать chat_template_kwargs.enable_thinking"
+        )]
+        thinking: Option<Toggle>,
+        #[arg(long, help = "Прочитать ключ сервера из stdin")]
+        api_key_stdin: bool,
+        #[arg(long, help = "Сделать профиль активным")]
+        activate: bool,
+        #[arg(long, help = "Заменить существующий профиль")]
+        force: bool,
+    },
+    #[command(about = "Сделать профиль активным; --model меняет его модель")]
+    Use { name: String },
+    #[command(about = "Сохранить ключ из stdin (--stdin) или удалить его (--delete)")]
+    Key {
+        name: String,
+        #[arg(long, conflicts_with = "delete", required_unless_present = "delete")]
+        stdin: bool,
+        #[arg(long)]
+        delete: bool,
+    },
+    #[command(about = "Удалить профиль вместе с ключом")]
+    Remove { name: String },
 }

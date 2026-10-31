@@ -417,12 +417,25 @@ impl Human {
                 tone("✗", "31", rich),
                 ui::safe(data["message"].as_str().unwrap_or_default())
             ),
+            "warning" => line!(
+                "{} {}",
+                tone("!", "33", rich),
+                ui::safe(data["message"].as_str().unwrap_or_default())
+            ),
             "context_compacted" => {
-                line!(
-                    "↻ Автокомпакт: {} → {} символов",
-                    number(data["before_chars"].as_u64().unwrap_or_default()),
-                    number(data["after_chars"].as_u64().unwrap_or_default())
-                );
+                if data["unit"] == "estimated_tokens" {
+                    line!(
+                        "↻ Автокомпакт: ~{} → ~{} оценочных токенов",
+                        number(data["before"].as_u64().unwrap_or_default()),
+                        number(data["after"].as_u64().unwrap_or_default())
+                    );
+                } else {
+                    line!(
+                        "↻ Автокомпакт: {} → {} символов",
+                        number(data["before_chars"].as_u64().unwrap_or_default()),
+                        number(data["after_chars"].as_u64().unwrap_or_default())
+                    );
+                }
                 line!(
                     "{}",
                     ui::safe(

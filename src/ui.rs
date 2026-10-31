@@ -49,13 +49,16 @@ pub fn line(label: &str, default: &str) -> Result<String> {
 }
 pub fn select_provider() -> Result<ProviderKind> {
     let _suspended = crate::screen::suspend()?;
-    eprintln!("\nПровайдер: 1) Yandex AI Studio  2) GigaChat  3) OpenRouter  4) свой OpenAI API");
+    eprintln!(
+        "\nПровайдер: 1) Yandex AI Studio  2) GigaChat  3) OpenRouter  4) свой OpenAI API  5) локальная модель (Ollama, llama.cpp, MLX, LM Studio)"
+    );
     match line("Выбор", "1")?.as_str() {
         "1" | "yandex" => Ok(ProviderKind::Yandex),
         "2" | "gigachat" => Ok(ProviderKind::GigaChat),
         "3" | "openrouter" => Ok(ProviderKind::OpenRouter),
         "4" | "custom" => Ok(ProviderKind::Custom),
-        _ => bail!("Выберите номер от 1 до 4"),
+        "5" | "local" => Ok(ProviderKind::Local),
+        _ => bail!("Выберите номер от 1 до 5"),
     }
 }
 pub async fn connect(
@@ -70,14 +73,20 @@ pub async fn connect(
             "Для настройки откройте rcode connect в терминале или задайте ключ через переменную окружения"
         );
     }
+    let kind = match kind {
+        Some(kind) => kind,
+        None => {
+            let _suspended = crate::screen::suspend()?;
+            select_provider()?
+        }
+    };
+    if kind == ProviderKind::Local {
+        return crate::local_ui::connect(store, settings, rich).await;
+    }
     // Only the legacy line/password forms own the suspended terminal. The
     // searchable picker below needs Screen's input and renderer running.
     let (mut p, key, save_key) = {
         let _suspended = crate::screen::suspend()?;
-        let kind = match kind {
-            Some(k) => k,
-            None => select_provider()?,
-        };
         let mut p = settings.provider(kind);
         if let Some(ca) = ca_override {
             p.ca_file = Some(ca.to_path_buf());
@@ -91,6 +100,7 @@ pub async fn connect(
             ProviderKind::Custom => {
                 "OpenAI-совместимый сервер: /v1/chat/completions с function calling"
             }
+            ProviderKind::Local => "Локальный OpenAI-совместимый сервер на 127.0.0.1",
         };
         eprintln!(
             "\n{}\nКлюч вводится скрыто и хранится локально отдельно от настроек.",
@@ -211,8 +221,7 @@ pub async fn connect(
         store.save_credential(p.kind, &key)?;
     }
     let mut updated = settings.clone();
-    updated.active = p.kind;
-    updated.providers.insert(p.kind.to_string(), p.clone());
+    updated.remember_provider(&p);
     store.save(&updated)?;
     *settings = updated;
     crate::screen::notice("Подключение сохранено. rcode doctor --check проверит доступ к API.");
@@ -270,7 +279,7 @@ fn connection_models(fetched: Vec<ModelInfo>, current: &str, key: &str) -> Vec<M
     models
 }
 
-fn pick_model(
+pub(crate) fn pick_model(
     models: &[ModelInfo],
     provider: &ProviderSettings,
     rich: bool,
@@ -409,7 +418,7 @@ pub fn editor() -> Result<rustyline::Editor<CommandHelper, rustyline::history::D
 
 // Disable echo before displaying the prompt: rpassword displays its prompt
 // first, which can echo an immediately pasted key before it configures the TTY.
-fn password(prompt: &str) -> Result<String> {
+pub(crate) fn password(prompt: &str) -> Result<String> {
     let _suspended = crate::screen::suspend()?;
     let _echo = password_echo::Guard::new()?;
     Ok(rpassword::prompt_password(prompt)?)

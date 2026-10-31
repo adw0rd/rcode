@@ -19,7 +19,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     net::IpAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -43,11 +43,25 @@ pub struct ProviderClient {
     gigachat_client: Option<Client>,
     base: Url,
     auth_url: Option<Url>,
-    credential: String,
+    /// `None` only for a local profile without a key: no Authorization header.
+    credential: Option<String>,
     token: Option<AccessToken>,
     generation_slots: Arc<Semaphore>,
     image_uploads: Arc<tokio::sync::Mutex<BTreeMap<String, String>>>,
     credits_forbidden: Arc<AtomicBool>,
+    /// Local servers only: pinned loopback client and state shared by clones.
+    local: Option<LocalConnection>,
+}
+
+#[derive(Clone)]
+struct LocalConnection {
+    client: Client,
+    runtime_context: Arc<Mutex<Option<u32>>>,
+    calibration: Arc<Mutex<f64>>,
+    /// Context probes made by this connection and its clones (bounded).
+    probes: Arc<std::sync::atomic::AtomicUsize>,
+    /// A smaller server context is reported once per connection.
+    context_warned: Arc<AtomicBool>,
 }
 #[derive(Clone)]
 struct AccessToken {
@@ -57,14 +71,33 @@ struct AccessToken {
 
 impl ProviderClient {
     pub fn new(settings: ProviderSettings, credential: String) -> Result<Self> {
+        Self::connect(settings, Some(credential))
+    }
+
+    /// Cloud providers require a key. A local profile may connect without
+    /// one; then no Authorization header is ever sent.
+    pub fn connect(settings: ProviderSettings, credential: Option<String>) -> Result<Self> {
         settings.validate_effort()?;
+        let is_local = settings.kind == ProviderKind::Local;
         let default = match settings.kind {
             ProviderKind::Yandex => "https://ai.api.cloud.yandex.net/v1",
             ProviderKind::GigaChat => "https://api.giga.chat/v1",
             ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
-            ProviderKind::Custom => "",
+            ProviderKind::Custom | ProviderKind::Local => "",
         };
+        if is_local {
+            crate::local::validate_local_endpoint(settings.base_url.as_deref().unwrap_or(default))
+                .map_err(|error| protocol(&error.to_string()))?;
+        }
         let base = checked_url(settings.base_url.as_deref().unwrap_or(default))?;
+        if is_local && settings.local.is_none() {
+            return Err(protocol("Профиль local повреждён: нет параметров local"));
+        }
+        let credential = if is_local {
+            credential.filter(|key| !key.trim().is_empty())
+        } else {
+            credential
+        };
         let auth_url = if settings.kind == ProviderKind::GigaChat {
             Some(checked_url(settings.auth_url.as_deref().unwrap_or(
                 "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
@@ -72,17 +105,26 @@ impl ProviderClient {
         } else {
             None
         };
-        if credential.trim().is_empty() {
+        if !is_local
+            && credential
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty())
+        {
             return Err(fail(FailureKind::Auth, None, "Не задан ключ провайдера"));
         }
-        if credential.contains(['\r', '\n']) {
+        if credential
+            .as_deref()
+            .is_some_and(|key| key.contains(['\r', '\n']))
+        {
             return Err(fail(
                 FailureKind::Auth,
                 None,
                 "Недопустимый формат ключа провайдера",
             ));
         }
-        if settings.model.trim().is_empty()
+        // A new local profile lists its server's models before one is chosen;
+        // a generation without a model is refused in `model()`.
+        if (settings.model.trim().is_empty() && !is_local)
             || settings.max_output_tokens == 0
             || settings.request_timeout_secs == 0
             || settings.idle_timeout_secs == 0
@@ -95,6 +137,7 @@ impl ProviderClient {
         }
         let mut builder = client_builder();
         let mut loopback_builder = client_builder().no_proxy();
+        let mut local_builder = is_local.then(local_client_builder);
         if let Some(path) = &settings.ca_file {
             let pem = std::fs::read(path)
                 .map_err(|_| fail(FailureKind::Transport, None, "Не удалось прочитать CA-файл"))?;
@@ -110,6 +153,8 @@ impl ProviderClient {
             }
             for certificate in certificates {
                 builder = builder.add_root_certificate(certificate.clone());
+                local_builder =
+                    local_builder.map(|local| local.add_root_certificate(certificate.clone()));
                 loopback_builder = loopback_builder.add_root_certificate(certificate);
             }
         }
@@ -123,11 +168,29 @@ impl ProviderClient {
         let loopback_client = loopback_builder
             .build()
             .map_err(|_| transport("Не удалось создать локальный HTTPS-клиент"))?;
-        let generation_slots = Arc::new(Semaphore::new(if settings.kind == ProviderKind::Yandex {
-            2
+        let local = local_builder
+            .map(|builder| {
+                builder
+                    .build()
+                    .map(|client| LocalConnection {
+                        client,
+                        runtime_context: Default::default(),
+                        calibration: Arc::new(Mutex::new(1.0)),
+                        probes: Default::default(),
+                        context_warned: Default::default(),
+                    })
+                    .map_err(|_| transport("Не удалось создать клиент локального сервера"))
+            })
+            .transpose()?;
+        let generation_slots = if is_local {
+            crate::local_runtime::generation_slot(&base)
         } else {
-            4
-        }));
+            Arc::new(Semaphore::new(if settings.kind == ProviderKind::Yandex {
+                2
+            } else {
+                4
+            }))
+        };
         Ok(Self {
             settings,
             client,
@@ -140,7 +203,91 @@ impl ProviderClient {
             generation_slots,
             image_uploads: Default::default(),
             credits_forbidden: Default::default(),
+            local,
         })
+    }
+
+    pub fn settings(&self) -> &ProviderSettings {
+        &self.settings
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// Reads the server context before the first request and once more after
+    /// the first answer (Ollama reports a model only once it is loaded). Returns
+    /// a one-time warning when the server context is smaller than the profile.
+    pub async fn refresh_local_context(&self) -> Option<String> {
+        const MAX_PROBES: usize = 2;
+        let local = self.local.as_ref()?;
+        crate::local_runtime::context_probe_path(self.settings.local.as_ref()?.runtime)?;
+        if lock(&local.runtime_context).is_some()
+            || local.probes.fetch_add(1, Ordering::SeqCst) >= MAX_PROBES
+        {
+            return None;
+        }
+        let context = self.probe_local_context().await?;
+        let profile = self.settings.local.as_ref()?.context_tokens;
+        (context < profile && !local.context_warned.swap(true, Ordering::SeqCst)).then(|| {
+            format!(
+                "Сервер сообщил контекст {context} токенов — меньше, чем в профиле ({profile}). rcode считает бюджет по {context} и не меняет настройки сервера; при необходимости увеличьте контекст на стороне сервера."
+            )
+        })
+    }
+
+    /// Reads the context loaded by a local server (llama.cpp `/props`, Ollama
+    /// `/api/ps`) with a short deadline. `None` when unknown; never retried
+    /// and never changes server settings.
+    pub async fn probe_local_context(&self) -> Option<u32> {
+        let local = self.local.as_ref()?;
+        let runtime = self.settings.local.as_ref()?.runtime;
+        let url = crate::local_runtime::origin(
+            &self.base,
+            crate::local_runtime::context_probe_path(runtime)?,
+        );
+        let mut request = local
+            .client
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(key) = &self.credential {
+            request = request.header(
+                AUTHORIZATION,
+                sensitive_header(&format!("Bearer {key}")).ok()?,
+            );
+        }
+        let deadline = crate::local_runtime::PROBE_DEADLINE;
+        let value = tokio::time::timeout(deadline, async {
+            let response = request.send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            read_json(response, deadline).await.ok()
+        })
+        .await
+        .ok()
+        .flatten()?;
+        let context = crate::local_runtime::parse_context(runtime, &value, &self.settings.model);
+        if context.is_some() {
+            *lock(&local.runtime_context) = context;
+        }
+        context
+    }
+
+    /// Context budget for this connection; cloud providers keep characters.
+    pub fn context_budget(&self, overhead: usize) -> crate::context::ContextBudget {
+        let (runtime, calibration) = self.local.as_ref().map_or((None, 1.0), |local| {
+            (*lock(&local.runtime_context), *lock(&local.calibration))
+        });
+        crate::context::ContextBudget::for_provider(&self.settings, runtime, calibration, overhead)
+    }
+
+    /// Calibrates later local estimates from the prompt tokens a server reported.
+    pub fn observe_prompt_tokens(&self, estimated: usize, observed: u64) {
+        if let Some(local) = &self.local {
+            let mut calibration = lock(&local.calibration);
+            *calibration = crate::context::calibrated(*calibration, estimated, observed);
+        }
     }
 
     pub async fn balance(&mut self) -> Result<BalanceReport> {
@@ -193,6 +340,7 @@ impl ProviderClient {
             },
             ProviderKind::Yandex => report.note=Some("Ключ AI Studio не даёт доступ к балансу Yandex Cloud Billing. Для Billing API нужна отдельная IAM-авторизация; баланс доступен в кабинете.".into()),
             ProviderKind::Custom => report.note=Some("У OpenAI-совместимого API нет стандартного метода баланса. Проверьте кабинет своего провайдера.".into()),
+            ProviderKind::Local => report.note=Some("Локальный сервер: баланс не применяется.".into()),
         }
         report.checked_at = epoch_seconds();
         Ok(report)
@@ -206,17 +354,28 @@ impl ProviderClient {
     ) -> Result<Completion> {
         // Clones share the allowance. Keep it through the complete SSE/JSON body,
         // including retries; reading only headers does not finish a generation.
-        let _slot = self
-            .generation_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| transport("Очередь модельных запросов закрыта"))?;
+        let slot = match self.generation_slots.clone().try_acquire_owned() {
+            Ok(slot) => Ok(slot),
+            Err(_) => {
+                // Status only: this text never reaches emit, the answer or history.
+                let screen = crate::screen::current().filter(|_| self.is_local());
+                if let Some(screen) = &screen {
+                    screen.busy("Жду локальную модель: занята другим запросом");
+                }
+                let slot = self.generation_slots.clone().acquire_owned().await;
+                if let Some(screen) = &screen {
+                    screen.busy("Локальная модель отвечает");
+                }
+                slot
+            }
+        };
+        let _slot = slot.map_err(|_| transport("Очередь модельных запросов закрыта"))?;
         let uploaded = self.prepare_images(messages).await?;
         let body = self.completion_body(messages, tools, &uploaded)?;
         let response = self
             .authorized_request(Method::POST, "chat/completions", Some(&body))
             .await?;
+        let local = self.is_local();
         let is_sse = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -228,18 +387,16 @@ impl ProviderClient {
             });
         let giga = self.settings.kind == ProviderKind::GigaChat;
         if is_sse {
-            let completion = read_sse(response, self.idle(), self.settings.kind, emit).await?;
-            validate_tool_output(&completion, tools)?;
+            let completion = read_sse(response, self.idle(), &self.settings, emit).await?;
+            validate_tool_output(&completion, tools, local)?;
             Ok(completion)
         } else {
             let value = read_json(response, self.idle()).await?;
-            let mut accumulator = Accumulator {
-                yandex_name_ids: self.settings.kind == ProviderKind::Yandex,
-                ..Accumulator::default()
-            };
+            let mut accumulator = Accumulator::new(&self.settings);
             accumulator.json_completion(&value, giga)?;
+            accumulator.flush_reasoning(false, &mut |_| {})?;
             let completion = accumulator.finish()?;
-            validate_tool_output(&completion, tools)?;
+            validate_tool_output(&completion, tools, local)?;
             if !completion.content.is_empty() {
                 emit(&completion.content);
             }
@@ -272,8 +429,17 @@ impl ProviderClient {
             .get("data")
             .and_then(Value::as_array)
             .ok_or_else(|| protocol("API моделей не вернул массив data"))?;
+        let local = self.is_local();
         models
             .iter()
+            .filter(|model| {
+                // Local servers also list embedding models; they cannot run an agent.
+                !local
+                    || !model
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(crate::local_runtime::is_embedding_model)
+            })
             .map(|model| {
                 let id = model
                     .get("id")
@@ -311,6 +477,7 @@ impl ProviderClient {
                     ),
                     supports_reasoning,
                     supported_efforts,
+                    supports_images: None,
                 })
             })
             .collect()
@@ -321,6 +488,11 @@ impl ProviderClient {
     }
 
     fn model(&self) -> Result<String> {
+        if self.settings.model.trim().is_empty() {
+            return Err(protocol(
+                "Модель не выбрана: выберите её через /model или --model",
+            ));
+        }
         if self.settings.kind != ProviderKind::Yandex || self.settings.model.starts_with("gpt://") {
             return Ok(self.settings.model.clone());
         }
@@ -347,7 +519,33 @@ impl ProviderClient {
         } else {
             compatible_messages(messages)?
         };
-        let mut body = json!({"model":self.model()?,"messages":messages,"stream":self.settings.stream,"max_tokens":self.settings.max_output_tokens});
+        let max_tokens = match &self.local {
+            Some(local) => crate::context::effective_output(
+                self.settings.max_output_tokens,
+                lock(&local.runtime_context).unwrap_or(u32::MAX).min(
+                    self.settings
+                        .local
+                        .as_ref()
+                        .map_or(u32::MAX, |l| l.context_tokens),
+                ),
+            ),
+            None => self.settings.max_output_tokens,
+        };
+        let mut body = json!({"model":self.model()?,"messages":messages,"stream":self.settings.stream,"max_tokens":max_tokens});
+        if let Some(local) = self.settings.local.as_ref().filter(|_| self.is_local()) {
+            // Effort is never sent to a local server; thinking only by explicit choice.
+            if let Some(thinking) = local.thinking {
+                body["chat_template_kwargs"] = json!({"enable_thinking":thinking});
+            }
+            if self.settings.stream && local.runtime.stream_usage() {
+                body["stream_options"] = json!({"include_usage":true});
+            }
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools.iter().map(|t| json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.parameters}})).collect());
+                body["tool_choice"] = json!("auto");
+            }
+            return Ok(body);
+        }
         if !self.settings.effort.is_auto() {
             if self.settings.kind == ProviderKind::OpenRouter {
                 body["reasoning"] = json!({"effort":self.settings.effort});
@@ -402,6 +600,16 @@ impl ProviderClient {
             for image in &message.images {
                 image.validate()?;
             }
+        }
+        if !images.is_empty()
+            && self.is_local()
+            && !self
+                .settings
+                .local
+                .as_ref()
+                .is_some_and(|local| local.vision)
+        {
+            return Err(protocol(LOCAL_NO_VISION));
         }
         if self.settings.kind != ProviderKind::GigaChat || images.is_empty() {
             return Ok(BTreeMap::new());
@@ -474,29 +682,35 @@ impl ProviderClient {
             self.refresh_token().await?;
         }
         for auth_attempt in 0..=1 {
-            let authorization = if giga {
-                format!(
+            let authorization = if self.is_local() {
+                self.credential.as_ref().map(|key| format!("Bearer {key}"))
+            } else if giga {
+                Some(format!(
                     "Bearer {}",
                     self.token
                         .as_ref()
                         .ok_or_else(|| protocol("Отсутствует OAuth-токен"))?
                         .value
-                )
+                ))
             } else if self.settings.kind == ProviderKind::Yandex {
-                if self.credential.starts_with("Bearer ") || self.credential.starts_with("Api-Key ")
-                {
-                    self.credential.clone()
-                } else {
-                    format!("Api-Key {}", self.credential)
-                }
+                let key = self.cloud_key();
+                Some(
+                    if key.starts_with("Bearer ") || key.starts_with("Api-Key ") {
+                        key.to_owned()
+                    } else {
+                        format!("Api-Key {key}")
+                    },
+                )
             } else {
-                format!("Bearer {}", self.credential)
+                Some(format!("Bearer {}", self.cloud_key()))
             };
             let mut request = self
                 .client
                 .request(method.clone(), endpoint(&self.base, path))
-                .header(AUTHORIZATION, sensitive_header(&authorization)?)
                 .header(reqwest::header::ACCEPT, "application/json");
+            if let Some(authorization) = &authorization {
+                request = request.header(AUTHORIZATION, sensitive_header(authorization)?);
+            }
             if self.settings.kind == ProviderKind::Yandex
                 && let Some(folder) = self.settings.folder_id.as_deref().filter(|s| !s.is_empty())
             {
@@ -533,11 +747,14 @@ impl ProviderClient {
         unreachable!("bounded authorization loop always returns")
     }
 
+    /// Cloud providers always carry a key (enforced in `connect`).
+    fn cloud_key(&self) -> &str {
+        self.credential.as_deref().unwrap_or_default()
+    }
+
     async fn refresh_token(&mut self) -> Result<()> {
-        let key = self
-            .credential
-            .strip_prefix("Basic ")
-            .unwrap_or(&self.credential);
+        let key = self.cloud_key();
+        let key = key.strip_prefix("Basic ").unwrap_or(key);
         let request = self
             .client
             .post(
@@ -602,7 +819,9 @@ impl ProviderClient {
             let next = request
                 .try_clone()
                 .ok_or_else(|| protocol("HTTP-запрос нельзя повторить"))?;
-            let client = if is_loopback(request.url()) {
+            let client = if let Some(local) = &self.local {
+                &local.client
+            } else if is_loopback(request.url()) {
                 &self.loopback_client
             } else if crate::certificates::official_gigachat_url(request.url()) {
                 self.gigachat_client.as_ref().unwrap_or(&self.client)
@@ -617,6 +836,17 @@ impl ProviderClient {
                     ))
                 })?
                 .map_err(|error| {
+                    if self.is_local() {
+                        return transport(&format!(
+                            "Локальный сервер {} {}",
+                            self.base,
+                            if error.is_connect() {
+                                "не отвечает. Запустите его или выберите другой профиль через /provider"
+                            } else {
+                                "оборвал соединение; проверьте, что сервер работает"
+                            }
+                        ));
+                    }
                     transport(if error.is_connect() {
                         "Не удалось подключиться к API; проверьте сеть и CA-сертификат"
                     } else {
@@ -657,6 +887,11 @@ impl ProviderClient {
         // Inspect for known context errors, but never include an upstream body (which can echo prompts or secrets).
         let bytes = read_bytes(response, self.idle()).await.unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+        if self.is_local()
+            && let Some((kind, message)) = self.local_failure(code, &text)
+        {
+            return Err(fail(kind, Some(code), &format!("{message} (HTTP {code})")));
+        }
         let (kind, message) = if matches!(code, 401 | 403) {
             (
                 FailureKind::Auth,
@@ -705,6 +940,85 @@ impl ProviderClient {
     }
 }
 
+impl ProviderClient {
+    /// Runtime-aware explanations for local servers; the body is only inspected.
+    fn local_failure(&self, code: u16, text: &str) -> Option<(FailureKind, String)> {
+        let profile = self
+            .settings
+            .local
+            .as_ref()
+            .map_or(crate::local::DRAFT_PROFILE, |local| local.profile.as_str());
+        if matches!(code, 401 | 403) {
+            return Some((
+                FailureKind::Auth,
+                format!(
+                    "Локальный сервер требует ключ или отклонил его. Сохраните ключ профиля: rcode local key {profile} --stdin"
+                ),
+            ));
+        }
+        let mentions_tools = text.contains("tool")
+            && ["support", "jinja", "template", "not enabled"]
+                .iter()
+                .any(|marker| text.contains(marker));
+        if matches!(code, 400 | 422 | 500) && mentions_tools {
+            return Some((
+                FailureKind::Protocol,
+                "Локальная модель или сервер не поддерживает вызов инструментов (tools); запрос не повторялся. Выберите модель с function calling; для llama.cpp запустите сервер с --jinja".into(),
+            ));
+        }
+        if matches!(code, 400 | 413 | 422 | 500)
+            && [
+                "context size",
+                "context length",
+                "context window",
+                "exceeds the available context",
+                "n_ctx",
+                "too many tokens",
+            ]
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
+            return Some((
+                FailureKind::Context,
+                "Запрос не помещается в контекст локального сервера. Уменьшите context_tokens профиля до фактического контекста сервера или увеличьте контекст на стороне сервера; /compact сократит историю".into(),
+            ));
+        }
+        if code == 404 {
+            return Some((
+                FailureKind::Protocol,
+                format!(
+                    "Локальный сервер не нашёл модель {} или endpoint; проверьте /model и адрес профиля {profile}",
+                    crate::ui::safe(&self.settings.model)
+                ),
+            ));
+        }
+        None
+    }
+}
+
+const LOCAL_NO_VISION: &str = "Модель профиля local не подтверждает изображения; запрос не отправлен. Если сервер и модель поддерживают vision, включите его явно: rcode local add ИМЯ --vision --force";
+
+/// Local servers: no proxy, no redirects, and `localhost` pinned to
+/// 127.0.0.1 inside the client: neither a resolver nor an IPv6 fallback can
+/// send a profile key to another address (see `local::endpoint_identity`).
+fn local_client_builder() -> reqwest::ClientBuilder {
+    use std::net::{Ipv4Addr, SocketAddr};
+    client_builder()
+        .no_proxy()
+        .resolve("localhost", SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+}
+
+pub(crate) fn local_http_client() -> Result<Client> {
+    local_client_builder()
+        .connect_timeout(crate::local_runtime::PROBE_DEADLINE)
+        .build()
+        .map_err(|_| transport("Не удалось создать клиент локального сервера"))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 fn client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -712,7 +1026,23 @@ fn client_builder() -> reqwest::ClientBuilder {
         .user_agent(concat!("rcode/", env!("CARGO_PKG_VERSION")))
 }
 
-fn validate_tool_output(completion: &Completion, tools: &[ToolDefinition]) -> Result<()> {
+fn validate_tool_output(
+    completion: &Completion,
+    tools: &[ToolDefinition],
+    local: bool,
+) -> Result<()> {
+    let text = completion.content.trim_start();
+    if local
+        && completion.tool_calls.is_empty()
+        && !tools.is_empty()
+        && ["<tool_call>", "<function=", "[TOOL_CALL_START]"]
+            .iter()
+            .any(|marker| text.starts_with(marker))
+    {
+        return Err(protocol(
+            "Локальный сервер вернул вызов инструмента обычным текстом вместо tool_calls; действие не исполнялось. Для llama.cpp запустите сервер с --jinja и шаблоном модели с tool calling; для MLX и LM Studio проверьте поддержку tool calling у модели и сервера.",
+        ));
+    }
     if completion.tool_calls.is_empty()
         && let Some(rest) = completion
             .content
@@ -1004,6 +1334,8 @@ struct Accumulator {
     calls: BTreeMap<u64, PartialCall>,
     terminal: bool,
     yandex_name_ids: bool,
+    /// Local servers only: reasoning fields and a leading `<think>` block are hidden.
+    think: Option<crate::think::ThinkFilter>,
 }
 #[derive(Default)]
 struct PartialCall {
@@ -1013,6 +1345,37 @@ struct PartialCall {
     kind: String,
 }
 impl Accumulator {
+    fn new(settings: &ProviderSettings) -> Self {
+        Self {
+            yandex_name_ids: settings.kind == ProviderKind::Yandex,
+            think: settings
+                .local
+                .as_ref()
+                .filter(|_| settings.kind == ProviderKind::Local)
+                .map(|local| crate::think::ThinkFilter::for_local(local.runtime, local.thinking)),
+            ..Self::default()
+        }
+    }
+    /// Emits text held back while deciding about a leading `<think>` block.
+    fn flush_reasoning(
+        &mut self,
+        streaming: bool,
+        emit: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<()> {
+        let Some(filter) = self.think.as_mut() else {
+            return Ok(());
+        };
+        let rest = filter
+            .finish(&mut self.completion.reasoning)
+            .map_err(|_| {
+                protocol("Модель не закрыла блок рассуждений <think>, ответа нет. Увеличьте max_output_tokens профиля или отключите рассуждения на сервере (rcode local add … --thinking off, если сервер это поддерживает)")
+            })?;
+        self.completion.content.push_str(&rest);
+        if streaming && !rest.is_empty() {
+            emit(&rest);
+        }
+        Ok(())
+    }
     fn json_completion(&mut self, value: &Value, giga: bool) -> Result<()> {
         self.common(value)?;
         let choice = value
@@ -1125,13 +1488,24 @@ impl Accumulator {
         {
             return Err(protocol("SSE содержит новые данные после finish_reason"));
         }
+        if self.think.is_some() {
+            for field in ["reasoning_content", "reasoning"] {
+                if let Some(text) = delta.get(field).and_then(Value::as_str) {
+                    self.completion.reasoning.push_str(text);
+                }
+            }
+        }
         if let Some(content) = delta.get("content").filter(|v| !v.is_null()) {
             let text = content
                 .as_str()
                 .ok_or_else(|| protocol("API вернул нетекстовый content"))?;
-            self.completion.content.push_str(text);
-            if streaming && !text.is_empty() {
-                emit(text);
+            let visible = match self.think.as_mut() {
+                Some(filter) => filter.push(text, &mut self.completion.reasoning),
+                None => text.to_owned(),
+            };
+            self.completion.content.push_str(&visible);
+            if streaming && !visible.is_empty() {
+                emit(&visible);
             }
         }
         if giga {
@@ -1262,9 +1636,10 @@ impl Accumulator {
 async fn read_sse(
     response: Response,
     idle: Duration,
-    kind: ProviderKind,
+    settings: &ProviderSettings,
     emit: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Completion> {
+    let kind = settings.kind;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_BODY as u64)
@@ -1276,10 +1651,7 @@ async fn read_sse(
     let mut data = String::new();
     let mut bytes = 0usize;
     let giga = kind == ProviderKind::GigaChat;
-    let mut accumulator = Accumulator {
-        yandex_name_ids: kind == ProviderKind::Yandex,
-        ..Accumulator::default()
-    };
+    let mut accumulator = Accumulator::new(settings);
     while let Some(chunk) = tokio::time::timeout(idle, stream.next())
         .await
         .map_err(|_| idle_timeout(idle))?
@@ -1303,6 +1675,7 @@ async fn read_sse(
             if line.is_empty() {
                 if !data.is_empty() {
                     if data.trim() == "[DONE]" {
+                        accumulator.flush_reasoning(true, emit)?;
                         return accumulator.finish();
                     }
                     let value: Value = serde_json::from_str(&data)

@@ -19,11 +19,18 @@ pub enum ProviderKind {
     GigaChat,
     OpenRouter,
     Custom,
+    Local,
 }
 
 impl ProviderKind {
-    pub const fn all() -> [Self; 4] {
-        [Self::Yandex, Self::GigaChat, Self::OpenRouter, Self::Custom]
+    pub const fn all() -> [Self; 5] {
+        [
+            Self::Yandex,
+            Self::GigaChat,
+            Self::OpenRouter,
+            Self::Custom,
+            Self::Local,
+        ]
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -32,6 +39,7 @@ impl ProviderKind {
             Self::GigaChat => "gigachat",
             Self::OpenRouter => "openrouter",
             Self::Custom => "custom",
+            Self::Local => "local",
         }
     }
 }
@@ -51,7 +59,10 @@ impl FromStr for ProviderKind {
             "gigachat" => Ok(Self::GigaChat),
             "openrouter" => Ok(Self::OpenRouter),
             "custom" => Ok(Self::Custom),
-            _ => bail!("Неизвестный провайдер: доступны yandex, gigachat, openrouter, custom"),
+            "local" => Ok(Self::Local),
+            _ => {
+                bail!("Неизвестный провайдер: доступны yandex, gigachat, openrouter, custom, local")
+            }
         }
     }
 }
@@ -144,6 +155,9 @@ pub struct ProviderSettings {
     pub request_timeout_secs: u64,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// Present only for `kind = local`; cloud entries serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<crate::local::LocalSettings>,
 }
 
 const fn default_stream() -> bool {
@@ -169,7 +183,10 @@ impl ProviderSettings {
             ProviderKind::GigaChat => ("GigaChat", "https://api.giga.chat/v1"),
             ProviderKind::OpenRouter => ("z-ai/glm-5.3-flash", "https://openrouter.ai/api/v1"),
             ProviderKind::Custom => ("local", "http://localhost:11434/v1"),
+            // A draft: the model comes from the server catalog or --model.
+            ProviderKind::Local => ("", "http://127.0.0.1:11434/v1"),
         };
+        let local = kind == ProviderKind::Local;
         Self {
             kind,
             model: model.into(),
@@ -181,8 +198,17 @@ impl ProviderSettings {
             ca_file: None,
             stream: default_stream(),
             max_output_tokens: default_max_output_tokens(),
-            request_timeout_secs: default_request_timeout_secs(),
-            idle_timeout_secs: default_idle_timeout_secs(),
+            request_timeout_secs: if local {
+                crate::local::DEFAULT_REQUEST_TIMEOUT_SECS
+            } else {
+                default_request_timeout_secs()
+            },
+            idle_timeout_secs: if local {
+                crate::local::DEFAULT_IDLE_TIMEOUT_SECS
+            } else {
+                default_idle_timeout_secs()
+            },
+            local: local.then(crate::local::draft_settings),
         }
     }
 
@@ -196,6 +222,12 @@ impl ProviderSettings {
             || self.idle_timeout_secs == 0
         {
             bail!("Лимит выходных токенов и таймауты должны быть больше нуля");
+        }
+        if self.kind == ProviderKind::Local {
+            return crate::local::validate(self);
+        }
+        if self.local.is_some() {
+            bail!("Параметры local допустимы только для провайдера local");
         }
         for endpoint in [&self.base_url, &self.auth_url].into_iter().flatten() {
             validate_endpoint(endpoint)?;
@@ -228,6 +260,9 @@ impl ProviderSettings {
     }
 
     pub(crate) fn validate_effort(&self) -> Result<()> {
+        if self.kind == ProviderKind::Local && !self.effort.is_auto() {
+            bail!("Для local effort не настраивается: используется auto (настройки сервера)");
+        }
         if matches!(self.kind, ProviderKind::Yandex | ProviderKind::GigaChat)
             && !matches!(
                 self.effort,
@@ -301,6 +336,8 @@ pub struct Settings {
     pub version: u32,
     pub active: ProviderKind,
     pub providers: BTreeMap<String, ProviderSettings>,
+    #[serde(default, skip_serializing_if = "crate::local::LocalProfiles::is_empty")]
+    pub local: crate::local::LocalProfiles,
 }
 
 impl Default for Settings {
@@ -310,18 +347,78 @@ impl Default for Settings {
             active: ProviderKind::Yandex,
             providers: ProviderKind::all()
                 .into_iter()
+                .filter(|kind| *kind != ProviderKind::Local)
                 .map(|kind| (kind.as_str().into(), ProviderSettings::new(kind)))
                 .collect(),
+            local: crate::local::LocalProfiles::default(),
         }
     }
 }
 
 impl Settings {
+    /// For local: the active profile, or an unsaved draft without a model.
     pub fn provider(&self, kind: ProviderKind) -> ProviderSettings {
+        if kind == ProviderKind::Local {
+            return self
+                .local
+                .active_profile()
+                .cloned()
+                .unwrap_or_else(|| ProviderSettings::new(kind));
+        }
         self.providers
             .get(kind.as_str())
             .cloned()
             .unwrap_or_else(|| ProviderSettings::new(kind))
+    }
+
+    /// Stores the selected provider and makes it active. Local settings go
+    /// into their named profile, never into `providers["local"]`.
+    /// A local provider without profile settings is invalid (see `validate`)
+    /// and is never stored, in particular not as `providers["local"]`.
+    pub fn remember_provider(&mut self, provider: &ProviderSettings) {
+        if provider.kind != ProviderKind::Local {
+            self.active = provider.kind;
+            self.providers
+                .insert(provider.kind.to_string(), provider.clone());
+            return;
+        }
+        if let Some(local) = &provider.local {
+            self.active = provider.kind;
+            self.local
+                .profiles
+                .insert(local.profile.clone(), provider.clone());
+            self.local.active = Some(local.profile.clone());
+        }
+    }
+}
+
+/// Whether a request may proceed, and with which key.
+#[derive(Debug)]
+pub enum CredentialState {
+    Present(Credential),
+    /// A local profile without a stored key: no Authorization header is sent.
+    NotRequired,
+    Missing,
+}
+
+impl CredentialState {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    pub fn into_key(self) -> Option<String> {
+        match self {
+            Self::Present(credential) => Some(credential.value),
+            Self::NotRequired | Self::Missing => None,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Present(credential) => &credential.source,
+            Self::NotRequired => "not_required",
+            Self::Missing => "missing",
+        }
     }
 }
 
@@ -471,6 +568,10 @@ impl ConfigStore {
     }
 
     pub fn credential(&self, kind: ProviderKind) -> Result<Option<Credential>> {
+        // Local keys are bound to a profile endpoint: see credential_for.
+        if kind == ProviderKind::Local {
+            return Ok(None);
+        }
         if let Some(credential) = credential_from_env(kind, |name| env::var(name).ok())? {
             return Ok(Some(credential));
         }
@@ -489,6 +590,10 @@ impl ConfigStore {
     }
 
     pub fn save_credential(&self, kind: ProviderKind, value: &str) -> Result<()> {
+        if kind == ProviderKind::Local {
+            // An unscoped "local" entry would never be read or deleted.
+            bail!("Ключ local хранится в профиле: rcode local key ИМЯ --stdin");
+        }
         validate_credential(value)?;
         let mut credentials = self.load_credentials()?;
         credentials
@@ -503,6 +608,117 @@ impl ConfigStore {
             write_private_json(&self.root.join("credentials.json"), &credentials)?;
         }
         Ok(())
+    }
+
+    /// The single resolver for a request snapshot. A local key is returned
+    /// only when the snapshot endpoint is the endpoint its profile is bound to.
+    pub fn credential_for(&self, provider: &ProviderSettings) -> Result<CredentialState> {
+        if provider.kind != ProviderKind::Local {
+            return Ok(match self.credential(provider.kind)? {
+                Some(credential) => CredentialState::Present(credential),
+                None => CredentialState::Missing,
+            });
+        }
+        let Some(local) = &provider.local else {
+            bail!("Профиль local повреждён: нет параметров local");
+        };
+        let settings = self.load()?;
+        let Some(profile) = settings.local.profiles.get(&local.profile) else {
+            // A deleted profile also deleted its key: a server that required
+            // one cannot be used until the user chooses a profile again.
+            if local.key_required {
+                bail!(
+                    "Профиль local «{}» удалён вместе с ключом, а его сервер требует ключ. Выберите профиль через /provider или --profile ИМЯ",
+                    local.profile
+                );
+            }
+            return Ok(CredentialState::NotRequired);
+        };
+        let key = self.local_credential(&local.profile)?;
+        let same_endpoint = provider
+            .base_url
+            .as_deref()
+            .and_then(crate::local::endpoint_identity)
+            .is_some_and(|snapshot| {
+                profile
+                    .base_url
+                    .as_deref()
+                    .and_then(crate::local::endpoint_identity)
+                    == Some(snapshot)
+            });
+        if !same_endpoint {
+            if key.is_some() || profile.local.as_ref().is_some_and(|l| l.key_required) {
+                bail!(
+                    "Адрес профиля local «{}» изменился или задан вручную; его ключ не отправляется на другой адрес. Выберите профиль заново через /provider или --profile {}",
+                    local.profile,
+                    local.profile
+                );
+            }
+            return Ok(CredentialState::NotRequired);
+        }
+        Ok(match key {
+            Some(credential) => CredentialState::Present(credential),
+            None if profile.local.as_ref().is_some_and(|l| l.key_required) => {
+                CredentialState::Missing
+            }
+            None => CredentialState::NotRequired,
+        })
+    }
+
+    pub fn local_credential(&self, profile: &str) -> Result<Option<Credential>> {
+        crate::local::validate_profile_name(profile)?;
+        self.load_credentials()?
+            .providers
+            .get(&format!("{}{profile}", crate::local::CREDENTIAL_PREFIX))
+            .map(|value| {
+                crate::local::validate_key(value).with_context(|| {
+                    format!("Сохранённый ключ профиля {profile} не подходит; сохраните его заново: rcode local key {profile} --stdin")
+                })?;
+                Ok(Credential {
+                    value: value.clone(),
+                    source: "credentials.json".into(),
+                })
+            })
+            .transpose()
+    }
+
+    pub fn save_local_credential(&self, profile: &str, value: &str) -> Result<()> {
+        crate::local::validate_profile_name(profile)?;
+        crate::local::validate_key(value)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let mut credentials = self.load_credentials()?;
+        credentials.providers.insert(
+            format!("{}{profile}", crate::local::CREDENTIAL_PREFIX),
+            value.into(),
+        );
+        write_private_json(&self.root.join("credentials.json"), &credentials)
+    }
+
+    pub fn delete_local_credential(&self, profile: &str) -> Result<()> {
+        crate::local::validate_profile_name(profile)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let mut credentials = self.load_credentials()?;
+        if credentials
+            .providers
+            .remove(&format!("{}{profile}", crate::local::CREDENTIAL_PREFIX))
+            .is_some()
+        {
+            write_private_json(&self.root.join("credentials.json"), &credentials)?;
+        }
+        Ok(())
+    }
+
+    /// Removes a profile together with its key; the active choice is cleared.
+    pub fn remove_local_profile(&self, settings: &mut Settings, profile: &str) -> Result<()> {
+        crate::local::validate_profile_name(profile)?;
+        if settings.local.profiles.remove(profile).is_none() {
+            bail!("Профиль local «{profile}» не найден");
+        }
+        if settings.local.active.as_deref() == Some(profile) {
+            settings.local.active = None;
+        }
+        self.delete_local_credential(profile)?;
+        self.save(settings)
     }
 
     fn load_credentials(&self) -> Result<Credentials> {
@@ -527,6 +743,8 @@ fn credential_from_env(
         ],
         ProviderKind::OpenRouter => &["RCODE_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"],
         ProviderKind::Custom => &["RCODE_CUSTOM_API_KEY", "OPENAI_API_KEY"],
+        // Generic and cloud env keys must never reach a local server.
+        ProviderKind::Local => &[],
     };
     for name in names {
         if let Some(value) = lookup(name) {
@@ -1140,6 +1358,41 @@ mod tests {
         assert_eq!(yandex.value, "stored-yandex");
         assert_eq!(yandex.source, "credentials.json");
         assert!(store.credential(ProviderKind::GigaChat).unwrap().is_none());
+        // Local profiles never inherit OPENAI_API_KEY or another env key, and
+        // a stored local key never becomes the custom key.
+        let mut settings = store.load().unwrap();
+        let profile = crate::local::profile_settings(
+            "isolated",
+            "http://127.0.0.1:8080/v1",
+            crate::local::LocalRuntime::LlamaCpp,
+            "m",
+        );
+        settings.remember_provider(&profile);
+        store.save(&settings).unwrap();
+        assert!(matches!(
+            store.credential_for(&profile).unwrap(),
+            CredentialState::NotRequired
+        ));
+        store
+            .save_local_credential("isolated", "isolated-local-key")
+            .unwrap();
+        assert!(
+            store
+                .credential(ProviderKind::Custom)
+                .unwrap()
+                .unwrap()
+                .value
+                == "custom-env",
+            "custom must keep its env key"
+        );
+        assert!(
+            matches!(store.credential_for(&profile).unwrap(), CredentialState::Present(c) if c.value == "isolated-local-key")
+        );
+        let router = ProviderSettings::new(ProviderKind::GigaChat);
+        assert!(matches!(
+            store.credential_for(&router).unwrap(),
+            CredentialState::Missing
+        ));
     }
 
     #[test]
@@ -1256,5 +1509,402 @@ mod tests {
         let linked_root = temp.path().join("linked-root");
         symlink(store.root(), &linked_root).unwrap();
         assert!(ConfigStore::at(linked_root).is_err());
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+    use crate::local::{LocalRuntime, LocalSettings};
+
+    fn local_profile(name: &str, base_url: &str) -> ProviderSettings {
+        crate::local::profile_settings(name, base_url, LocalRuntime::Ollama, "qwen3:8b")
+    }
+
+    #[test]
+    fn local_kind_round_trips_and_all_has_five() {
+        assert_eq!(ProviderKind::all().len(), 5);
+        assert_eq!(ProviderKind::Local.as_str(), "local");
+        assert_eq!(
+            "local".parse::<ProviderKind>().unwrap(),
+            ProviderKind::Local
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderKind::Local).unwrap(),
+            serde_json::json!("local")
+        );
+        let defaults = Settings::default();
+        assert!(!defaults.providers.contains_key("local"));
+        let value = serde_json::to_value(&defaults).unwrap();
+        assert!(
+            value.get("local").is_none(),
+            "empty profiles are not written"
+        );
+    }
+
+    #[test]
+    fn old_config_without_local_loads_and_saves_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "active": "openrouter",
+            "providers": {
+                "openrouter": {"kind":"openrouter","model":"z-ai/glm-5.3-flash","base_url":"https://openrouter.ai/api/v1","folder_id":null,"auth_url":null,"scope":null,"ca_file":null,"stream":true,"max_output_tokens":4096,"request_timeout_secs":300,"idle_timeout_secs":90},
+                "custom": {"kind":"custom","model":"local","base_url":"http://localhost:11434/v1","folder_id":null,"auth_url":null,"scope":null,"ca_file":null,"stream":true,"max_output_tokens":4096,"request_timeout_secs":300,"idle_timeout_secs":90}
+            }
+        });
+        fs::write(
+            store.root().join("config.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let settings = store.load().unwrap();
+        assert!(settings.local.is_empty());
+        store.save(&settings).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.root().join("config.json")).unwrap()).unwrap();
+        assert_eq!(saved, legacy);
+    }
+
+    #[test]
+    fn local_profiles_round_trip_with_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let mut settings = Settings::default();
+        settings.remember_provider(&local_profile("qwen-mlx", "http://127.0.0.1:8080/v1"));
+        settings.remember_provider(&local_profile("ollama", "http://127.0.0.1:11434/v1"));
+        assert_eq!(settings.active, ProviderKind::Local);
+        assert_eq!(settings.local.active.as_deref(), Some("ollama"));
+        settings.local.active = Some("qwen-mlx".into());
+        store.save(&settings).unwrap();
+        let loaded = ConfigStore::at(store.root()).unwrap().load().unwrap();
+        assert_eq!(loaded.active, ProviderKind::Local);
+        let active = loaded.provider(ProviderKind::Local);
+        assert_eq!(active.base_url.as_deref(), Some("http://127.0.0.1:8080/v1"));
+        assert_eq!(active.local.as_ref().unwrap().profile, "qwen-mlx");
+        assert!(!loaded.providers.contains_key("local"));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.root().join("config.json")).unwrap()).unwrap();
+        assert_eq!(raw["local"]["active"], "qwen-mlx");
+        assert_eq!(
+            raw["local"]["profiles"]["qwen-mlx"]["local"]["runtime"],
+            "ollama"
+        );
+        assert!(raw["providers"]["openrouter"].get("local").is_none());
+    }
+
+    #[test]
+    fn local_without_profiles_is_an_unsaved_invalid_draft() {
+        let settings = Settings::default();
+        let draft = settings.provider(ProviderKind::Local);
+        assert_eq!(draft.kind, ProviderKind::Local);
+        assert!(draft.local.is_some());
+        assert!(draft.validate().is_err(), "a draft needs a model");
+        assert!(
+            serde_json::to_value(&settings)
+                .unwrap()
+                .get("local")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_validate_rejects_non_loopback_and_userinfo() {
+        for url in [
+            "http://192.168.1.10:8080/v1",
+            "https://example.com/v1",
+            "http://example.com/v1",
+            "http://user@127.0.0.1:8080/v1",
+            "http://user:pw@localhost:8080/v1",
+            "http://127.0.0.1:8080/v1?key=x",
+            "http://localhost.evil/v1",
+            "http://[::ffff:127.0.0.1]:8080/v1",
+            "ftp://127.0.0.1/v1",
+        ] {
+            let profile = local_profile("p", url);
+            let error = profile.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("127.0.0.1") || error.contains("URL"),
+                "{url}: {error}"
+            );
+        }
+        let mut missing = local_profile("p", "http://127.0.0.1:8080/v1");
+        missing.base_url = None;
+        assert!(missing.validate().is_err());
+        let mut wrong = local_profile("p", "http://127.0.0.1:8080/v1");
+        wrong.local = None;
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn local_validate_accepts_localhost_127_x_ipv6() {
+        for url in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://127.0.0.2:1234/v1",
+            "http://[::1]:8080/v1",
+            "https://localhost:8443/v1",
+        ] {
+            local_profile("p", url).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn local_effort_must_be_auto() {
+        for effort in Effort::all() {
+            let mut profile = local_profile("p", "http://127.0.0.1:8080/v1");
+            profile.effort = effort;
+            assert_eq!(
+                profile.validate().is_ok(),
+                effort == Effort::Auto,
+                "{effort}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_output_cap_8192_and_quarter_ctx() {
+        let mut profile = local_profile("p", "http://127.0.0.1:8080/v1");
+        assert_eq!(profile.max_output_tokens, 4096);
+        assert_eq!(profile.request_timeout_secs, 600);
+        assert_eq!(profile.idle_timeout_secs, 180);
+        assert_eq!(profile.local.as_ref().unwrap().context_tokens, 32_768);
+        profile.max_output_tokens = 8192;
+        profile.validate().unwrap();
+        profile.max_output_tokens = 8193;
+        assert!(profile.validate().is_err());
+        profile.local.as_mut().unwrap().context_tokens = 16_384;
+        profile.max_output_tokens = 4096;
+        profile.validate().unwrap();
+        profile.max_output_tokens = 4097;
+        assert!(profile.validate().is_err());
+        profile.max_output_tokens = 1024;
+        profile.local.as_mut().unwrap().context_tokens = 1024;
+        assert!(profile.validate().is_err(), "context below the minimum");
+    }
+
+    #[test]
+    fn profile_name_rules() {
+        for name in ["a", "qwen-mlx", "ollama.2", "x_y", "0abc", &"a".repeat(32)] {
+            crate::local::validate_profile_name(name).unwrap();
+        }
+        for name in [
+            "",
+            "-a",
+            ".a",
+            "A",
+            "имя",
+            "a b",
+            "a/b",
+            "a:b",
+            &"a".repeat(33),
+        ] {
+            assert!(crate::local::validate_profile_name(name).is_err(), "{name}");
+        }
+        let mut profile = local_profile("Bad Name", "http://127.0.0.1:8080/v1");
+        assert!(profile.validate().is_err());
+        profile.local = Some(LocalSettings {
+            profile: "ok".into(),
+            ..profile.local.clone().unwrap()
+        });
+        profile.validate().unwrap();
+    }
+
+    #[test]
+    fn cloud_kinds_cannot_carry_local_settings() {
+        let mut custom = ProviderSettings::new(ProviderKind::Custom);
+        custom.local = local_profile("p", "http://127.0.0.1:8080/v1").local;
+        assert!(custom.validate().is_err());
+    }
+
+    #[test]
+    fn local_credential_never_reads_env() {
+        let env: BTreeMap<&str, &str> = [
+            ("OPENAI_API_KEY", "generic-secret"),
+            ("RCODE_CUSTOM_API_KEY", "custom-secret"),
+            ("RCODE_LOCAL_API_KEY", "local-env-secret"),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            credential_from_env(ProviderKind::Local, |name| env
+                .get(name)
+                .map(|v| (*v).into()))
+            .unwrap()
+            .is_none()
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let mut settings = Settings::default();
+        let profile = local_profile("noauth", "http://127.0.0.1:8080/v1");
+        settings.remember_provider(&profile);
+        store.save(&settings).unwrap();
+        assert!(store.credential(ProviderKind::Local).unwrap().is_none());
+        assert!(matches!(
+            store.credential_for(&profile).unwrap(),
+            CredentialState::NotRequired
+        ));
+    }
+
+    #[test]
+    fn local_key_stored_under_profile_and_deleted_with_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let mut settings = Settings::default();
+        let first = local_profile("first", "http://127.0.0.1:8080/v1");
+        let second = local_profile("second", "http://localhost:8080/v1");
+        settings.remember_provider(&first);
+        settings.remember_provider(&second);
+        store.save(&settings).unwrap();
+        store
+            .save_local_credential("first", "first-secret-key")
+            .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.root().join("credentials.json")).unwrap())
+                .unwrap();
+        assert_eq!(raw["providers"]["local:first"], "first-secret-key");
+        assert!(raw["providers"].get("local").is_none());
+        match store.credential_for(&first).unwrap() {
+            CredentialState::Present(credential) => {
+                assert_eq!(credential.value, "first-secret-key");
+                assert_eq!(credential.source, "credentials.json");
+            }
+            _ => panic!("profile key expected"),
+        }
+        assert!(matches!(
+            store.credential_for(&second).unwrap(),
+            CredentialState::NotRequired
+        ));
+        // Cloud kinds never see a local profile key (env-independent check;
+        // the isolated child process covers resolution with a cleared env).
+        assert!(!raw["providers"].as_object().unwrap().contains_key("custom"));
+        assert!(store.credential(ProviderKind::Local).unwrap().is_none());
+        store.remove_local_profile(&mut settings, "first").unwrap();
+        assert!(!settings.local.profiles.contains_key("first"));
+        assert!(store.local_credential("first").unwrap().is_none());
+        assert!(
+            ConfigStore::at(store.root())
+                .unwrap()
+                .load()
+                .unwrap()
+                .local
+                .profiles
+                .contains_key("second")
+        );
+    }
+
+    #[test]
+    fn local_credentials_and_settings_never_use_unscoped_local_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        assert!(
+            store
+                .save_credential(ProviderKind::Local, "orphan-local-key")
+                .is_err()
+        );
+        assert!(store.save_local_credential("box", "short").is_err());
+        let mut settings = Settings::default();
+        let mut broken = ProviderSettings::new(ProviderKind::Local);
+        broken.local = None;
+        settings.remember_provider(&broken);
+        assert!(!settings.providers.contains_key("local"));
+        assert_eq!(settings.active, ProviderKind::Yandex);
+        assert!(
+            !fs::read_to_string(store.root().join("credentials.json"))
+                .unwrap_or_default()
+                .contains("orphan-local-key")
+        );
+    }
+
+    #[test]
+    fn deleted_profile_snapshot_works_without_key_and_fails_when_key_was_required() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let mut settings = Settings::default();
+        let open = local_profile("open", "http://127.0.0.1:8080/v1");
+        let mut keyed = local_profile("keyed", "http://127.0.0.1:8081/v1");
+        keyed.local.as_mut().unwrap().key_required = true;
+        settings.remember_provider(&open);
+        settings.remember_provider(&keyed);
+        store.save(&settings).unwrap();
+        store
+            .save_local_credential("keyed", "keyed-secret-value")
+            .unwrap();
+        store.remove_local_profile(&mut settings, "open").unwrap();
+        store.remove_local_profile(&mut settings, "keyed").unwrap();
+        // Session snapshots outlive their profiles.
+        assert!(matches!(
+            store.credential_for(&open).unwrap(),
+            CredentialState::NotRequired
+        ));
+        let error = store.credential_for(&keyed).unwrap_err().to_string();
+        assert!(error.contains("удалён"), "{error}");
+        assert!(!error.contains("keyed-secret-value"));
+    }
+
+    #[test]
+    fn local_key_is_bound_to_the_snapshot_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let mut settings = Settings::default();
+        let profile = local_profile("keyed", "http://127.0.0.1:8080/v1");
+        settings.remember_provider(&profile);
+        store.save(&settings).unwrap();
+        store
+            .save_local_credential("keyed", "keyed-secret")
+            .unwrap();
+        // Host aliases of the same loopback endpoint keep the key.
+        let mut alias = profile.clone();
+        alias.base_url = Some("http://localhost:8080/v1/".into());
+        assert!(matches!(
+            store.credential_for(&alias).unwrap(),
+            CredentialState::Present(_)
+        ));
+        // A different port is a different server: never send the key there.
+        let mut moved = profile.clone();
+        moved.base_url = Some("http://127.0.0.1:9090/v1".into());
+        let error = store.credential_for(&moved).unwrap_err().to_string();
+        assert!(
+            error.contains("/provider") || error.contains("--profile"),
+            "{error}"
+        );
+        assert!(!error.contains("keyed-secret"));
+        // A deleted profile has no key; a no-auth server still works.
+        store.remove_local_profile(&mut settings, "keyed").unwrap();
+        assert!(matches!(
+            store.credential_for(&profile).unwrap(),
+            CredentialState::NotRequired
+        ));
+    }
+
+    #[test]
+    fn key_required_profile_without_key_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        let mut settings = Settings::default();
+        let mut profile = local_profile("needs-key", "http://127.0.0.1:8080/v1");
+        profile.local.as_mut().unwrap().key_required = true;
+        settings.remember_provider(&profile);
+        store.save(&settings).unwrap();
+        assert!(matches!(
+            store.credential_for(&profile).unwrap(),
+            CredentialState::Missing
+        ));
+    }
+
+    #[test]
+    fn custom_credential_unchanged() {
+        // Values are never printed: developer environments may hold real keys.
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(temp.path().join("rcode")).unwrap();
+        store
+            .save_credential(ProviderKind::Custom, "custom-stored")
+            .unwrap();
+        let custom = ProviderSettings::new(ProviderKind::Custom);
+        assert!(matches!(
+            store.credential_for(&custom).unwrap(),
+            CredentialState::Present(_)
+        ));
     }
 }

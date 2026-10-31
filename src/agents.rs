@@ -585,6 +585,25 @@ fn context_size(messages: &[Message]) -> usize {
     serde_json::to_string(messages).map_or(MAX_CONTEXT_CHARS + 1, |text| text.chars().count())
 }
 
+/// Subagents keep the 64000-character cap; on a local server the request must
+/// also fit the estimated-token budget of the server context.
+fn context_overflow(
+    client: &ProviderClient,
+    messages: &[Message],
+    definitions: &[ToolDefinition],
+) -> Option<String> {
+    if context_size(messages) > MAX_CONTEXT_CHARS {
+        return Some("Контекст субагента достиг лимита 64000 символов".into());
+    }
+    let budget = client.context_budget(crate::context::estimate_tools(definitions));
+    (budget.is_tokens() && budget.request_used(messages) > budget.limit).then(|| {
+        format!(
+            "Контекст субагента превысил бюджет локальной модели: {} оценочных токенов",
+            budget.limit
+        )
+    })
+}
+
 async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
     let role = match task.role {
         AgentRole::Explorer => "explorer",
@@ -621,8 +640,8 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
         for message in &mut messages {
             redact_message(message, &secrets);
         }
-        if context_size(&messages) > MAX_CONTEXT_CHARS {
-            return Err("Контекст субагента достиг лимита 64000 символов".into());
+        if let Some(error) = context_overflow(&task.client, &messages, &definitions) {
+            return Err(error);
         }
         let mut completion = task
             .client
@@ -674,8 +693,8 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
             return Ok(result);
         }
         messages.push(Message::assistant(&completion));
-        if context_size(&messages) > MAX_CONTEXT_CHARS {
-            return Err("Контекст субагента достиг лимита 64000 символов".into());
+        if let Some(error) = context_overflow(&task.client, &messages, &definitions) {
+            return Err(error);
         }
         for call in completion.tool_calls {
             if tool_requests >= MAX_TOOL_REQUESTS {
@@ -728,8 +747,8 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
             }
             last_error = outcome.is_error.then(|| bounded(&outcome.content, 2000));
             messages.push(Message::tool(&call, outcome.content));
-            if context_size(&messages) > MAX_CONTEXT_CHARS {
-                return Err("Контекст субагента достиг лимита 64000 символов".into());
+            if let Some(error) = context_overflow(&task.client, &messages, &definitions) {
+                return Err(error);
             }
         }
     }
@@ -1485,5 +1504,34 @@ mod tests {
             .unwrap();
         assert!(!wait(&mut pool, &id).await.is_error);
         assert_eq!(pool.records()[0].result.chars().count(), 16000);
+    }
+
+    #[test]
+    fn local_subagent_context_respects_the_token_budget() {
+        let mut settings = crate::local::profile_settings(
+            "box",
+            "http://127.0.0.1:9/v1",
+            crate::local::LocalRuntime::Mlx,
+            "m",
+        );
+        settings.local.as_mut().unwrap().context_tokens = 8192;
+        settings.max_output_tokens = 2048;
+        // Constructing a client does not touch the network.
+        let local = ProviderClient::connect(settings, None).unwrap();
+        let definitions = Tools::definitions();
+        let small = vec![Message::user("короткая задача")];
+        assert!(context_overflow(&local, &small, &definitions).is_none());
+        // ~40 000 characters: under the 64 000-character cap, over 8192 tokens.
+        let large = vec![Message::user("fn main() { work(); } ".repeat(1800))];
+        assert!(context_size(&large) < MAX_CONTEXT_CHARS);
+        let error = context_overflow(&local, &large, &definitions).unwrap();
+        assert!(error.contains("оценочных токенов"), "{error}");
+        // Cloud subagents keep the character cap only.
+        let cloud = ProviderClient::new(
+            ProviderSettings::new(ProviderKind::Custom),
+            "agent-fixture-secret".into(),
+        )
+        .unwrap();
+        assert!(context_overflow(&cloud, &large, &definitions).is_none());
     }
 }

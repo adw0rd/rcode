@@ -1,9 +1,10 @@
 use crate::{
-    app::{Events, configured_tools, prepare_context, turn, user_shell},
+    app::{Events, configured_tools, context_budget, prepare_context, turn, user_shell},
     balance::BalanceMonitor,
     cli::{ApprovalMode, Cli},
     config::{ConfigStore, Effort, ProviderKind, ProviderSettings, Settings},
-    presentation,
+    context::ContextBudget,
+    local_app, presentation,
     protocol::{Message, ModelInfo, ProviderMeta},
     provider::ProviderClient,
     state::{AUTO_COMPACT_THRESHOLD, CONTEXT_LIMIT, Session},
@@ -79,6 +80,15 @@ async fn provider_choice(
     let mut pending = tokio::task::JoinSet::new();
     let mut choices = Vec::new();
     for (index, kind) in kinds.iter().copied().enumerate() {
+        if kind == ProviderKind::Local {
+            // Local servers have no balance API and no request is made here.
+            choices.push(Choice {
+                label: kind.to_string(),
+                detail: crate::local_ui::summary(settings, store),
+                enabled: true,
+            });
+            continue;
+        }
         let credential = store.credential(kind).ok().flatten();
         let detail = match credential {
             None => "настроить ключ доступа".into(),
@@ -156,23 +166,30 @@ fn commit_provider(
     p: ProviderSettings,
 ) -> Result<()> {
     p.validate()?;
-    let key = store
-        .credential(p.kind)?
-        .context("Нет ключа — сначала /connect")?;
-    let next = ProviderClient::new(p.clone(), key.value.clone())?;
-    settings.active = p.kind;
-    settings.providers.insert(p.kind.to_string(), p.clone());
+    if p.kind == ProviderKind::Local {
+        // The in-memory profiles may predate another process's changes.
+        settings.local = local_app::check_current(store, &p)?.local;
+    }
+    let next = local_app::client(store, &p, events, "Нет ключа — сначала /connect")?;
+    settings.remember_provider(&p);
     store.save(settings)?;
     session.provider = p;
     session.save(store)?;
     *client = next;
-    events.remember(key.value);
-    notice!(
-        "✓ {} / {} · effort {}",
-        session.provider.kind,
-        ui::safe(&session.provider.model),
-        session.provider.effort
-    );
+    if session.provider.kind == ProviderKind::Local {
+        notice!(
+            "✓ local · профиль {} / {}",
+            ui::safe(local_app::profile_name(&session.provider)),
+            ui::safe(&session.provider.model)
+        );
+    } else {
+        notice!(
+            "✓ {} / {} · effort {}",
+            session.provider.kind,
+            ui::safe(&session.provider.model),
+            session.provider.effort
+        );
+    }
     Ok(())
 }
 
@@ -200,13 +217,26 @@ async fn select_model(
     } else {
         model_target(session.provider.kind, args)
     };
-    let mut next = if kind == session.provider.kind {
+    let mut next = if kind == ProviderKind::Local
+        && (force_provider || session.provider.kind != ProviderKind::Local)
+    {
+        // /provider local: saved profiles, discovery or a manual address.
+        let Some(profile) = crate::local_ui::choose_profile(store, settings, rich).await? else {
+            return Ok(());
+        };
+        profile
+    } else if kind == session.provider.kind {
         session.provider.clone()
     } else {
         settings.provider(kind)
     };
-    if store.credential(kind)?.is_none() {
+    if kind != ProviderKind::Local && store.credential(kind)?.is_none() {
         next = ui::connect(store, settings, Some(kind), rich, None).await?;
+    }
+    if kind == ProviderKind::Local {
+        // A session snapshot whose profile moved or was removed neither lists
+        // models nor asks for a key: that key would be saved under the name.
+        local_app::check_current(store, &next)?;
     }
     if let Some(id) = model {
         if id != next.model {
@@ -219,11 +249,13 @@ async fn select_model(
         models.clear();
         return Ok(());
     }
-    let key = store
-        .credential(kind)?
-        .context("Нет ключа выбранного провайдера")?;
-    let mut candidate_client = ProviderClient::new(next.clone(), key.value)?;
-    let Some(mut fetched) = catalog(&mut candidate_client, events).await? else {
+    let Some(mut fetched) = (if kind == ProviderKind::Local {
+        local_catalog(store, &mut next, events).await?
+    } else {
+        let mut candidate_client =
+            local_app::client(store, &next, events, "Нет ключа выбранного провайдера")?;
+        catalog(&mut candidate_client, events).await?
+    }) else {
         return Ok(());
     };
     fetched.sort_by(|a, b| {
@@ -231,7 +263,7 @@ async fn select_model(
             .cmp(&(b.id != next.model))
             .then_with(|| a.id.cmp(&b.id))
     });
-    if !fetched.iter().any(|m| m.id == next.model) {
+    if !next.model.is_empty() && !fetched.iter().any(|m| m.id == next.model) {
         fetched.insert(
             0,
             ModelInfo {
@@ -253,6 +285,11 @@ async fn select_model(
             }
             if m.supports_tools == Some(false) {
                 parts.push("нет вызова инструментов".into());
+            } else if kind == ProviderKind::Local && m.supports_tools.is_none() {
+                parts.push("инструменты не подтверждены".into());
+            }
+            if m.supports_images == Some(true) {
+                parts.push("изображения".into());
             }
             Choice {
                 label: m.name.clone(),
@@ -287,6 +324,40 @@ async fn select_model(
     *models = fetched;
     Ok(())
 }
+/// Models of a local profile endpoint; a 401/403 asks once for the profile key.
+/// Unreachable servers still allow a manual model ID.
+async fn local_catalog(
+    store: &ConfigStore,
+    profile: &mut ProviderSettings,
+    events: &Events,
+) -> Result<Option<Vec<ModelInfo>>> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if let Some(screen) = crate::screen::current() {
+        screen.bind_cancel(cancel.clone());
+    }
+    events.busy("Получаю список моделей локального сервера");
+    let result = tokio::select! {
+        value = crate::local_ui::catalog(store, profile) => Some(value),
+        _ = tokio::signal::ctrl_c() => None,
+        _ = cancel.cancelled() => None,
+    };
+    events.pause();
+    let fetched = match result {
+        None => return Ok(None),
+        Some(Ok((models, _))) => models,
+        Some(Err(error)) => {
+            // A profile moved meanwhile is an error, not a missing catalog.
+            local_app::check_current(store, profile)?;
+            notice!(
+                "Список моделей недоступен: {}. Можно ввести ID модели вручную.",
+                ui::safe(&events.redact(&format!("{error:#}")))
+            );
+            Vec::new()
+        }
+    };
+    Ok(Some(crate::local_ui::local_models(fetched, &profile.model)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn select_effort(
     args: &[&str],
@@ -359,7 +430,7 @@ async fn select_effort(
     p.effort = effort;
     commit_provider(store, settings, session, client, events, p)
 }
-fn footer(session: &Session, runtime: &Cli, plan: bool) -> Footer {
+fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) -> Footer {
     Footer {
         model: session.provider.model.clone(),
         provider: session.provider.kind.to_string(),
@@ -378,7 +449,9 @@ fn footer(session: &Session, runtime: &Cli, plan: bool) -> Footer {
             "ask".into()
         },
         plan,
-        context_chars: session.context_chars(),
+        context_chars: budget.request_used(&session.messages),
+        context_limit: budget.limit,
+        context_tokens: budget.is_tokens(),
         input_tokens: session.usage.input_tokens,
         output_tokens: session.usage.output_tokens,
         workspace: session
@@ -389,7 +462,13 @@ fn footer(session: &Session, runtime: &Cli, plan: bool) -> Footer {
             .into_owned(),
     }
 }
-fn status(session: &Session, runtime: &Cli, plan: bool, models: &[ModelInfo]) {
+fn status(
+    session: &Session,
+    runtime: &Cli,
+    plan: bool,
+    models: &[ModelInfo],
+    budget: &ContextBudget,
+) {
     notice!(
         "\nМодель       {} / {}\nEffort       {}\nРежим        {} · shell {}\nПапка        {}\nСессия       {}",
         session.provider.kind,
@@ -414,9 +493,35 @@ fn status(session: &Session, runtime: &Cli, plan: bool, models: &[ModelInfo]) {
         session.root.display(),
         session.id
     );
-    context(session, models);
+    if session.provider.kind == ProviderKind::Local {
+        notice!(
+            "Профиль      local · {} @{}",
+            ui::safe(local_app::profile_name(&session.provider)),
+            ui::safe(session.provider.base_url.as_deref().unwrap_or_default())
+        );
+    }
+    context(session, models, budget);
 }
-fn context(session: &Session, models: &[ModelInfo]) {
+fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget) {
+    if budget.is_tokens() {
+        // Local: estimated tokens against the server context; nothing is invented.
+        notice!(
+            "Контекст     ~{} / {} оценочных токенов (вместе с системным промптом и инструментами)",
+            budget.request_used(&session.messages),
+            budget.limit
+        );
+        notice!("{}", budget.limit_sentence());
+        if session.last_usage.input_tokens > 0 {
+            notice!(
+                "Последний запрос — {} входных токенов по данным сервера",
+                session.last_usage.input_tokens
+            );
+        }
+        notice!(
+            "История сокращается автоматически перед запросом, когда приближается к лимиту. /compact сокращает её вручную, /clear создаёт новую сессию."
+        );
+        return;
+    }
     notice!(
         "Контекст     {} / {} символов — локальный бюджет CLI",
         session.context_chars(),
@@ -622,14 +727,17 @@ pub async fn run(
 ) -> Result<i32> {
     let rich = events.display.is_rich();
     let _screen = if rich {
-        Some(crate::screen::start(footer(session, cli, cli.plan))?)
+        Some(crate::screen::start(footer(
+            session,
+            cli,
+            cli.plan,
+            &context_budget(client, session, cli, cli.plan),
+        ))?)
     } else {
         None
     };
     let mut runtime = cli.clone();
-    let mut balance_monitor = crate::screen::current().map(|screen| {
-        BalanceMonitor::start(client.clone(), session.provider.model.clone(), screen)
-    });
+    let mut balance_monitor = start_balance_monitor(client, session);
     let mut plan = cli.plan;
     let mut composer = terminal::Editor::new();
     let mut input_history =
@@ -662,7 +770,12 @@ pub async fn run(
     let restored_context = if cli.resume.is_some() {
         // Compact before hydration, then announce below the restored conversation.
         // An oversized protected task remains available for /compact or /new.
-        Some(prepare_context(session, store, 0)?)
+        Some(prepare_context(
+            session,
+            store,
+            0,
+            &context_budget(client, session, cli, plan),
+        )?)
     } else {
         None
     };
@@ -671,13 +784,14 @@ pub async fn run(
         context.report(events);
     }
     loop {
+        let budget = context_budget(client, session, &runtime, plan);
         if let Some(screen) = crate::screen::current() {
-            screen.set_footer(footer(session, &runtime, plan));
+            screen.set_footer(footer(session, &runtime, plan, &budget));
         }
         let input = if let Some(p) = first.take() {
             Input::Submit(p)
         } else if rich {
-            composer.read(&footer(session, &runtime, plan))?
+            composer.read(&footer(session, &runtime, plan, &budget))?
         } else {
             composer.read_plain(if plan {
                 "rcode [план] › "
@@ -721,7 +835,7 @@ pub async fn run(
             input_history = None;
         }
         if let Some(command) = input.strip_prefix('!') {
-            if let Err(error) = user_shell(session, store, tools, events, command).await {
+            if let Err(error) = user_shell(session, store, tools, events, command, &budget).await {
                 events.emit(
                     "error",
                     json!({"message":events.redact(&format!("{error:#}"))}),
@@ -755,7 +869,7 @@ pub async fn run(
                     }Ok(())
                 },
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
-                "/status"=>{status(session,&runtime,plan,&models);Ok(())},
+                "/status"=>{status(session,&runtime,plan,&models,&budget);Ok(())},
                 "/balance"=>{
                     if !args.is_empty(){bail!("/balance — баланс текущего провайдера; сменить провайдера: /provider");}
                     let cancel=tokio_util::sync::CancellationToken::new();
@@ -775,7 +889,7 @@ pub async fn run(
                     notice!("{}",events.redact(&agents_view(records,args.first().copied())?));
                     Ok(())
                 },
-                "/context"=>{context(session,&models);Ok(())},
+                "/context"=>{context(session,&models,&budget);Ok(())},
                 "/export"=>{
                     let path=crate::export::write(session,input.strip_prefix(command).unwrap_or_default(),|text|events.redact(text))?;
                     notice!("✓ Диалог сохранён: {}",ui::safe(&events.redact(&path.to_string_lossy())));
@@ -784,7 +898,7 @@ pub async fn run(
                 "/cost"=>{cost(session);Ok(())},
                 "/diff"=>{notice!("{}",ui::safe(&tools.diff()?));Ok(())},
                 "/undo"=>{let text=tools.undo()?;notice!("{}",ui::safe(&text));let mut message=Message::user(format!("Пользователь выполнил /undo: {text}. Перечитай файлы перед изменениями."));message.provider_meta=Some(ProviderMeta{kind:"rcode_runtime".into(),data:json!({"undo":true})});session.messages.push(message);session.save(store)},
-                "/compact"=>{let saved=session.compact()?;session.save(store)?;notice!("✓ История сокращена на {saved} символов");Ok(())},
+                "/compact"=>{let saved=session.compact_within(&budget)?;session.save(store)?;notice!("✓ История сокращена на {saved} {}",budget.unit_label());Ok(())},
                 "/clear"|"/new"=>{*session=Session::new(&session.root,session.provider.clone())?;session.save(store)?;*tools=configured_tools(&session.root,&session.dir(store).join("checkpoints"),&runtime)?;notice!("✓ Новая сессия: {}",session.id);Ok(())},
                 "/resume"=>{
                     let id=if let Some(id)=args.first(){Some((*id).to_owned())}else{
@@ -794,10 +908,11 @@ pub async fn run(
                         }
                     };
                     if let Some(id)=id{
-                        let mut restored=Session::load(store,&id,&session.root)?;let key=store.credential(restored.provider.kind)?.context("Нет ключа провайдера сохранённой сессии")?;
-                        let next=ProviderClient::new(restored.provider.clone(),key.value.clone())?;
+                        // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
+                        let mut restored=Session::load(store,&id,&session.root)?;
+                        let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;events.remember(key.value);models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        *session=restored;*client=next;*tools=next_tools;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _=>bail!("Неизвестная команда. / открывает меню, /help — справку"),
@@ -807,9 +922,7 @@ pub async fn run(
                 "/model" | "/models" | "/provider" | "/connect" | "/login" | "/effort" | "/resume"
             ) {
                 drop(balance_monitor.take());
-                balance_monitor = crate::screen::current().map(|screen| {
-                    BalanceMonitor::start(client.clone(), session.provider.model.clone(), screen)
-                });
+                balance_monitor = start_balance_monitor(client, session);
             }
             events.pause();
             if let Err(e) = result {
@@ -831,6 +944,15 @@ pub async fn run(
     }
     events.pause();
     Ok(0)
+}
+
+/// Background balance for cloud providers; a local server has no balance API.
+fn start_balance_monitor(client: &ProviderClient, session: &Session) -> Option<BalanceMonitor> {
+    if session.provider.kind == ProviderKind::Local {
+        return None;
+    }
+    crate::screen::current()
+        .map(|screen| BalanceMonitor::start(client.clone(), session.provider.model.clone(), screen))
 }
 
 fn hydrate(session: &Session, events: &Events) {
@@ -941,6 +1063,23 @@ mod tests {
             (ProviderKind::OpenRouter, Some("qwen/coder".into()))
         );
     }
+    #[test]
+    fn efforts_for_local_is_only_auto() {
+        let local = crate::local::profile_settings(
+            "box",
+            "http://127.0.0.1:8080/v1",
+            crate::local::LocalRuntime::LlamaCpp,
+            "m",
+        );
+        let reasoning = ModelInfo {
+            supports_reasoning: Some(true),
+            supported_efforts: Some(vec![Effort::Low, Effort::High]),
+            ..ModelInfo::default()
+        };
+        assert_eq!(efforts(&local, None), vec![Effort::Auto]);
+        assert_eq!(efforts(&local, Some(&reasoning)), vec![Effort::Auto]);
+    }
+
     #[test]
     fn unsupported_effort_is_not_offered() {
         let p = ProviderSettings::new(ProviderKind::OpenRouter);

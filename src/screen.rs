@@ -476,6 +476,8 @@ impl Screen {
             permissions: "ask".into(),
             plan: false,
             context_chars: 0,
+            context_limit: crate::state::CONTEXT_LIMIT,
+            context_tokens: false,
             input_tokens: 0,
             output_tokens: 0,
             workspace: "project".into(),
@@ -569,12 +571,22 @@ fn status(
             mode
         )
     };
-    let percent = footer.context_chars.saturating_mul(100) / 180_000;
+    let percent = footer.context_percent();
     let filled = (percent.min(100) / 10).min(10);
     let meter = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
+    // Local servers: estimated tokens of the server context, not characters.
+    let unit = if footer.context_tokens {
+        format!(
+            "~{}/{} ток.",
+            num(footer.context_chars as u64),
+            num(footer.context_limit as u64)
+        )
+    } else {
+        "лок.".into()
+    };
     let second = if width >= 78 {
         format!(
-            "Контекст [{meter}] {percent}% лок. · ↑{} ↓{} ток. · {}",
+            "Контекст [{meter}] {percent}% {unit} · ↑{} ↓{} ток. · {}",
             num(footer.input_tokens),
             num(footer.output_tokens),
             if scroll == 0 {
@@ -585,7 +597,12 @@ fn status(
         )
     } else {
         format!(
-            "Контекст {percent}% лок. · ↑{} ↓{}",
+            "Контекст {percent}% {} · ↑{} ↓{}",
+            if footer.context_tokens {
+                "~ток."
+            } else {
+                "лок."
+            },
             num(footer.input_tokens),
             num(footer.output_tokens)
         )
@@ -1409,6 +1426,31 @@ impl Drop for Suspended {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_meter_uses_the_footer_budget_unit() {
+        let mut footer = Footer {
+            model: "m".into(),
+            provider: "local".into(),
+            effort: "auto".into(),
+            permissions: "ask".into(),
+            plan: false,
+            context_chars: 90_000,
+            context_limit: crate::state::CONTEXT_LIMIT,
+            context_tokens: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            workspace: "project".into(),
+        };
+        let cloud = status(&footer, "", 120, 0, 120)[1].0.clone();
+        assert!(cloud.contains("50% лок."), "{cloud}");
+        footer.context_tokens = true;
+        footer.context_limit = 20_000;
+        footer.context_chars = 5_000;
+        let local = status(&footer, "", 120, 0, 120)[1].0.clone();
+        assert!(local.contains("25% ~5.0k/20.0k ток."), "{local}");
+        assert!(status(&footer, "", 60, 0, 60)[1].0.contains("~ток."));
+    }
 
     fn route(screen: &Screen, event: Event) {
         // Match compose's test viewport instead of reading the host console size.

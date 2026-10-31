@@ -19,7 +19,6 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) const MAX_INPUT: usize = 65_536;
-const CONTEXT_BUDGET: usize = 180_000;
 pub(crate) const MAX_HISTORY: usize = 1_000;
 
 #[derive(Clone, Debug)]
@@ -29,10 +28,23 @@ pub struct Footer {
     pub effort: String,
     pub permissions: String,
     pub plan: bool,
+    /// Used local context: characters for cloud, estimated tokens for local.
     pub context_chars: usize,
+    pub context_limit: usize,
+    /// The budget is in estimated tokens of a local server context.
+    pub context_tokens: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub workspace: String,
+}
+
+impl Footer {
+    pub fn context_percent(&self) -> usize {
+        self.context_chars
+            .saturating_mul(100)
+            .checked_div(self.context_limit)
+            .unwrap_or(0)
+    }
 }
 
 pub struct CommandSpec {
@@ -905,14 +917,32 @@ fn editor_layout(
         view.push(status, RowStyle::Subtle, width);
     }
     if footer_rows > 1 {
-        let percent = footer
-            .context_chars
-            .saturating_mul(100)
-            .checked_div(CONTEXT_BUDGET)
-            .unwrap_or(0);
+        let percent = footer.context_percent();
         let filled = percent.min(100) / 10;
         let meter = format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled));
-        let context = if width >= 90 {
+        let context = if footer.context_tokens {
+            if width >= 90 {
+                format!(
+                    "Контекст [{meter}] {percent}% · ~{}/{} ток. (оценка) · токены ↑{} ↓{}",
+                    grouped(footer.context_chars as u64),
+                    grouped(footer.context_limit as u64),
+                    grouped(footer.input_tokens),
+                    grouped(footer.output_tokens)
+                )
+            } else if width >= 59 {
+                format!(
+                    "Контекст [{meter}] {percent}% (оценка) · ↑{} ↓{} ток.",
+                    grouped(footer.input_tokens),
+                    grouped(footer.output_tokens)
+                )
+            } else {
+                format!(
+                    "Контекст ~{percent}% · ↑{} ↓{} ток.",
+                    grouped(footer.input_tokens),
+                    grouped(footer.output_tokens)
+                )
+            }
+        } else if width >= 90 {
             format!(
                 "Контекст [{meter}] {percent}% · локальный {}/180 000 симв. · токены ↑{} ↓{}",
                 grouped(footer.context_chars as u64),
@@ -1395,6 +1425,8 @@ mod tests {
             permissions: "спрашивать".into(),
             plan: true,
             context_chars: 90_000,
+            context_limit: 180_000,
+            context_tokens: false,
             input_tokens: 1234,
             output_tokens: 567,
             workspace: "/путь/с/宽/символами\u{1b}[2J".into(),
@@ -1577,6 +1609,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn footer_shows_estimated_tokens_for_local() {
+        let mut footer = footer();
+        footer.context_tokens = true;
+        footer.context_limit = 25_396;
+        footer.context_chars = 12_698;
+        let text = editor_view(&ReadState::default(), &footer, 180, 24)
+            .rows
+            .join("\n");
+        assert!(text.contains("50%"), "{text}");
+        assert!(text.contains("~12 698/25 396 ток. (оценка)"), "{text}");
+        assert!(!text.contains("180 000") && !text.contains("симв."));
+        let narrow = editor_view(&ReadState::default(), &footer, 80, 24)
+            .rows
+            .join("\n");
+        assert!(narrow.contains("[█████░░░░░] 50% (оценка)"), "{narrow}");
     }
 
     #[test]

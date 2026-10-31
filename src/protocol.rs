@@ -114,6 +114,8 @@ pub struct Completion {
     pub finish_reason: String,
     pub model: Option<String>,
     pub provider_meta: Option<ProviderMeta>,
+    /// Local-server reasoning; never shown, stored in history or sent back.
+    pub reasoning: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -127,6 +129,8 @@ pub struct ModelInfo {
     pub supports_reasoning: Option<bool>,
     #[serde(default)]
     pub supported_efforts: Option<Vec<Effort>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_images: Option<bool>,
 }
 
 #[cfg(test)]

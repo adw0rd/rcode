@@ -244,7 +244,7 @@ impl BalanceReport {
             ProviderKind::OpenRouter => Some("https://openrouter.ai/settings/credits"),
             ProviderKind::GigaChat => Some("https://developers.sber.ru/studio/"),
             ProviderKind::Yandex => Some("https://center.yandex.cloud/billing/accounts"),
-            ProviderKind::Custom => None,
+            ProviderKind::Custom | ProviderKind::Local => None,
         };
         if let Some(link) = link {
             rows.push(format!("Кабинет: {link}"));
