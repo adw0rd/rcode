@@ -6,7 +6,7 @@
 [![Релиз](https://img.shields.io/github/v/release/adw0rd/rcode)](https://github.com/adw0rd/rcode/releases/latest)
 [![MIT](https://img.shields.io/badge/лицензия-MIT-blue)](LICENSE)
 
-Выберите GigaChat, Yandex AI Studio, OpenRouter или свой OpenAI-совместимый API, подключите ключ и опишите задачу. rcode изучает проект, редактирует файлы, запускает команды и проверяет результат. Написан на Rust, интерфейс и справка — на русском.
+Выберите GigaChat, Yandex AI Studio, OpenRouter, локальную модель (Ollama, llama.cpp, MLX, LM Studio на вашем компьютере) или свой OpenAI-совместимый API, подключите ключ и опишите задачу. rcode изучает проект, редактирует файлы, запускает команды и проверяет результат. Написан на Rust, интерфейс и справка — на русском.
 
 ![GigaChat Ultra создаёт FastAPI-приложение в rcode](docs/demo.gif)
 
