@@ -18,6 +18,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 macro_rules! notice {($($arg:tt)*)=>{crate::screen::notice(format!($($arg)*))};}
@@ -854,7 +855,7 @@ fn bounded_agent_text(text: &str, limit: usize) -> String {
     }
     result
 }
-fn help() {
+fn help(registry: &crate::commands::CommandRegistry) {
     notice!("\nКоманды rcode");
     for c in terminal::COMMANDS {
         notice!("  {:15} {}", c.name, c.description);
@@ -862,6 +863,41 @@ fn help() {
     notice!(
         "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать"
     );
+    let custom: Vec<_> = registry.loadable().collect();
+    if !custom.is_empty() {
+        notice!("\nПользовательские команды");
+        for c in custom {
+            let hint = c
+                .hint
+                .as_deref()
+                .map(|hint| format!(" [{hint}]"))
+                .unwrap_or_default();
+            notice!(
+                "  {:15} {} · {}",
+                format!("/{}", c.name),
+                format!("{}{hint}", c.description),
+                c.scope.as_str()
+            );
+        }
+        let unsupported: Vec<_> = registry
+            .loadable()
+            .filter(|c| !c.unsupported.is_empty())
+            .map(|c| format!("/{}", c.name))
+            .collect();
+        if !unsupported.is_empty() {
+            notice!(
+                "  {} — синтаксис !-shell и @файл не исполняется, текст уходит модели как есть",
+                unsupported.join(", ")
+            );
+        }
+    }
+    if registry
+        .commands
+        .iter()
+        .any(|c| c.shadowed_by == Some(crate::commands::Shadow::Builtin))
+    {
+        notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
+    }
     notice!(
         "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
@@ -956,6 +992,22 @@ fn skill_problems(problems: &[SkillProblem], events: &Events) {
         notice!("! Скиллы: ещё предупреждений — {}", problems.len() - SHOWN);
     }
 }
+
+/// Command-file warnings, at most ten lines; shown again only when the set changes.
+fn command_problems(problems: &[crate::commands::CommandProblem], events: &Events) {
+    const SHOWN: usize = 10;
+    for problem in problems.iter().take(SHOWN) {
+        notice!(
+            "! {}: {} ({})",
+            ui::safe(&events.redact(&problem.path.display().to_string())),
+            problem.message,
+            problem.code
+        );
+    }
+    if problems.len() > SHOWN {
+        notice!("! Команды: ещё предупреждений — {}", problems.len() - SHOWN);
+    }
+}
 /// `skills`: the snapshot `dispatch` discovered; later inputs rediscover.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -1027,6 +1079,8 @@ pub(crate) async fn run(
         context.report(events);
     }
     let mut shown_problems = Vec::new();
+    let mut shown_command_problems: Vec<String> = Vec::new();
+    let mut unsupported_shown: HashSet<String> = HashSet::new();
     let mut snapshot = Some(skills);
     loop {
         // New and changed skills are picked up without a restart; one turn
@@ -1038,6 +1092,24 @@ pub(crate) async fn run(
             skill_problems(&skills.problems, events);
             shown_problems = skills.problems.clone();
         }
+        let registry = crate::commands::CommandRegistry::discover(store.root(), &session.root);
+        let command_fingerprints: Vec<String> = registry
+            .problems
+            .iter()
+            .map(|problem| {
+                format!(
+                    "{}|{}|{}",
+                    problem.path.display(),
+                    problem.code,
+                    problem.message
+                )
+            })
+            .collect();
+        if command_fingerprints != shown_command_problems {
+            command_problems(&registry.problems, events);
+            shown_command_problems = command_fingerprints;
+        }
+        composer.set_commands(registry.menu());
         let budget = context_budget(client, session, &runtime, plan, &skills);
         if let Some(screen) = crate::screen::current() {
             screen.set_footer(footer(session, &runtime, plan, &budget));
@@ -1111,8 +1183,12 @@ pub(crate) async fn run(
             if matches!(command, "/exit" | "/quit") {
                 break;
             }
+            let custom = command
+                .strip_prefix('/')
+                .and_then(|name| registry.find(name))
+                .map(|entry| (entry.name.clone(), entry.unsupported.to_vec()));
             let result:Result<()>=async{match command{
-                "/help"=>{help();Ok(())},
+                "/help"=>{help(&registry);Ok(())},
                 "/model"|"/models"=>select_model(&args,false,rich,store,settings,session,client,events,&mut models).await,
                 "/provider"=>select_model(&args,true,rich,store,settings,session,client,events,&mut models).await,
                 "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
@@ -1188,6 +1264,29 @@ pub(crate) async fn run(
                         *session=restored;*client=next;*tools=next_tools;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
+                _ if custom.is_some() => {
+                    let (name, unsupported) = custom.unwrap();
+                    if !unsupported.is_empty() && unsupported_shown.insert(name.clone()) {
+                        notice!(
+                            "Команда «/{name}» содержит !-shell или @файл — это не исполняется: rcode передаёт текст модели, а команды выполняются только инструментами с подтверждением"
+                        );
+                    }
+                    let arguments = input.strip_prefix(command).unwrap_or_default().trim_start();
+                    let prompt = registry
+                        .find(&name)
+                        .context("Команда исчезла при перечитывании")?
+                        .expand(arguments)?;
+                    if rich {
+                        notice!(
+                            "\n{} {}",
+                            presentation::tone("❯", "1;38;5;110", true),
+                            ui::safe(&redacted)
+                        );
+                    }
+                    turn(session, store, tools, client, events, &runtime, &prompt, plan, &skills)
+                        .await
+                        .map(drop)
+                }
                 _=>bail!("Неизвестная команда. / открывает меню, /help — справку"),
             }}.await;
             if matches!(

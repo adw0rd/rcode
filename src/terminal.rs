@@ -143,6 +143,24 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
+#[derive(Clone)]
+pub struct MenuCommand {
+    pub name: String,
+    pub description: String,
+    pub custom: bool,
+}
+
+fn builtin_menu() -> Vec<MenuCommand> {
+    COMMANDS
+        .iter()
+        .map(|command| MenuCommand {
+            name: command.name.to_owned(),
+            description: command.description.to_owned(),
+            custom: false,
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Input {
     Submit(String),
@@ -153,6 +171,7 @@ pub enum Input {
 #[derive(Default)]
 pub struct Editor {
     history: Vec<String>,
+    custom: Vec<MenuCommand>,
 }
 
 impl Editor {
@@ -160,10 +179,19 @@ impl Editor {
         Self::default()
     }
 
+    pub fn set_commands(&mut self, custom: Vec<MenuCommand>) {
+        self.custom = custom;
+    }
+
     pub fn read_plain(&self, prompt: &str) -> Result<Input> {
         // Readline owns Unix signal handlers while alive. Drop it before any
         // API wait so Ctrl+C reaches Tokio; the shared input history lives here.
-        let mut editor = crate::ui::editor()?;
+        let names: Vec<String> = self
+            .custom
+            .iter()
+            .map(|command| command.name.clone())
+            .collect();
+        let mut editor = crate::ui::editor_with_commands(&names)?;
         for entry in &self.history {
             let _ = editor.add_history_entry(entry.as_str());
         }
@@ -184,7 +212,9 @@ impl Editor {
         }
         let _guard = TerminalGuard::enter()?;
         let mut frame = InlineFrame::new(crate::screen::Mode::Editor);
-        let mut state = ReadState::default();
+        let mut menu = builtin_menu();
+        menu.extend(self.custom.iter().cloned());
+        let mut state = ReadState::new(menu);
         loop {
             let (width, height) = terminal::size()?;
             let view = if frame.fullscreen() {
@@ -461,16 +491,35 @@ impl Buffer {
     }
 }
 
-#[derive(Default)]
 struct ReadState {
     buffer: Buffer,
     history_index: Option<usize>,
     draft: String,
     command_index: usize,
     menu_dismissed: bool,
+    menu: Vec<MenuCommand>,
+}
+
+impl Default for ReadState {
+    fn default() -> Self {
+        Self {
+            buffer: Buffer::default(),
+            history_index: None,
+            draft: String::new(),
+            command_index: 0,
+            menu_dismissed: false,
+            menu: builtin_menu(),
+        }
+    }
 }
 
 impl ReadState {
+    fn new(menu: Vec<MenuCommand>) -> Self {
+        Self {
+            menu,
+            ..Self::default()
+        }
+    }
     fn key(&mut self, key: KeyEvent, history: &[String]) -> Option<Input> {
         if key.kind == KeyEventKind::Release {
             return None;
@@ -577,7 +626,7 @@ impl ReadState {
         if self.menu_dismissed || !text.starts_with('/') || text.chars().any(char::is_whitespace) {
             return vec![];
         }
-        COMMANDS
+        self.menu
             .iter()
             .enumerate()
             .filter_map(|(index, command)| command.name.starts_with(text).then_some(index))
@@ -586,8 +635,9 @@ impl ReadState {
 
     fn complete(&mut self) {
         if let Some(index) = self.commands().get(self.command_index).copied() {
+            let name = self.menu[index].name.clone();
             self.buffer = Buffer::default();
-            self.buffer.insert(COMMANDS[index].name);
+            self.buffer.insert(&name);
             self.menu_dismissed = true;
         }
     }
@@ -881,7 +931,7 @@ fn editor_layout(
         let selected = state.command_index.min(commands.len() - 1);
         let offset = selected.saturating_sub(menu_rows - 1);
         for (position, &index) in commands.iter().enumerate().skip(offset).take(menu_rows) {
-            let command = &COMMANDS[index];
+            let command = &state.menu[index];
             let selected = position == selected;
             view.push(
                 format!(
@@ -1517,7 +1567,7 @@ mod tests {
         assert_eq!(
             matches
                 .iter()
-                .map(|&i| COMMANDS[i].name)
+                .map(|&i| state.menu[i].name.as_str())
                 .collect::<Vec<_>>(),
             ["/provider", "/permissions", "/plan"]
         );

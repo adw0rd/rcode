@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod balance;
 mod certificates;
+pub(crate) mod commands;
 pub mod config;
 pub mod context;
 pub(crate) mod frontmatter;

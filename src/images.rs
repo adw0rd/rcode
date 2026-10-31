@@ -189,7 +189,7 @@ fn image_path(text: &str) -> bool {
 
 /// Сохраняет исходные кавычки/пробелы обычного текста. Декодирует только пути
 /// в кавычках и экранирование пробелов, которые терминалы вставляют при drop.
-fn tokens(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+pub(crate) fn tokens(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut result = Vec::new();
     let mut chars = text.char_indices().peekable();
     while let Some((start, first)) = chars.next() {

@@ -379,7 +379,9 @@ pub fn approve(preview: &str) -> Result<Approval> {
     }
 }
 
-pub struct CommandHelper;
+pub struct CommandHelper {
+    extra: Vec<String>,
+}
 impl rustyline::Helper for CommandHelper {}
 impl rustyline::validate::Validator for CommandHelper {}
 impl rustyline::highlight::Highlighter for CommandHelper {}
@@ -395,9 +397,13 @@ impl rustyline::completion::Completer for CommandHelper {
         _: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
         let prefix = &line[..pos];
-        let candidates = crate::terminal::COMMANDS
+        let mut names: Vec<&str> = crate::terminal::COMMANDS
             .iter()
             .map(|command| command.name)
+            .collect();
+        names.extend(self.extra.iter().map(String::as_str));
+        let candidates = names
+            .into_iter()
             .filter(|s| s.starts_with(prefix))
             .map(|s| rustyline::completion::Pair {
                 display: s.into(),
@@ -408,11 +414,18 @@ impl rustyline::completion::Completer for CommandHelper {
     }
 }
 pub fn editor() -> Result<rustyline::Editor<CommandHelper, rustyline::history::DefaultHistory>> {
+    editor_with_commands(&[])
+}
+pub fn editor_with_commands(
+    extra: &[String],
+) -> Result<rustyline::Editor<CommandHelper, rustyline::history::DefaultHistory>> {
     let config = rustyline::Config::builder()
         .max_history_size(crate::terminal::MAX_HISTORY)?
         .build();
     let mut editor = rustyline::Editor::with_config(config)?;
-    editor.set_helper(Some(CommandHelper));
+    editor.set_helper(Some(CommandHelper {
+        extra: extra.to_vec(),
+    }));
     Ok(editor)
 }
 
