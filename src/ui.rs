@@ -359,16 +359,27 @@ pub(crate) fn pick_model(
 pub enum Approval {
     Yes,
     No,
+    /// «Разрешить похожие»: сохранить правило для этого проекта.
+    Always,
     Cancel,
 }
-pub fn approve(preview: &str) -> Result<Approval> {
+pub fn approve(preview: &str, always: Option<&str>) -> Result<Approval> {
     if let Some(screen) = crate::screen::current() {
-        return screen.approve(&safe(preview));
+        return screen.approve(&safe(preview), always);
     }
     eprintln!("\n{}", safe(preview));
+    let hint = match always {
+        Some(token) => format!(
+            "Разрешить? [y/N/a] (a — разрешить «{}» всегда) ",
+            safe(token)
+        ),
+        None => "Разрешить? [y/N] ".to_owned(),
+    };
     let mut editor = rustyline::DefaultEditor::new()?;
-    match editor.readline("Разрешить? [y/N] ") {
-        Ok(s) => Ok(if matches!(s.trim(), "y" | "Y" | "yes" | "да" | "д") {
+    match editor.readline(&hint) {
+        Ok(s) => Ok(if matches!(s.trim(), "a" | "A" | "ф" | "Ф" | "always") {
+            Approval::Always
+        } else if matches!(s.trim(), "y" | "Y" | "yes" | "да" | "д") {
             Approval::Yes
         } else {
             Approval::No

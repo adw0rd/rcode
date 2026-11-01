@@ -466,6 +466,10 @@ impl CredentialState {
 struct ProjectPermissions {
     version: u32,
     projects: BTreeMap<PathBuf, ApprovalMode>,
+    /// Первый токен shell-команд, разрешённых без подтверждения в проекте
+    /// («Разрешить похожие» в диалоге подтверждения).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    shell_allow: BTreeMap<PathBuf, Vec<String>>,
 }
 
 impl Default for ProjectPermissions {
@@ -473,6 +477,7 @@ impl Default for ProjectPermissions {
         Self {
             version: FORMAT_VERSION,
             projects: BTreeMap::new(),
+            shell_allow: BTreeMap::new(),
         }
     }
 }
@@ -580,6 +585,37 @@ impl ConfigStore {
         let _lock = lock_state_file(&self.root.join("permissions.lock"))?;
         let mut permissions = self.load_permissions()?;
         permissions.projects.insert(root, mode);
+        write_private_json(&self.root.join("permissions.json"), &permissions)
+    }
+
+    /// Сохранённые правила «Разрешить похожие» для проекта.
+    pub fn shell_rules(&self, root: &Path) -> Vec<String> {
+        self.load_permissions()
+            .ok()
+            .and_then(|permissions| {
+                let root = root.canonicalize().ok()?;
+                permissions.shell_allow.get(&root).cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn add_shell_rule(&self, root: &Path, token: &str) -> Result<()> {
+        if token.is_empty()
+            || token.len() > 48
+            || token
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            bail!("Недопустимый токен правила «{token:?}»");
+        }
+        let root = root.canonicalize()?;
+        let _lock = lock_state_file(&self.root.join("permissions.lock"))?;
+        let mut permissions = self.load_permissions()?;
+        let rules = permissions.shell_allow.entry(root).or_default();
+        if !rules.iter().any(|rule| rule == token) {
+            rules.push(token.to_owned());
+            rules.sort();
+        }
         write_private_json(&self.root.join("permissions.json"), &permissions)
     }
 
@@ -1970,4 +2006,34 @@ mod local_tests {
             CredentialState::Present(_)
         ));
     }
+}
+#[test]
+fn shell_rules_roundtrip_per_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ConfigStore::at(temp.path().join("home")).unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(store.shell_rules(&project).is_empty());
+    store.add_shell_rule(&project, "printf").unwrap();
+    store.add_shell_rule(&project, "cargo").unwrap();
+    store.add_shell_rule(&project, "printf").unwrap();
+    assert_eq!(store.shell_rules(&project), ["cargo", "printf"]);
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.root().join("permissions.json")).unwrap())
+            .unwrap();
+    let project_key = project.canonicalize().unwrap().display().to_string();
+    let entry = &saved["shell_allow"][&project_key];
+    assert_eq!(entry.as_array().map(Vec::len), Some(2), "файл: {saved}");
+    assert_eq!(entry[0], "cargo");
+    // Другой проект не получает чужих правил.
+    let other = temp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    assert!(store.shell_rules(&other).is_empty());
+    store
+        .add_shell_rule(&project, "не токен с пробелом")
+        .unwrap_err();
+    // Правила и режим сосуществуют в одном файле.
+    store.save_permissions(&project, ApprovalMode::Ask).unwrap();
+    assert_eq!(store.permissions_for(&project).unwrap(), ApprovalMode::Ask);
+    assert_eq!(store.shell_rules(&project), ["cargo", "printf"]);
 }

@@ -408,24 +408,46 @@ impl Screen {
     pub fn context(&self, chars: usize) {
         self.change(|s| s.footer.context_chars = chars);
     }
-    pub fn approve(&self, preview: &str) -> Result<crate::ui::Approval> {
+    pub fn approve(&self, preview: &str, always: Option<&str>) -> Result<crate::ui::Approval> {
         self.line(&format!("\nПодтверждение действия:\n{}", ui::safe(preview)));
         self.change(|s| {
             s.scroll = 0;
             s.anchor = None;
         });
-        let mut allow = false;
+        let always = always.filter(|token| !token.is_empty());
+        let options = if always.is_some() { 3usize } else { 2usize };
+        let mut selected = 0usize;
         let result = (|| -> Result<crate::ui::Approval> {
             loop {
+                let marker = |index: usize| {
+                    if index == selected {
+                        "›".to_owned()
+                    } else {
+                        " ".to_owned()
+                    }
+                };
+                let mut option_row = format!(
+                    "│ {} Отклонить   {} Разрешить один раз",
+                    marker(0),
+                    marker(1)
+                );
+                if let Some(token) = always {
+                    option_row.push_str(&format!(
+                        "   {} Разрешить «{}» всегда",
+                        marker(2),
+                        ui::safe(token)
+                    ));
+                }
+                let hint = if always.is_some() {
+                    "╰ y — один раз · a — всегда · n/Esc — нет · Enter — выбранное".to_owned()
+                } else {
+                    "╰ y — разрешить · n/Esc — нет · Enter — выбранное".to_owned()
+                };
                 self.set_panel(Panel {
                     rows: vec![
                         "╭ Подтверждение действия ─────────────────────".into(),
-                        format!(
-                            "│ {} Отклонить    {} Разрешить один раз",
-                            if allow { " " } else { "›" },
-                            if allow { "›" } else { " " }
-                        ),
-                        "╰ y — разрешить · n/Esc — нет · Enter — выбранное".into(),
+                        option_row,
+                        hint,
                     ],
                     styles: vec![Paint::Border, Paint::Selected, Paint::Muted],
                     cursor: None,
@@ -440,6 +462,9 @@ impl Screen {
                         (KeyCode::Char('y' | 'Y' | 'д' | 'Д'), _) => {
                             return Ok(ui::Approval::Yes);
                         }
+                        (KeyCode::Char('a' | 'A' | 'ф' | 'Ф'), _) if always.is_some() => {
+                            return Ok(ui::Approval::Always);
+                        }
                         (KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Esc, _) => {
                             return Ok(ui::Approval::No);
                         }
@@ -450,12 +475,12 @@ impl Screen {
                             | KeyCode::Down
                             | KeyCode::Tab,
                             _,
-                        ) => allow = !allow,
+                        ) => selected = (selected + 1) % options,
                         (KeyCode::Enter, _) => {
-                            return Ok(if allow {
-                                ui::Approval::Yes
-                            } else {
-                                ui::Approval::No
+                            return Ok(match selected {
+                                1 => ui::Approval::Yes,
+                                2 => ui::Approval::Always,
+                                _ => ui::Approval::No,
                             });
                         }
                         _ => {}

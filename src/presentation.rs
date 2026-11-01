@@ -418,6 +418,13 @@ impl Human {
                     line!("    ↳ {detail}");
                 }
             }
+            "shell_rule" => {
+                line!(
+                    "{} команды «{} …» больше не запрашиваются в этом проекте",
+                    tone("  ✓", "32", rich),
+                    clip(data["token"].as_str().unwrap_or("?"), 40)
+                );
+            }
             "vision" => {
                 let model = data["model"].as_str().unwrap_or("-");
                 if data["provider"].is_null() {

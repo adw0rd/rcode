@@ -698,6 +698,15 @@ impl RepeatedResults {
     }
 }
 
+/// First whitespace-delimited token of the shell command, when present.
+fn shell_token(args: &Value) -> Option<String> {
+    args.get("command")
+        .and_then(Value::as_str)?
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+}
+
 /// Conservative: a single plain read command (`cat`, `head`, `tail`, `ls`, `wc`,
 /// `stat`) whose words contain no shell syntax. Anything else is not classified.
 fn read_only_shell(arguments: &Value) -> bool {
@@ -887,7 +896,7 @@ impl ToolExecutor<'_> {
                 }
             );
             self.events.pause();
-            let approved = match ui::approve(&self.events.redact(&preview))? {
+            let approved = match ui::approve(&self.events.redact(&preview), None)? {
                 ui::Approval::Yes => true,
                 ui::Approval::No => false,
                 ui::Approval::Cancel => {
@@ -895,6 +904,7 @@ impl ToolExecutor<'_> {
                     cancel.cancel();
                     false
                 }
+                ui::Approval::Always => true,
             };
             if !approved {
                 self.denied = true;
@@ -928,6 +938,7 @@ impl ToolExecutor<'_> {
         }
         let permitted = if (write && self.cli.file_edits_allowed())
             || (shell && self.cli.shell_allowed())
+            || (shell && self.shell_rule_permits(args))
             || (!write && !shell)
         {
             true
@@ -949,7 +960,8 @@ impl ToolExecutor<'_> {
                 );
             }
             self.events.pause();
-            match ui::approve(&self.events.redact(&preview))? {
+            let always = if shell { shell_token(args) } else { None };
+            match ui::approve(&self.events.redact(&preview), always.as_deref())? {
                 ui::Approval::Yes => true,
                 ui::Approval::No => false,
                 ui::Approval::Cancel => {
@@ -957,6 +969,29 @@ impl ToolExecutor<'_> {
                     cancel.cancel();
                     false
                 }
+                ui::Approval::Always => match always.as_deref().and_then(|token| {
+                    self.store
+                        .and_then(|store| store.add_shell_rule(self.tools.root(), token).ok())
+                }) {
+                    Some(()) => {
+                        crate::screen::notice(format!(
+                            "✓ Команды «{} …» больше не запрашиваются в этом проекте",
+                            always.as_deref().unwrap_or_default()
+                        ));
+                        let token = always.unwrap_or_default();
+                        self.events.emit(
+                            "shell_rule",
+                            json!({"version": 1, "token": token, "root": self.tools.root().display().to_string()}),
+                        );
+                        true
+                    }
+                    None => {
+                        crate::screen::notice(
+                            "Правило сохранить не удалось; команда разрешена один раз",
+                        );
+                        true
+                    }
+                },
             }
         };
         if !permitted {
@@ -986,6 +1021,15 @@ impl ToolExecutor<'_> {
         self.tools
             .execute_for(name, args, cancel, actor.map(|r| r.agent_id.as_str()))
             .await
+    }
+
+    /// «Разрешить похожие»: первый токен команды против правил проекта.
+    fn shell_rule_permits(&self, args: &Value) -> bool {
+        let Some(token) = shell_token(args) else {
+            return false;
+        };
+        self.store
+            .is_some_and(|store| store.shell_rules(self.tools.root()).contains(&token))
     }
 
     async fn serve(&mut self, request: AgentRequest) -> Result<()> {

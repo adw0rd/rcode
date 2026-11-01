@@ -74,6 +74,11 @@
 - Установка и обновление — staging + атомарный rename под `skills.lock`; локальные правки набора отказывают без `--force` и сохраняются в `МЕТКА.backup-…`. Манифест `skills.json` неизвестной версии — ошибка без перезаписи.
 - Проверки: `cargo test --lib -- skills:: commands:: skill_sources:: skill_tool::`, `cargo test --test skills_cli --test skills_activation` и PTY: `RCODE_REQUIRE_PTY_TEST=1 cargo test --test commands_pty --test terminal_pty`. Корпус реальных скиллов — ignored-тест с `RCODE_SKILLS_CORPUS`.
 
+## Разрешение похожих shell-команд
+
+- Диалог подтверждения имеет три варианта: `ui::Approval::{Yes,No,Always,Cancel}`, `Screen::approve(preview, always)`; «всегда» сохраняет первый токен команды (`shell_token`) в `permissions.json` → `ProjectPermissions.shell_allow` по canonical-пути проекта (`ConfigStore::shell_rules/add_shell_rule`), Executor пропускает панель при совпадении токена (`shell_rule_permits`). JSONL: событие `shell_rule`. Правило — только токен без shell-семантики; в fullscreen stdin-промптов нет.
+- Проверка: `cargo test --lib -- config:: shell_rules && RCODE_REQUIRE_PTY_TEST=1 cargo test --test terminal_pty` (сценарий APPROVAL_ALWAYS/ALWAYS_REPEAT).
+
 ## Вспомогательная модель чтения изображений
 
 - `vision.rs` — читатель: когда `ProviderClient::declares_images` говорит «нет» (local без `--vision`; каталог — только для OpenRouter, `architecture.input_modalities`), картинки уходят выбранной модели, основной идёт текст. Выбор — `/vision` (`vision.rs::choose`), настройка `Settings.vision`, ключи общие с провайдером; в fullscreen во время хода stdin-промптов нет — только подсказка `/vision`.

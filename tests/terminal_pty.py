@@ -391,6 +391,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "name": "write_file", "arguments": json.dumps({"path": filename, "content": "approved via PTY\n"})}}]},
                        "finish_reason": "tool_calls"}]})
             return
+        if prompt == "APPROVAL_ALWAYS":
+            self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
+                           "name": "run_command", "arguments": json.dumps({"command": "printf 'always via PTY\n' > always.txt"})}}]},
+                       "finish_reason": "tool_calls"}]})
+            return
+        if prompt == "ALWAYS_REPEAT":
+            self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
+                           "name": "run_command", "arguments": json.dumps({"command": "printf 'repeat\n' > always.txt"})}}]},
+                       "finish_reason": "tool_calls"}]})
+            return
         if prompt == "CANCEL_REQUEST":
             self.server.cancel_started.set()
             self.server.release_cancel.wait(timeout=6)
@@ -757,6 +769,33 @@ def main(binary):
                 else:
                     assert (workspace / filename).read_text() == "approved via PTY\n"
                 terminal.assert_footer("alpha-one", "openrouter", "high", "ask")
+
+            phase("always rule")
+
+            # «Разрешить похожие»: a сохраняет первый токен команды в
+            # permissions.json; повторная команда с тем же токеном идёт без панели.
+            mark = terminal.mark()
+            terminal.send("APPROVAL_ALWAYS\r")
+            terminal.until(lambda: "› Отклонить" in terminal.grid.rows()[-4]
+                           and "Разрешить «printf» всегда" in terminal.grid.rows()[-4],
+                           "approval panel with the always option")
+            terminal.send("a")
+            terminal.editor_after("TOOL_FINISHED_APPROVAL_ALWAYS", mark)
+            assert (workspace / "always.txt").read_text() == "always via PTY\n", terminal.dump()
+            import json as _json
+            rules = _json.loads((home / "permissions.json").read_text())
+            saved = [rules_ for rules_ in rules["shell_allow"].values()
+                     if "printf" in rules_]
+            assert saved, rules
+            repeat_mark = terminal.mark()
+            terminal.send("ALWAYS_REPEAT\r")
+            terminal.editor_after("TOOL_FINISHED_ALWAYS_REPEAT", repeat_mark)
+            assert (workspace / "always.txt").read_text() == "repeat\n", terminal.dump()
+            # Если бы правило не сработало, ход застрял бы на панели: попасть
+            # в editor_after без нажатий стало бы невозможно.
+            assert not any(
+                "› Отклонить" in row for row in terminal.grid.rows()[-6:]
+            ), terminal.dump()
 
             phase("approvals complete")
             # A real child API request stays pending while agent_update renders
