@@ -773,8 +773,31 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
                 .unwrap_or_default(),
         );
     }
+    // Правая часть статус-строки: путь проекта (хвостом — видно, над чем
+    // работаем) и версия; при узкой ширине остаётся только версия.
     let version = if width >= 54 {
-        format!("rcode {}", env!("CARGO_PKG_VERSION"))
+        let brand = format!("rcode {}", env!("CARGO_PKG_VERSION"));
+        let path = s.footer.workspace.trim();
+        if path.is_empty() {
+            brand
+        } else {
+            let max_right = (width / 2).clamp(20, 64);
+            let budget = max_right
+                .saturating_sub(UnicodeWidthStr::width(brand.as_str()))
+                .saturating_sub(3);
+            let mut shown: String = path
+                .chars()
+                .rev()
+                .take(budget)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            if UnicodeWidthStr::width(path) > budget {
+                shown.insert(0, '…');
+            }
+            format!("{shown} · {brand}")
+        }
     } else {
         format!("v{}", env!("CARGO_PKG_VERSION"))
     };

@@ -464,12 +464,7 @@ fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) 
         context_tokens: budget.is_tokens(),
         input_tokens: session.usage.input_tokens,
         output_tokens: session.usage.output_tokens,
-        workspace: session
-            .root
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned(),
+        workspace: session.root.display().to_string(),
     }
 }
 fn status(

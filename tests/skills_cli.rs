@@ -1064,3 +1064,58 @@ fn symlink_collections_in_linked_roots_are_visible() {
     #[cfg(not(unix))]
     assert_eq!(output.code, 2, "{} {}", output.stdout, output.stderr);
 }
+
+#[test]
+fn install_runs_from_the_model_shell_with_user_approval() {
+    if !require_git() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let repo = sandbox._temp.path().join("shell-repo");
+    fs::create_dir_all(&repo).unwrap();
+    write_initial_repo(&repo);
+    let output = Process::new(sandbox.binary())
+        .args([
+            "skills",
+            "install",
+            &repo.display().to_string(),
+            "--yes",
+            "--json",
+        ])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &sandbox.home)
+        .env("RCODE_HOME", &sandbox.home)
+        .env("RCODE_MODEL_SHELL", "1")
+        .current_dir(&sandbox.project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        sandbox
+            .home
+            .join("skill-sources/shell-repo/skills/one/SKILL.md")
+            .is_file()
+    );
+
+    let refused = Process::new(sandbox.binary())
+        .args(["websearch", "provider", "brave", "--json"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &sandbox.home)
+        .env("RCODE_HOME", &sandbox.home)
+        .env("RCODE_MODEL_SHELL", "1")
+        .current_dir(&sandbox.project)
+        .output()
+        .unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "ключи поиска из shell модели недоступны"
+    );
+}

@@ -325,15 +325,6 @@ fn plain(event: &Value) -> String {
     parts.join("  ")
 }
 
-fn model_shell_guard() -> Result<()> {
-    if std::env::var("RCODE_MODEL_SHELL").as_deref() == Ok("1") {
-        bail!(
-            "Установка и обновление наборов недоступны из shell модели; попросите пользователя выполнить это сам"
-        );
-    }
-    Ok(())
-}
-
 fn confirm(json_mode: bool, details: &str) -> Result<()> {
     if json_mode || !std::io::stdin().is_terminal() {
         bail!("Подтвердите действие флагом --yes");
@@ -564,7 +555,6 @@ async fn install(
     options: &InstallOptions,
     events: &mut Events,
 ) -> Result<i32> {
-    model_shell_guard()?;
     let source = crate::skill_sources::parse_source(&options.source, store.root(), root)?;
     let label = options
         .name
@@ -782,7 +772,6 @@ async fn check(
     cli: &Cli,
     events: &mut Events,
 ) -> Result<i32> {
-    model_shell_guard()?;
     let manifest = crate::skill_sources::Manifest::read(store.root())?;
     let selected = select_labels(&manifest, labels)?;
     if !selected.is_empty()
@@ -949,7 +938,6 @@ async fn update(
     cli: &Cli,
     events: &mut Events,
 ) -> Result<i32> {
-    model_shell_guard()?;
     let mut manifest = crate::skill_sources::Manifest::read(store.root())?;
     let wanted: Vec<String> = if options.all || options.labels.is_empty() {
         manifest.sources().keys().cloned().collect()
@@ -1156,7 +1144,6 @@ async fn remove(
     cli: &Cli,
     events: &mut Events,
 ) -> Result<i32> {
-    model_shell_guard()?;
     let mut manifest = crate::skill_sources::Manifest::read(store.root())?;
     if !manifest.sources().contains_key(label) {
         bail!("Набор «{label}» не установлен; смотрите rcode skills list");
@@ -1215,7 +1202,6 @@ async fn link(
     cli: &Cli,
     events: &mut Events,
 ) -> Result<i32> {
-    model_shell_guard()?;
     if !crate::skill_sources::valid_label(name) {
         bail!("Недопустимая метка {name:?}; используйте строчные латинские буквы, цифры, _ и -");
     }
@@ -1279,7 +1265,6 @@ async fn link(
 }
 
 async fn unlink(store: &ConfigStore, label: &str, cli: &Cli, events: &mut Events) -> Result<i32> {
-    model_shell_guard()?;
     let mut manifest = crate::skill_sources::Manifest::read(store.root())?;
     if manifest.linked_mut().remove(label).is_none() {
         bail!("Метка «{label}» не подключена; смотрите rcode skills list");
