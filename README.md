@@ -106,6 +106,8 @@ rcode skills link ~/work/my-skills --name mine                 # подключ�
 rcode skills list && rcode skills update                       # каталог и обновление
 ```
 
+Установить набор можно и прямо в диалоге: попросите модель — она запустит `rcode skills install …` через shell, а rcode покажет панель подтверждения. В сессии работают команды `/skills` (каталог) и `/skill ID запрос` (явный выбор).
+
 Свои скиллы кладите в каталог данных rcode (`RCODE_HOME`, по умолчанию — каталог `rcode` в данных пользователя) в `skills/ИМЯ/SKILL.md` или в `.rcode/skills/` проекта. Пользовательские команды — Markdown-файлы в `RCODE_HOME/commands/` или `.rcode/commands/`: `git/pr.md` станет `/git:pr`, `$ARGUMENTS` и `$1…$9` подставляются в текст запроса. Поля `allowed-tools`, `hooks` и скрипты наборов rcode не исполняет: права определяет только приложение.
 
 Подробнее — в [руководстве](docs/usage.md#скиллы).
