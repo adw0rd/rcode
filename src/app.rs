@@ -186,6 +186,9 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     if let Some(Command::Commands { command }) = &cli.command {
         return crate::skills_cli::run_commands(command, cli, &store, events).await;
     }
+    if let Some(Command::Websearch { command }) = &cli.command {
+        return crate::web_search::run(command, &store, events).await;
+    }
     if let Some(Command::Connect { provider }) = &cli.command {
         ui::connect(
             &store,
@@ -550,6 +553,7 @@ fn turn_definitions(plan: bool, local: bool, skills: bool) -> Vec<ToolDefinition
         .chain((!local).then(crate::balance::BalanceTool::definition))
         .chain(skills.then(crate::skill_tool::definition))
         .chain(std::iter::once(crate::web_fetch::definition()))
+        .chain(std::iter::once(crate::web_search::definition()))
         .collect()
 }
 
@@ -604,6 +608,8 @@ struct ToolExecutor<'a> {
     denied: bool,
     last_error: bool,
     balance: Option<crate::balance::BalanceTool>,
+    /// Configuration store for first-run setup prompts; absent in tests.
+    store: Option<&'a ConfigStore>,
     /// Snapshot of the turn; `load_skill` reads only these skills.
     skills: &'a SkillCatalog,
     /// Page size of `load_skill` for the current step.
@@ -668,6 +674,7 @@ impl RepeatedResults {
         let counted = match name {
             "read_file" | "list_files" | "search" | crate::skill_tool::TOOL_NAME => true,
             "web_fetch" => true,
+            crate::web_search::TOOL_NAME => true,
             "run_command" => serde_json::from_str::<Value>(&call.function.arguments)
                 .is_ok_and(|args| read_only_shell(&args)),
             _ => false,
@@ -794,6 +801,24 @@ impl ToolExecutor<'_> {
             // grants, so plan mode and read-only roles keep it.
             Ok(args) if name == crate::web_fetch::TOOL_NAME => {
                 crate::web_fetch::execute(&args, cancel).await
+            }
+            // Read-only web search through the configured provider. When the
+            // user has not configured one yet, the main agent offers setup
+            // once, interactively; plan mode and subagents only get the hint.
+            Ok(args) if name == crate::web_search::TOOL_NAME => {
+                let configured = match self.store {
+                    Some(store) => crate::web_search::resolve(store)?,
+                    None => None,
+                };
+                match configured {
+                    Some(config) => crate::web_search::execute(&config, &args, cancel).await,
+                    None => crate::web_search::unconfigured_receipt(
+                        self.store,
+                        self.cli,
+                        self.plan,
+                        actor.is_some(),
+                    ),
+                }
             }
             Ok(args) => {
                 let read_only =
@@ -1279,6 +1304,7 @@ pub(crate) async fn turn(
         denied: false,
         last_error: false,
         balance: None,
+        store: Some(store),
         skills,
         skill_page: SkillPage::default(),
     };
@@ -1764,6 +1790,7 @@ mod tests {
                 ProviderClient::new(provider, "worker-balance-fixture".into()).unwrap(),
                 "test".into(),
             )),
+            store: None,
             skills: &SkillCatalog::empty(),
             skill_page: SkillPage::default(),
         };
@@ -1854,6 +1881,7 @@ mod tests {
                 denied: false,
                 last_error: false,
                 balance: None,
+                store: None,
                 skills: &SkillCatalog::empty(),
                 skill_page: SkillPage::default(),
             };
@@ -1909,6 +1937,7 @@ mod tests {
             denied: false,
             last_error: false,
             balance: None,
+            store: None,
             skills: &SkillCatalog::empty(),
             skill_page: SkillPage::default(),
         };
@@ -1962,6 +1991,7 @@ mod tests {
             denied: false,
             last_error: false,
             balance: None,
+            store: None,
             skills: &SkillCatalog::empty(),
             skill_page: SkillPage::default(),
         };
@@ -2200,6 +2230,7 @@ mod tests {
             .chain(AgentPool::definitions())
             .chain(std::iter::once(crate::balance::BalanceTool::definition()))
             .chain(std::iter::once(crate::web_fetch::definition()))
+            .chain(std::iter::once(crate::web_search::definition()))
             .map(|definition| definition.name)
             .collect();
         assert_eq!(
@@ -2224,8 +2255,12 @@ mod tests {
         assert_eq!(
             plan.iter()
                 .rev()
-                .find(|name| name.as_str() != crate::web_fetch::TOOL_NAME),
-            Some(&crate::skill_tool::TOOL_NAME.to_owned())
+                .find(|name| {
+                    name.as_str() != crate::web_fetch::TOOL_NAME
+                        && name.as_str() != crate::web_search::TOOL_NAME
+                })
+                .map(|name| name.as_str()),
+            Some(crate::skill_tool::TOOL_NAME)
         );
         // An empty catalog still declares the tool while history holds its calls.
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
@@ -2333,6 +2368,7 @@ mod tests {
             denied: false,
             last_error: false,
             balance: None,
+            store: None,
             skills: &skills,
             skill_page: SkillPage::default(),
         };

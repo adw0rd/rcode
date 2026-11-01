@@ -20,6 +20,7 @@ pub mod state;
 mod think;
 pub mod tools;
 pub mod web_fetch;
+pub mod web_search;
 
 pub mod app;
 pub mod cli;

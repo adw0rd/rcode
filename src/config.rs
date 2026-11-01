@@ -338,6 +338,25 @@ pub struct Settings {
     pub providers: BTreeMap<String, ProviderSettings>,
     #[serde(default, skip_serializing_if = "crate::local::LocalProfiles::is_empty")]
     pub local: crate::local::LocalProfiles,
+    #[serde(default, skip_serializing_if = "WebSearchSettings::is_unset")]
+    pub websearch: WebSearchSettings,
+}
+
+/// Веб-поиск для `web_search`: провайдер, ключ в `credentials.json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl WebSearchSettings {
+    pub fn is_unset(&self) -> bool {
+        self.provider.is_none() && self.folder_id.is_none() && self.base_url.is_none()
+    }
 }
 
 impl Default for Settings {
@@ -351,6 +370,7 @@ impl Default for Settings {
                 .map(|kind| (kind.as_str().into(), ProviderSettings::new(kind)))
                 .collect(),
             local: crate::local::LocalProfiles::default(),
+            websearch: WebSearchSettings::default(),
         }
     }
 }
@@ -600,6 +620,29 @@ impl ConfigStore {
             .providers
             .insert(kind.as_str().into(), value.into());
         write_private_json(&self.root.join("credentials.json"), &credentials)
+    }
+
+    /// Generic key slot for auxiliary integrations (for example websearch).
+    pub fn named_credential(&self, name: &str) -> Result<Option<String>> {
+        let credentials = self.load_credentials()?;
+        Ok(credentials.providers.get(name).cloned())
+    }
+
+    pub fn save_named_credential(&self, name: &str, value: &str) -> Result<()> {
+        validate_credential(value)?;
+        let mut credentials = self.load_credentials()?;
+        credentials
+            .providers
+            .insert(name.to_owned(), value.to_owned());
+        write_private_json(&self.root.join("credentials.json"), &credentials)
+    }
+
+    pub fn delete_named_credential(&self, name: &str) -> Result<()> {
+        let mut credentials = self.load_credentials()?;
+        if credentials.providers.remove(name).is_some() {
+            write_private_json(&self.root.join("credentials.json"), &credentials)?;
+        }
+        Ok(())
     }
 
     pub fn delete_credential(&self, kind: ProviderKind) -> Result<()> {

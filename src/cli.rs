@@ -145,6 +145,29 @@ pub enum Command {
         #[command(subcommand)]
         command: CommandsCommand,
     },
+    #[command(about = "Веб-поиск для инструмента web_search: Yandex Search API, Brave или Tavily")]
+    Websearch {
+        #[command(subcommand)]
+        command: WebsearchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum WebsearchCommand {
+    #[command(about = "Показать настроенного провайдера поиска")]
+    Status,
+    #[command(about = "Выбрать провайдера поиска: yandex, brave или tavily")]
+    Provider {
+        #[arg(value_name = "PROVIDER")]
+        name: String,
+    },
+    #[command(about = "Ключ провайдера: читается из stdin или скрытым вводом")]
+    Key {
+        #[arg(long)]
+        api_key_stdin: bool,
+    },
+    #[command(about = "Отключить веб-поиск и удалить ключ")]
+    Clear,
 }
 
 #[derive(Debug, Subcommand, Clone)]
