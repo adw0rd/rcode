@@ -167,7 +167,7 @@ fn configured_brave_searches_and_returns_results() {
     response.extend_from_slice(search_body.as_bytes());
     let (port, listener) = serve(response);
     let base = format!("http://127.0.0.1:{port}");
-    configure_sandbox(&sandbox, "brave", &base);
+    configure_sandbox(&sandbox, "brave", Some(&base));
     let server = Server::start(move |request, index| {
         if !request.is_generation() {
             return no_generation();
@@ -196,13 +196,16 @@ fn configured_brave_searches_and_returns_results() {
     let _listener_guard = listener;
 }
 
-fn configure_sandbox(sandbox: &Sandbox, provider: &str, base: &str) {
-    let config = json!({
+fn configure_sandbox(sandbox: &Sandbox, provider: &str, base: Option<&str>) {
+    let mut config = json!({
         "version": 1,
         "active": "custom",
         "providers": {"custom": {"kind": "custom", "model": "fixture-model", "base_url": "https://fixture.invalid/v1"}},
-        "websearch": {"provider": provider, "base_url": base}
+        "websearch": {"provider": provider}
     });
+    if let Some(base) = base {
+        config["websearch"]["base_url"] = json!(base);
+    }
     let path = sandbox.state.join("config.json");
     std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
     #[cfg(unix)]
@@ -252,7 +255,7 @@ fn yandex_search_receives_api_key_and_folder_id() {
     response.extend_from_slice(search_body.as_bytes());
     let (port, listener) = serve(response);
     let base = format!("http://127.0.0.1:{port}");
-    configure_sandbox(&sandbox, "yandex", &base);
+    configure_sandbox(&sandbox, "yandex", Some(&base));
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(sandbox.state.join("config.json")).unwrap())
             .unwrap();
@@ -347,4 +350,76 @@ fn websearch_cli_manages_provider_and_key() {
     )
     .unwrap();
     assert!(credentials["providers"].get("websearch").is_none());
+}
+
+/// Живой вызов Tavily: запускается только с TAVILY_API_KEY в окружении и
+/// только явно (`cargo test --test web_search -- --ignored`). Это не fixture:
+/// расходуются квоты реального API, содержимое результатов не фиксируется.
+#[test]
+#[ignore = "живой вызов Tavily по TAVILY_API_KEY; запуск: cargo test --test web_search -- --ignored live_tavily"]
+fn live_tavily_search() {
+    let Ok(key) = std::env::var("TAVILY_API_KEY") else {
+        eprintln!("SKIP live Tavily: TAVILY_API_KEY не задана");
+        assert!(
+            std::env::var_os("RCODE_REQUIRE_LIVE_TEST").is_none_or(|value| value != "1"),
+            "RCODE_REQUIRE_LIVE_TEST=1 требует TAVILY_API_KEY"
+        );
+        return;
+    };
+    assert!(key.len() >= 8, "TAVILY_API_KEY подозрительно короткая");
+    let sandbox = Sandbox::new();
+    configure_sandbox(&sandbox, "tavily", None);
+    let credentials = json!({"version": 1, "providers": {"custom": API_KEY, "websearch": key}});
+    let path = sandbox.state.join("credentials.json");
+    std::fs::write(&path, serde_json::to_string(&credentials).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let server = Server::start(move |request, index| {
+        if !request.is_generation() {
+            return no_generation();
+        }
+        if index == 0 {
+            return tool_reply(
+                "w1",
+                "web_search",
+                &json!({"query": "Tavily search API for AI agents", "max_results": 5}),
+            );
+        }
+        text_reply("Ответ готов")
+    });
+    let output = sandbox.exec(&server, "Найди Tavily search API");
+    let stdout = stdout_text(&output);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipts = tool_results(&output);
+    assert_eq!(receipts.len(), 1, "{stdout}");
+    assert!(
+        receipts[0].get("error").is_none(),
+        "живой Tavily вернул ошибку: {}",
+        receipts[0]
+    );
+    assert_eq!(receipts[0]["provider"], "tavily");
+    let count = receipts[0]["count"].as_u64().unwrap();
+    assert!((1..=5).contains(&count), "count={count}");
+    let results = receipts[0]["results"].as_array().unwrap();
+    for result in results {
+        assert!(
+            result["url"].as_str().unwrap().starts_with("http"),
+            "нет URL: {result}"
+        );
+        assert!(!result["title"].as_str().unwrap().is_empty());
+    }
+    // Ключ не попадает в события и логи.
+    assert!(!stdout.contains(&key), "ключ утёк в JSONL");
+    println!(
+        "live Tavily: {count} результатов, первый URL {}",
+        results[0]["url"]
+    );
 }
