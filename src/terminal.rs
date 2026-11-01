@@ -62,6 +62,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Выбрать провайдера",
     },
     CommandSpec {
+        name: "/vision",
+        description: "Модель для чтения изображений",
+    },
+    CommandSpec {
         name: "/effort",
         description: "Настроить глубину рассуждений",
     },

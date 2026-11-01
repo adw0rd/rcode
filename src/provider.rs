@@ -211,6 +211,32 @@ impl ProviderClient {
         &self.settings
     }
 
+    /// Does the target model accept image inputs: local profiles declare it
+    /// with `--vision`; for OpenRouter the catalog publishes input
+    /// modalities, other cloud providers are assumed to accept images (the
+    /// historical behavior). A failed catalog request never blocks the turn.
+    pub(crate) async fn declares_images(&mut self) -> bool {
+        if self.is_local() {
+            return self
+                .settings
+                .local
+                .as_ref()
+                .is_some_and(|local| local.vision);
+        }
+        if self.settings.kind != ProviderKind::OpenRouter {
+            return true;
+        }
+        match self.models().await {
+            Ok(models) => {
+                if let Some(info) = models.iter().find(|model| model.id == self.settings.model) {
+                    return info.supports_images != Some(false);
+                }
+                true
+            }
+            Err(_) => true,
+        }
+    }
+
     pub fn is_local(&self) -> bool {
         self.local.is_some()
     }
@@ -459,6 +485,15 @@ impl ProviderClient {
                     });
                 let (supports_reasoning, supported_efforts) =
                     reasoning_metadata(model, self.settings.kind);
+                let supports_images = model
+                    .get("architecture")
+                    .and_then(|architecture| architecture.get("input_modalities"))
+                    .and_then(Value::as_array)
+                    .map(|modalities| {
+                        modalities
+                            .iter()
+                            .any(|modality| modality.as_str() == Some("image"))
+                    });
                 Ok(ModelInfo {
                     id: id.into(),
                     name: model
@@ -477,7 +512,7 @@ impl ProviderClient {
                     ),
                     supports_reasoning,
                     supported_efforts,
-                    supports_images: None,
+                    supports_images,
                 })
             })
             .collect()

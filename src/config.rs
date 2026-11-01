@@ -340,6 +340,25 @@ pub struct Settings {
     pub local: crate::local::LocalProfiles,
     #[serde(default, skip_serializing_if = "WebSearchSettings::is_unset")]
     pub websearch: WebSearchSettings,
+    #[serde(default, skip_serializing_if = "VisionSettings::is_unset")]
+    pub vision: VisionSettings,
+}
+
+/// Вспомогательная модель для чтения изображений, если основная их не
+/// принимает. Ключи — те же, что у основного провайдера; для local модель —
+/// имя профиля, обязанного иметь `--vision`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl VisionSettings {
+    pub fn is_unset(&self) -> bool {
+        self.provider.is_none() && self.model.is_none()
+    }
 }
 
 /// Веб-поиск для `web_search`: провайдер, ключ в `credentials.json`.
@@ -371,6 +390,7 @@ impl Default for Settings {
                 .collect(),
             local: crate::local::LocalProfiles::default(),
             websearch: WebSearchSettings::default(),
+            vision: VisionSettings::default(),
         }
     }
 }

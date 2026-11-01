@@ -51,7 +51,12 @@ fn efforts(p: &ProviderSettings, model: Option<&ModelInfo>) -> Vec<Effort> {
     }
     options
 }
-fn choose(title: &str, choices: &[Choice], current: usize, rich: bool) -> Result<Option<usize>> {
+pub(crate) fn choose(
+    title: &str,
+    choices: &[Choice],
+    current: usize,
+    rich: bool,
+) -> Result<Option<usize>> {
     if rich {
         return terminal::select(title, choices, current);
     }
@@ -1192,6 +1197,7 @@ pub(crate) async fn run(
                 "/model"|"/models"=>select_model(&args,false,rich,store,settings,session,client,events,&mut models).await,
                 "/provider"=>select_model(&args,true,rich,store,settings,session,client,events,&mut models).await,
                 "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
+                "/vision"=>crate::vision::choose(rich,store,settings,events).await,
                 "/connect"|"/login"=>{let kind=args.first().map(|s|s.parse::<ProviderKind>()).transpose()?;let next=ui::connect(store,settings,kind,rich,None).await?;commit_provider(store,settings,session,client,events,next)?;models.clear();Ok(())},
                 "/permissions"=>{
                     if let Some(mode)=permissions_choice(&args,rich,runtime.permissions())? {

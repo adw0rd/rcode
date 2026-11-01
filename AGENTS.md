@@ -74,6 +74,11 @@
 - Установка и обновление — staging + атомарный rename под `skills.lock`; локальные правки набора отказывают без `--force` и сохраняются в `МЕТКА.backup-…`. Манифест `skills.json` неизвестной версии — ошибка без перезаписи.
 - Проверки: `cargo test --lib -- skills:: commands:: skill_sources:: skill_tool::`, `cargo test --test skills_cli --test skills_activation` и PTY: `RCODE_REQUIRE_PTY_TEST=1 cargo test --test commands_pty --test terminal_pty`. Корпус реальных скиллов — ignored-тест с `RCODE_SKILLS_CORPUS`.
 
+## Вспомогательная модель чтения изображений
+
+- `vision.rs` — читатель: когда `ProviderClient::declares_images` говорит «нет» (local без `--vision`; каталог — только для OpenRouter, `architecture.input_modalities`), картинки уходят выбранной модели, основной идёт текст. Выбор — `/vision` (`vision.rs::choose`), настройка `Settings.vision`, ключи общие с провайдером; в fullscreen во время хода stdin-промптов нет — только подсказка `/vision`.
+- Проверка: `cargo test --lib -- vision:: && cargo test --test vision`.
+
 ## Терминальный интерфейс
 
 - `screen.rs` единолично управляет полноэкранным viewport, очередью событий, историей и закреплённым футером. `terminal.rs` отвечает за ввод и меню; `interactive.rs` — за команды; `presentation.rs` — за форматирование сообщений.

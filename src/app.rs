@@ -1250,7 +1250,7 @@ pub(crate) async fn turn(
 ) -> Result<i32> {
     session.repair_pending()?;
     let prompt = events.redact(prompt);
-    let message = crate::images::user_message(&prompt, &session.root)?;
+    let mut message = crate::images::user_message(&prompt, &session.root)?;
     // Read-only and bounded: lets a smaller server context shrink the budget first.
     local_app::refresh_context(client, events).await;
     let budget = context_budget(client, session, cli, plan, skills);
@@ -1277,11 +1277,39 @@ pub(crate) async fn turn(
     for image in &message.images {
         events.emit("image", json!({"name": image.name, "bytes": image.bytes}));
     }
+    let cancel = CancellationToken::new();
+    let _interrupt = TurnInterrupt::bind(cancel.clone())?;
+    if !message.images.is_empty() && !client.declares_images().await {
+        match crate::vision::resolve(store)? {
+            Some(reader) => {
+                let description = crate::vision::transcribe(
+                    store,
+                    &reader,
+                    &message.images,
+                    message.content.as_deref(),
+                    &cancel,
+                )
+                .await
+                .map_err(|error| anyhow::Error::msg(format!("{error:#}")))?;
+                let provider = reader.kind.as_str().to_owned();
+                let model = reader.model.clone();
+                let images = message.images.len();
+                crate::vision::apply_transcription(&mut message, &reader, &description);
+                events.emit(
+                    "vision",
+                    json!({"version": 1, "provider": provider, "model": model, "images": images}),
+                );
+            }
+            None => {
+                return Err(anyhow::Error::msg(
+                    "Модель не принимает изображения, а модель для чтения не настроена. Наберите /vision и выберите провайдера и модель с поддержкой изображений — rcode будет отправлять скрины ей, а основной модели передавать текст.",
+                ));
+            }
+        }
+    }
     session.messages.push(message);
     session.save(store)?;
     tools.begin_turn()?;
-    let cancel = CancellationToken::new();
-    let _interrupt = TurnInterrupt::bind(cancel.clone())?;
     events.emit("start",json!({"session_id":session.id,"provider":session.provider.kind,"model":session.provider.model,"plan":plan}));
     if let Some(screen) = crate::screen::current() {
         screen.bind_cancel(cancel.clone());

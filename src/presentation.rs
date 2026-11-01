@@ -418,6 +418,18 @@ impl Human {
                     line!("    ↳ {detail}");
                 }
             }
+            "vision" => {
+                let model = data["model"].as_str().unwrap_or("-");
+                if data["provider"].is_null() {
+                    line!("{} чтение изображений выключено", tone("  ✓", "32", rich));
+                } else {
+                    line!(
+                        "{} скрины будет читать {}",
+                        tone("  ✓", "32", rich),
+                        clip(model, 60)
+                    );
+                }
+            }
             "preview" => {
                 for line in data["diff"].as_str().unwrap_or_default().lines() {
                     let color = if line.starts_with('+') {
