@@ -296,3 +296,16 @@ pub(crate) async fn choose(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn yandex_declares_no_images_without_network() {
+        let settings = Settings::default().provider(ProviderKind::Yandex);
+        let mut client =
+            crate::provider::ProviderClient::connect(settings, Some("test".into())).unwrap();
+        assert!(!client.declares_images().await);
+    }
+}

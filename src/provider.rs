@@ -223,6 +223,12 @@ impl ProviderClient {
                 .as_ref()
                 .is_some_and(|local| local.vision);
         }
+        // Живая проверка 2026-11-02: Yandex AI Studio молча отбрасывает
+        // изображения (prompt_tokens не учитывают картинку, модели отвечают
+        // «не могу видеть изображения»); сигнал от каталога недоступен.
+        if self.settings.kind == ProviderKind::Yandex {
+            return false;
+        }
         if self.settings.kind != ProviderKind::OpenRouter {
             return true;
         }
