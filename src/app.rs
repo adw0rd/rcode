@@ -720,10 +720,15 @@ pub(crate) fn classify_shell(args: &Value, root: &Path, rcode_home: Option<&Path
         return ShellRisk::Normal;
     };
     let mut words = command.split_whitespace();
-    let program = match words.next() {
-        Some(word) => word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase(),
+    let raw_program = match words.next() {
+        Some(word) => word.to_owned(),
         None => return ShellRisk::Normal,
     };
+    let program = raw_program
+        .rsplit('/')
+        .next()
+        .unwrap_or(&raw_program)
+        .to_ascii_lowercase();
     let rest: Vec<&str> = words.collect();
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -856,8 +861,140 @@ pub(crate) fn classify_shell(args: &Value, root: &Path, rcode_home: Option<&Path
             }
             ShellRisk::Normal
         }
-        _ => ShellRisk::Normal,
+        _ => inspect_runner(&raw_program, &program, &rest, root, home, rcode_home),
     }
+}
+
+/// Скрипты и интерпретаторы: строка команды сама по себе не показывает
+/// удалений, поэтому содержимое раннера проверяется. Путь к скрипту
+/// резолвится от корня проекта; встреченные деструктивные операции делают
+/// команду «удалением» без гранта (цели внутри скрипта неизвестны).
+fn inspect_runner(
+    raw_program: &str,
+    program: &str,
+    rest: &[&str],
+    root: &Path,
+    home: Option<&Path>,
+    _rcode_home: Option<&Path>,
+) -> ShellRisk {
+    let runners_file = [
+        "sh", "bash", "zsh", "dash", "python", "python3", "node", "bun", "deno",
+    ];
+    let inline_flag = ["-c", "-e"];
+    let mut script: Option<String> = None;
+    let mut inline: Option<String> = None;
+    let script_suffix = |word: &&str| {
+        word.ends_with(".sh")
+            || word.ends_with(".bash")
+            || word.ends_with(".py")
+            || word.ends_with(".js")
+            || word.ends_with(".mjs")
+            || word.ends_with(".ts")
+            || word.ends_with(".mts")
+    };
+    if runners_file.contains(&program) {
+        if let Some(position) = rest.iter().position(|word| inline_flag.contains(word)) {
+            inline = Some(rest[position + 1..].join(" "));
+        } else {
+            script = rest
+                .iter()
+                .rev()
+                .find(|word| script_suffix(word))
+                .map(|word| (*word).to_owned());
+        }
+    } else if raw_program.starts_with("./") || raw_program.contains('/') {
+        script = Some(raw_program.to_owned());
+    } else if matches!(program, "make" | "npm" | "pnpm" | "yarn" | "bun") {
+        script = Some("package.json".to_owned());
+        if program == "make" {
+            script = Some("Makefile".to_owned());
+        }
+    }
+    let Some(source) = script.clone().or_else(|| inline.clone()) else {
+        return ShellRisk::Normal;
+    };
+    let content = match inline {
+        Some(text) => Some(text),
+        None => {
+            let Some(path) = resolve_script_path(root, &source, home) else {
+                return ShellRisk::Normal;
+            };
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return ShellRisk::Normal;
+            };
+            if !metadata.is_file() || metadata.len() > 512 * 1024 {
+                return ShellRisk::Normal;
+            }
+            std::fs::read_to_string(&path).ok()
+        }
+    };
+    let Some(content) = content else {
+        return ShellRisk::Normal;
+    };
+    if script_is_destructive(&content) {
+        return ShellRisk::Deletion {
+            targets: vec![],
+            scope: None,
+        };
+    }
+    ShellRisk::Normal
+}
+
+fn resolve_script_path(root: &Path, source: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let expanded = if let Some(tail) = source.strip_prefix("~/") {
+        home.map(|home| home.join(tail))?
+    } else {
+        PathBuf::from(source)
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        root.join(expanded)
+    };
+    Some(normalize_path(&absolute))
+}
+
+/// Вхождение токена с границами: сосед — не буква (или это `-`, как в `rm -rf`).
+fn contains_token(text: &str, token: &str) -> bool {
+    let bytes = text.as_bytes();
+    let pattern = token.as_bytes();
+    if pattern.len() > bytes.len() {
+        return false;
+    }
+    for index in 0..=bytes.len() - pattern.len() {
+        if &bytes[index..index + pattern.len()] != pattern {
+            continue;
+        }
+        let before_ok = index == 0
+            || !bytes[index - 1].is_ascii_alphanumeric()
+            || matches!(bytes[index - 1], b'"' | b'\'' | b':');
+        let after = index + pattern.len();
+        let after_ok = after == bytes.len()
+            || !bytes[after].is_ascii_alphanumeric()
+            || bytes[after] == b'-'
+            || bytes[after] == b'(';
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Деструктивные признаки в тексте скрипта: токены с границами, чтобы не
+/// ловить «rm» внутри слов (inform, alarm). Работает и для однострочных
+/// файлов вроде package.json.
+fn script_is_destructive(content: &str) -> bool {
+    contains_token(content, "rm")
+        || contains_token(content, "rmdir")
+        || contains_token(content, "unlink")
+        || contains_token(content, "shred")
+        || (contains_token(content, "git") && contains_token(content, "clean"))
+        || content.contains(" -delete")
+        || content.contains("dd if=")
+        || content.contains("mkfs")
+        || contains_token(content, "rmtree")
+        || content.contains("rmSync")
+        || contains_token(content, "rimraf")
 }
 
 fn candidate_absolute(path: &Path) -> bool {
@@ -2872,5 +3009,118 @@ mod shell_risk_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod runner_risk_tests {
+    use super::*;
+
+    fn risk_with_root(command: &str, root: &Path) -> ShellRisk {
+        classify_shell(&json!({"command": command}), root, None)
+    }
+
+    fn prepare(root: &Path, name: &str, content: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join(name), content).unwrap();
+    }
+
+    #[test]
+    fn inline_shell_code_with_home_rm_is_a_grantless_deletion() {
+        let root = std::env::temp_dir().join("runner-risk-inline");
+        match risk_with_root("sh -c 'rm -rf ~'", &root) {
+            ShellRisk::Deletion { targets, scope } => {
+                assert!(targets.is_empty() && scope.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_with_deletions_is_a_grantless_deletion() {
+        let root = std::env::temp_dir().join("runner-risk-script");
+        let _ = std::fs::remove_dir_all(&root);
+        prepare(
+            &root,
+            "setup.sh",
+            "#!/bin/sh\ncp -r src dst\nrm -rf \"$HOME/.claude/skills/gstack\"\necho done\n",
+        );
+        match risk_with_root("./setup.sh", &root) {
+            ShellRisk::Deletion { targets, scope } => {
+                assert!(targets.is_empty(), "цели внутри скрипта неизвестны");
+                assert!(scope.is_none(), "грант по каталогу невозможен");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_without_destructive_ops_is_normal() {
+        let root = std::env::temp_dir().join("runner-risk-clean");
+        let _ = std::fs::remove_dir_all(&root);
+        prepare(
+            &root,
+            "build.sh",
+            "#!/bin/sh\ncargo build --release\necho alarm inform armed\n",
+        );
+        assert!(matches!(
+            risk_with_root("./build.sh", &root),
+            ShellRisk::Normal
+        ));
+    }
+
+    #[test]
+    fn python_script_with_rmtree_is_flagged() {
+        let root = std::env::temp_dir().join("runner-risk-python");
+        let _ = std::fs::remove_dir_all(&root);
+        prepare(
+            &root,
+            "clean.py",
+            "import shutil\nshutil.rmtree('/tmp/cache', ignore_errors=True)\n",
+        );
+        assert!(matches!(
+            risk_with_root("python3 clean.py", &root),
+            ShellRisk::Deletion { .. }
+        ));
+    }
+
+    #[test]
+    fn npm_run_scans_package_scripts() {
+        let root = std::env::temp_dir().join("runner-risk-npm");
+        let _ = std::fs::remove_dir_all(&root);
+        prepare(
+            &root,
+            "package.json",
+            r#"{"name":"x","scripts":{"clean":"rm -rf ./dist"}}"#,
+        );
+        assert!(matches!(
+            risk_with_root("npm run clean", &root),
+            ShellRisk::Deletion { .. }
+        ));
+        prepare(
+            &root,
+            "package2.json",
+            r#"{"name":"x","scripts":{"build":"tsc -p ."}}"#,
+        );
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"tsc -p ."}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            risk_with_root("npm run build", &root),
+            ShellRisk::Normal
+        ));
+    }
+
+    #[test]
+    fn missing_script_is_normal() {
+        let root = std::env::temp_dir().join("runner-risk-missing");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(matches!(
+            risk_with_root("./does-not-exist.sh", &root),
+            ShellRisk::Normal
+        ));
     }
 }

@@ -78,7 +78,8 @@
 
 - `classify_shell` (`app.rs`) делит shell-команды: `Normal` (прежние правила), `Deletion` (rm/rmdir/unlink/shred/git clean -f/find -delete — подтверждение всегда, даже в full-access; грант «Разрешить удаления в каталог» хранится в `permissions.json` → `delete_scopes`), `Dangerous` (dd/mkfs/diskutil/rm -rf ~/.rcode/mv поверх дома — подтверждение без гранта). Скоуп-гранты не покрывают цели вне каталога; цели резолвятся с `~`, `$HOME` и относительно root.
 - Автобэкапы: `write_private_bytes` копирует `config.json`/`permissions.json`/`skills.json` в `backups/` (ротация 5); `credentials.json` никогда не бэкапится — гигиена ключей.
-- Проверка: `cargo test --lib -- shell_risk_tests critical_state_files` и PTY full-access сценарий удаления.
+- `inspect_runner` — содержимое раннеров (`bash/sh скрипт`, `./файл`, `python/node/bun/deno`, `sh -c`, `make`, `npm/pnpm/yarn/bun run` → package.json) сканируется `script_is_destructive` (токены с границами: `rm`/`rmdir`/`unlink`/`shred`/`rmtree`/`rimraf`/`rmSync`/`git clean`+`f`/`-delete`/`dd if=`/`mkfs`); попадание — `Deletion` без гранта. Нет HOME и цель `~/…` — `Dangerous`. Ограничение: глу­бина один файл, полная гарантия — OS-песочница.
+- Проверка: `cargo test --lib -- shell_risk_tests runner_risk_tests critical_state_files` и PTY full-access сценарий удаления.
 
 ## Панели выбора во время хода
 
