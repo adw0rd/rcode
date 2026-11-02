@@ -54,6 +54,7 @@ fn full_access_is_explicit_persistent_and_revocable() {
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .envs(std::env::var_os("RCODE_PTY_DUMP_GRID").map(|value| ("RCODE_PTY_DUMP_GRID", value)))
+        .envs(std::env::var_os("RCODE_DEBUG_DECISION").map(|value| ("RCODE_DEBUG_DECISION", value)))
         .stdin(Stdio::null())
         .stdout(stdout.try_clone().unwrap())
         .stderr(stderr.try_clone().unwrap())

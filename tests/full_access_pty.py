@@ -7,6 +7,7 @@ import signal
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 sys.dont_write_bytecode = True
@@ -23,7 +24,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         last=max(i for i,m in enumerate(messages) if m['role']=='user')
         prompt=messages[last]['content']
         tools=sum(m['role']=='tool' for m in messages[last+1:])
-        if tools==0:
+        if prompt.startswith('FULL_RM') and tools==0:
+            name,args='run_command',{'command':'rm -rf ~/full-pty/gone'}
+        elif tools==0:
             name,args='write_file',{'path':str(self.server.target),'content':'FULL_PTY_OK\n'}
         elif tools==1 and prompt.startswith('FULL_WORK'):
             name,args='run_command',{'command':"printf 'SHELL_FULL_OK' > shell-full.txt"}
@@ -37,6 +40,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 
 
+import os as _os
 def main(binary):
     server=LoopbackHTTPServer(('127.0.0.1',0),Handler);server.requests=[]
     worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
@@ -48,6 +52,7 @@ def main(binary):
                 'kind':'custom','model':'full-fixture','base_url':f'http://127.0.0.1:{server.server_port}/v1','stream':False}}}))
             (home/'credentials.json').write_text(json.dumps({'version':1,'providers':{'custom':'full-fixture-key'}}))
             for p in home.iterdir():p.chmod(0o600)
+            _dbg=open('/Users/colinfrl/work/rcode/internal/pty-child-stderr.txt','ab')
             terminal=ConnectTerminal(binary,project,home,[])
             try:
                 terminal.until(terminal.editor_ready,'initial editor')
@@ -76,7 +81,9 @@ def main(binary):
                 terminal.send('/exit\r');terminal.finished()
             finally:terminal.close()
 
-            terminal=ConnectTerminal(binary,project,home,[])
+            _dbg=open('/Users/colinfrl/work/rcode/internal/pty-child-stderr.txt','ab')
+            terminal=ConnectTerminal(binary,project,home,[],
+                                         extra_env={'RCODE_DEBUG_DECISION':'1','HOME':str(home)})
             try:
                 terminal.until(terminal.editor_ready,'editor after restart')
                 terminal.assert_footer('full-access')
@@ -85,6 +92,27 @@ def main(binary):
                 terminal.editor_after('FULL_PTY_DONE',mark)
                 assert server.target.read_text()=='FULL_PTY_OK\n'
                 assert 'Подтверждение действия' not in terminal.text(mark)
+
+                # Удаление в full-access: панель обязательна, грант по каталогу.
+                (home/'full-pty').mkdir(exist_ok=True)
+                (home/'full-pty'/'gone').write_text('victim\n')
+                mark=terminal.mark();terminal.send('FULL_RM now\r')
+                terminal.until(lambda:'Удаление файлов запрашивает подтверждение' in terminal.text(mark),'deletion notice in full access')
+                terminal.until(lambda:'удаления в' in terminal.text(mark),'deletion grant option')
+                terminal.pump(0);time.sleep(0.2);terminal.pump(0)
+                terminal.send('\r')
+                terminal.editor_after('FULL_PTY_DONE',mark)
+                assert (home/'full-pty'/'gone').exists(),'denied rm must leave the file'
+                mark=terminal.mark();terminal.send('FULL_RM again\r')
+                terminal.until(lambda:'● run_command' in terminal.text(mark),'second deletion tool started')
+                terminal.until(lambda:'Разрешить «удаления в' in terminal.text(mark),'deletion panel again')
+                terminal.pump(0);time.sleep(0.2);terminal.pump(0)
+                terminal.send('a')
+                terminal.editor_after('FULL_PTY_DONE',mark)
+                assert not (home/'full-pty'/'gone').exists(),'granted deletion executed'
+                scopes=json.loads((home/'permissions.json').read_text()).get('delete_scopes',{})
+                assert any('full-pty' in scope for scopes_ in scopes.values() for scope in scopes_), scopes
+
                 terminal.command('/permissions ask','✓ Разрешения: ask')
                 terminal.assert_footer('ask')
                 assert json.loads((home/'permissions.json').read_text())['projects'][str(project.resolve())]=='ask'
@@ -93,6 +121,7 @@ def main(binary):
                 terminal.expect('Дополнительный каталог:',mark)
                 terminal.until(lambda:any('Разрешить один раз' in r for r in terminal.grid.rows()[-6:]),'scope reapproval after downgrade')
                 assert not server.target.exists(),'Stale full grant survived downgrade'
+                terminal.pump(0);time.sleep(0.2);terminal.pump(0)
                 terminal.send('\r')
                 terminal.editor_after('FULL_PTY_DONE',mark)
                 assert not server.target.exists()

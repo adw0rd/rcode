@@ -108,10 +108,10 @@ class Terminal:
     def expect(self, text, mark=0):
         self.until(lambda: text in self.text(mark), repr(text))
 
-    def editor_after(self, text, mark=0):
+    def editor_after(self, text, mark=0, wait=4.0):
         def ready():
             return text in self.text(mark) and self.editor_ready()
-        self.until(ready, f"composer after {text!r}")
+        self.until(ready, f"composer after {text!r}", seconds=wait)
         self.assert_footer()
 
     def editor_ready(self):
@@ -158,7 +158,8 @@ class Terminal:
         assert {1002, 1006}.issubset(self.grid.mouse_modes), "Wheel and drag capture must stay enabled"
 
     def dump(self):
-        return "\n".join(f"{index + 1:02d}|{row}" for index, row in enumerate(self.grid.rows()))
+        grid = "\n".join(f"{index + 1:02d}|{row}" for index, row in enumerate(self.grid.rows()))
+        return f"{grid}\nRAW TAIL:\n{self.text().replace(chr(13), chr(10))[-1200:]}"
 
     def capture(self, name):
         self.snapshots[name] = {"width": self.grid.width, "height": self.grid.height,

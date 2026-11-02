@@ -767,20 +767,38 @@ pub(crate) fn classify_shell(args: &Value, root: &Path, rcode_home: Option<&Path
                 let recursive = rest
                     .iter()
                     .any(|word| word.starts_with('-') && word.contains(['r', 'R']));
+                // Домашний каталог не определён (пустой HOME): "~…" нельзя
+                // проверить — требуем подтверждение без гранта.
+                if home.is_none()
+                    && rest
+                        .iter()
+                        .any(|word| word.starts_with('~') || word.starts_with("$HOME"))
+                {
+                    return ShellRisk::Dangerous {
+                        reason: "домашний каталог не определён; проверьте путь в команде"
+                            .to_owned(),
+                    };
+                }
+                let home_root = |text: &str| {
+                    resolve(text).is_some_and(|target| home.is_some_and(|home| target == home))
+                };
                 let touches = |text: &str| {
-                    touches_home(text)
+                    home_root(text)
                         || resolve(text).is_some_and(|target| {
-                            target.file_name().is_some_and(|name| name == ".rcode")
+                            rcode_home.is_some_and(|rcode| target == rcode)
+                                || target.file_name().is_some_and(|name| name == ".rcode")
                         })
                         || text == "/"
                         || text == "/*"
                         || text == "*"
                         || text == ".*"
+                        || text.ends_with("/*")
                 };
-                if recursive && rest.iter().any(|word| touches(word)) {
+                let wiped: Vec<&str> = rest.iter().copied().filter(|word| touches(word)).collect();
+                if recursive && !wiped.is_empty() {
                     return ShellRisk::Dangerous {
                         reason: format!(
-                            "rm -r по {rest:?} может стереть домашний каталог или данные rcode"
+                            "rm -r по {wiped:?} может стереть домашний каталог или данные rcode"
                         ),
                     };
                 }
@@ -2807,13 +2825,7 @@ mod shell_risk_tests {
 
     #[test]
     fn rm_recursive_over_home_or_glob_is_dangerous_without_grant() {
-        for command in [
-            "rm -rf ~",
-            "rm -rf ~/*",
-            "rm -rf $HOME/work",
-            "rm -fr *",
-            "rm -rf .rcode",
-        ] {
+        for command in ["rm -rf ~", "rm -rf ~/*", "rm -fr *", "rm -rf .rcode"] {
             match risk(command) {
                 ShellRisk::Dangerous { reason } => assert!(!reason.is_empty(), "{command}"),
                 other => panic!("{command}: {other:?}"),
@@ -2821,6 +2833,11 @@ mod shell_risk_tests {
         }
         assert!(matches!(risk("rm notes.txt"), ShellRisk::Deletion { .. }));
         assert!(matches!(risk("rm -r build"), ShellRisk::Deletion { .. }));
+        // Конкретный путь в хоуме — грантуемое удаление, не Dangerous.
+        match risk("rm -rf $HOME/work/old") {
+            ShellRisk::Deletion { scope, .. } => assert!(scope.is_some()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
