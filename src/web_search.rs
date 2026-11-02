@@ -8,6 +8,12 @@ use crate::{
     protocol::{ToolDefinition, ToolOutcome},
     ui,
 };
+
+macro_rules! notice {
+    ($($arg:tt)*) => {
+        crate::screen::notice(format!($($arg)*))
+    };
+}
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::io::IsTerminal;
@@ -599,14 +605,73 @@ fn model_shell_guard() -> Result<()> {
 /// setup dialog once; everything else gets the headless instructions.
 pub(crate) fn unconfigured_receipt(
     store: Option<&ConfigStore>,
+    events: &crate::app::Events,
     cli: &crate::cli::Cli,
     plan: bool,
     subagent: bool,
 ) -> ToolOutcome {
+    // Fullscreen: the Screen owns stdin during a turn, so the choice happens
+    // in a keyboard panel; the key itself is entered later (via /websearch or
+    // `rcode websearch key --stdin`), never from the model's shell.
     if !plan
         && !cli.json
         && ui::terminal()
         && !subagent
+        && let (Some(store), Some(screen)) = (store, crate::screen::current())
+    {
+        let all = Provider::all();
+        let options: Vec<String> = all
+            .iter()
+            .map(|provider| provider.label().to_owned())
+            .chain(["Пропустить — настроить позже".to_owned()])
+            .collect();
+        match screen.choose("Веб-поиск не настроен. Выбрать провайдера?", &options)
+        {
+            Ok(Some(index)) if index < all.len() => {
+                let provider = all[index];
+                match store.load().map(|mut settings: Settings| {
+                    settings.websearch.provider = Some(provider.as_str().to_owned());
+                    settings
+                }) {
+                    Ok(settings) => match store.save(&settings) {
+                        Ok(()) => {
+                            crate::screen::notice(format!(
+                                "✓ Провайдер поиска: {}. Ключ ещё не задан: наберите /websearch или выполните echo КЛЮЧ | rcode websearch key --stdin",
+                                provider.label()
+                            ));
+                            events_notice(
+                                events,
+                                &format!("выбран провайдер поиска {}", provider.as_str()),
+                            );
+                        }
+                        Err(error) => {
+                            return ToolOutcome::error(
+                                json!({"error": "setup_failed", "message": crate::ui::safe(&format!("{error:#}"))}).to_string(),
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        return ToolOutcome::error(
+                            json!({"error": "setup_failed", "message": crate::ui::safe(&format!("{error:#}"))}).to_string(),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                return ToolOutcome::error(
+                    json!({"error": "setup_failed", "message": crate::ui::safe(&format!("{error:#}"))}).to_string(),
+                );
+            }
+            _ => {}
+        }
+        return unconfigured_error_receipt();
+    }
+    // Plain mode without a Screen: a stdin prompt is safe here.
+    if !plan
+        && !cli.json
+        && ui::terminal()
+        && !subagent
+        && crate::screen::current().is_none()
         && let Some(store) = store
     {
         match setup(store) {
@@ -621,15 +686,86 @@ pub(crate) fn unconfigured_receipt(
             }
         }
     }
+    unconfigured_error_receipt()
+}
+
+fn unconfigured_error_receipt() -> ToolOutcome {
     ToolOutcome::error(
         json!({
             "error": "not_configured",
-            "message": "Веб-поиск не настроен. Попросите пользователя выполнить:\n  rcode websearch provider yandex|brave|tavily\n  echo КЛЮЧ | rcode websearch key --stdin"
+            "message": "Веб-поиск не настроен или ключ не задан. Попросите пользователя набрать /websearch (выбор провайдера и ключ) или выполнить:\n  rcode websearch provider yandex|brave|tavily\n  echo КЛЮЧ | rcode websearch key --stdin"
         })
         .to_string(),
     )
 }
 
+fn events_notice(events: &crate::app::Events, message: &str) {
+    events.emit("websearch", json!({"version": 1, "notice": message}));
+}
+
+/// `/websearch`: интерактивная настройка поиска между ходами — провайдер и
+/// ключ (скрытый ввод). Здесь stdin безопасен: Screen не читает ввод.
+pub(crate) async fn choose(
+    rich: bool,
+    store: &ConfigStore,
+    settings: &mut Settings,
+    events: &mut crate::app::Events,
+) -> Result<()> {
+    let current = match (
+        &settings.websearch.provider,
+        store.named_credential(CREDENTIAL_ID)?,
+    ) {
+        (Some(provider), Some(_)) => format!("{provider}, ключ задан"),
+        (Some(provider), None) => format!("{provider}, ключ не задан"),
+        _ => "не настроено".to_owned(),
+    };
+    notice!("Веб-поиск: {}", crate::ui::safe(&current));
+    let all = Provider::all();
+    let mut choices: Vec<crate::terminal::Choice> = all
+        .iter()
+        .map(|provider| crate::terminal::Choice {
+            label: provider.as_str().to_owned(),
+            detail: provider.label().into(),
+            enabled: true,
+        })
+        .collect();
+    choices.push(crate::terminal::Choice {
+        label: "Выключить поиск".into(),
+        detail: "убрать провайдера и ключ".into(),
+        enabled: true,
+    });
+    let Some(selected) = crate::interactive::choose("Провайдер веб-поиска", &choices, 0, rich)?
+    else {
+        return Ok(());
+    };
+    if selected == all.len() {
+        store.delete_named_credential(CREDENTIAL_ID)?;
+        settings.websearch = WebSearchSettings::default();
+        store.save(settings)?;
+        events.emit(
+            "websearch",
+            json!({"version": 1, "provider": null, "key": false}),
+        );
+        notice!("Веб-поиск выключен.");
+        return Ok(());
+    }
+    let provider = all[selected];
+    settings.websearch.provider = Some(provider.as_str().to_owned());
+    let key = ui::password(&format!("API-ключ {} (ввод скрыт): ", provider.label()))?;
+    let key = key.trim();
+    if key.chars().count() < MIN_KEY_CHARS {
+        notice!("! Ключ короче {MIN_KEY_CHARS} символов; провайдер сохранён, ключ не задан");
+    } else {
+        store.save_named_credential(CREDENTIAL_ID, key)?;
+        notice!("✓ Ключ сохранён в credentials.json");
+    }
+    store.save(settings)?;
+    events.emit(
+        "websearch",
+        json!({"version": 1, "provider": provider.as_str(), "key": !key.is_empty()}),
+    );
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -66,6 +66,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Модель для чтения изображений",
     },
     CommandSpec {
+        name: "/websearch",
+        description: "Провайдер и ключ веб-поиска",
+    },
+    CommandSpec {
         name: "/effort",
         description: "Настроить глубину рассуждений",
     },

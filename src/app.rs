@@ -823,6 +823,7 @@ impl ToolExecutor<'_> {
                     Some(config) => crate::web_search::execute(&config, &args, cancel).await,
                     None => crate::web_search::unconfigured_receipt(
                         self.store,
+                        self.events,
                         self.cli,
                         self.plan,
                         actor.is_some(),

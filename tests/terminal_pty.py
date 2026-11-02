@@ -391,6 +391,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "name": "write_file", "arguments": json.dumps({"path": filename, "content": "approved via PTY\n"})}}]},
                        "finish_reason": "tool_calls"}]})
             return
+        if prompt in ("WEBSEARCH_CHOICE", "WEBSEARCH_SETUP"):
+            self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
+                           "name": "web_search", "arguments": json.dumps({"query": "gstack rcode"})}}]},
+                       "finish_reason": "tool_calls"}]})
+            return
         if prompt == "APPROVAL_ALWAYS":
             self.reply({"choices": [{"message": {"role": "assistant", "content": None,
                        "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
@@ -796,6 +802,36 @@ def main(binary):
             assert not any(
                 "› Отклонить" in row for row in terminal.grid.rows()[-6:]
             ), terminal.dump()
+
+            phase("websearch choice panel")
+
+            # Esc в панели выбора — «Пропустить»: ход получает not_configured.
+            mark = terminal.mark()
+            terminal.send("WEBSEARCH_CHOICE\r")
+            terminal.until(lambda: "Пропустить — настроить позже" in terminal.text(mark),
+                           "websearch provider choice panel")
+            terminal.pump(0)
+            time.sleep(0.2)
+            terminal.pump(0)
+            terminal.send("\x1b")
+            terminal.editor_after("TOOL_FINISHED_WEBSEARCH_CHOICE", mark)
+            config_path = home / "config.json"
+            assert not config_path.exists() or "websearch" not in config_path.read_text(), \
+                "Esc не должен менять конфигурацию"
+
+            # Enter выбирает первого провайдера (Yandex); ключ ещё не задан.
+            mark = terminal.mark()
+            terminal.send("WEBSEARCH_SETUP\r")
+            terminal.until(lambda: "Пропустить — настроить позже" in terminal.text(mark),
+                           "websearch provider choice panel again")
+            terminal.pump(0)
+            time.sleep(0.2)
+            terminal.pump(0)
+            terminal.send("\r")
+            terminal.editor_after("TOOL_FINISHED_WEBSEARCH_SETUP", mark)
+            import json as _json
+            config = _json.loads(config_path.read_text())
+            assert config["websearch"]["provider"] == "yandex", config
 
             phase("approvals complete")
             # A real child API request stays pending while agent_update renders

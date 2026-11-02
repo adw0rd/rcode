@@ -1193,6 +1193,7 @@ pub(crate) async fn run(
                 "/provider"=>select_model(&args,true,rich,store,settings,session,client,events,&mut models).await,
                 "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
                 "/vision"=>crate::vision::choose(rich,store,settings,events).await,
+                "/websearch"=>crate::web_search::choose(rich,store,settings,events).await,
                 "/connect"|"/login"=>{let kind=args.first().map(|s|s.parse::<ProviderKind>()).transpose()?;let next=ui::connect(store,settings,kind,rich,None).await?;commit_provider(store,settings,session,client,events,next)?;models.clear();Ok(())},
                 "/permissions"=>{
                     if let Some(mode)=permissions_choice(&args,rich,runtime.permissions())? {

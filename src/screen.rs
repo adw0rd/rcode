@@ -492,6 +492,56 @@ impl Screen {
         self.clear_panel();
         result
     }
+    /// Multi-choice panel during a turn: the Screen owns stdin, so choices are
+    /// keyboard-driven like `approve`; Esc returns None, Enter picks marked.
+    pub fn choose(&self, title: &str, options: &[String]) -> Result<Option<usize>> {
+        self.line(&format!("\n{}", ui::safe(title)));
+        self.change(|s| {
+            s.scroll = 0;
+            s.anchor = None;
+        });
+        let mut selected = 0usize;
+        let result = (|| -> Result<Option<usize>> {
+            loop {
+                let mut rows = vec![format!("╭ {} ─────────────────────", ui::safe(title))];
+                for (index, option) in options.iter().enumerate() {
+                    rows.push(format!(
+                        "│ {} {}",
+                        if index == selected { "›" } else { " " },
+                        ui::safe(option)
+                    ));
+                }
+                rows.push("╰ ↑/↓ — выбор · Enter — подтвердить · Esc — отмена".into());
+                self.set_panel(Panel {
+                    rows,
+                    styles: vec![Paint::Border, Paint::Selected, Paint::Muted],
+                    cursor: None,
+                    mode: Mode::Approval,
+                });
+                match self.event()? {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => match (k.code, k.modifiers)
+                    {
+                        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            return Ok(None);
+                        }
+                        (KeyCode::Esc, _) => return Ok(None),
+                        (KeyCode::Up | KeyCode::Left | KeyCode::Char('k'), _) => {
+                            selected = selected.checked_sub(1).unwrap_or(options.len() - 1);
+                        }
+                        (KeyCode::Down | KeyCode::Right | KeyCode::Tab | KeyCode::Char('j'), _) => {
+                            selected = (selected + 1) % options.len().max(1);
+                        }
+                        (KeyCode::Enter, _) => return Ok(Some(selected)),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        })();
+        self.clear_panel();
+        result
+    }
+
     #[cfg(test)]
     pub(crate) fn test_screen() -> Arc<Self> {
         Self::new(Footer {
