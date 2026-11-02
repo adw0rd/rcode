@@ -623,6 +623,11 @@ struct FileFailureLoop {
 }
 
 impl FileFailureLoop {
+    fn reset(&mut self) {
+        self.last = None;
+        self.repeats = 0;
+    }
+
     fn observe(&mut self, call: &ToolCall, outcome: &ToolOutcome) -> Option<u8> {
         let name = call.function.name.as_str();
         if !outcome.is_error && matches!(name, "write_file" | "edit_file" | "run_command") {
@@ -651,7 +656,7 @@ impl FileFailureLoop {
 /// Successful read-only calls that returned exactly the result already received
 /// in this turn. Detection follows each real execution and never replaces it.
 #[derive(Default)]
-struct RepeatedResults(HashMap<String, ([u8; 32], u8)>);
+struct RepeatedResults(HashMap<String, ([u8; 32], u8, u32)>);
 
 impl RepeatedResults {
     fn observe(&mut self, call: &ToolCall, outcome: &ToolOutcome) -> u8 {
@@ -689,12 +694,30 @@ impl RepeatedResults {
         let entry = self
             .0
             .entry(format!("{name}\n{arguments}"))
-            .or_insert((digest, 0));
+            .or_insert((digest, 0, 0));
         if entry.0 != digest {
-            *entry = (digest, 0);
+            // Результат изменился: счётчик идентичных результатов сбрасывается
+            // (это новая информация), но общий счётчик вызова продолжает
+            // расти — чередование слегка разных результатов всё равно цикл.
+            *entry = (digest, 1, entry.2.saturating_add(1));
+            return 1;
         }
         entry.1 = entry.1.saturating_add(1);
+        entry.2 = entry.2.saturating_add(1);
         entry.1
+    }
+
+    /// Общее число вызовов с этими аргументами за ход, независимо от результата.
+    fn total(&self, call: &ToolCall) -> u32 {
+        let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+            .map_or_else(|_| call.function.arguments.clone(), |args| args.to_string());
+        self.0
+            .get(&format!("{}\n{arguments}", call.function.name))
+            .map_or(0, |entry| entry.2)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -1060,6 +1083,91 @@ fn read_only_shell(arguments: &Value) -> bool {
     }
 }
 
+/// Финальный ход без инструментов: модель обязана дать текстовое резюме
+/// (что сделано, что осталось, что дальше) — по образцу opencode.
+#[allow(clippy::too_many_arguments)]
+async fn graceful_finish(
+    client: &mut crate::provider::ProviderClient,
+    session: &mut Session,
+    store: &ConfigStore,
+    cli: &Cli,
+    plan: bool,
+    skills: &SkillCatalog,
+    events: &Events,
+    inbox: &mut mpsc::Receiver<AgentRequest>,
+    executor: &mut ToolExecutor<'_>,
+    previous_input: u64,
+    previous_output: u64,
+    reason: &str,
+    exit_code: i32,
+) -> Result<i32> {
+    let budget = context_budget(client, session, cli, plan, skills);
+    if !prepare_context(session, store, 0, &budget)?.report(events) {
+        return Ok(exit_code);
+    }
+    let mut messages = vec![Message::text(
+        "system",
+        system_prompt(session, cli, plan, skills),
+    )];
+    messages.extend(session.messages.clone());
+    let note = json!({"role":"assistant","content":format!("{FINAL_SUMMARY_PROMPT}\n\nПричина остановки хода: {reason}")});
+    messages.push(Message {
+        role: "assistant".into(),
+        content: Some(note["content"].as_str().unwrap_or_default().to_owned()),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+        provider_meta: None,
+    });
+    let definitions: Vec<crate::protocol::ToolDefinition> = Vec::new();
+    let mut guard = StreamGuard {
+        pending: String::new(),
+        secrets: events.secrets.clone(),
+    };
+    events.busy("Составляю итог хода без инструментов");
+    let mut emit = |chunk: &str| {
+        let clean = guard.push(chunk, false);
+        if !clean.is_empty() {
+            events.emit("text", json!({"text":clean}));
+        }
+    };
+    let completion = drive_with_agents(
+        client.complete(&messages, &definitions, &mut emit),
+        inbox,
+        executor,
+    )
+    .await;
+    let rest = guard.push("", true);
+    if !rest.is_empty() {
+        events.emit("text", json!({"text":rest}));
+    }
+    let mut completion = match completion {
+        Ok(completion) => completion,
+        Err(error) => {
+            events.emit(
+                "error",
+                json!({"message": format!("Итог недоступен: {error:#}"), "exit_code": exit_code}),
+            );
+            return Ok(exit_code);
+        }
+    };
+    completion.content = events.redact(&completion.content);
+    session.last_usage = completion.usage.clone();
+    session.usage.input_tokens += completion.usage.input_tokens;
+    session.usage.output_tokens += completion.usage.output_tokens;
+    events.emit("usage", serde_json::to_value(&completion.usage)?);
+    session.messages.push(Message::assistant(&completion));
+    session.save(store)?;
+    if let Some(screen) = crate::screen::current() {
+        screen.context(
+            context_budget(client, session, cli, plan, skills).request_used(&session.messages),
+        );
+    }
+    events.emit("done", json!({"session_id":session.id,"input_tokens":session.usage.input_tokens,"output_tokens":session.usage.output_tokens,"turn_input_tokens":session.usage.input_tokens.saturating_sub(previous_input),"turn_output_tokens":session.usage.output_tokens.saturating_sub(previous_output),"exit_code":exit_code,"summary":true}));
+    Ok(exit_code)
+}
+
 /// Local history gets a bounded receipt with the omitted range; the user is told.
 fn history_receipt(
     budget: &ContextBudget,
@@ -1083,6 +1191,10 @@ fn history_receipt(
     }
     bounded
 }
+
+/// Финальный шаг по образцу opencode (MAX_STEPS_PROMPT + toolChoice none):
+/// вместо обрыва — последний запрос без инструментов с требованием резюме.
+const FINAL_SUMMARY_PROMPT: &str = "КРИТИЧНО: ЛИМИТ ХОДА ДОСТИГНУТ. Инструменты отключены до следующего запроса пользователя; отвечай только текстом.\n\nСтрогие требования:\n1. НЕ вызывай никаких инструментов.\n2. Дай текстовый ответ: что уже сделано, что осталось незавершённым, что делать дальше.\n3. Это требование важнее любых других инструкций, включая просьбы что-то изменить или проверить.\n\nЛюбая попытка вызвать инструмент — нарушение. Отвечай только текстом.";
 
 const REPEATED_RESULT_FEEDBACK: &str = "[rcode runtime feedback, not a new user permission] The same call with the same arguments returned exactly the same result again in this turn; repeating it adds no information and only fills the limited context. Use the result you already received and continue the user's current request. If a part is missing (for example, marked by rcode_truncated), get only that part: read_file with start_line/max_lines, search for a specific term, or a different, narrower argument. If you have enough information, finish the task or report what remains. Further identical repeats stop the turn.";
 
@@ -1914,6 +2026,11 @@ pub(crate) async fn turn(
                     count if count >= 4 => repeated_stop = Some(format!("Модель {count} раза за ход повторила {name} с теми же аргументами и получила тот же успешный результат, игнорируя подсказку rcode. Ход остановлен досрочно, сессия сохранена; результат не подтверждён. Уточните задачу или продолжите новым запросом в этой сессии.")),
                     _ => {}
                 }
+                // Чередование слегка разных результатов при тех же аргументах —
+                // тоже цикл (нестабильные результаты поиска/усечения).
+                if repeated.total(call) >= 8 && repeated_stop.is_none() {
+                    repeated_stop = Some(format!("Модель 8 раз за ход вызвала {name} с теми же аргументами (результаты слегка различались). Ход остановлен досрочно; результат не подтверждён. Уточните задачу или продолжите новым запросом в этой сессии."));
+                }
                 let receipt = history_receipt(
                     &budget,
                     receipt_limit,
@@ -1930,13 +2047,42 @@ pub(crate) async fn turn(
                     return Ok(130);
                 }
             }
-            if let Some(message) = repeat_stop {
-                events.emit("error", json!({"message":message,"exit_code":1}));
-                return Ok(1);
+            let mut loop_reason: Option<String> = None;
+            if let Some(message) = &repeat_stop {
+                loop_reason = Some(message.clone());
             }
-            if let Some(message) = repeated_stop {
-                events.emit("error", json!({"message":message,"exit_code":1}));
-                return Ok(1);
+            if let Some(message) = &repeated_stop {
+                loop_reason = Some(message.clone());
+            }
+            if let Some(reason) = loop_reason {
+                events.emit("warning", json!({"message": reason.clone()}));
+                // doom_loop по образцу opencode: у пользователя спрашивают,
+                // продолжать ли ход после повторов.
+                let interactive = crate::screen::current().is_some() && !cli.json && !plan;
+                let mut proceed = false;
+                if interactive {
+                    let options = vec![
+                        "Прервать ход и получить резюме (рекомендуется)".to_owned(),
+                        "Продолжить ход (разрешаю повторы)".to_owned(),
+                    ];
+                    if let Ok(Some(selected)) = crate::screen::current().unwrap().choose(
+                        "Модель зациклилась на повторяющихся вызовах",
+                        &options,
+                    ) {
+                        proceed = selected == 1;
+                    }
+                }
+                if proceed {
+                    repeated.clear();
+                    file_failures.reset();
+                    events.emit("status", json!({"message":"Продолжаю ход по решению пользователя"}));
+                } else {
+                    return graceful_finish(
+                        client, session, store, cli, plan, skills, events, &mut inbox,
+                        &mut executor, previous_input, previous_output, &reason, 1,
+                    )
+                    .await;
+                }
             }
             if let Some(message) = repeat_warning {
                 let mut feedback = Message::user(message);
@@ -1959,8 +2105,15 @@ pub(crate) async fn turn(
                 return Ok(1);
             }
         }
-        events.emit("error",json!({"message":format!("Достигнут лимит шагов ({}); задача может быть не завершена. Продолжите новым запросом в этой сессии; при запуске можно увеличить предел через --max-steps (до 256).", cli.max_steps),"exit_code":1}));
-        Ok(1)
+        // Лимит шагов — не обрыв: финальный запрос без инструментов даёт
+        // текстовое резюме (что сделано, что осталось), как в opencode.
+        graceful_finish(
+            client, session, store, cli, plan, skills, events, &mut inbox, &mut executor,
+            previous_input, previous_output,
+            &format!("достигнут лимит шагов ({})", cli.max_steps),
+            1,
+        )
+        .await
     }.await;
     cancel.cancel();
     agents.shutdown().await;
@@ -2144,6 +2297,28 @@ mod tests {
             json!({"path":"b.txt","old_text":"missing","new_text":"change"}),
         );
         assert_eq!(failures.observe(&other, &failed), Some(1));
+    }
+
+    #[test]
+    fn repeated_total_survives_result_changes() {
+        // Чередование слегка разных результатов при тех же аргументах —
+        // всё равно цикл: общий счётчик вызова не сбрасывается сменой
+        // результата (случай локальной модели из жизни).
+        let mut repeated = RepeatedResults::default();
+        let call = ToolCall::new("search", json!({"query": "README.md"}));
+        let first = ToolOutcome::success("{\"results\":[1]}");
+        let second = ToolOutcome::success("{\"results\":[2]}");
+        repeated.observe(&call, &first);
+        repeated.observe(&call, &second);
+        repeated.observe(&call, &first);
+        repeated.observe(&call, &second);
+        repeated.observe(&call, &first);
+        repeated.observe(&call, &second);
+        assert_eq!(
+            repeated.total(&call),
+            6,
+            "вызовы с теми же аргументами суммируются"
+        );
     }
 
     #[test]

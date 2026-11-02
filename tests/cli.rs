@@ -432,7 +432,7 @@ fn repeated_write_errors_are_not_hidden_by_successful_reads() {
     let replies = (0..4).flat_map(|i| [
         tool_reply("read_file", json!({"path":"a.txt"})),
         tool_reply("write_file", json!({"path":"a.txt","content":format!("attempt {i}"),"expected_sha256":"incorrect"})),
-    ]).collect();
+    ]).chain(std::iter::once(final_reply("Остановлено: файл не изменён, причина повторов ясна."))).collect();
     let (url, handle) = server(replies);
     let out = run(
         &root,
@@ -451,8 +451,16 @@ fn repeated_write_errors_are_not_hidden_by_successful_reads() {
     let requests = handle.join().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(1), "{text}");
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 9);
     assert!(text.contains("Повторяется ошибка записи"), "{text}");
+    assert!(text.contains("\"summary\":true"), "{text}");
+    // Финальный запрос уходит без инструментов (резюме вместо обрыва).
+    assert!(requests[8]["messages"].as_array().unwrap().iter().any(|m| {
+        m["role"] == "assistant"
+            && m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("ЛИМИТ ХОДА"))
+    }));
     assert!(requests[4]["messages"].as_array().unwrap().iter().any(|m| {
         m["role"] == "user"
             && m["content"]
@@ -466,11 +474,14 @@ fn repeated_write_errors_are_not_hidden_by_successful_reads() {
 }
 
 #[test]
-fn step_limit_reports_the_actual_budget_and_how_to_continue() {
+fn step_limit_ends_with_a_tool_free_summary() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("project");
     std::fs::create_dir(&root).unwrap();
-    let (url, handle) = server(vec![tool_reply("list_files", json!({}))]);
+    let (url, handle) = server(vec![
+        tool_reply("list_files", json!({})),
+        final_reply("Сделано: просмотрены файлы проекта. Осталось: продолжить осмотр."),
+    ]);
     let out = run(
         &root,
         &tmp.path().join("home"),
@@ -480,11 +491,9 @@ fn step_limit_reports_the_actual_budget_and_how_to_continue() {
     handle.join().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("лимит шагов (1)"), "{text}");
-    assert!(
-        text.contains("--max-steps") && text.contains("новым запросом"),
-        "{text}"
-    );
+    assert!(text.contains("\"summary\":true"), "{text}");
+    assert!(text.contains("Осталось: продолжить осмотр"), "{text}");
+    assert!(!text.contains("лимит шагов (1)"), "{text}");
 }
 
 #[test]

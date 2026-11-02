@@ -330,6 +330,20 @@ fn stubborn_identical_shell_reads_get_feedback_then_a_bounded_stop() {
         if !request.is_generation() {
             return models();
         }
+        // Финальный запрос без инструментов (резюме после остановки цикла).
+        if request.json()["messages"]
+            .as_array()
+            .is_some_and(|messages| {
+                messages.iter().any(|m| {
+                    m["role"] == "assistant"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("ЛИМИТ ХОДА"))
+                })
+            })
+        {
+            return text_reply("Остановлено после повторов: прочитан только README.");
+        }
         tool_reply(
             &format!("call_{index}"),
             "run_command",
@@ -343,7 +357,7 @@ fn stubborn_identical_shell_reads_get_feedback_then_a_bounded_stop() {
     assert_eq!(output.status.code(), Some(1), "{log}");
     let generations = server.generations();
     assert!(
-        generations.len() <= 6,
+        generations.len() <= 7,
         "{} requests\n{log}",
         generations.len()
     );
@@ -354,25 +368,37 @@ fn stubborn_identical_shell_reads_get_feedback_then_a_bounded_stop() {
     }));
     let events = events(&output);
     // Every requested command really ran: detection never replaces execution.
+    // Последний запрос — резюме без инструментов: запросов на один больше.
     let results = of_type(&events, "tool_result");
-    assert_eq!(results.len(), generations.len(), "{log}");
+    assert_eq!(results.len() + 1, generations.len(), "{log}");
     assert!(
         results.iter().all(|result| result["name"] == "run_command"
             && result["is_error"] == false
             && result["content"].as_str().unwrap().contains(TAIL)),
         "{log}"
     );
-    let errors = of_type(&events, "error");
-    assert_eq!(errors.len(), 1, "{log}");
-    let message = errors[0]["message"].as_str().unwrap();
+    // Остановка цикла больше не «ошибка»: предупреждение с причиной,
+    // затем резюме без инструментов (opencode-стиль).
+    let warnings = of_type(&events, "warning");
     assert!(
-        message.contains("run_command") && !message.contains("лимит шагов"),
-        "{message}"
+        warnings.iter().any(|event| {
+            event["message"].as_str().is_some_and(|message| {
+                message.contains("run_command") && !message.contains("лимит шагов")
+            })
+        }),
+        "{log}"
+    );
+    let done = of_type(&events, "done");
+    assert!(done.iter().any(|event| event["summary"] == true), "{log}");
+    assert!(
+        text(&output).contains("Остановлено после повторов"),
+        "{log}"
     );
     assert!(of_type(&events, "context_compacted").len() <= 2, "{log}");
     let mut session = home.load(&events);
     assert_eq!(session.repair_pending().unwrap(), 0);
-    assert_eq!(session.messages.last().unwrap().role, "tool");
+    // Последнее сообщение — текстовое резюме ассистента (финальный шаг).
+    assert_eq!(session.messages.last().unwrap().role, "assistant");
 }
 
 /// Identical receipts of commands with side effects or shell syntax are not a
@@ -442,6 +468,20 @@ fn alternating_identical_reads_are_also_bounded() {
         if !request.is_generation() {
             return models();
         }
+        // Финальный запрос без инструментов (резюме после остановки цикла).
+        if request.json()["messages"]
+            .as_array()
+            .is_some_and(|messages| {
+                messages.iter().any(|m| {
+                    m["role"] == "assistant"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("ЛИМИТ ХОДА"))
+                })
+            })
+        {
+            return text_reply("Остановлено после повторов: README изучен.");
+        }
         let (name, arguments) = if index % 2 == 0 {
             ("read_file", json!({"path":"README.md"}))
         } else {
@@ -454,8 +494,15 @@ fn alternating_identical_reads_are_also_bounded() {
     let output = home.exec(&[], "Изучи README gstack");
     let log = text(&output);
     assert_eq!(output.status.code(), Some(1), "{log}");
-    assert!(server.generations().len() <= 8, "{log}");
-    assert_eq!(of_type(&events(&output), "error").len(), 1, "{log}");
+    assert!(server.generations().len() <= 9, "{log}");
+    let events = events(&output);
+    assert_eq!(of_type(&events, "error").len(), 0, "{log}");
+    let done = of_type(&events, "done");
+    assert!(done.iter().any(|event| event["summary"] == true), "{log}");
+    assert!(
+        text(&output).contains("Остановлено после повторов"),
+        "{log}"
+    );
 }
 
 #[test]
