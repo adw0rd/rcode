@@ -528,16 +528,95 @@ impl Default for Credentials {
     }
 }
 
+/// Platform config dir of the pre-0.9.1 layout (`~/Library/Application
+/// Support/rcode`, `~/.config/rcode`), when it exists.
+fn legacy_home() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "rcode").map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .context("Не удалось определить домашний каталог; укажите RCODE_HOME")
+}
+
+/// One-time move of the pre-0.9.1 data directory into `~/.rcode` so configs,
+/// skills and sessions transfer between machines by copying one folder.
+/// Runs only when the new root is absent or empty; an existing non-empty
+/// `~/.rcode` is never touched.
+fn migrate_from_legacy(root: &Path, legacy: Option<&Path>) -> Result<()> {
+    let Some(legacy) = legacy else {
+        return Ok(());
+    };
+    if legacy == root {
+        return Ok(());
+    }
+    let legacy_meta = match std::fs::symlink_metadata(legacy) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        _ => return Ok(()),
+    };
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(metadata) if metadata.is_dir() => {
+            let empty = std::fs::read_dir(root)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            if !empty {
+                return Ok(());
+            }
+            std::fs::remove_dir(root).ok();
+        }
+        Ok(_) => return Ok(()),
+        Err(_) => return Ok(()),
+    }
+    let _ = legacy_meta;
+    match std::fs::rename(legacy, root) {
+        Ok(()) => {
+            ensure_private_directory(root)?;
+            Ok(())
+        }
+        Err(_) => {
+            // Different filesystems: copy entry by entry, then remove the old tree.
+            ensure_private_directory(root)?;
+            copy_tree(legacy, root)?;
+            std::fs::remove_dir_all(legacy).ok();
+            Ok(())
+        }
+    }
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("Не удалось прочитать {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("Не удалось прочитать {}", source.display()))?;
+        let metadata = std::fs::symlink_metadata(entry.path())
+            .with_context(|| format!("Не удалось прочитать {}", entry.path().display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if metadata.is_dir() {
+            ensure_private_directory(&target)?;
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("Не удалось скопировать {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 impl ConfigStore {
     pub fn new() -> Result<Self> {
         let root = match env::var_os("RCODE_HOME") {
             Some(path) if !path.is_empty() => PathBuf::from(path),
             Some(_) => bail!("RCODE_HOME не должен быть пустым"),
-            None => directories::ProjectDirs::from("", "", "rcode")
-                .context("Не удалось определить каталог настроек; укажите RCODE_HOME")?
-                .config_dir()
-                .to_path_buf(),
+            None => home_dir()?.join(".rcode"),
         };
+        migrate_from_legacy(&root, legacy_home().as_deref())?;
         Self::at(root)
     }
 
@@ -2036,4 +2115,57 @@ fn shell_rules_roundtrip_per_project() {
     store.save_permissions(&project, ApprovalMode::Ask).unwrap();
     assert_eq!(store.permissions_for(&project).unwrap(), ApprovalMode::Ask);
     assert_eq!(store.shell_rules(&project), ["cargo", "printf"]);
+}
+#[test]
+fn migration_moves_the_legacy_home_into_rcode_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let legacy = temp.path().join("legacy").join("rcode");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("config.json"), "{}").unwrap();
+    fs::create_dir_all(legacy.join("skills/demo")).unwrap();
+    fs::write(legacy.join("skills/demo/SKILL.md"), "x").unwrap();
+    let root = temp.path().join("home").join(".rcode");
+
+    migrate_from_legacy(&root, Some(&legacy)).unwrap();
+    assert!(root.join("config.json").is_file());
+    assert!(root.join("skills/demo/SKILL.md").is_file());
+    assert!(!legacy.exists(), "старый каталог переносится");
+
+    // Повторный запуск не мешает: новый каталог не пуст.
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("stale.json"), "{}").unwrap();
+    migrate_from_legacy(&root, Some(&legacy)).unwrap();
+    assert!(
+        legacy.join("stale.json").is_file(),
+        "непустой новый каталог не трогаем"
+    );
+    assert!(!root.join("stale.json").exists());
+
+    // Пустой новый каталог (без файлов) заполняется переносом.
+    fs::remove_dir_all(&root).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    migrate_from_legacy(&root, Some(&legacy)).unwrap();
+    assert!(
+        root.join("stale.json").is_file(),
+        "пустой новый каталог заполняется"
+    );
+    assert!(!legacy.exists());
+
+    // Чужой legacy не существует — тихий выход.
+    let absent = temp.path().join("absent");
+    migrate_from_legacy(&root, Some(&absent)).unwrap();
+}
+
+#[test]
+fn rcode_home_env_is_not_migrated() {
+    // При явном RCODE_HOME миграция выполняется в этот каталог,
+    // а платформенный legacy не трогается.
+    let temp = tempfile::tempdir().unwrap();
+    let legacy = temp.path().join("platform");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("config.json"), "{}").unwrap();
+    let root = temp.path().join("custom");
+    migrate_from_legacy(&root, Some(&legacy)).unwrap();
+    assert!(root.join("config.json").is_file());
+    assert!(!legacy.exists());
 }

@@ -124,9 +124,11 @@ class Terminal:
 
     def busy_ready(self):
         rows = self.grid.rows()
+        tail = rows[-6:]
         return (self.grid.frame_complete and self.grid.alternate and "Контекст" in rows[-1]
-                and not self.grid.cursor_visible and rows[-5].startswith("╭ rcode")
-                and rows[-4].startswith("│ ") and rows[-3].startswith("╰"))
+                and not self.grid.cursor_visible and any(r.startswith("╭ rcode") for r in tail)
+                and any(r.startswith("╰") for r in tail)
+                and not any(r.startswith("❯") and r.endswith("код") for r in tail))
 
     def expect_body(self, text):
         self.until(lambda: any(text in row for row in self.grid.rows()[:-5]),
@@ -250,6 +252,8 @@ class Fixture(LoopbackHTTPServer):
         self.release_stream_second = threading.Event()
         self.agent_started = threading.Event()
         self.release_agent = threading.Event()
+        self.busy_started = threading.Event()
+        self.release_busy = threading.Event()
         super().__init__(("127.0.0.1", 0), Handler)
 
     def recorded(self):
@@ -359,6 +363,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if body["messages"][-1]["role"] == "tool":
             self.reply({"choices": [{"message": {"role": "assistant", "content": "TOOL_FINISHED_" + prompt},
                                      "finish_reason": "stop"}]})
+            return
+        if prompt == "queued вопрос":
+            self.reply({"choices": [{"message": {"role": "assistant",
+                                                 "content": "QUEUED_TURN_DONE"},
+                                      "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 9, "completion_tokens": 3}})
+            return
+        if prompt == "BUSY_TYPE_PROMPT":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def event(value):
+                self.wfile.write(("data: " + json.dumps(value, ensure_ascii=False) + "\n\n").encode())
+                self.wfile.flush()
+            try:
+                event({"choices": [{"delta": {"content": "BUSY_FIRST " + "." * 48 + "\n"}, "finish_reason": None}]})
+                self.server.busy_started.set()
+                self.server.release_busy.wait(timeout=6)
+                event({"choices": [{"delta": {"content": "BUSY_SECOND\n"}, "finish_reason": None}]})
+                event({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                       "usage": {"prompt_tokens": 21, "completion_tokens": 4}})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         if prompt == "STREAM_REQUEST":
             self.send_response(200)
@@ -644,6 +675,9 @@ def main(binary):
             terminal.send("foo")
             terminal.drain()
             assert terminal.busy_ready(), "Typing during SSE replaced busy panel with editor"
+            terminal.send("\x15")
+            terminal.drain()
+            assert terminal.busy_ready(), "Ctrl+U during busy must keep the busy panel"
             fixture.release_stream_first.set()
             terminal.until(fixture.stream_second.is_set, "second SSE fragment sent")
             terminal.expect_body("STREAM_SECOND")
@@ -658,6 +692,28 @@ def main(binary):
             fixture.release_stream_second.set()
             terminal.editor_after("STREAM_SECOND", mark)
             terminal.expect_body("STREAM_SECOND")
+
+            phase("queued typing during turn")
+
+            # Печатаем во время хода: черновик виден в панели, Enter — в очередь.
+            mark = terminal.mark()
+            terminal.send("BUSY_TYPE_PROMPT\r")
+            terminal.until(fixture.busy_started.is_set, "busy turn started for queued typing")
+            terminal.expect_body("BUSY_FIRST")
+            terminal.until(terminal.busy_ready, "busy panel for queued typing")
+            terminal.send("queued вопрос")
+            terminal.drain()
+            terminal.until(lambda: "▸ queued вопрос" in terminal.text(mark),
+                           "draft row shown in the busy panel")
+            terminal.send("\r")
+            terminal.until(lambda: "в очереди: 1" in terminal.text(mark),
+                           "queued message counter")
+            fixture.release_busy.set()
+            terminal.editor_after("BUSY_SECOND", mark)
+            # После хода очередь отправляется сама: новый ход с этим сообщением.
+            terminal.until(lambda: "QUEUED_TURN_DONE" in terminal.text(mark),
+                           "queued turn executed automatically")
+            terminal.expect_body("QUEUED_TURN_DONE")
             phase("stream complete")
 
             mark = terminal.mark()

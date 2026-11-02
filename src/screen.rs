@@ -112,6 +112,8 @@ struct State {
     editor_events: VecDeque<Event>,
     selection: Option<TextSelection>,
     copy_hint: Option<String>,
+    draft: String,
+    queued: Vec<String>,
 }
 struct TextSelection {
     value: Selection,
@@ -206,6 +208,8 @@ impl Screen {
                 editor_events: VecDeque::new(),
                 selection: None,
                 copy_hint: None,
+                draft: String::new(),
+                queued: Vec::new(),
             }),
             wake: Condvar::new(),
             io: Mutex::new(()),
@@ -378,6 +382,19 @@ impl Screen {
     }
     pub fn pause(&self) {
         self.change(|s| s.phase = None);
+    }
+    /// Забирает сообщения, набранные во время хода; незафиксированный
+    /// черновик тоже уходит в очередь, чтобы ввод не терялся.
+    pub fn take_queue(&self) -> Vec<String> {
+        let out = std::cell::RefCell::new(Vec::new());
+        self.change(|s| {
+            let mut queued = std::mem::take(&mut s.queued);
+            if !s.draft.is_empty() {
+                queued.push(std::mem::take(&mut s.draft));
+            }
+            out.borrow_mut().extend(queued);
+        });
+        out.into_inner()
     }
     pub fn bind_cancel(&self, token: CancellationToken) {
         self.change(|s| s.cancel = token);
@@ -752,21 +769,43 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
             width.saturating_sub(2),
         );
         let content = clip(&flat(&label), width.saturating_sub(4));
+        let mut rows = vec![
+            format!(
+                "╭{title}{}╮",
+                "─".repeat(width.saturating_sub(2 + UnicodeWidthStr::width(title.as_str())))
+            ),
+            format!(
+                "│ {content}{} │",
+                " ".repeat(width.saturating_sub(4 + UnicodeWidthStr::width(content.as_str())))
+            ),
+        ];
+        // Черновик и очередь: то, что пользователь набирает во время хода.
+        let draft = s.draft.replace('\n', " ⏎ ");
+        if !draft.is_empty() {
+            let shown = clip(&draft, width.saturating_sub(6));
+            rows.push(format!(
+                "│ ▸ {}{} │",
+                shown,
+                " ".repeat(width.saturating_sub(6 + UnicodeWidthStr::width(shown.as_str())))
+            ));
+        }
+        if !s.queued.is_empty() {
+            let note = clip(
+                &format!("в очереди: {} · Enter добавит ещё", s.queued.len()),
+                width.saturating_sub(6),
+            );
+            rows.push(format!(
+                "│ {}{} │",
+                note,
+                " ".repeat(width.saturating_sub(4 + UnicodeWidthStr::width(note.as_str())))
+            ));
+        }
+        rows.push(format!(
+            "╰{hint}{}╯",
+            "─".repeat(width.saturating_sub(2 + UnicodeWidthStr::width(hint.as_str())))
+        ));
         Panel {
-            rows: vec![
-                format!(
-                    "╭{title}{}╮",
-                    "─".repeat(width.saturating_sub(2 + UnicodeWidthStr::width(title.as_str())))
-                ),
-                format!(
-                    "│ {content}{} │",
-                    " ".repeat(width.saturating_sub(4 + UnicodeWidthStr::width(content.as_str())))
-                ),
-                format!(
-                    "╰{hint}{}╯",
-                    "─".repeat(width.saturating_sub(2 + UnicodeWidthStr::width(hint.as_str())))
-                ),
-            ],
+            rows,
             styles: vec![Paint::Border, Paint::Normal, Paint::Muted],
             cursor: None,
             mode: Mode::Busy,
@@ -1155,6 +1194,46 @@ fn route_at_size(screen: &Screen, event: Event, (width, height): (u16, u16)) {
                         deliver = false;
                     } else if s.mode == Mode::Busy {
                         deliver = false;
+                        if k.modifiers.contains(KeyModifiers::CONTROL) {
+                            match k.code {
+                                KeyCode::Char('w') => {
+                                    while s.draft.ends_with(' ') || s.draft.ends_with('\n') {
+                                        s.draft.pop();
+                                    }
+                                    while !s.draft.is_empty()
+                                        && !s.draft.ends_with(' ')
+                                        && !s.draft.ends_with('\n')
+                                    {
+                                        s.draft.pop();
+                                    }
+                                }
+                                KeyCode::Char('u') => s.draft.clear(),
+                                _ => {}
+                            }
+                        } else {
+                            match k.code {
+                                KeyCode::Enter
+                                    if !k
+                                        .modifiers
+                                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                                {
+                                    if !s.draft.is_empty() {
+                                        let text = std::mem::take(&mut s.draft);
+                                        s.queued.push(text);
+                                    }
+                                }
+                                KeyCode::Enter => s.draft.push('\n'),
+                                KeyCode::Char(ch)
+                                    if !k.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    s.draft.push(ch);
+                                }
+                                KeyCode::Backspace => {
+                                    s.draft.pop();
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -1230,9 +1309,17 @@ fn route_at_size(screen: &Screen, event: Event, (width, height): (u16, u16)) {
                 }
                 deliver = false;
             }
-            Event::Resize(_, _) | Event::Paste(_) => {
+            Event::Resize(_, _) => {
                 s.selection = None;
                 s.copy_hint = None;
+            }
+            Event::Paste(text) => {
+                s.selection = None;
+                s.copy_hint = None;
+                if s.mode == Mode::Busy {
+                    s.draft
+                        .push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                }
             }
             _ => {}
         }

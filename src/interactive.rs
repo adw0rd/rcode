@@ -1054,7 +1054,7 @@ pub(crate) async fn run(
             }
         };
     let mut models = Vec::<ModelInfo>::new();
-    let mut first = cli.prompt.clone();
+    let mut pending: std::collections::VecDeque<String> = cli.prompt.clone().into_iter().collect();
     let mut interrupted: Option<Instant> = None;
     presentation::welcome(
         &session.root,
@@ -1114,7 +1114,10 @@ pub(crate) async fn run(
         if let Some(screen) = crate::screen::current() {
             screen.set_footer(footer(session, &runtime, plan, &budget));
         }
-        let input = if let Some(p) = first.take() {
+        let input = if let Some(p) = pending.pop_front() {
+            if let Some(screen) = crate::screen::current() {
+                screen.line(&format!("\n❯ {}", events.redact(&p)));
+            }
             Input::Submit(p)
         } else if rich {
             composer.read(&footer(session, &runtime, plan, &budget))?
@@ -1299,6 +1302,9 @@ pub(crate) async fn run(
                 balance_monitor = start_balance_monitor(client, session);
             }
             events.pause();
+            if let Some(screen) = crate::screen::current() {
+                pending.extend(screen.take_queue());
+            }
             if let Err(e) = result {
                 events.emit("error", json!({"message":format!("{e:#}")}));
             }
@@ -1319,6 +1325,9 @@ pub(crate) async fn run(
             events.emit("error", json!({"message":format!("{e:#}")}));
         }
         events.pause();
+        if let Some(screen) = crate::screen::current() {
+            pending.extend(screen.take_queue());
+        }
     }
     events.pause();
     Ok(0)

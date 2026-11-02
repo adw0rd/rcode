@@ -365,6 +365,13 @@ struct Buffer {
     cursor: usize,
 }
 
+fn word_grapheme(g: &str) -> bool {
+    !g.chars().all(char::is_whitespace)
+        && g.chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-')
+}
+
 impl Buffer {
     fn insert(&mut self, text: &str) {
         let available = MAX_INPUT.saturating_sub(self.text.len());
@@ -417,6 +424,68 @@ impl Buffer {
         self.text.drain(start..self.cursor);
         self.cursor = start;
         self.normalize_cursor();
+    }
+
+    /// Word-left: skip whitespace behind the cursor, then a run of the same
+    /// character class. Word characters are alphanumerics plus `_` and `-`,
+    /// like shell editors — so `--vision` and `skills install` move as words.
+    /// Word-left: skip whitespace behind the cursor, then a run of the same
+    /// character class.
+    fn left_word(&mut self) {
+        while self.cursor > 0
+            && self.text[..self.cursor]
+                .graphemes(true)
+                .next_back()
+                .is_some_and(|g| g.chars().all(char::is_whitespace))
+        {
+            self.left();
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let word = word_grapheme;
+        let is_word = self.text[..self.cursor]
+            .graphemes(true)
+            .next_back()
+            .is_some_and(word);
+        while self.cursor > 0 {
+            let Some(g) = self.text[..self.cursor].graphemes(true).next_back() else {
+                break;
+            };
+            if word(g) != is_word {
+                break;
+            }
+            self.left();
+        }
+    }
+
+    /// Word-right: skip a run of the current class, then whitespace.
+    fn right_word(&mut self) {
+        let word = word_grapheme;
+        let Some(first) = self.text[self.cursor..].graphemes(true).next() else {
+            return;
+        };
+        let is_word = word(first);
+        while let Some(g) = self.text[self.cursor..].graphemes(true).next() {
+            if word(g) != is_word {
+                break;
+            }
+            self.right();
+        }
+        while let Some(g) = self.text[self.cursor..].graphemes(true).next() {
+            if g.chars().all(char::is_whitespace) {
+                self.right();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn delete_word_forward(&mut self) {
+        let start = self.cursor;
+        self.right_word();
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
     }
 
     fn delete_word(&mut self) {
@@ -604,8 +673,28 @@ impl ReadState {
                     self.history(history, !down);
                 }
             }
-            KeyCode::Left => self.buffer.left(),
-            KeyCode::Right => self.buffer.right(),
+            KeyCode::Left => {
+                if alt {
+                    self.buffer.left_word();
+                } else {
+                    self.buffer.left();
+                }
+            }
+            KeyCode::Right => {
+                if alt {
+                    self.buffer.right_word();
+                } else {
+                    self.buffer.right();
+                }
+            }
+            KeyCode::Backspace if alt => {
+                self.buffer.delete_word();
+                self.edited();
+            }
+            KeyCode::Delete if alt => {
+                self.buffer.delete_word_forward();
+                self.edited();
+            }
             KeyCode::Home => self.buffer.home(),
             KeyCode::End => self.buffer.end(),
             KeyCode::Backspace => {
@@ -1541,6 +1630,40 @@ mod tests {
         assert!(buffer.text.len() <= 65_536);
         assert!(buffer.text.ends_with('宽'));
         assert_eq!(buffer.cursor, buffer.text.len());
+    }
+
+    #[test]
+    fn alt_word_motion_moves_by_words_in_both_directions() {
+        let mut state = ReadState::default();
+        for ch in "настроить rcode-v9 быстро".chars() {
+            state.key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &[]);
+        }
+        let tail = state.buffer.text.len();
+        assert_eq!(tail, 40, "байтовые позиции: кириллица по два байта");
+        state.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.cursor, 28, "Alt+Left в начало «быстро»");
+        state.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.cursor, 19, "Alt+Left через слово с дефисом");
+        state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.cursor, 28, "Alt+Right не остаётся на пробеле");
+        state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.cursor, tail, "Alt+Right до конца");
+        state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.cursor, tail, "Alt+Right в конце не растёт");
+    }
+
+    #[test]
+    fn alt_backspace_and_delete_remove_words() {
+        let mut state = ReadState::default();
+        for ch in "первый второй третий".chars() {
+            state.key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &[]);
+        }
+        state.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.text, "первый второй ");
+        state.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &[]);
+        state.key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), &[]);
+        state.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT), &[]);
+        assert_eq!(state.buffer.text, "второй ");
     }
 
     #[test]

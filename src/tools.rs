@@ -84,6 +84,7 @@ pub struct Tools {
     dir: Dir,
     extra_dirs: BTreeMap<PathBuf, Dir>,
     checkpoint_path: PathBuf,
+    checkpoint_root: PathBuf,
     checkpoint_dir: Dir,
     checkpoints: Checkpoints,
     active_turn: Option<usize>,
@@ -200,11 +201,33 @@ impl Tools {
             dir,
             extra_dirs: BTreeMap::new(),
             checkpoint_path,
+            checkpoint_root: checkpoint_absolute,
             checkpoint_dir,
             checkpoints,
             active_turn: None,
             read_snapshots: HashMap::new(),
         })
+    }
+
+    /// Reopens the checkpoint directory handle. The catalog may be deleted
+    /// externally while the session is live (an `rm -rf` of RCODE_HOME, for
+    /// example); then the cached handle keeps returning ENOENT and every
+    /// turn fails at the checkpoint. Recreate and reopen instead.
+    fn reopen_checkpoint_dir(&mut self) -> Result<()> {
+        std::fs::create_dir_all(&self.checkpoint_root)?;
+        let checkpoint_path = std::fs::canonicalize(&self.checkpoint_root)?;
+        ensure!(
+            !checkpoint_path.starts_with(&self.root),
+            "Checkpoint должен храниться вне рабочего проекта"
+        );
+        let dir = Dir::open_ambient_dir(&checkpoint_path, cap_std::ambient_authority())?;
+        #[cfg(unix)]
+        {
+            use cap_std::fs::PermissionsExt;
+            dir.set_permissions(".", Permissions::from_mode(0o700))?;
+        }
+        self.checkpoint_dir = dir;
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -626,15 +649,15 @@ impl Tools {
         }
     }
 
-    fn persist(&self) -> Result<()> {
-        let result = (|| -> Result<()> {
-            let bytes = serde_json::to_vec(&self.checkpoints)?;
-            ensure!(
-                bytes.len() <= MAX_CHECKPOINT_BYTES,
-                "Превышен лимит checkpoint (64 MiB)"
-            );
+    fn persist(&mut self) -> Result<()> {
+        let bytes = serde_json::to_vec(&self.checkpoints)?;
+        ensure!(
+            bytes.len() <= MAX_CHECKPOINT_BYTES,
+            "Превышен лимит checkpoint (64 MiB)"
+        );
+        let attempt = |dir: &Dir| -> Result<()> {
             atomic_write(
-                &self.checkpoint_dir,
+                dir,
                 OsString::from(CHECKPOINT_FILE).as_os_str(),
                 &bytes,
                 Some(0o600),
@@ -643,9 +666,19 @@ impl Tools {
             // cap-std directory handles may use O_PATH on Linux, which cannot be
             // fsynced. Open the same directory for reading through the capability.
             #[cfg(unix)]
-            self.checkpoint_dir.open(".")?.sync_all()?;
+            dir.open(".")?.sync_all()?;
             Ok(())
-        })();
+        };
+        // Recreate and retry only when the checkpoint directory itself was
+        // deleted externally (an `rm -rf` of RCODE_HOME). A present directory
+        // with an unwritable journal is corruption: fail fatally, never patch
+        // it over.
+        let result = if self.checkpoint_root.is_dir() {
+            attempt(&self.checkpoint_dir)
+        } else {
+            self.reopen_checkpoint_dir()
+                .and_then(|()| attempt(&self.checkpoint_dir))
+        };
         result.map_err(|e| CheckpointFailure(format!("{e:#}")).into())
     }
 
@@ -1852,6 +1885,19 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn externally_deleted_checkpoint_dir_is_recreated_on_the_next_turn() {
+        let mut f = Fixture::new();
+        std::fs::remove_dir_all(&f.state).unwrap();
+        f.tools.begin_turn().unwrap();
+        let restored = std::fs::read_to_string(f.state.join("checkpoints.json")).unwrap();
+        assert!(restored.contains("\"version\""), "{restored}");
+        // После восстановления каталога ход продолжает работать: begin_turn
+        // не падает повторно.
+        f.tools.begin_turn().unwrap();
+        assert!(f.state.join("checkpoints.json").is_file());
+    }
+
     struct Fixture {
         _temp: TempDir,
         root: PathBuf,
@@ -2729,7 +2775,7 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await;
-        assert!(out.is_err());
+        assert!(out.is_err(), "write должен упасть на checkpoint: {out:?}");
         assert_eq!(fs::read_to_string(f.root.join("a.rs")).unwrap(), "user");
     }
 
