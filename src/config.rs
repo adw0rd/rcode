@@ -470,6 +470,10 @@ struct ProjectPermissions {
     /// («Разрешить похожие» в диалоге подтверждения).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     shell_allow: BTreeMap<PathBuf, Vec<String>>,
+    /// Каталоги, в которых удаления (rm и подобные) больше не спрашиваются:
+    /// пользователь явно выдал грант в диалоге удаления.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    delete_scopes: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Default for ProjectPermissions {
@@ -478,6 +482,7 @@ impl Default for ProjectPermissions {
             version: FORMAT_VERSION,
             projects: BTreeMap::new(),
             shell_allow: BTreeMap::new(),
+            delete_scopes: BTreeMap::new(),
         }
     }
 }
@@ -694,6 +699,29 @@ impl ConfigStore {
         if !rules.iter().any(|rule| rule == token) {
             rules.push(token.to_owned());
             rules.sort();
+        }
+        write_private_json(&self.root.join("permissions.json"), &permissions)
+    }
+
+    /// Каталоги, где удаления не спрашиваются (гранты «Разрешить удаления в …»).
+    pub fn delete_scopes(&self, root: &Path) -> Vec<PathBuf> {
+        self.load_permissions()
+            .ok()
+            .and_then(|permissions| {
+                let root = root.canonicalize().ok()?;
+                permissions.delete_scopes.get(&root).cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn add_delete_scope(&self, root: &Path, scope: &Path) -> Result<()> {
+        let root = root.canonicalize()?;
+        let _lock = lock_state_file(&self.root.join("permissions.lock"))?;
+        let mut permissions = self.load_permissions()?;
+        let scopes = permissions.delete_scopes.entry(root).or_default();
+        if !scopes.iter().any(|existing| existing == scope) {
+            scopes.push(scope.to_path_buf());
+            scopes.sort();
         }
         write_private_json(&self.root.join("permissions.json"), &permissions)
     }
@@ -1067,6 +1095,11 @@ fn read_json<T: DeserializeOwned>(path: &Path, kind: &str) -> Result<Option<T>> 
 
 /// Atomically replaces an application-owned JSON file with a private (0600 on Unix) file.
 /// Existing parent directories keep their permissions; symlink destinations are refused.
+/// Критичные файлы состояния: перед перезаписью предыдущая версия уходит в
+/// `backups/` (ротация последних копий) — страховка от случайной очистки.
+const BACKED_UP_FILES: &[&str] = &["config.json", "permissions.json", "skills.json"];
+const BACKUPS_KEEP: usize = 5;
+
 pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|_| anyhow::anyhow!("Не удалось сериализовать файл состояния"))?;
@@ -1074,7 +1107,54 @@ pub fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_private_bytes(path, &bytes)
 }
 
+fn backup_state_file(path: &Path) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    if !BACKED_UP_FILES.contains(&name) {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(previous) = std::fs::read(path) else {
+        return;
+    };
+    let backups = parent.join("backups");
+    if std::fs::create_dir_all(&backups).is_err() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or_default();
+    let _ = std::fs::write(backups.join(format!("{name}.{stamp}")), &previous);
+    prune_backups(&backups, name);
+}
+
+fn prune_backups(backups: &Path, name: &str) {
+    let mut stamps: Vec<u64> = std::fs::read_dir(backups)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let file = entry.file_name().to_string_lossy().into_owned();
+                    let prefix = format!("{name}.");
+                    let stamp = file.strip_prefix(&prefix)?;
+                    stamp.parse::<u64>().ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    stamps.sort_unstable();
+    stamps.reverse();
+    for stamp in stamps.into_iter().skip(BACKUPS_KEEP) {
+        let _ = std::fs::remove_file(backups.join(format!("{name}.{stamp}")));
+    }
+}
+
 pub(crate) fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    backup_state_file(path);
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2168,4 +2248,36 @@ fn rcode_home_env_is_not_migrated() {
     migrate_from_legacy(&root, Some(&legacy)).unwrap();
     assert!(root.join("config.json").is_file());
     assert!(!legacy.exists());
+}
+#[test]
+fn critical_state_files_keep_rotating_backups() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("config.json");
+    for round in 0..8u64 {
+        write_private_json(&path, &serde_json::json!({"version": 1, "round": round})).unwrap();
+    }
+    let backups: Vec<_> = std::fs::read_dir(temp.path().join("backups"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(backups.len(), BACKUPS_KEEP, "{backups:?}");
+    let latest = backups.iter().max().map(String::as_str).unwrap();
+    let content = std::fs::read_to_string(temp.path().join("backups").join(latest)).unwrap();
+    assert!(
+        content.contains("\"round\": 6"),
+        "предпоследняя копия: {content}"
+    );
+
+    // Файлы с секретами не бэкапятся: ключи живут только в credentials.json.
+    let credentials = temp.path().join("credentials.json");
+    write_private_json(&credentials, &serde_json::json!({"version": 1})).unwrap();
+    write_private_json(&credentials, &serde_json::json!({"version": 2})).unwrap();
+    assert!(
+        !temp
+            .path()
+            .join("backups")
+            .join("credentials.json")
+            .exists()
+    );
 }

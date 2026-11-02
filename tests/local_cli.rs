@@ -101,6 +101,11 @@ impl Home {
         let mut text = String::new();
         let mut stack = vec![self.state.clone()];
         while let Some(path) = stack.pop() {
+            // backups/ — ротационные копии с теми же правами 0600; инварианты
+            // гигиены ключей проверяются по живым файлам состояния.
+            if path.is_dir() && path.file_name().is_some_and(|name| name == "backups") {
+                continue;
+            }
             if path.is_dir() {
                 stack.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
             } else if let Ok(content) = std::fs::read(&path) {

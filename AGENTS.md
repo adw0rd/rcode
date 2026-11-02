@@ -74,6 +74,12 @@
 - Установка и обновление — staging + атомарный rename под `skills.lock`; локальные правки набора отказывают без `--force` и сохраняются в `МЕТКА.backup-…`. Манифест `skills.json` неизвестной версии — ошибка без перезаписи.
 - Проверки: `cargo test --lib -- skills:: commands:: skill_sources:: skill_tool::`, `cargo test --test skills_cli --test skills_activation` и PTY: `RCODE_REQUIRE_PTY_TEST=1 cargo test --test commands_pty --test terminal_pty`. Корпус реальных скиллов — ignored-тест с `RCODE_SKILLS_CORPUS`.
 
+## Удаления и разрушительные команды
+
+- `classify_shell` (`app.rs`) делит shell-команды: `Normal` (прежние правила), `Deletion` (rm/rmdir/unlink/shred/git clean -f/find -delete — подтверждение всегда, даже в full-access; грант «Разрешить удаления в каталог» хранится в `permissions.json` → `delete_scopes`), `Dangerous` (dd/mkfs/diskutil/rm -rf ~/.rcode/mv поверх дома — подтверждение без гранта). Скоуп-гранты не покрывают цели вне каталога; цели резолвятся с `~`, `$HOME` и относительно root.
+- Автобэкапы: `write_private_bytes` копирует `config.json`/`permissions.json`/`skills.json` в `backups/` (ротация 5); `credentials.json` никогда не бэкапится — гигиена ключей.
+- Проверка: `cargo test --lib -- shell_risk_tests critical_state_files` и PTY full-access сценарий удаления.
+
 ## Панели выбора во время хода
 
 - `Screen::choose(title, options)` — клавиатурная панель выбора в полноэкранном режиме во время хода (Esc — None, Enter — индекс); stdin-промпты в это время запрещены. Используется для настройки веб-поиска при первом `web_search`; `/websearch` — полная настройка между ходами (`web_search.rs::choose`). В plain-режиме работает прежний stdin-промпт.

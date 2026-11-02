@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     future::Future,
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -698,7 +698,173 @@ impl RepeatedResults {
     }
 }
 
-/// First whitespace-delimited token of the shell command, when present.
+/// Классификация shell-команды по риску удаления данных (по мотивам
+/// практик opencode/Claude Code/Codex: once/always/deny + скоупы).
+#[derive(Debug)]
+pub(crate) enum ShellRisk {
+    /// Обычная команда: действуют прежние правила (full-access, токены).
+    Normal,
+    /// Удаление файлов: спрашивает всегда, даже в full-access; после
+    /// подтверждения можно выдать грант «удалять в этом каталоге всегда».
+    Deletion {
+        targets: Vec<PathBuf>,
+        scope: Option<PathBuf>,
+    },
+    /// Разрушительная операция с носителем или данными rcode/дома:
+    /// спрашивает всегда, грант не выдаётся.
+    Dangerous { reason: String },
+}
+
+pub(crate) fn classify_shell(args: &Value, root: &Path, rcode_home: Option<&Path>) -> ShellRisk {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return ShellRisk::Normal;
+    };
+    let mut words = command.split_whitespace();
+    let program = match words.next() {
+        Some(word) => word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase(),
+        None => return ShellRisk::Normal,
+    };
+    let rest: Vec<&str> = words.collect();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let home = home.as_deref();
+    let resolve = |text: &str| -> Option<PathBuf> {
+        let expanded = if let Some(tail) = text.strip_prefix("~/") {
+            home.map(|home| home.join(tail))
+        } else if text == "~" {
+            home.map(|home| home.to_path_buf())
+        } else if let Some(tail) = text.strip_prefix("$HOME/") {
+            home.map(|home| home.join(tail))
+        } else {
+            Some(PathBuf::from(text))
+        }?;
+        let absolute = if candidate_absolute(&expanded) {
+            expanded
+        } else {
+            root.join(expanded)
+        };
+        Some(normalize_path(&absolute))
+    };
+    let touches_home = |text: &str| {
+        let Some(candidate) = resolve(text) else {
+            return false;
+        };
+        home.is_some_and(|home| candidate.starts_with(home))
+            || rcode_home.is_some_and(|rcode| candidate.starts_with(rcode))
+    };
+    match program.as_str() {
+        "rm" | "rmdir" | "unlink" | "shred" => {
+            let targets: Vec<PathBuf> = rest
+                .iter()
+                .filter(|word| !word.starts_with('-'))
+                .filter_map(|word| resolve(word))
+                .collect();
+            if targets.is_empty() {
+                return ShellRisk::Normal;
+            }
+            if program == "rm" {
+                let recursive = rest
+                    .iter()
+                    .any(|word| word.starts_with('-') && word.contains(['r', 'R']));
+                let touches = |text: &str| {
+                    touches_home(text)
+                        || resolve(text).is_some_and(|target| {
+                            target.file_name().is_some_and(|name| name == ".rcode")
+                        })
+                        || text == "/"
+                        || text == "/*"
+                        || text == "*"
+                        || text == ".*"
+                };
+                if recursive && rest.iter().any(|word| touches(word)) {
+                    return ShellRisk::Dangerous {
+                        reason: format!(
+                            "rm -r по {rest:?} может стереть домашний каталог или данные rcode"
+                        ),
+                    };
+                }
+            }
+            let mut scopes = targets.iter().map(|target| target_parent(target));
+            let first = scopes.next().unwrap_or_default();
+            let scope = if scopes.all(|scope| scope == first) && !first.as_os_str().is_empty() {
+                Some(first)
+            } else {
+                None
+            };
+            ShellRisk::Deletion { targets, scope }
+        }
+        "git" if rest.first().is_some_and(|word| *word == "clean") => {
+            let flags = rest
+                .iter()
+                .skip(1)
+                .any(|word| word.starts_with('-') && word.contains('f'));
+            if flags {
+                return ShellRisk::Deletion {
+                    targets: vec![root.to_path_buf()],
+                    scope: Some(root.to_path_buf()),
+                };
+            }
+            ShellRisk::Normal
+        }
+        "find" => {
+            let deleting = rest
+                .iter()
+                .any(|word| *word == "-delete" || (*word == "-exec" || *word == "-execdir"));
+            if deleting {
+                return ShellRisk::Deletion {
+                    targets: rest
+                        .first()
+                        .and_then(|word| resolve(word))
+                        .into_iter()
+                        .collect(),
+                    scope: None,
+                };
+            }
+            ShellRisk::Normal
+        }
+        "mv" | "dd" | "mkfs" | "diskutil" => {
+            if matches!(program.as_str(), "dd" | "mkfs" | "diskutil") {
+                return ShellRisk::Dangerous {
+                    reason: "dd/mkfs/diskutil — разрушительная операция с носителем".to_owned(),
+                };
+            }
+            if let Some(target) = rest.last()
+                && touches_home(target)
+            {
+                return ShellRisk::Dangerous {
+                    reason: format!("mv затрагивает домашний каталог или данные rcode: {target}"),
+                };
+            }
+            ShellRisk::Normal
+        }
+        _ => ShellRisk::Normal,
+    }
+}
+
+fn candidate_absolute(path: &Path) -> bool {
+    path.is_absolute()
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn target_parent(target: &Path) -> PathBuf {
+    target.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// First whitespace-delimited token of the shell command, when present./// First whitespace-delimited token of the shell command, when present.
 fn shell_token(args: &Value) -> Option<String> {
     args.get("command")
         .and_then(Value::as_str)?
@@ -937,9 +1103,37 @@ impl ToolExecutor<'_> {
                 return Ok(ToolOutcome::error(format!("{error:#}")));
             }
         }
+        let risk = shell.then(|| {
+            classify_shell(
+                args,
+                self.tools.root(),
+                self.store.map(|store| store.root()),
+            )
+        });
+        let danger: Option<String> = risk.as_ref().and_then(|risk| match risk {
+            ShellRisk::Dangerous { reason } => Some(reason.clone()),
+            _ => None,
+        });
+        let deletion_scope = risk.as_ref().and_then(|risk| match risk {
+            ShellRisk::Deletion { scope, .. } => scope.clone(),
+            _ => None,
+        });
         let permitted = if (write && self.cli.file_edits_allowed())
-            || (shell && self.cli.shell_allowed())
-            || (shell && self.shell_rule_permits(args))
+            || (shell
+                && self.cli.shell_allowed()
+                && !matches!(
+                    risk,
+                    Some(ShellRisk::Dangerous { .. }) | Some(ShellRisk::Deletion { .. })
+                ))
+            || (shell
+                && !matches!(
+                    risk,
+                    Some(ShellRisk::Dangerous { .. }) | Some(ShellRisk::Deletion { .. })
+                )
+                && self.shell_rule_permits(args))
+            || (shell
+                && matches!(risk, Some(ShellRisk::Deletion { .. }))
+                && self.deletion_scope_permits(args))
             || (!write && !shell)
         {
             true
@@ -961,7 +1155,26 @@ impl ToolExecutor<'_> {
                 );
             }
             self.events.pause();
-            let always = if shell { shell_token(args) } else { None };
+            if let Some(reason) = &danger {
+                crate::screen::notice(format!(
+                    "! Опасная команда: {}. Подтверждение обязательно даже в full-access.",
+                    reason
+                ));
+            }
+            if matches!(risk, Some(ShellRisk::Deletion { .. })) {
+                crate::screen::notice(
+                    "Удаление файлов запрашивает подтверждение всегда, даже в full-access.",
+                );
+            }
+            let always: Option<String> = if danger.is_some() {
+                None
+            } else if let Some(scope) = &deletion_scope {
+                Some(format!("удаления в {}", scope.display()))
+            } else if shell {
+                shell_token(args)
+            } else {
+                None
+            };
             match ui::approve(&self.events.redact(&preview), always.as_deref())? {
                 ui::Approval::Yes => true,
                 ui::Approval::No => false,
@@ -970,29 +1183,53 @@ impl ToolExecutor<'_> {
                     cancel.cancel();
                     false
                 }
-                ui::Approval::Always => match always.as_deref().and_then(|token| {
-                    self.store
-                        .and_then(|store| store.add_shell_rule(self.tools.root(), token).ok())
-                }) {
-                    Some(()) => {
-                        crate::screen::notice(format!(
-                            "✓ Команды «{} …» больше не запрашиваются в этом проекте",
-                            always.as_deref().unwrap_or_default()
-                        ));
-                        let token = always.unwrap_or_default();
-                        self.events.emit(
-                            "shell_rule",
-                            json!({"version": 1, "token": token, "root": self.tools.root().display().to_string()}),
-                        );
-                        true
+                ui::Approval::Always => {
+                    let grant: Option<(String, bool)> = always.as_deref().and_then(|label| {
+                        let store = self.store?;
+                        let scope_grant = deletion_scope.as_ref().is_some_and(|scope| {
+                            label == format!("удаления в {}", scope.display())
+                        });
+                        if scope_grant {
+                            let scope = deletion_scope.clone().unwrap_or_default();
+                            return store
+                                .add_delete_scope(self.tools.root(), &scope)
+                                .ok()
+                                .map(|()| (label.to_owned(), true));
+                        }
+                        store
+                            .add_shell_rule(self.tools.root(), label)
+                            .ok()
+                            .map(|()| (label.to_owned(), false))
+                    });
+                    match grant {
+                        Some((label, delete_scope)) => {
+                            if delete_scope {
+                                crate::screen::notice(format!(
+                                    "✓ Удаления в {label} больше не запрашиваются в этом проекте"
+                                ));
+                                self.events.emit(
+                                    "shell_rule",
+                                    json!({"version": 1, "delete_scope": label, "root": self.tools.root().display().to_string()}),
+                                );
+                            } else {
+                                crate::screen::notice(format!(
+                                    "✓ Команды «{label} …» больше не запрашиваются в этом проекте"
+                                ));
+                                self.events.emit(
+                                    "shell_rule",
+                                    json!({"version": 1, "token": label, "root": self.tools.root().display().to_string()}),
+                                );
+                            }
+                            true
+                        }
+                        None => {
+                            crate::screen::notice(
+                                "Правило сохранить не удалось; команда разрешена один раз",
+                            );
+                            true
+                        }
                     }
-                    None => {
-                        crate::screen::notice(
-                            "Правило сохранить не удалось; команда разрешена один раз",
-                        );
-                        true
-                    }
-                },
+                }
             }
         };
         if !permitted {
@@ -1022,6 +1259,25 @@ impl ToolExecutor<'_> {
         self.tools
             .execute_for(name, args, cancel, actor.map(|r| r.agent_id.as_str()))
             .await
+    }
+
+    /// Удаления внутри уже выданных скоупов больше не спрашиваются.
+    fn deletion_scope_permits(&self, args: &Value) -> bool {
+        let Some(ShellRisk::Deletion { targets, .. }) = self
+            .store
+            .as_ref()
+            .map(|store| classify_shell(args, self.tools.root(), Some(store.root())))
+        else {
+            return false;
+        };
+        let scopes = match self.store {
+            Some(store) => store.delete_scopes(self.tools.root()),
+            None => return false,
+        };
+        !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| scopes.iter().any(|scope| target.starts_with(scope)))
     }
 
     /// «Разрешить похожие»: первый токен команды против правил проекта.
@@ -2519,5 +2775,85 @@ mod tests {
             SkillPage::for_step(&ContextBudget::cloud(), None),
             SkillPage::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod shell_risk_tests {
+    use super::*;
+
+    fn risk(command: &str) -> ShellRisk {
+        let root = std::env::temp_dir().join("shell-risk-root");
+        classify_shell(&json!({"command": command}), &root, None)
+    }
+
+    fn deletion_targets(command: &str) -> (Vec<PathBuf>, Option<PathBuf>) {
+        match risk(command) {
+            ShellRisk::Deletion { targets, scope } => (targets, scope),
+            other => panic!("{command}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deletions_are_classified_with_a_scope_when_targets_share_a_parent() {
+        let (targets, scope) = deletion_targets("rm -rf /tmp/build/objects /tmp/build/logs");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(scope.as_deref(), Some(Path::new("/tmp/build")));
+        let (_, scope) = deletion_targets("rm /tmp/a /var/b");
+        assert_eq!(scope, None, "разные родители — грант не предлагается");
+        let (_, scope) = deletion_targets("rmdir ~/projects/old");
+        assert!(scope.is_some());
+    }
+
+    #[test]
+    fn rm_recursive_over_home_or_glob_is_dangerous_without_grant() {
+        for command in [
+            "rm -rf ~",
+            "rm -rf ~/*",
+            "rm -rf $HOME/work",
+            "rm -fr *",
+            "rm -rf .rcode",
+        ] {
+            match risk(command) {
+                ShellRisk::Dangerous { reason } => assert!(!reason.is_empty(), "{command}"),
+                other => panic!("{command}: {other:?}"),
+            }
+        }
+        assert!(matches!(risk("rm notes.txt"), ShellRisk::Deletion { .. }));
+        assert!(matches!(risk("rm -r build"), ShellRisk::Deletion { .. }));
+    }
+
+    #[test]
+    fn git_clean_with_force_and_find_delete_are_deletions() {
+        assert!(matches!(risk("git clean -fdx"), ShellRisk::Deletion { .. }));
+        assert!(matches!(risk("git status"), ShellRisk::Normal));
+        assert!(matches!(
+            risk("find /tmp/cache -name '*.o' -delete"),
+            ShellRisk::Deletion { .. }
+        ));
+        assert!(matches!(risk("find . -name '*.rs'"), ShellRisk::Normal));
+    }
+
+    #[test]
+    fn carrier_and_home_moves_are_dangerous_without_grant() {
+        match risk("dd if=/dev/zero of=/dev/disk2") {
+            ShellRisk::Dangerous { reason } => assert!(!reason.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(risk("cargo build"), ShellRisk::Normal));
+        assert!(matches!(risk("mv a.txt b.txt"), ShellRisk::Normal));
+    }
+
+    #[test]
+    fn relative_targets_resolve_against_the_project_root() {
+        let root = std::env::temp_dir().join("shell-risk-relative");
+        let risk = classify_shell(&json!({"command": "rm -rf build/logs"}), &root, None);
+        match risk {
+            ShellRisk::Deletion { targets, scope } => {
+                assert_eq!(targets, [root.join("build/logs")]);
+                assert_eq!(scope.as_deref(), Some(root.join("build").as_path()));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
