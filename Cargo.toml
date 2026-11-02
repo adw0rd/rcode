@@ -1,6 +1,6 @@
 [package]
 name = "rcode-cli"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Терминальный агент для разработки с Yandex AI Studio, GigaChat, OpenRouter и локальными моделями"
