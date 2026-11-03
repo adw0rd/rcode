@@ -1885,6 +1885,9 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    // Windows prevents deleting the open checkpoint lock; this external-deletion
+    // scenario is possible on Unix and must not weaken locking to run on Windows.
+    #[cfg(unix)]
     #[test]
     fn externally_deleted_checkpoint_dir_is_recreated_on_the_next_turn() {
         let mut f = Fixture::new();

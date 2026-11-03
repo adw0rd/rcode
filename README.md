@@ -41,7 +41,7 @@ brew upgrade adw0rd/tap/rcode
 Или установите из исходников с Rust **1.88+**:
 
 ```sh
-cargo install --git https://github.com/adw0rd/rcode.git --tag v0.6.2 --locked
+cargo install --git https://github.com/adw0rd/rcode.git --locked
 ```
 
 ## Начать работу
@@ -109,6 +109,30 @@ rcode skills list && rcode skills update                       # каталог 
 Установить набор можно и прямо в диалоге: попросите модель — она запустит `rcode skills install …` через shell, а rcode покажет панель подтверждения. В сессии работают команды `/skills` (каталог) и `/skill ID запрос` (явный выбор).
 
 Свои скиллы кладите в каталог данных rcode (`RCODE_HOME`, по умолчанию — каталог `rcode` в данных пользователя) в `skills/ИМЯ/SKILL.md` или в `.rcode/skills/` проекта. Пользовательские команды — Markdown-файлы в `RCODE_HOME/commands/` или `.rcode/commands/`: `git/pr.md` станет `/git:pr`, `$ARGUMENTS` и `$1…$9` подставляются в текст запроса. Поля `allowed-tools`, `hooks` и скрипты наборов rcode не исполняет: права определяет только приложение.
+
+### Рекомендуемый набор: rstack
+
+[rstack](https://github.com/adw0rd/rstack) — адаптация рабочих процессов gstack для инструментов и разрешений rcode. Рекомендуем начать с ревью изменений, проверки исправлений и поиска причин ошибок:
+
+```sh
+rcode skills install https://github.com/adw0rd/rstack.git --name rstack
+```
+
+После установки в диалоге:
+
+```text
+/skill rstack:review Проверь текущие изменения и укажи подтверждённые ошибки.
+/skill rstack:qa Воспроизведи баг, исправь причину и проверь результат.
+/skill rstack:investigate Разберись, почему падает этот тест.
+```
+
+Или для одного запуска:
+
+```sh
+rcode exec 'Используй rstack:review для текущих изменений; ничего не исправляй.'
+```
+
+Скиллы сохраняют действующие разрешения проекта. Процедуры для браузера, iOS и внешних сервисов требуют отдельных runtime; сам набор их не устанавливает. Описание остальных процедур и ограничений — в [README rstack](https://github.com/adw0rd/rstack#readme).
 
 Подробнее — в [руководстве](docs/usage.md#скиллы).
 

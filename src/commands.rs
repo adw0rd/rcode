@@ -838,9 +838,10 @@ mod tests {
         let fixture = Fixture::new();
         put(&fixture.user().join("a/b/c.md"), "глубоко");
         put(&fixture.user().join("big.md"), "x".repeat(64 * 1024 + 1));
+        command_file(&fixture.user(), "real", "тело");
         #[cfg(unix)]
         {
-            let target = command_file(&fixture.user(), "real", "тело");
+            let target = fixture.user().join("real.md");
             let link = fixture.user().join("link.md");
             std::os::unix::fs::symlink(target, link).unwrap();
         }

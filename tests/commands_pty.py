@@ -73,7 +73,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
         self.server.requests.append(json.loads(body))
-        self.reply(200, {"choices": [{"message": {"role": "assistant", "content": "CMD_PTY_OK"},
+        # Each turn has a distinct response: old screen contents must never
+        # satisfy a wait for a request that has not reached the server yet.
+        response = f"CMD_PTY_OK_{len(self.server.requests)}"
+        self.reply(200, {"choices": [{"message": {"role": "assistant", "content": response},
                                       "finish_reason": "stop"}],
                          "usage": {"prompt_tokens": 900, "completion_tokens": 3}})
 
@@ -135,14 +138,14 @@ def main(binary):
                                and not any("Команды ·" in row for row in terminal.grid.rows()),
                                "Tab completed the command name")
                 terminal.send(" 42 \"две части\"\r")
-                terminal.expect_body("CMD_PTY_OK")
+                terminal.expect_body("CMD_PTY_OK_1")
                 terminal.until(terminal.editor_ready, "composer after the expanded command")
                 assert last_user_prompt(fixture) == (
                     "Подготовь PR для задачи 42. Дополнительно учти: 42 \"две части\""), fixture.requests
 
                 # 2. Unsupported syntax is passed literally and reported once.
                 terminal.send("/run проверь\r")
-                terminal.expect_body("CMD_PTY_OK")
+                terminal.expect_body("CMD_PTY_OK_2")
                 terminal.until(terminal.editor_ready, "composer after /run")
                 assert last_user_prompt(fixture) == "Запусти !`touch MARKER` и все тесты проверь", fixture.requests
                 assert "не исполняется" in terminal.text(), terminal.dump()
@@ -159,7 +162,7 @@ def main(binary):
 
                 # 4. /skill names the resolved skill in the request.
                 terminal.send("/skill writer проверь текст\r")
-                terminal.expect_body("CMD_PTY_OK")
+                terminal.expect_body("CMD_PTY_OK_3")
                 terminal.until(terminal.editor_ready, "composer after /skill")
                 assert "writer" in last_user_prompt(fixture), fixture.requests
 

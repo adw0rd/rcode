@@ -1104,3 +1104,161 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
     with_skill.push(web_search);
     assert_eq!(tool_names(&generations[1]), with_skill);
 }
+
+/// Настоящие неизменённые Superpowers, закреплённые по upstream commit и MIT.
+/// Проверяет transport/tools, а не качество решения Qwen (для этого live lane).
+fn real_superpowers() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/superpowers-upstream")
+}
+
+fn link_real_superpowers(sandbox: &Sandbox) {
+    let source = sandbox.root.join("upstream/skills");
+    copy_tree(&real_superpowers().join("skills"), &source);
+    let output = sandbox.rcode(&[
+        "-C",
+        sandbox.project.to_str().unwrap(),
+        "skills",
+        "link",
+        source.to_str().unwrap(),
+        "--name",
+        "superpowers",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", log(&output));
+}
+
+#[test]
+fn real_superpowers_main_and_supporting_files_reach_model_without_rewriting() {
+    let sandbox = Sandbox::new();
+    link_real_superpowers(&sandbox);
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(real_superpowers().join("UPSTREAM.json")).unwrap())
+            .unwrap();
+    let files: Vec<String> = manifest["files"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    for file in &files {
+        assert_eq!(
+            manifest["files"][file],
+            format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(real_superpowers().join(file)).unwrap())
+            ),
+            "upstream fixture drift: {file}"
+        );
+    }
+    let calls = files.clone();
+    let server = Server::start(move |request, index| {
+        if !request.is_generation() {
+            return no_generation();
+        }
+        if let Some(file) = calls.get(index) {
+            let relative = file.strip_prefix("skills/").unwrap();
+            let (skill, resource) = relative.split_once('/').unwrap();
+            let mut arguments = json!({"name":format!("superpowers:{skill}")});
+            if resource != "SKILL.md" {
+                arguments["file"] = json!(resource);
+            }
+            tool_reply(&format!("real_{index}"), "load_skill", &arguments)
+        } else {
+            text_reply("UPSTREAM_TRANSPORT_VERIFIED")
+        }
+    });
+    let output = sandbox.exec(&server, &[], "Загрузи настоящие Superpowers и их ресурсы");
+    assert_eq!(output.status.code(), Some(0), "{}", log(&output));
+    let requests = server.generations();
+    assert_eq!(requests.len(), files.len() + 1);
+    let prompt = system(&requests[0]);
+    for id in [
+        "using-superpowers",
+        "test-driven-development",
+        "systematic-debugging",
+        "requesting-code-review",
+        "verification-before-completion",
+    ] {
+        assert!(prompt.contains(&format!("superpowers:{id}")), "{prompt}");
+    }
+    assert!(
+        prompt.contains("Skill = load_skill")
+            && prompt.contains("Task/Agent = spawn_agent with wait_agent")
+    );
+    for (index, file) in files.iter().enumerate() {
+        let page = last_receipt(&requests[index + 1]);
+        let (_, resource) = file
+            .strip_prefix("skills/")
+            .unwrap()
+            .split_once('/')
+            .unwrap();
+        assert_eq!(page["path"], resource, "{page}");
+        assert_eq!(page["sha256"], manifest["files"][file], "{page}");
+        assert!(
+            page["next_line"].is_null(),
+            "fixture should fit one page: {page}"
+        );
+        let original = std::fs::read_to_string(real_superpowers().join(file)).unwrap();
+        if resource == "SKILL.md" {
+            let (_, expected_body) = original
+                .strip_prefix("---\n")
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap();
+            assert_eq!(page["content"], expected_body, "{file}");
+        } else {
+            assert_eq!(page["content"], original, "{file}");
+        }
+    }
+}
+
+#[test]
+fn real_superpowers_loaded_in_plan_cannot_add_shell_or_write_capabilities() {
+    let sandbox = Sandbox::new();
+    link_real_superpowers(&sandbox);
+    let server = Server::start(|request, index| {
+        if !request.is_generation() {
+            return no_generation();
+        }
+        if index == 0 {
+            tool_reply(
+                "plan_real",
+                "load_skill",
+                &json!({"name":"superpowers:test-driven-development"}),
+            )
+        } else {
+            text_reply("PLAN_ONLY_NO_ACTIONS")
+        }
+    });
+    let output = sandbox.exec(
+        &server,
+        &["--plan"],
+        "Спланируй проверку по Superpowers; ничего не меняй",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", log(&output));
+    let requests = server.generations();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let names = tool_names(request);
+        assert!(names.iter().any(|n| n == "load_skill"));
+        for forbidden in ["run_command", "write_file", "edit_file", "apply_patch"] {
+            assert!(!names.iter().any(|n| n == forbidden), "{names:?}");
+        }
+    }
+    assert!(
+        last_receipt(&requests[1])["content"]
+            .as_str()
+            .unwrap()
+            .contains("RED-GREEN-REFACTOR")
+            || last_receipt(&requests[1])["content"]
+                .as_str()
+                .unwrap()
+                .contains("Red-Green-Refactor")
+    );
+    assert!(
+        std::fs::read_dir(&sandbox.project)
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}

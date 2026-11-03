@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/obra/superpowers",
+  "commit": "6efe32c9e2dd002d0c394e861e0529675d1ab32e",
+  "files": {
+    "skills/using-superpowers/SKILL.md": "316e29381219adf0cac62190c67aeabf427d6e6e5f2735541d502b3d339be7aa",
+    "skills/using-superpowers/references/codex-tools.md": "9014e6746c9a6d3af9eeb9608f1ad637ee334e5a12d178747e3042937fc3da2b",
+    "skills/test-driven-development/SKILL.md": "7dee67b4af6bdccc7a914ca34533184d64592d0f5b23aeae631538168db14994",
+    "skills/test-driven-development/testing-anti-patterns.md": "bde453bc258f06543987477c837939afaa774ea2acbd9f308d702fc452bc4283",
+    "skills/systematic-debugging/SKILL.md": "4999cb851360485eca5074e727bbdd62ef20549c5d5b01216fcbf5831badb473",
+    "skills/systematic-debugging/root-cause-tracing.md": "a81bee9448794d261b4aca8487c595d11ff4bd4e10a5f96bca1117dd32527050",
+    "skills/systematic-debugging/defense-in-depth.md": "1e175fb86fc357e58c6aebf5441e481e1b7868b4380c0456b63a17eefbd18ba7",
+    "skills/systematic-debugging/condition-based-waiting.md": "e89fec8400d6cd50f43407cec9fab50976ba4d55d0ec2eb51c0bd68036b54c26",
+    "skills/systematic-debugging/condition-based-waiting-example.ts": "40ae5ebe497fdf310200e43fe986552546d0a22837c0d39e855db1cfd33eb88e",
+    "skills/systematic-debugging/find-polluter.sh": "6462747eae9b175ac145b78bcfaeab755654a75e32637f08eb633f065a9e1d7c",
+    "skills/verification-before-completion/SKILL.md": "ea52d15aabaf72bc6b558efe2c126f161b53961090ddcd712000273bfe8c7b6c",
+    "skills/requesting-code-review/SKILL.md": "a5ff68586ccf62d1803cedeb71d60fd96ec05591d29c8d123196117eefd34cd0",
+    "skills/requesting-code-review/code-reviewer.md": "7f5328dca12cb200005ae9d4386f63a9b0acb735ece57f82db206b4a3189ccae"
+  }
+}

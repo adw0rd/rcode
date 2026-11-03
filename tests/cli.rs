@@ -492,7 +492,16 @@ fn step_limit_ends_with_a_tool_free_summary() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(text.contains("\"summary\":true"), "{text}");
-    assert!(text.contains("Осталось: продолжить осмотр"), "{text}");
+    let summary_text: String = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["type"] == "text")
+        .filter_map(|event| event["text"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        summary_text, "Сделано: просмотрены файлы проекта. Осталось: продолжить осмотр.",
+        "{text}"
+    );
     assert!(!text.contains("лимит шагов (1)"), "{text}");
 }
 

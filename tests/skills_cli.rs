@@ -1119,3 +1119,109 @@ fn install_runs_from_the_model_shell_with_user_approval() {
         "ключи поиска из shell модели недоступны"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn remote_install_requires_consent_but_yes_reaches_git_without_stdin_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let bin = sandbox.home.join("fake-bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = sandbox.home.join("git-called");
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf called > \"$HOME/git-called\"\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let invoke = |yes: bool| {
+        let mut command = Process::new(sandbox.binary());
+        command
+            .env_clear()
+            .env("HOME", &sandbox.home)
+            .env("RCODE_HOME", &sandbox.home)
+            .env(
+                "PATH",
+                std::env::join_paths([
+                    bin.clone(),
+                    PathBuf::from("/usr/bin"),
+                    PathBuf::from("/bin"),
+                ])
+                .unwrap(),
+            )
+            .current_dir(&sandbox.project)
+            .stdin(std::process::Stdio::null())
+            .args([
+                "skills",
+                "install",
+                "https://example.invalid/skills.git",
+                "--name",
+                "remote",
+                "--json",
+            ]);
+        if yes {
+            command.arg("--yes");
+        }
+        command.output().unwrap()
+    };
+    let denied = invoke(false);
+    assert_eq!(denied.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&denied.stdout).contains("--yes"));
+    assert!(!marker.exists(), "no network operation before consent");
+    let allowed = invoke(true);
+    assert_eq!(
+        allowed.status.code(),
+        Some(2),
+        "fake Git deliberately fails"
+    );
+    assert!(
+        marker.exists(),
+        "explicit --yes must reach Git, not prompt again: {}",
+        String::from_utf8_lossy(&allowed.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&allowed.stdout).contains("Подтвердите действие"));
+    assert!(
+        !sandbox.home.join("skills.json").exists(),
+        "failed clone must not register a source"
+    );
+}
+
+#[test]
+fn relative_local_git_source_stays_local_for_check_and_update() {
+    if !require_git() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let repo = sandbox._temp.path().join("relative-repo");
+    fs::create_dir_all(&repo).unwrap();
+    write_initial_repo(&repo);
+    let installed = sandbox.run(&["skills", "install", "../relative-repo", "--yes", "--json"]);
+    assert_eq!(
+        installed.code, 0,
+        "{} {}",
+        installed.stdout, installed.stderr
+    );
+    for (action, expected_status) in [("check", "up_to_date"), ("update", "updated")] {
+        let output = sandbox.run(&["skills", action, "relative-repo", "--json"]);
+        assert_eq!(
+            output.code, 0,
+            "{action}: {} {}",
+            output.stdout, output.stderr
+        );
+        assert!(
+            output
+                .events()
+                .iter()
+                .any(|event| event["type"] == "skill_source" && event["status"] == expected_status),
+            "{action}: {}",
+            output.stdout
+        );
+    }
+    assert!(
+        sandbox
+            .home
+            .join("skill-sources/relative-repo/skills/one/SKILL.md")
+            .is_file()
+    );
+}

@@ -52,7 +52,6 @@ def main(binary):
                 'kind':'custom','model':'full-fixture','base_url':f'http://127.0.0.1:{server.server_port}/v1','stream':False}}}))
             (home/'credentials.json').write_text(json.dumps({'version':1,'providers':{'custom':'full-fixture-key'}}))
             for p in home.iterdir():p.chmod(0o600)
-            _dbg=open('/Users/colinfrl/work/rcode/internal/pty-child-stderr.txt','ab')
             terminal=ConnectTerminal(binary,project,home,[])
             try:
                 terminal.until(terminal.editor_ready,'initial editor')
@@ -81,7 +80,6 @@ def main(binary):
                 terminal.send('/exit\r');terminal.finished()
             finally:terminal.close()
 
-            _dbg=open('/Users/colinfrl/work/rcode/internal/pty-child-stderr.txt','ab')
             terminal=ConnectTerminal(binary,project,home,[],
                                          extra_env={'RCODE_DEBUG_DECISION':'1','HOME':str(home)})
             try:

@@ -3128,7 +3128,14 @@ mod shell_risk_tests {
     fn deletions_are_classified_with_a_scope_when_targets_share_a_parent() {
         let (targets, scope) = deletion_targets("rm -rf /tmp/build/objects /tmp/build/logs");
         assert_eq!(targets.len(), 2);
-        assert_eq!(scope.as_deref(), Some(Path::new("/tmp/build")));
+        // Rooted paths use the fixture project's drive on Windows.
+        let expected = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .unwrap()
+            .join("tmp")
+            .join("build");
+        assert_eq!(scope.as_deref(), Some(expected.as_path()));
         let (_, scope) = deletion_targets("rm /tmp/a /var/b");
         assert_eq!(scope, None, "разные родители — грант не предлагается");
         let (_, scope) = deletion_targets("rmdir ~/projects/old");
