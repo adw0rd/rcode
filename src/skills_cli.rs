@@ -901,7 +901,11 @@ async fn check(
 fn record_kind(record: &crate::skill_sources::SourceRecord) -> crate::skill_sources::SourceKind {
     if record.kind == "dir" {
         crate::skill_sources::SourceKind::Dir
-    } else if record.url.starts_with('/') {
+    } else if Path::new(&record.url).is_absolute()
+        || record.url.starts_with('/')
+        || record.url.starts_with("./")
+        || record.url.starts_with("../")
+    {
         crate::skill_sources::SourceKind::GitLocal
     } else {
         crate::skill_sources::SourceKind::GitHttps

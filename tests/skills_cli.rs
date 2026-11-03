@@ -1186,3 +1186,42 @@ fn remote_install_requires_consent_but_yes_reaches_git_without_stdin_prompt() {
         "failed clone must not register a source"
     );
 }
+
+#[test]
+fn relative_local_git_source_stays_local_for_check_and_update() {
+    if !require_git() {
+        return;
+    }
+    let sandbox = Sandbox::new();
+    let repo = sandbox._temp.path().join("relative-repo");
+    fs::create_dir_all(&repo).unwrap();
+    write_initial_repo(&repo);
+    let installed = sandbox.run(&["skills", "install", "../relative-repo", "--yes", "--json"]);
+    assert_eq!(
+        installed.code, 0,
+        "{} {}",
+        installed.stdout, installed.stderr
+    );
+    for (action, expected_status) in [("check", "up_to_date"), ("update", "updated")] {
+        let output = sandbox.run(&["skills", action, "relative-repo", "--json"]);
+        assert_eq!(
+            output.code, 0,
+            "{action}: {} {}",
+            output.stdout, output.stderr
+        );
+        assert!(
+            output
+                .events()
+                .iter()
+                .any(|event| event["type"] == "skill_source" && event["status"] == expected_status),
+            "{action}: {}",
+            output.stdout
+        );
+    }
+    assert!(
+        sandbox
+            .home
+            .join("skill-sources/relative-repo/skills/one/SKILL.md")
+            .is_file()
+    );
+}
