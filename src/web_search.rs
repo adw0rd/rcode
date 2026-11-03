@@ -20,7 +20,7 @@ use std::io::IsTerminal;
 use std::sync::OnceLock;
 
 pub(crate) const TOOL_NAME: &str = "web_search";
-pub(crate) const CREDENTIAL_ID: &str = "websearch";
+const LEGACY_CREDENTIAL_ID: &str = "websearch";
 /// Results admitted to the receipt; each snippet is clipped.
 const MAX_RESULTS: usize = 10;
 const MAX_URL_CHARS: usize = 300;
@@ -64,6 +64,45 @@ impl Provider {
     fn all() -> [Self; 3] {
         [Self::Yandex, Self::Brave, Self::Tavily]
     }
+
+    fn credential_id(self) -> &'static str {
+        match self {
+            Self::Yandex => "websearch:yandex",
+            Self::Brave => "websearch:brave",
+            Self::Tavily => "websearch:tavily",
+        }
+    }
+}
+
+// The provider is part of the credential slot, so a concurrent/late key save
+// cannot bind the old provider's secret to a new provider in config.json.
+// Legacy unscoped keys have no provable owner and are never sent to an API.
+fn clear_keys(store: &ConfigStore) -> Result<()> {
+    store.delete_named_credential(LEGACY_CREDENTIAL_ID)?;
+    for provider in Provider::all() {
+        store.delete_named_credential(provider.credential_id())?;
+    }
+    Ok(())
+}
+
+fn prepare_provider_selection(
+    store: &ConfigStore,
+    settings: &mut WebSearchSettings,
+    provider: Provider,
+) -> Result<()> {
+    if settings.provider.as_deref() != Some(provider.as_str()) {
+        clear_keys(store)?;
+        *settings = WebSearchSettings {
+            provider: Some(provider.as_str().to_owned()),
+            ..WebSearchSettings::default()
+        };
+    }
+    Ok(())
+}
+
+fn save_key(store: &ConfigStore, provider: Provider, key: &str) -> Result<()> {
+    store.save_named_credential(provider.credential_id(), key)?;
+    store.delete_named_credential(LEGACY_CREDENTIAL_ID)
 }
 
 #[derive(Clone)]
@@ -77,7 +116,7 @@ pub(crate) struct Config {
 pub(crate) fn definition() -> ToolDefinition {
     ToolDefinition {
         name: TOOL_NAME.into(),
-        description: "Поиск в интернете через настроенный поисковый API (Yandex Search API, Brave или Tavily). Только чтение; без запросов разрешений. Если поиск не настроен, попросите пользователя выполнить `rcode websearch provider ИМЯ` и передать ключ через `rcode websearch key --stdin`."
+        description: "Поиск в интернете через настроенный поисковый API (Yandex Search API, Brave Search API или Tavily). Только чтение; без запросов разрешений. Если поиск не настроен, предложите пользователю выбрать API через /websearch или `rcode websearch provider ИМЯ`, затем ввести ключ скрыто через `rcode websearch key`. Не просите ключ в чат или в аргументы shell; --stdin предназначен для программной настройки."
             .into(),
         parameters: json!({
             "type": "object",
@@ -101,7 +140,10 @@ pub(crate) fn resolve(store: &ConfigStore) -> Result<Option<Config>> {
     let Some(provider) = Provider::parse(name) else {
         return Ok(None);
     };
-    let Some(key) = store.named_credential(CREDENTIAL_ID)? else {
+    let Some(key) = store
+        .named_credential(provider.credential_id())?
+        .filter(|key| key.chars().count() >= MIN_KEY_CHARS)
+    else {
         return Ok(None);
     };
     Ok(Some(Config {
@@ -221,9 +263,62 @@ struct Hit {
 
 /// Lenient response parsing: Yandex Cloud shapes vary between deployments,
 /// so results are collected from every known field arrangement.
-fn parse(provider: Provider, body: &str) -> Result<Vec<Hit>, String> {
-    let value: Value =
+fn redact_key(text: &str, key: &str) -> String {
+    if key.is_empty() {
+        return text.to_owned();
+    }
+    let mut variants = Vec::new();
+    let mut variant = key.to_owned();
+    for _ in 0..3 {
+        variants.push(variant.clone());
+        let encoded = urlencoded(&variant);
+        let mut lower_hex = encoded.clone().into_bytes();
+        let mut index = 0;
+        while index + 2 < lower_hex.len() {
+            if lower_hex[index] == b'%' {
+                lower_hex[index + 1..index + 3].make_ascii_lowercase();
+                index += 3;
+            } else {
+                index += 1;
+            }
+        }
+        variants.push(encoded);
+        variants.push(String::from_utf8(lower_hex).expect("percent encoding is ASCII"));
+        let encoded = serde_json::to_string(&variant).expect("string serialization");
+        variant = encoded[1..encoded.len() - 1].to_owned();
+    }
+    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    variants.dedup();
+    variants.iter().fold(text.to_owned(), |text, value| {
+        text.replace(value, "[REDACTED]")
+    })
+}
+
+fn redact_values(value: &mut Value, key: &str) {
+    match value {
+        Value::String(text) => *text = redact_key(text, key),
+        Value::Array(values) => {
+            for value in values {
+                redact_values(value, key);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_values(value, key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse(provider: Provider, body: &str, key: Option<&str>) -> Result<Vec<Hit>, String> {
+    let mut value: Value =
         serde_json::from_str(body).map_err(|_| "Ответ провайдера не является JSON".to_owned())?;
+    if let Some(key) = key {
+        // Scrub decoded strings before clipping, otherwise a clipped credential
+        // could leave a secret prefix in the model's receipt and saved history.
+        redact_values(&mut value, key);
+    }
     let arrays: Vec<&Value> = match provider {
         Provider::Brave => vec![
             value
@@ -367,7 +462,8 @@ pub(crate) async fn execute(
             Ok(response) => response,
             Err(error) => {
                 return ToolOutcome::error(
-                    json!({"error": "provider_error", "message": format!("{error}")}).to_string(),
+                    json!({"error": "provider_error", "message": error.without_url().to_string()})
+                        .to_string(),
                 );
             }
         };
@@ -376,7 +472,8 @@ pub(crate) async fn execute(
             Ok(body) => body,
             Err(error) => {
                 return ToolOutcome::error(
-                    json!({"error": "provider_error", "message": format!("{error}")}).to_string(),
+                    json!({"error": "provider_error", "message": error.without_url().to_string()})
+                        .to_string(),
                 );
             }
         };
@@ -385,7 +482,7 @@ pub(crate) async fn execute(
                 json!({"error": "provider_error", "status": status, "message": "Поисковый API вернул ошибку; проверьте ключ и лимиты"}).to_string(),
             );
         }
-        let hits = match parse(config.provider, &body) {
+        let hits = match parse(config.provider, &body, Some(&config.key)) {
             Ok(hits) => hits,
             Err(message) => {
                 return ToolOutcome::error(
@@ -408,19 +505,21 @@ pub(crate) async fn execute(
         ToolOutcome::success(
             json!({
                 "provider": config.provider.as_str(),
-                "query": query,
+                "query": redact_key(query, &config.key),
                 "results": results,
                 "count": count,
             })
             .to_string(),
         )
     };
-    tokio::select! {
+    let mut outcome = tokio::select! {
         outcome = search => outcome,
         _ = cancel.cancelled() => ToolOutcome::error(
             json!({"error": "interrupted", "message": "Поиск отменён"}).to_string(),
         ),
-    }
+    };
+    outcome.content = redact_key(&outcome.content, &config.key);
+    outcome
 }
 
 /// Interactive first-run setup: the user picks a provider, enters the key
@@ -474,10 +573,11 @@ pub(crate) fn setup(store: &ConfigStore) -> Result<Option<Config>> {
             settings.folder_id = Some(folder.to_owned());
         }
     }
-    store.save_named_credential(CREDENTIAL_ID, &key)?;
     let mut loaded: Settings = store.load()?;
+    prepare_provider_selection(store, &mut loaded.websearch, provider)?;
     loaded.websearch = settings;
     store.save(&loaded)?;
+    save_key(store, provider, &key)?;
     println!("✓ Поиск настроен: {}", provider.label());
     resolve(store)
 }
@@ -530,7 +630,7 @@ pub async fn run(
                 anyhow::bail!("Провайдер не распознан: yandex, brave или tavily");
             };
             let mut settings: Settings = store.load()?;
-            settings.websearch.provider = Some(provider.as_str().to_owned());
+            prepare_provider_selection(store, &mut settings.websearch, provider)?;
             store.save(&settings)?;
             events.emit(
                 "websearch",
@@ -538,8 +638,10 @@ pub async fn run(
             );
             if !events.json {
                 println!("✓ Провайдер поиска: {}", provider.label());
-                if store.named_credential(CREDENTIAL_ID)?.is_none() {
-                    println!("Ключ ещё не задан: echo КЛЮЧ | rcode websearch key --stdin");
+                if store.named_credential(provider.credential_id())?.is_none() {
+                    println!(
+                        "Ключ ещё не задан: rcode websearch key (скрытый ввод) или /websearch"
+                    );
                 }
             }
             Ok(0)
@@ -547,11 +649,14 @@ pub async fn run(
         WebsearchCommand::Key { api_key_stdin } => {
             model_shell_guard()?;
             let settings: Settings = store.load()?;
-            if settings.websearch.provider.is_none() {
-                anyhow::bail!(
-                    "Сначала выберите провайдера: rcode websearch provider yandex|brave|tavily"
-                );
-            }
+            let provider = settings
+                .websearch
+                .provider
+                .as_deref()
+                .and_then(Provider::parse)
+                .context(
+                    "Сначала выберите провайдера: rcode websearch provider yandex|brave|tavily",
+                )?;
             let key = if std::io::stdin().is_terminal() && !*api_key_stdin {
                 ui::password("Ключ поискового API (ввод скрыт): ")?
             } else {
@@ -567,7 +672,7 @@ pub async fn run(
             if key.chars().count() < MIN_KEY_CHARS {
                 anyhow::bail!("Ключ не короче {MIN_KEY_CHARS} символов не сохраняется");
             }
-            store.save_named_credential(CREDENTIAL_ID, key)?;
+            save_key(store, provider, key)?;
             events.emit("websearch", json!({"version": 1, "key": true}));
             if !events.json {
                 println!("✓ Ключ сохранён в credentials.json");
@@ -576,7 +681,7 @@ pub async fn run(
         }
         WebsearchCommand::Clear => {
             model_shell_guard()?;
-            store.delete_named_credential(CREDENTIAL_ID)?;
+            clear_keys(store)?;
             let mut settings: Settings = store.load()?;
             settings.websearch = WebSearchSettings::default();
             store.save(&settings)?;
@@ -629,14 +734,14 @@ pub(crate) fn unconfigured_receipt(
         {
             Ok(Some(index)) if index < all.len() => {
                 let provider = all[index];
-                match store.load().map(|mut settings: Settings| {
-                    settings.websearch.provider = Some(provider.as_str().to_owned());
-                    settings
+                match store.load().and_then(|mut settings: Settings| {
+                    prepare_provider_selection(store, &mut settings.websearch, provider)?;
+                    Ok(settings)
                 }) {
                     Ok(settings) => match store.save(&settings) {
                         Ok(()) => {
                             crate::screen::notice(format!(
-                                "✓ Провайдер поиска: {}. Ключ ещё не задан: наберите /websearch или выполните echo КЛЮЧ | rcode websearch key --stdin",
+                                "✓ Провайдер поиска: {}. Ключ ещё не задан: наберите /websearch или выполните rcode websearch key (скрытый ввод)",
                                 provider.label()
                             ));
                             events_notice(
@@ -693,7 +798,7 @@ fn unconfigured_error_receipt() -> ToolOutcome {
     ToolOutcome::error(
         json!({
             "error": "not_configured",
-            "message": "Веб-поиск не настроен или ключ не задан. Попросите пользователя набрать /websearch (выбор провайдера и ключ) или выполнить:\n  rcode websearch provider yandex|brave|tavily\n  echo КЛЮЧ | rcode websearch key --stdin"
+            "message": "Веб-поиск не выполнен: поисковый API не настроен или ключ не задан. Предложите пользователю выбрать Yandex Search API (Yandex Cloud), Brave Search API или Tavily. В интерактиве наберите /websearch; отдельно: rcode websearch provider yandex|brave|tavily, затем rcode websearch key (скрытый ввод). Для программной настройки ключ передаётся через stdin: rcode websearch key --stdin. Ключ старой версии без привязки к API нужно сохранить повторно. Не просите присылать ключ в чат или подставлять его в аргументы shell. Без настройки результатов поиска нет — не выдумывайте источники."
         })
         .to_string(),
     )
@@ -711,12 +816,9 @@ pub(crate) async fn choose(
     settings: &mut Settings,
     events: &mut crate::app::Events,
 ) -> Result<()> {
-    let current = match (
-        &settings.websearch.provider,
-        store.named_credential(CREDENTIAL_ID)?,
-    ) {
-        (Some(provider), Some(_)) => format!("{provider}, ключ задан"),
-        (Some(provider), None) => format!("{provider}, ключ не задан"),
+    let current = match (&settings.websearch.provider, resolve(store)?.is_some()) {
+        (Some(provider), true) => format!("{provider}, ключ задан"),
+        (Some(provider), false) => format!("{provider}, ключ не задан"),
         _ => "не настроено".to_owned(),
     };
     notice!("Веб-поиск: {}", crate::ui::safe(&current));
@@ -739,7 +841,7 @@ pub(crate) async fn choose(
         return Ok(());
     };
     if selected == all.len() {
-        store.delete_named_credential(CREDENTIAL_ID)?;
+        clear_keys(store)?;
         settings.websearch = WebSearchSettings::default();
         store.save(settings)?;
         events.emit(
@@ -750,19 +852,20 @@ pub(crate) async fn choose(
         return Ok(());
     }
     let provider = all[selected];
-    settings.websearch.provider = Some(provider.as_str().to_owned());
     let key = ui::password(&format!("API-ключ {} (ввод скрыт): ", provider.label()))?;
     let key = key.trim();
+    prepare_provider_selection(store, &mut settings.websearch, provider)?;
+    store.save(settings)?;
     if key.chars().count() < MIN_KEY_CHARS {
-        notice!("! Ключ короче {MIN_KEY_CHARS} символов; провайдер сохранён, ключ не задан");
+        notice!("! Ключ короче {MIN_KEY_CHARS} символов; новый ключ не сохранён");
     } else {
-        store.save_named_credential(CREDENTIAL_ID, key)?;
+        save_key(store, provider, key)?;
         notice!("✓ Ключ сохранён в credentials.json");
     }
-    store.save(settings)?;
+    let configured = store.named_credential(provider.credential_id())?.is_some();
     events.emit(
         "websearch",
-        json!({"version": 1, "provider": provider.as_str(), "key": !key.is_empty()}),
+        json!({"version": 1, "provider": provider.as_str(), "key": configured}),
     );
     Ok(())
 }
@@ -855,6 +958,7 @@ mod tests {
                 {"title": "Qwen3", "url": "https://qwen.example/a", "description": "Модель"},
                 {"title": {"value": "Объектный title"}, "url": "https://qwen.example/b"}
             ]}}"#,
+            None,
         )
         .unwrap();
         assert_eq!(hits.len(), 2);
@@ -867,6 +971,7 @@ mod tests {
         let hits = parse(
             Provider::Tavily,
             r#"{"results": [{"title": "T", "url": "https://t.example", "content": "Содержание"}]}"#,
+            None,
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
@@ -881,8 +986,8 @@ mod tests {
             r#"{"response": {"docs": [{"url": "https://y.example/1", "title": {"value": "A"}, "snippet": [{"text": "S"}]}]}}"#,
         ];
         for body in bodies {
-            let hits =
-                parse(Provider::Yandex, body).unwrap_or_else(|error| panic!("{error}: {body}"));
+            let hits = parse(Provider::Yandex, body, None)
+                .unwrap_or_else(|error| panic!("{error}: {body}"));
             assert_eq!(hits.len(), 1, "{body}");
             assert_eq!(hits[0].url, "https://y.example/1");
             assert_eq!(hits[0].title, "A");
@@ -892,7 +997,45 @@ mod tests {
 
     #[test]
     fn non_json_response_is_an_honest_error() {
-        assert!(parse(Provider::Brave, "<html>gateway</html>").is_err());
+        assert!(parse(Provider::Brave, "<html>gateway</html>", None).is_err());
+    }
+
+    #[test]
+    fn reflected_json_escaped_key_is_redacted_before_result_clipping() {
+        let key = "synthetic-\\\"quoted-key";
+        let body = json!({"results":[{
+            "title":format!("{}{key}", "x".repeat(MAX_TITLE_CHARS - 2)),
+            "url":"https://fixture.invalid",
+            "content":format!("nested JSON: {}", serde_json::to_string(key).unwrap())
+        }]})
+        .to_string();
+        let hits = parse(Provider::Tavily, &body, Some(key)).unwrap();
+        assert_eq!(
+            hits[0].title,
+            format!("{}[R…", "x".repeat(MAX_TITLE_CHARS - 2))
+        );
+        assert!(!hits[0].snippet.contains("synthetic"));
+        assert!(hits[0].snippet.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn reflected_url_encoded_keys_are_redacted_before_result_clipping() {
+        let key = "synthetic-/+\\\"key";
+        let encoded = "synthetic-%2F%2B%5C%22key";
+        let lowercase = "synthetic-%2f%2b%5c%22key";
+        let body = json!({"results":[{
+            "title":format!("{}{encoded}", "x".repeat(MAX_TITLE_CHARS - 2)),
+            "url":format!("https://fixture.invalid/?key={lowercase}"),
+            "content":"JSON encoded: synthetic-%2F%2B%5C%5C%5C%22key"
+        }]})
+        .to_string();
+        let hits = parse(Provider::Tavily, &body, Some(key)).unwrap();
+        assert_eq!(
+            hits[0].title,
+            format!("{}[R…", "x".repeat(MAX_TITLE_CHARS - 2))
+        );
+        assert_eq!(hits[0].url, "https://fixture.invalid/?key=[REDACTED]");
+        assert_eq!(hits[0].snippet, "JSON encoded: [REDACTED]");
     }
 
     #[test]
@@ -959,6 +1102,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_error_does_not_include_the_request_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let outcome = execute(
+            &config(Provider::Brave, Some(&format!("http://127.0.0.1:{port}"))),
+            &json!({"query": "private-query-marker"}),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(outcome.is_error);
+        let receipt: Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(receipt["error"], "provider_error");
+        assert!(!outcome.content.contains("private-query-marker"));
+        assert!(!outcome.content.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
     async fn tavily_fixture_post_body_reaches_the_fixture() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -970,7 +1131,7 @@ mod tests {
         );
         let mut response = head.into_bytes();
         response.extend_from_slice(body.as_bytes());
-        std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0u8; 8192];
             let read = Read::read(&mut stream, &mut buffer).unwrap_or(0);
@@ -981,12 +1142,16 @@ mod tests {
             assert!(request.contains("\"query\":\"rcode\""));
         });
         let outcome = execute(
-            &config(Provider::Tavily, Some(&format!("http://127.0.0.1:{port}"))),
+            &config(
+                Provider::Tavily,
+                Some(&format!("http://127.0.0.1:{port}/search")),
+            ),
             &json!({"query": "rcode"}),
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert!(!outcome.is_error, "{}", outcome.content);
+        server.join().unwrap();
         let receipt: Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(receipt["provider"], "tavily");
         assert_eq!(receipt["count"], 1);

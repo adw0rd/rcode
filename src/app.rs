@@ -1094,14 +1094,48 @@ async fn graceful_finish(
     plan: bool,
     skills: &SkillCatalog,
     events: &Events,
-    inbox: &mut mpsc::Receiver<AgentRequest>,
-    executor: &mut ToolExecutor<'_>,
+    agents: &mut AgentPool,
+    cancel: &CancellationToken,
     previous_input: u64,
     previous_output: u64,
     reason: &str,
     exit_code: i32,
 ) -> Result<i32> {
+    // Stop the broker's producers before taking the summary snapshot. A final
+    // text-only request must not run worker tools or race with late writes.
+    agents.shutdown().await;
+    sync_agents(session, agents, events)?;
     let budget = context_budget(client, session, cli, plan, skills);
+    let pending: Vec<_> = agents
+        .uncollected_ids()
+        .into_iter()
+        .map(|id| ToolCall::new("wait_agent", json!({"agent_id":id})))
+        .collect();
+    if !pending.is_empty() {
+        // Use the same correlated receipts as ordinary automatic collection,
+        // including completed results and explicit cancellation of unfinished work.
+        session
+            .messages
+            .push(Message::assistant(&crate::protocol::Completion {
+                tool_calls: pending.clone(),
+                ..Default::default()
+            }));
+        let receipt_limit = budget.receipt_limit().map(|limit| limit / pending.len());
+        for call in pending {
+            let args = serde_json::from_str(&call.function.arguments)?;
+            let outcome = agents.execute("wait_agent", &args).await;
+            let receipt = history_receipt(
+                &budget,
+                receipt_limit,
+                "wait_agent",
+                outcome.content,
+                outcome.is_error,
+                events,
+            );
+            session.messages.push(Message::tool(&call, receipt));
+        }
+    }
+    session.save(store)?;
     if !prepare_context(session, store, 0, &budget)?.report(events) {
         return Ok(exit_code);
     }
@@ -1110,16 +1144,10 @@ async fn graceful_finish(
         system_prompt(session, cli, plan, skills),
     )];
     messages.extend(session.messages.clone());
-    let note = json!({"role":"assistant","content":format!("{FINAL_SUMMARY_PROMPT}\n\nПричина остановки хода: {reason}")});
-    messages.push(Message {
-        role: "assistant".into(),
-        content: Some(note["content"].as_str().unwrap_or_default().to_owned()),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        name: None,
-        provider_meta: None,
-    });
+    messages.push(Message::text(
+        "assistant",
+        format!("{FINAL_SUMMARY_PROMPT}\n\nПричина остановки хода: {reason}"),
+    ));
     let definitions: Vec<crate::protocol::ToolDefinition> = Vec::new();
     let mut guard = StreamGuard {
         pending: String::new(),
@@ -1132,22 +1160,22 @@ async fn graceful_finish(
             events.emit("text", json!({"text":clean}));
         }
     };
-    let completion = drive_with_agents(
-        client.complete(&messages, &definitions, &mut emit),
-        inbox,
-        executor,
-    )
-    .await;
+    let completion = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "Ход прерван; дочерние задачи отменены").into()),
+        result = client.complete(&messages, &definitions, &mut emit) => result,
+    };
     let rest = guard.push("", true);
     if !rest.is_empty() {
         events.emit("text", json!({"text":rest}));
     }
     let mut completion = match completion {
         Ok(completion) => completion,
+        Err(error) if crate::app::exit_code(&error) == 130 => return Err(error),
         Err(error) => {
             events.emit(
                 "error",
-                json!({"message": format!("Итог недоступен: {error:#}"), "exit_code": exit_code}),
+                json!({"message": format!("Итог недоступен: {error:#}. Причина остановки хода: {reason}"), "exit_code": exit_code}),
             );
             return Ok(exit_code);
         }
@@ -1156,7 +1184,22 @@ async fn graceful_finish(
     session.last_usage = completion.usage.clone();
     session.usage.input_tokens += completion.usage.input_tokens;
     session.usage.output_tokens += completion.usage.output_tokens;
+    session.usage.cached_input_tokens += completion.usage.cached_input_tokens;
     events.emit("usage", serde_json::to_value(&completion.usage)?);
+    // A provider can ignore the missing tool definitions. Discard that response
+    // before saving any call arguments or metadata; no action was attempted.
+    let invalid = if !completion.tool_calls.is_empty() {
+        Some("модель вернула вызов инструмента вместо текстового резюме; действие не исполнялось")
+    } else if completion.content.trim().is_empty() {
+        Some("модель вернула пустое текстовое резюме")
+    } else {
+        None
+    };
+    if let Some(message) = invalid {
+        session.save(store)?;
+        events.emit("error", json!({"message":format!("Итог недоступен: {message}. Причина остановки хода: {reason}. Выполненная работа сохранена; перед продолжением проверьте файлы."),"exit_code":exit_code}));
+        return Ok(exit_code);
+    }
     session.messages.push(Message::assistant(&completion));
     session.save(store)?;
     if let Some(screen) = crate::screen::current() {
@@ -2078,8 +2121,8 @@ pub(crate) async fn turn(
                     events.emit("status", json!({"message":"Продолжаю ход по решению пользователя"}));
                 } else {
                     return graceful_finish(
-                        client, session, store, cli, plan, skills, events, &mut inbox,
-                        &mut executor, previous_input, previous_output, &reason, 1,
+                        client, session, store, cli, plan, skills, events, &mut agents,
+                        &cancel, previous_input, previous_output, &reason, 1,
                     )
                     .await;
                 }
@@ -2108,7 +2151,7 @@ pub(crate) async fn turn(
         // Лимит шагов — не обрыв: финальный запрос без инструментов даёт
         // текстовое резюме (что сделано, что осталось), как в opencode.
         graceful_finish(
-            client, session, store, cli, plan, skills, events, &mut inbox, &mut executor,
+            client, session, store, cli, plan, skills, events, &mut agents, &cancel,
             previous_input, previous_output,
             &format!("достигнут лимит шагов ({})", cli.max_steps),
             1,

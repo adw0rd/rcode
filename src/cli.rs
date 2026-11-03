@@ -163,7 +163,7 @@ pub enum WebsearchCommand {
     },
     #[command(about = "Ключ провайдера: читается из stdin или скрытым вводом")]
     Key {
-        #[arg(long)]
+        #[arg(long, visible_alias = "stdin")]
         api_key_stdin: bool,
     },
     #[command(about = "Отключить веб-поиск и удалить ключ")]

@@ -329,6 +329,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.server.requests.append(body)
         prompt = next(message["content"] for message in reversed(body["messages"])
                       if message["role"] == "user")
+        actual_user = next((index for index in reversed(range(len(body["messages"])))
+                            if body["messages"][index]["role"] == "user"
+                            and not body["messages"][index]["content"].startswith("[rcode runtime feedback")), None)
+        loop_prompt = body["messages"][actual_user]["content"] if actual_user is not None else None
+        if loop_prompt in ("LOOP_ABORT", "LOOP_CONTINUE"):
+            turn = body["messages"][actual_user + 1:]
+            final_step = any(message["role"] == "assistant"
+                             and "ЛИМИТ ХОДА" in (message.get("content") or "") for message in turn)
+            reads = sum(message["role"] == "tool" for message in turn)
+            if final_step or (loop_prompt == "LOOP_CONTINUE" and reads >= 4):
+                if final_step:
+                    assert "tools" not in body, body
+                answer = "LOOP_SUMMARY_ABORT" if final_step else "LOOP_CONTINUED"
+                self.reply({"choices": [{"message": {"role": "assistant", "content": answer},
+                                         "finish_reason": "stop"}]})
+            else:
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "loop_read_" + str(reads), "type": "function",
+                                           "function": {"name": "list_files", "arguments": "{}"}}]},
+                           "finish_reason": "tool_calls"}]})
+            return
         if prompt == "PTY_AGENT_VIEW_CHILD":
             self.server.agent_started.set()
             self.server.release_agent.wait(timeout=6)
@@ -859,6 +880,24 @@ def main(binary):
             assert not any(
                 "› Отклонить" in row for row in terminal.grid.rows()[-6:]
             ), terminal.dump()
+
+            phase("loop choice panel")
+            for prompt, answer, expected in [("LOOP_ABORT", "\r", "LOOP_SUMMARY_ABORT"),
+                                             ("LOOP_CONTINUE", "\x1b[B\r", "LOOP_CONTINUED")]:
+                mark = terminal.mark()
+                before = len(fixture.recorded())
+                terminal.send(prompt + "\r")
+                terminal.until(lambda: any("› Прервать ход и получить резюме" in row
+                                           for row in terminal.grid.rows()[:-2])
+                               and any("Продолжить ход (разрешаю повторы)" in row
+                                       for row in terminal.grid.rows()[:-2]),
+                               "loop choice above pinned footer")
+                terminal.assert_footer("openrouter", "ask")
+                assert len(fixture.recorded()) == before + 4, "Панель должна остановить генерации после четырёх повторов"
+                terminal.capture(prompt.lower())
+                terminal.send(answer)
+                terminal.editor_after(expected, mark)
+                assert len(fixture.recorded()) == before + 5, "Выбор должен вызвать ровно один следующий запрос"
 
             phase("websearch choice panel")
 

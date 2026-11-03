@@ -151,6 +151,18 @@ fn unconfigured_search_returns_instructions_without_prompt() {
         "{}",
         stdout_text(&output)
     );
+    let guidance = receipts[0]["message"].as_str().unwrap();
+    for provider in ["Yandex Search API", "Brave Search API", "Tavily"] {
+        assert!(
+            guidance.contains(provider),
+            "Нет понятного выбора {provider}: {guidance}"
+        );
+    }
+    assert!(guidance.contains("/websearch") && guidance.contains("rcode websearch key"));
+    assert!(
+        !guidance.contains("echo КЛЮЧ"),
+        "Ключ не должен вводиться в аргументах команды или истории shell"
+    );
 }
 
 #[test]
@@ -196,6 +208,73 @@ fn configured_brave_searches_and_returns_results() {
     let _listener_guard = listener;
 }
 
+#[test]
+fn reflected_search_keys_never_enter_results_model_history_or_events() {
+    for (key, reflected) in [
+        (SEARCH_KEY, SEARCH_KEY),
+        ("synthetic-/+key", "synthetic-%2F%2Bkey"),
+    ] {
+        let sandbox = Sandbox::new();
+        let search_api = Server::start(move |_, _| {
+            Response::json(
+                200,
+                json!({"results":[{
+                    "title":format!("API reflected {reflected}"),
+                    "url":format!("https://fixture.invalid/?debug={reflected}"),
+                    "content":format!("prefix {reflected} suffix")
+                }]}),
+            )
+        });
+        configure_sandbox(&sandbox, "tavily", Some(&search_api.url));
+        std::fs::write(
+            sandbox.state.join("credentials.json"),
+            json!({"version":1,"providers":{"custom":API_KEY,"websearch:tavily":key}}).to_string(),
+        )
+        .unwrap();
+        let model = Server::start(|request, index| {
+            if !request.is_generation() {
+                return no_generation();
+            }
+            if index == 0 {
+                return tool_reply("w1", "web_search", &json!({"query":"fixture"}));
+            }
+            text_reply("Ответ с отредактированным результатом")
+        });
+        let output = sandbox.exec(&model, "Найди fixture");
+        assert!(output.status.success());
+        assert!(
+            !stdout_text(&output).contains(reflected),
+            "Ключ попал в JSONL результата"
+        );
+        assert!(
+            model
+                .generations()
+                .iter()
+                .all(|request| !request.json().to_string().contains(reflected)),
+            "Ключ передан модели"
+        );
+        let session = std::fs::read_dir(sandbox.state.join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("session.json");
+        assert!(
+            !std::fs::read_to_string(session)
+                .unwrap()
+                .contains(reflected),
+            "Ключ сохранён в историю"
+        );
+        assert!(
+            tool_results(&output)[0]["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+    }
+}
+
 fn configure_sandbox(sandbox: &Sandbox, provider: &str, base: Option<&str>) {
     let mut config = json!({
         "version": 1,
@@ -213,8 +292,9 @@ fn configure_sandbox(sandbox: &Sandbox, provider: &str, base: Option<&str>) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+    let credential_id = format!("websearch:{provider}");
     let credentials =
-        json!({"version": 1, "providers": {"custom": API_KEY, "websearch": SEARCH_KEY}});
+        json!({"version": 1, "providers": {"custom": API_KEY, (credential_id): SEARCH_KEY}});
     let path = sandbox.state.join("credentials.json");
     std::fs::write(&path, serde_json::to_string(&credentials).unwrap()).unwrap();
     #[cfg(unix)]
@@ -288,6 +368,45 @@ fn yandex_search_receives_api_key_and_folder_id() {
 }
 
 #[test]
+fn websearch_key_accepts_the_documented_stdin_flag() {
+    let sandbox = Sandbox::new();
+    assert!(
+        sandbox
+            .rcode(&["websearch", "provider", "tavily"])
+            .status
+            .success()
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rcode"))
+        .args(["websearch", "key", "--stdin"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .envs(std::env::var_os("SYSTEMROOT").map(|value| ("SYSTEMROOT", value)))
+        .env("RCODE_HOME", &sandbox.state)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(SEARCH_KEY.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let credentials: Value =
+        serde_json::from_slice(&std::fs::read(sandbox.state.join("credentials.json")).unwrap())
+            .unwrap();
+    assert_eq!(credentials["providers"]["websearch:tavily"], SEARCH_KEY);
+    assert!(!stdout_text(&output).contains(SEARCH_KEY));
+}
+
+#[test]
 fn websearch_cli_manages_provider_and_key() {
     let sandbox = Sandbox::new();
     let status = sandbox.rcode(&["websearch", "status", "--json"]);
@@ -334,7 +453,7 @@ fn websearch_cli_manages_provider_and_key() {
         &std::fs::read_to_string(sandbox.state.join("credentials.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(credentials["providers"]["websearch"], SEARCH_KEY);
+    assert_eq!(credentials["providers"]["websearch:brave"], SEARCH_KEY);
 
     let status = sandbox.rcode(&["websearch", "status", "--json"]);
     assert!(
@@ -350,6 +469,105 @@ fn websearch_cli_manages_provider_and_key() {
     )
     .unwrap();
     assert!(credentials["providers"].get("websearch").is_none());
+    assert!(credentials["providers"].get("websearch:brave").is_none());
+}
+
+#[test]
+fn changing_search_provider_requires_its_own_key_and_resets_api_options() {
+    let sandbox = Sandbox::new();
+    configure_sandbox(&sandbox, "brave", Some("http://127.0.0.1:9"));
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(sandbox.state.join("config.json")).unwrap()).unwrap();
+    config["websearch"]["folder_id"] = json!("old-folder");
+    std::fs::write(sandbox.state.join("config.json"), config.to_string()).unwrap();
+    // Reselecting the same API must preserve a valid key and its configuration.
+    assert!(
+        sandbox
+            .rcode(&["websearch", "provider", "brave"])
+            .status
+            .success()
+    );
+    assert!(
+        events(&sandbox.rcode(&["websearch", "status", "--json"]))
+            .iter()
+            .any(|event| event["provider"] == "brave" && event["key"] == true)
+    );
+    assert!(
+        sandbox
+            .rcode(&["websearch", "provider", "tavily"])
+            .status
+            .success()
+    );
+    let status = sandbox.rcode(&["websearch", "status", "--json"]);
+    assert!(
+        events(&status).iter().all(|event| event["key"] == false),
+        "{}",
+        stdout_text(&status)
+    );
+    let changed: Value =
+        serde_json::from_slice(&std::fs::read(sandbox.state.join("config.json")).unwrap()).unwrap();
+    assert!(changed["websearch"]["base_url"].is_null());
+    assert!(changed["websearch"]["folder_id"].is_null());
+}
+
+#[test]
+fn legacy_or_other_api_search_keys_never_reach_the_selected_provider() {
+    for slot in ["websearch", "websearch:brave"] {
+        let sandbox = Sandbox::new();
+        let search_api = Server::start(|_, _| {
+            Response::json(
+                200,
+                json!({"results":[{
+                    "title":"Fixture", "url":"https://fixture.invalid", "content":"fixture"
+                }]}),
+            )
+        });
+        configure_sandbox(&sandbox, "tavily", Some(&search_api.url));
+        std::fs::write(
+            sandbox.state.join("credentials.json"),
+            json!({
+                "version":1, "providers":{"custom":API_KEY, (slot):SEARCH_KEY}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let model = Server::start(|request, index| {
+            if !request.is_generation() {
+                return no_generation();
+            }
+            if index == 0 {
+                return tool_reply("w1", "web_search", &json!({"query":"fixture"}));
+            }
+            text_reply("Настройте ключ выбранного API")
+        });
+        let output = sandbox.exec(&model, "Найди fixture");
+        let receipts = tool_results(&output);
+        assert_eq!(
+            receipts[0]["error"],
+            "not_configured",
+            "{slot}: {}",
+            stdout_text(&output)
+        );
+        assert!(
+            search_api.requests().is_empty(),
+            "Непривязанный ключ отправлен в API"
+        );
+    }
+}
+
+#[test]
+fn clearing_search_removes_scoped_and_legacy_keys_but_preserves_model_keys() {
+    let sandbox = Sandbox::new();
+    configure_sandbox(&sandbox, "tavily", None);
+    std::fs::write(sandbox.state.join("credentials.json"), json!({
+        "version":1, "providers":{"custom":API_KEY,"websearch":SEARCH_KEY,
+            "websearch:yandex":SEARCH_KEY,"websearch:brave":SEARCH_KEY,"websearch:tavily":SEARCH_KEY}
+    }).to_string()).unwrap();
+    assert!(sandbox.rcode(&["websearch", "clear"]).status.success());
+    let credentials: Value =
+        serde_json::from_slice(&std::fs::read(sandbox.state.join("credentials.json")).unwrap())
+            .unwrap();
+    assert_eq!(credentials["providers"], json!({"custom":API_KEY}));
 }
 
 /// Живой вызов Tavily: запускается только с TAVILY_API_KEY в окружении и
@@ -369,7 +587,8 @@ fn live_tavily_search() {
     assert!(key.len() >= 8, "TAVILY_API_KEY подозрительно короткая");
     let sandbox = Sandbox::new();
     configure_sandbox(&sandbox, "tavily", None);
-    let credentials = json!({"version": 1, "providers": {"custom": API_KEY, "websearch": key}});
+    let credentials =
+        json!({"version": 1, "providers": {"custom": API_KEY, "websearch:tavily": key}});
     let path = sandbox.state.join("credentials.json");
     std::fs::write(&path, serde_json::to_string(&credentials).unwrap()).unwrap();
     #[cfg(unix)]
