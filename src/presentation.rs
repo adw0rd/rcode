@@ -418,6 +418,21 @@ impl Human {
                     line!("    ↳ {detail}");
                 }
             }
+            "plan_updated" => {
+                if let Some(steps) = data["steps"].as_array() {
+                    for step in steps {
+                        let mark = match step["status"].as_str().unwrap_or_default() {
+                            "completed" => "✓",
+                            "in_progress" => "→",
+                            _ => "·",
+                        };
+                        line!(
+                            "  {mark} {}",
+                            clip(step["step"].as_str().unwrap_or_default(), 160)
+                        );
+                    }
+                }
+            }
             "shell_rule" => {
                 line!(
                     "{} команды «{} …» больше не запрашиваются в этом проекте",

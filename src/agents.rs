@@ -503,9 +503,8 @@ fn bounded(text: &str, limit: usize) -> String {
 }
 
 fn redact(text: &str, secrets: &[String]) -> String {
-    secrets.iter().fold(text.to_owned(), |text, secret| {
-        text.replace(secret, "[REDACTED]")
-    })
+    crate::redaction::redact_text(text, secrets)
+        .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
 }
 
 fn redact_value(value: &mut Value, secrets: &[String]) {
@@ -537,7 +536,9 @@ fn redact_payload(text: &str, secrets: &[String]) -> String {
 }
 
 fn redact_call(call: &mut ToolCall, secrets: &[String]) {
-    call.id = redact(&call.id, secrets);
+    if redact(&call.id, secrets) != call.id || call.id.len() > 256 {
+        call.id = format!("call_{}", uuid::Uuid::new_v4().simple());
+    }
     call.kind = redact(&call.kind, secrets);
     call.function.name = redact(&call.function.name, secrets);
     call.function.arguments = redact_payload(&call.function.arguments, secrets);
@@ -578,7 +579,10 @@ struct WorkerTask {
 }
 
 fn readonly_tool(name: &str) -> bool {
-    matches!(name, "read_file" | "list_files" | "search")
+    matches!(
+        name,
+        "read_file" | "list_files" | "search" | "read_tool_output"
+    )
 }
 
 fn context_size(messages: &[Message]) -> usize {
@@ -626,6 +630,7 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
     let definitions: Vec<_> = Tools::definitions()
         .into_iter()
         .filter(|definition| !task.read_only || readonly_tool(&definition.name))
+        .chain(std::iter::once(crate::artifact_tool::definition()))
         .collect();
     let mut tool_requests = 0;
     let mut denied = false;
@@ -968,7 +973,10 @@ mod tests {
                 .collect();
             assert!(!names.iter().any(|name| AgentPool::is_tool(name)));
             if role != "worker" || read_only {
-                assert_eq!(names, vec!["read_file", "list_files", "search"]);
+                assert_eq!(
+                    names,
+                    vec!["read_file", "list_files", "search", "read_tool_output"]
+                );
             }
             request
                 .reply

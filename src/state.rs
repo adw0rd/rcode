@@ -129,6 +129,8 @@ pub struct Session {
     pub last_usage: Usage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<crate::agents::AgentRecord>,
+    #[serde(default)]
+    pub task_state: crate::task_state::TaskState,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -161,12 +163,14 @@ impl Session {
             usage: Usage::default(),
             last_usage: Usage::default(),
             agents: Vec::new(),
+            task_state: crate::task_state::TaskState::default(),
         })
     }
     pub fn dir(&self, store: &ConfigStore) -> PathBuf {
         store.sessions_dir().join(&self.id)
     }
     pub fn save(&mut self, store: &ConfigStore) -> Result<()> {
+        self.task_state.validate_session(&self.id)?;
         crate::images::save(&self.messages, &self.dir(store))?;
         self.updated_at = now();
         write_private_json(&self.dir(store).join("session.json"), self)
@@ -182,6 +186,7 @@ impl Session {
             bail!("Неподдерживаемая версия сессии {}", session.version);
         }
         uuid::Uuid::parse_str(&session.id).context("Некорректный ID сессии")?;
+        session.task_state.validate_session(&session.id)?;
         Ok(session)
     }
     pub fn load(store: &ConfigStore, id: &str, root: &Path) -> Result<Self> {
@@ -310,9 +315,19 @@ impl Session {
     ) -> Result<usize> {
         let message_chars = |message: &Message| budget.measure(message);
         let threshold = budget.threshold();
+        // Local profiles already exclude the answer and provider reserve from
+        // their input allowance. Their early compaction trigger is not a hard
+        // limit for indivisible user requests. Keep additional tool headroom;
+        // cloud providers retain their historical character-based cutoff.
+        let limit = if budget.is_tokens() {
+            budget.history_limit().saturating_sub(budget.reserve())
+        } else {
+            threshold
+        };
         let unit = budget.unit_label();
         let before = self.context_used(budget);
-        if !force && before.saturating_add(incoming_chars) <= threshold {
+        let requested = before.saturating_add(incoming_chars);
+        if !force && requested <= limit && (requested <= threshold || self.messages.is_empty()) {
             return Ok(0);
         }
         let latest_user = (incoming_chars == 0)
@@ -480,11 +495,18 @@ impl Session {
             }
             .message()?;
             let newest_cost: usize = blocks[newest].messages.iter().map(message_chars).sum();
+            // Local `limit` already withholds tool headroom. Keep the legacy
+            // extra margin for character-budgeted cloud history only.
+            let receipt_reserve = if budget.is_tokens() {
+                0
+            } else {
+                budget.reserve()
+            };
             if protected_cost(&blocks)
                 .saturating_add(newest_cost)
                 .saturating_add(message_chars(&minimal))
-                .saturating_add(budget.reserve())
-                <= threshold
+                .saturating_add(receipt_reserve)
+                <= limit
             {
                 blocks[newest].protected = true;
             }
@@ -497,7 +519,7 @@ impl Session {
         let protected_chars = protected_cost(&blocks);
         let desired = target
             .max(protected_chars.saturating_add(budget.reserve()))
-            .min(threshold);
+            .min(limit);
         let mut summary = memory.message()?;
         while memory.facts.len() > 1
             && protected_chars.saturating_add(message_chars(&summary)) > desired
@@ -514,7 +536,7 @@ impl Session {
             summary = memory.message()?;
         }
         let required = protected_chars.saturating_add(message_chars(&summary));
-        if required > threshold {
+        if required > limit {
             bail!(
                 "Не удаётся безопасно сократить контекст: текущий запрос, незавершённые инструменты и обязательные сведения требуют {required} {unit}. Для ответа и результатов инструментов нужен резерв; сократите запрос или начните новую сессию. {}",
                 budget.limit_sentence()
@@ -562,7 +584,7 @@ impl Session {
         }
         let after: usize = messages.iter().map(message_chars).sum();
         if after >= before {
-            if force {
+            if force || before.saturating_add(incoming_chars) <= limit {
                 return Ok(0);
             }
             bail!(
@@ -1027,6 +1049,122 @@ mod tests {
             "m",
         );
         ContextBudget::for_provider(&settings, None, 1.0, overhead)
+    }
+
+    #[test]
+    fn local_compaction_threshold_does_not_reject_a_protected_request_that_fits() {
+        let mut settings = crate::local::profile_settings(
+            "p",
+            "http://127.0.0.1:8080/v1",
+            crate::local::LocalRuntime::Mlx,
+            "m",
+        );
+        settings.local.as_mut().unwrap().context_tokens = 16384;
+        let budget = ContextBudget::for_provider(&settings, None, 1.0, 6234);
+        let project = tempdir().unwrap();
+        let mut session = Session::new(project.path(), settings).unwrap();
+        let prompt = format!("{} KEEP_COMPLETE_REQUEST", "a".repeat(9350));
+        let message = Message::user(&prompt);
+        let incoming = budget.measure(&message);
+        assert!(incoming > budget.threshold());
+        assert!(incoming + budget.reserve() < budget.history_limit());
+        // First-turn preflight must not manufacture a compaction failure.
+        assert_eq!(session.auto_compact_within(incoming, &budget).unwrap(), 0);
+        session.messages.push(Message::user("Original goal"));
+        session
+            .messages
+            .push(Message::text("assistant", "old response ".repeat(2500)));
+        session.messages.push(message);
+        assert!(session.auto_compact_within(0, &budget).unwrap() > 0);
+        assert!(session.context_used(&budget) + budget.reserve() <= budget.history_limit());
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.content.as_deref() == Some(&prompt))
+        );
+        // Being above the soft trigger is not by itself a reason to reject
+        // an already minimal, safe request on the next preflight.
+        let snapshot = serde_json::to_value(&session).unwrap();
+        assert_eq!(session.auto_compact_within(0, &budget).unwrap(), 0);
+        assert_eq!(serde_json::to_value(&session).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn local_compaction_still_rejects_a_request_that_consumes_reserved_headroom() {
+        let budget = local_budget(9000);
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::new(project.path(), ProviderSettings::new(ProviderKind::Local)).unwrap();
+        let snapshot = serde_json::to_value(&session).unwrap();
+        let incoming = budget.history_limit() - budget.reserve() + 1;
+        assert!(session.auto_compact_within(incoming, &budget).is_err());
+        assert_eq!(serde_json::to_value(&session).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn local_compaction_checks_headroom_even_when_the_soft_trigger_is_higher() {
+        let budget = local_budget(24_196); // 1200 history tokens; trigger 1000, headroom 256.
+        assert_eq!(budget.history_limit(), 1200);
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::new(project.path(), ProviderSettings::new(ProviderKind::Local)).unwrap();
+        let snapshot = serde_json::to_value(&session).unwrap();
+        assert!(980 < budget.threshold());
+        assert!(session.auto_compact_within(980, &budget).is_err());
+        assert_eq!(serde_json::to_value(&session).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn local_compaction_empty_history_does_not_require_a_synthetic_memory() {
+        let budget = local_budget(21_000);
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::new(project.path(), ProviderSettings::new(ProviderKind::Local)).unwrap();
+        let limit = budget.history_limit() - budget.reserve();
+        assert_eq!(session.auto_compact_within(limit, &budget).unwrap(), 0);
+        assert!(session.messages.is_empty());
+        assert!(session.auto_compact_within(limit + 1, &budget).is_err());
+        assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn local_compaction_above_the_trigger_delivers_the_newest_receipt_verbatim() {
+        let budget = local_budget(15_396);
+        assert_eq!(budget.history_limit(), 10_000);
+        let project = tempdir().unwrap();
+        let mut session =
+            Session::new(project.path(), ProviderSettings::new(ProviderKind::Local)).unwrap();
+        session.messages.push(Message::user("Original goal"));
+        session
+            .messages
+            .push(Message::text("assistant", "old content ".repeat(3000)));
+        let current = Message::user("a".repeat(20_850));
+        assert!(budget.measure(&current) > budget.threshold());
+        session.messages.push(current);
+        let call = ToolCall::new("read_file", json!({"path":"fresh.txt"}));
+        session.messages.push(Message::assistant(&Completion {
+            tool_calls: vec![call.clone()],
+            ..Completion::default()
+        }));
+        let receipt = format!("FRESH_HEAD {} FRESH_TAIL", "x".repeat(1700));
+        session.messages.push(Message::tool(&call, &receipt));
+        assert!(session.auto_compact_within(0, &budget).unwrap() > 0);
+        assert!(session.context_used(&budget) + budget.reserve() <= budget.history_limit());
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.as_deref() == Some(&receipt))
+        );
+        session.auto_compact_within(0, &budget).unwrap();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|m| m.role == "tool" && m.content.as_deref() == Some(&receipt))
+        );
+        assert_eq!(occurrences(&session, "FRESH_HEAD"), 1);
     }
 
     fn memory_message(facts: Vec<String>) -> Message {

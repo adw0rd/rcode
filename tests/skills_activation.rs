@@ -27,7 +27,6 @@ use support::{Request, Response, Server, text_reply, tool_reply};
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 const API_KEY: &str = "skills-activation-fixture-key";
 const GUIDANCE: &str = "Skills are listed below as JSON";
-const RUNTIME_BLOCK: &str = "\nThe final runtime block below";
 const PAGE_BYTES: usize = 24 * 1024;
 
 /// Изолированное окружение: свои HOME/USERPROFILE/XDG/RCODE_HOME и проект рядом.
@@ -286,12 +285,34 @@ fn catalog_json(system: &str) -> Option<String> {
     Some(json.to_owned())
 }
 
-/// The whole catalog block as inserted: from its leading newline up to the
-/// runtime block (local providers get no balance guidance in between).
+/// The complete skills block, excluding the separate host task state.
 fn catalog_block(system: &str) -> &str {
     let start = system.find(&format!("\n{GUIDANCE}")).unwrap();
-    let end = system.find(RUNTIME_BLOCK).unwrap();
+    // The renderer's omitted-ID/count notes follow </rcode_skills> and are
+    // still part of its measured cost. TaskState is a separate host block.
+    let end = system[start..].find("\n<rcode_task_state>\n").unwrap() + start;
     &system[start..end]
+}
+
+fn normalize_task_reference_ids(system: String) -> String {
+    let opening = "\n<rcode_task_state>\n";
+    let start = system.find(opening).unwrap() + opening.len();
+    let end = system[start..].find("\n</rcode_task_state>\n").unwrap() + start;
+    let raw = system[start..end].lines().last().unwrap();
+    let mut task: Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(task["goal_preview"], "Привет");
+    assert_eq!(task["current_is_goal"], true);
+    assert!(task["goal_source"].is_string());
+    assert!(task["request_journal"].is_string());
+    for field in ["goal_source", "current_source", "request_journal"] {
+        if let Some(id) = task[field].as_str() {
+            uuid::Uuid::parse_str(id).unwrap();
+            task[field] = Value::String("host-reference".into());
+        }
+    }
+    // Independent sessions mint different immutable IDs; every other field
+    // and all guidance must remain exactly equal with/without a skill.
+    system.replacen(raw, &task.to_string(), 1)
 }
 
 fn runtime(system: &str) -> Value {
@@ -1071,6 +1092,8 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
         .chain(AgentPool::definitions())
         .map(|tool| tool.name)
         .chain([
+            "update_plan".to_owned(),
+            "read_tool_output".to_owned(),
             "get_provider_balance".to_owned(),
             "web_fetch".to_owned(),
             "web_search".to_owned(),
@@ -1095,7 +1118,10 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
             after[start..end].to_owned()
         })
         .unwrap();
-    assert_eq!(after.replacen(&block, "", 1), before);
+    assert_eq!(
+        normalize_task_reference_ids(after.replacen(&block, "", 1)),
+        normalize_task_reference_ids(before),
+    );
     let mut with_skill = expected.clone();
     let web_search = with_skill.pop().unwrap();
     let web_fetch = with_skill.pop().unwrap();

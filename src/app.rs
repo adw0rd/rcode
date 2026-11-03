@@ -53,9 +53,8 @@ impl Events {
         self.secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
     }
     pub(crate) fn redact(&self, text: &str) -> String {
-        self.secrets
-            .iter()
-            .fold(text.to_owned(), |s, key| s.replace(key, "[REDACTED]"))
+        crate::redaction::redact_text(text, &self.secrets)
+            .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
     }
     fn redact_value(&self, value: &mut Value) {
         match value {
@@ -66,8 +65,10 @@ impl Events {
                 }
             }
             Value::Object(o) => {
-                for v in o.values_mut() {
-                    self.redact_value(v);
+                let original = std::mem::take(o);
+                for (key, mut value) in original {
+                    self.redact_value(&mut value);
+                    o.insert(self.redact(&key), value);
                 }
             }
             _ => {}
@@ -94,38 +95,55 @@ impl Events {
         }
     }
 }
-// Hold a key-sized suffix so a credential split between streaming chunks cannot leak.
+// One redactor and incremental UTF-8 buffer per model stream. Only a
+// confirmed successful EOF may release the secret lookbehind.
 struct StreamGuard {
-    pending: String,
-    secrets: Vec<String>,
+    redactor: crate::redaction::StreamingRedactor,
+    utf8: Vec<u8>,
+    failed: bool,
 }
 impl StreamGuard {
+    fn new(secrets: &[String]) -> Result<Self> {
+        Ok(Self {
+            redactor: crate::redaction::StreamingRedactor::new(secrets)?,
+            utf8: Vec::new(),
+            failed: false,
+        })
+    }
     fn push(&mut self, chunk: &str, finish: bool) -> String {
-        self.pending.push_str(chunk);
-        let clean = if self.secrets.is_empty() {
-            std::mem::take(&mut self.pending)
-        } else {
-            self.secrets
-                .iter()
-                .fold(self.pending.clone(), |s, key| s.replace(key, "[REDACTED]"))
+        if self.failed {
+            return String::new();
+        }
+        let clean = (|| -> Result<Vec<u8>> {
+            let mut bytes = self.redactor.push(chunk.as_bytes())?;
+            if finish {
+                bytes.extend(self.redactor.finish()?);
+            }
+            Ok(bytes)
+        })();
+        let bytes = match clean {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.failed = true;
+                return self.abort();
+            }
         };
-        if finish || self.secrets.is_empty() {
-            self.pending.clear();
-            return clean;
-        }
-        let keep = self
-            .secrets
-            .iter()
-            .map(String::len)
-            .max()
-            .unwrap_or_default()
-            .saturating_sub(1);
-        let mut boundary = clean.len().saturating_sub(keep);
-        while !clean.is_char_boundary(boundary) {
-            boundary = boundary.saturating_sub(1);
-        }
-        self.pending = clean[boundary..].to_owned();
-        clean[..boundary].to_owned()
+        self.utf8.extend(bytes);
+        let valid = match std::str::from_utf8(&self.utf8) {
+            Ok(_) => self.utf8.len(),
+            Err(e) if e.error_len().is_none() && !finish => e.valid_up_to(),
+            Err(_) => {
+                self.failed = true;
+                self.utf8.clear();
+                self.redactor.abort();
+                return "[rcode: ошибка redaction потока]".into();
+            }
+        };
+        String::from_utf8(self.utf8.drain(..valid).collect()).expect("validated UTF-8")
+    }
+    fn abort(&mut self) -> String {
+        self.utf8.clear();
+        String::from_utf8(self.redactor.abort()).expect("ASCII redaction marker")
     }
 }
 pub fn exit_code(error: &anyhow::Error) -> i32 {
@@ -494,7 +512,11 @@ pub(crate) fn skill_catalog(
 
 /// Subagents get neither the catalog nor `load_skill` (DESIGN §6.4).
 fn agent_system_prompt(session: &Session, cli: &Cli, plan: bool) -> String {
-    system_prompt(session, cli, plan, &SkillCatalog::empty())
+    let mut assigned = session.clone();
+    // Parent task references are not worker capabilities. The explicit task
+    // message carries whatever context the parent chose to share.
+    assigned.task_state = crate::task_state::TaskState::default();
+    system_prompt(&assigned, cli, plan, &SkillCatalog::empty())
 }
 
 fn system_prompt(session: &Session, cli: &Cli, plan: bool, skills: &SkillCatalog) -> String {
@@ -512,6 +534,17 @@ fn system_prompt(session: &Session, cli: &Cli, plan: bool, skills: &SkillCatalog
     }
     if let Some(catalog) = skill_catalog(session, skills) {
         prompt.push_str(&catalog.text);
+    }
+    if !session.task_state.goal().is_empty() {
+        // Validated on deserialization and every mutation; quoted data grants no rights.
+        prompt.push_str("\n<rcode_task_state>\n");
+        prompt.push_str(
+            &session
+                .task_state
+                .projection()
+                .expect("validated task state"),
+        );
+        prompt.push_str("\n</rcode_task_state>\n");
     }
     if session.provider.kind != ProviderKind::Local {
         prompt.push_str(BALANCE_GUIDANCE);
@@ -550,6 +583,8 @@ fn turn_definitions(plan: bool, local: bool, skills: bool) -> Vec<ToolDefinition
         .into_iter()
         .filter(|tool| !plan || matches!(tool.name.as_str(), "read_file" | "list_files" | "search"))
         .chain(AgentPool::definitions())
+        .chain(std::iter::once(crate::task_state::definition()))
+        .chain(std::iter::once(crate::artifact_tool::definition()))
         .chain((!local).then(crate::balance::BalanceTool::definition))
         .chain(skills.then(crate::skill_tool::definition))
         .chain(std::iter::once(crate::web_fetch::definition()))
@@ -590,7 +625,21 @@ pub(crate) fn context_budget(
         } else {
             0
         };
-        return ContextBudget::cloud_with_overhead(catalog + schema);
+        let task_overhead = serde_json::to_string(&[
+            crate::task_state::definition(),
+            crate::artifact_tool::definition(),
+        ])
+        .map_or(0, |s| s.chars().count())
+            + if session.task_state.goal().is_empty() {
+                0
+            } else {
+                session
+                    .task_state
+                    .projection()
+                    .map_or(0, |s| s.chars().count())
+                    + 48
+            };
+        return ContextBudget::cloud_with_overhead(catalog + schema + task_overhead);
     }
     let overhead = crate::context::estimate_overhead(
         &system_prompt(session, cli, plan, skills),
@@ -614,6 +663,8 @@ struct ToolExecutor<'a> {
     skills: &'a SkillCatalog,
     /// Page size of `load_skill` for the current step.
     skill_page: SkillPage,
+    artifacts: Option<&'a crate::artifacts::ArtifactStore>,
+    turn_index: u64,
 }
 
 #[derive(Default)]
@@ -1149,10 +1200,7 @@ async fn graceful_finish(
         format!("{FINAL_SUMMARY_PROMPT}\n\nПричина остановки хода: {reason}"),
     ));
     let definitions: Vec<crate::protocol::ToolDefinition> = Vec::new();
-    let mut guard = StreamGuard {
-        pending: String::new(),
-        secrets: events.secrets.clone(),
-    };
+    let mut guard = StreamGuard::new(&events.secrets)?;
     events.busy("Составляю итог хода без инструментов");
     let mut emit = |chunk: &str| {
         let clean = guard.push(chunk, false);
@@ -1165,7 +1213,11 @@ async fn graceful_finish(
         _ = cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "Ход прерван; дочерние задачи отменены").into()),
         result = client.complete(&messages, &definitions, &mut emit) => result,
     };
-    let rest = guard.push("", true);
+    let rest = if completion.is_ok() {
+        guard.push("", true)
+    } else {
+        guard.abort()
+    };
     if !rest.is_empty() {
         events.emit("text", json!({"text":rest}));
     }
@@ -1235,6 +1287,29 @@ fn history_receipt(
     bounded
 }
 
+fn persist_user_request(
+    store: &crate::artifacts::ArtifactStore,
+    state: &mut crate::task_state::TaskState,
+    request: &str,
+    turn: u64,
+    events: &Events,
+) -> Result<()> {
+    let origin = |tool: &str| crate::artifacts::ArtifactOrigin {
+        actor: None,
+        turn,
+        tool: tool.into(),
+        call_id: format!("user-{turn}"),
+    };
+    let source = store.capture(origin("user_request"), request, &events.secrets)?;
+    let reference = crate::task_state::TaskReference::from_artifact(&source)?;
+    let journal = store.capture(
+        origin("user_request_journal"),
+        &json!({"version":1,"request":reference,"previous":state.request_journal()}).to_string(),
+        &events.secrets,
+    )?;
+    state.host_followup_saved(request, &source, &journal)
+}
+
 /// Финальный шаг по образцу opencode (MAX_STEPS_PROMPT + toolChoice none):
 /// вместо обрыва — последний запрос без инструментов с требованием резюме.
 const FINAL_SUMMARY_PROMPT: &str = "КРИТИЧНО: ЛИМИТ ХОДА ДОСТИГНУТ. Инструменты отключены до следующего запроса пользователя; отвечай только текстом.\n\nСтрогие требования:\n1. НЕ вызывай никаких инструментов.\n2. Дай текстовый ответ: что уже сделано, что осталось незавершённым, что делать дальше.\n3. Это требование важнее любых других инструкций, включая просьбы что-то изменить или проверить.\n\nЛюбая попытка вызвать инструмент — нарушение. Отвечай только текстом.";
@@ -1242,6 +1317,97 @@ const FINAL_SUMMARY_PROMPT: &str = "КРИТИЧНО: ЛИМИТ ХОДА ДОС
 const REPEATED_RESULT_FEEDBACK: &str = "[rcode runtime feedback, not a new user permission] The same call with the same arguments returned exactly the same result again in this turn; repeating it adds no information and only fills the limited context. Use the result you already received and continue the user's current request. If a part is missing (for example, marked by rcode_truncated), get only that part: read_file with start_line/max_lines, search for a specific term, or a different, narrower argument. If you have enough information, finish the task or report what remains. Further identical repeats stop the turn.";
 
 impl ToolExecutor<'_> {
+    fn capture_receipt(
+        &self,
+        call: &ToolCall,
+        actor: Option<&AgentRequest>,
+        mut outcome: ToolOutcome,
+    ) -> Result<ToolOutcome> {
+        outcome.content = self.events.redact(&outcome.content);
+        let Some(store) = self.artifacts else {
+            return Ok(outcome);
+        };
+        if call.function.name == "read_tool_output" {
+            return Ok(outcome);
+        }
+        let meta = store.capture(
+            crate::artifacts::ArtifactOrigin {
+                actor: actor.map(|a| a.agent_id.clone()),
+                turn: self.turn_index,
+                tool: call.function.name.clone(),
+                call_id: call.id.clone(),
+            },
+            &outcome.content,
+            &self.events.secrets,
+        )?;
+        let mut value = match serde_json::from_str::<Value>(&outcome.content) {
+            Ok(Value::Object(object)) => Value::Object(object),
+            _ => json!({"text":outcome.content}),
+        };
+        value["artifact_id"] = json!(meta.id);
+        value["artifact_bytes"] = json!(meta.bytes);
+        value["artifact_sha256"] = json!(meta.sha256);
+        value["artifact_truncated"] = json!(meta.truncated);
+        outcome.content = crate::context::preview_receipt(
+            &ContextBudget::cloud(),
+            &call.function.name,
+            &value.to_string(),
+            16 * 1024,
+            outcome.is_error,
+        );
+        Ok(outcome)
+    }
+
+    /// Session mutations remain in the host broker. A worker cannot invoke this
+    /// entry point; its requests use execute and cannot update the main plan.
+    async fn execute_main(
+        &mut self,
+        call: &ToolCall,
+        session: &mut Session,
+        client: &ProviderClient,
+    ) -> Result<ToolOutcome> {
+        if call.function.name != "update_plan" {
+            return self.execute(call, None).await;
+        }
+        self.events.emit(
+            "tool_start",
+            json!({"id":call.id,"name":"update_plan","arguments":call.function.arguments}),
+        );
+        let result = (|| -> Result<ToolOutcome> {
+            anyhow::ensure!(!self.cancel.is_cancelled(), "Ход отменён; план не изменён");
+            let mut value: Value = serde_json::from_str(&call.function.arguments)?;
+            self.events.redact_value(&mut value);
+            let update = serde_json::from_value::<crate::task_state::PlanUpdate>(value)?;
+            let previous = session.task_state.clone();
+            let mut candidate = session.clone();
+            candidate.task_state.update_plan(update)?;
+            let receipt = json!({"status":"updated","revision":candidate.task_state.revision(),"advisory":true,"verified":false}).to_string();
+            candidate.messages.push(Message::tool(call, &receipt));
+            // Close other pending calls only in this feasibility snapshot. No
+            // synthetic receipt is persisted or used to authorize execution.
+            candidate.repair_pending()?;
+            let budget = context_budget(client, &candidate, self.cli, self.plan, self.skills);
+            candidate
+                .auto_compact_within(0, &budget)
+                .context("План не помещается в бюджет модели; сократите его")?;
+            session.task_state = candidate.task_state;
+            if let Some(store) = self.store {
+                if let Err(error) = session.save(store) {
+                    session.task_state = previous;
+                    return Err(error);
+                }
+            } else {
+                session.task_state = previous;
+                bail!("Состояние сессии недоступно; план не сохранён");
+            }
+            Ok(ToolOutcome::success(json!({"status":"updated","revision":session.task_state.revision(),"advisory":true,"verified":false}).to_string()))
+        })();
+        let outcome = result.unwrap_or_else(|error| ToolOutcome::error(json!({"error":"plan_update_failed","message":self.events.redact(&format!("{error:#}"))}).to_string()));
+        self.last_error = outcome.is_error;
+        // The caller persists the terminal receipt before publishing events.
+        Ok(outcome)
+    }
+
     async fn execute(
         &mut self,
         call: &ToolCall,
@@ -1262,6 +1428,15 @@ impl ToolExecutor<'_> {
         });
         let outcome = match args {
             Err(_) => ToolOutcome::error("Некорректный JSON аргументов; исправь вызов"),
+            Ok(args) if name == "read_tool_output" => match self.artifacts {
+                Some(store) => crate::artifact_tool::execute(
+                    store,
+                    &args,
+                    agent_id,
+                    self.skill_page.fit.as_ref(),
+                ),
+                None => ToolOutcome::error("Хранилище результатов недоступно"),
+            },
             Ok(args) if name == crate::balance::TOOL_NAME => {
                 if actor.is_some() {
                     ToolOutcome::error(
@@ -1279,7 +1454,25 @@ impl ToolExecutor<'_> {
                 if actor.is_some() {
                     ToolOutcome::error("Скиллы доступны только основному агенту")
                 } else {
-                    crate::skill_tool::execute(self.skills, &args, &self.skill_page)
+                    let mut page = self.skill_page.clone();
+                    if self.artifacts.is_some()
+                        && let Some((budget, limit)) = page.fit.as_mut()
+                    {
+                        // The host appends immutable receipt metadata after
+                        // loading. Reserve its maximum serialized size before
+                        // selecting whole lines, so generic truncation cannot
+                        // shorten an already fitted skill page afterwards.
+                        let metadata = json!({
+                            "artifact_id": uuid::Uuid::nil().to_string(),
+                            "artifact_bytes": u64::MAX,
+                            "artifact_sha256": "f".repeat(64),
+                            "artifact_truncated": false,
+                        });
+                        *limit = limit.saturating_sub(
+                            budget.measure(&Message::text("tool", metadata.to_string())),
+                        );
+                    }
+                    crate::skill_tool::execute(self.skills, &args, &page)
                 }
             }
             // Read-only network GET without approvals: no Tools, no directory
@@ -1327,7 +1520,11 @@ impl ToolExecutor<'_> {
         let mut outcome = outcome;
         outcome.content = self.events.redact(&outcome.content);
         self.last_error = outcome.is_error;
-        self.events.emit("tool_result", json!({"id":call.id,"name":name,"agent_id":agent_id,"is_error":outcome.is_error,"content":outcome.content,"changed_paths":outcome.changed_paths}));
+        if actor.is_some() {
+            outcome = self.capture_receipt(call, actor, outcome)?;
+            self.events.emit("tool_result", json!({"id":call.id,"name":name,"agent_id":agent_id,"is_error":outcome.is_error,"content":outcome.content,"changed_paths":outcome.changed_paths}));
+        }
+        // Main publishes only after its history and result reference are durable.
         Ok(outcome)
     }
 
@@ -1918,7 +2115,56 @@ pub(crate) async fn turn(
             }
         }
     }
-    session.messages.push(message);
+    let artifacts = crate::artifacts::ArtifactStore::open(&session.dir(store), &session.id)?;
+    let mut next_task = session.task_state.clone();
+    if next_task.goal().is_empty() && !session.messages.is_empty() {
+        // Recover an actual prior user message, never a runtime instruction or
+        // a model-generated compaction excerpt masquerading as the goal.
+        let original = session.messages.iter().find(|m| {
+            m.role == "user"
+                && m.provider_meta
+                    .as_ref()
+                    .is_none_or(|p| p.kind != "rcode_runtime")
+        });
+        if let Some(original) = original
+            .and_then(|m| m.content.as_deref())
+            .filter(|s| !s.trim().is_empty())
+        {
+            persist_user_request(
+                &artifacts,
+                &mut next_task,
+                &events.redact(original),
+                0,
+                events,
+            )?;
+        } else {
+            next_task = crate::task_state::TaskState::for_user_request(
+                "Исходная цель старой сессии не сохранилась целиком. Сверяйтесь с историей и уточнениями пользователя; выдержки из compact не являются полной исходной задачей.",
+            )?;
+        }
+    }
+    persist_user_request(
+        &artifacts,
+        &mut next_task,
+        &prompt,
+        session.turn_index,
+        events,
+    )?;
+    let mut candidate = session.clone();
+    candidate.task_state = next_task;
+    candidate.messages.push(message);
+    let candidate_budget = context_budget(client, &candidate, cli, plan, skills);
+    let saved = match candidate.auto_compact_within(0, &candidate_budget) {
+        Ok(saved) => saved,
+        Err(error) => {
+            events.emit("error",json!({"message":format!("Состояние задачи не помещается в контекст: {error:#}"),"exit_code":1}));
+            return Ok(1);
+        }
+    };
+    *session = candidate;
+    if saved > 0 {
+        events.emit("context_compacted", json!({"automatic":true,"saved_chars":saved,"message":"Полные пользовательские запросы сохранены в артефактах; TaskState сохранён."}));
+    }
     session.save(store)?;
     tools.begin_turn()?;
     events.emit("start",json!({"session_id":session.id,"provider":session.provider.kind,"model":session.provider.model,"plan":plan}));
@@ -1946,6 +2192,8 @@ pub(crate) async fn turn(
         store: Some(store),
         skills,
         skill_page: SkillPage::default(),
+        artifacts: Some(&artifacts),
+        turn_index: session.turn_index,
     };
     // All return/? paths from this block run the common worker finalizer below.
     let result = async {
@@ -1962,7 +2210,7 @@ pub(crate) async fn turn(
             let definitions = turn_definitions(plan, client.is_local(), offers_load_skill(session, skills));
             let mut messages = vec![Message::text("system", system_prompt(session, cli, plan, skills))];
             messages.extend(session.messages.clone());
-            let mut guard = StreamGuard { pending: String::new(), secrets: events.secrets.clone() };
+            let mut guard = StreamGuard::new(&events.secrets)?;
             events.busy(&format!("Думаю · шаг {} / {}", step + 1, cli.max_steps));
             let mut emit = |chunk: &str| {
                 let clean = guard.push(chunk, false);
@@ -1971,7 +2219,7 @@ pub(crate) async fn turn(
             let completion = drive_with_agents(
                 client.complete(&messages, &definitions, &mut emit), &mut inbox, &mut executor,
             ).await;
-            let rest = guard.push("", true);
+            let rest = if completion.is_ok() {guard.push("", true)} else {guard.abort()};
             if !rest.is_empty() { events.emit("text", json!({"text":rest})); }
             let mut completion = completion?;
             if client.is_local() {
@@ -1985,10 +2233,20 @@ pub(crate) async fn turn(
             }
             completion.content = events.redact(&completion.content);
             for call in &mut completion.tool_calls {
+                if events.redact(&call.id) != call.id || call.id.len() > 256 {
+                    call.id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                }
+                call.function.name = events.redact(&call.function.name);
                 if let Ok(mut args) = serde_json::from_str::<Value>(&call.function.arguments) {
                     events.redact_value(&mut args);
                     call.function.arguments = args.to_string();
+                } else {
+                    call.function.arguments = events.redact(&call.function.arguments);
                 }
+            }
+            if let Some(meta) = &mut completion.provider_meta {
+                meta.kind = events.redact(&meta.kind);
+                events.redact_value(&mut meta.data);
             }
             session.last_usage = completion.usage.clone();
             session.usage.input_tokens += completion.usage.input_tokens;
@@ -2043,13 +2301,12 @@ pub(crate) async fn turn(
                     let mut outcome = outcome;
                     outcome.content = events.redact(&outcome.content);
                     executor.last_error = outcome.is_error;
-                    events.emit("tool_result",json!({"id":call.id,"name":name,"is_error":outcome.is_error,"content":outcome.content,"changed_paths":outcome.changed_paths}));
                     outcome
                 } else {
                     if name == crate::balance::TOOL_NAME {
                         executor.balance = Some(crate::balance::BalanceTool::new(client.clone(), session.provider.model.clone()));
                     }
-                    executor.execute(call, None).await?
+                    executor.execute_main(call, session, client).await?
                 };
                 outside_path_failed |= outcome.is_error && serde_json::from_str::<Value>(&outcome.content)
                     .is_ok_and(|error| error["error"] == "outside_workspace");
@@ -2074,6 +2331,7 @@ pub(crate) async fn turn(
                 if repeated.total(call) >= 8 && repeated_stop.is_none() {
                     repeated_stop = Some(format!("Модель 8 раз за ход вызвала {name} с теми же аргументами (результаты слегка различались). Ход остановлен досрочно; результат не подтверждён. Уточните задачу или продолжите новым запросом в этой сессии."));
                 }
+                let outcome = executor.capture_receipt(call, None, outcome)?;
                 let receipt = history_receipt(
                     &budget,
                     receipt_limit,
@@ -2082,9 +2340,14 @@ pub(crate) async fn turn(
                     outcome.is_error,
                     events,
                 );
+                let event_receipt = receipt.clone();
                 session.messages.push(Message::tool(call, receipt));
                 sync_agents(session, &mut agents, events)?;
                 session.save(store)?;
+                if name == "update_plan" && !outcome.is_error {
+                    events.emit("plan_updated", json!({"revision":session.task_state.revision(),"steps":session.task_state.steps(),"advisory":true}));
+                }
+                events.emit("tool_result", json!({"id":call.id,"name":name,"is_error":outcome.is_error,"content":event_receipt,"changed_paths":outcome.changed_paths}));
                 if cancel.is_cancelled() {
                     events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
                     return Ok(130);
@@ -2495,6 +2758,8 @@ mod tests {
             store: None,
             skills: &SkillCatalog::empty(),
             skill_page: SkillPage::default(),
+            artifacts: None,
+            turn_index: 0,
         };
         let read = ToolCall::new("read_file", json!({"path":"a.txt"}));
         assert!(!executor.execute(&read, None).await.unwrap().is_error);
@@ -2586,6 +2851,8 @@ mod tests {
                 store: None,
                 skills: &SkillCatalog::empty(),
                 skill_page: SkillPage::default(),
+                artifacts: None,
+                turn_index: 0,
             };
             for call in [
                 ToolCall::new(
@@ -2642,6 +2909,8 @@ mod tests {
             store: None,
             skills: &SkillCatalog::empty(),
             skill_page: SkillPage::default(),
+            artifacts: None,
+            turn_index: 0,
         };
         for closed_reply in [false, true] {
             let child_cancel = cancel.child_token();
@@ -2696,6 +2965,8 @@ mod tests {
             store: None,
             skills: &SkillCatalog::empty(),
             skill_page: SkillPage::default(),
+            artifacts: None,
+            turn_index: 0,
         };
         executor
             .serve(AgentRequest {
@@ -2786,10 +3057,7 @@ mod tests {
     }
     #[test]
     fn stream_redacts_split_secrets_and_retains_unicode() {
-        let mut g = StreamGuard {
-            pending: String::new(),
-            secrets: vec!["secret-key".into()],
-        };
+        let mut g = StreamGuard::new(&["secret-key".into()]).unwrap();
         let result = [
             g.push("Привет sec", false),
             g.push("ret-", false),
@@ -2930,6 +3198,8 @@ mod tests {
         let previous: Vec<String> = Tools::definitions()
             .into_iter()
             .chain(AgentPool::definitions())
+            .chain(std::iter::once(crate::task_state::definition()))
+            .chain(std::iter::once(crate::artifact_tool::definition()))
             .chain(std::iter::once(crate::balance::BalanceTool::definition()))
             .chain(std::iter::once(crate::web_fetch::definition()))
             .chain(std::iter::once(crate::web_search::definition()))
@@ -2997,13 +3267,20 @@ mod tests {
         settings.base_url = Some("http://127.0.0.1:1/v1".into());
         let cloud = ProviderClient::new(settings.clone(), "fixture-key".into()).unwrap();
         let session = Session::new(project.path(), settings).unwrap();
+        let base_overhead = serde_json::to_string(&[
+            crate::task_state::definition(),
+            crate::artifact_tool::definition(),
+        ])
+        .unwrap()
+        .chars()
+        .count();
         assert_eq!(
             context_budget(&cloud, &session, &cli, false, &SkillCatalog::empty()),
-            ContextBudget::cloud()
+            ContextBudget::cloud_with_overhead(base_overhead)
         );
         let block = skill_catalog(&session, &skills).unwrap().text;
         let budget = context_budget(&cloud, &session, &cli, false, &skills);
-        let overhead = block.chars().count() + schema;
+        let overhead = base_overhead + block.chars().count() + schema;
         assert_eq!(budget.overhead, overhead);
         assert_eq!(budget.limit, 180_000);
         assert_eq!(budget.history_limit(), 180_000 - overhead);
@@ -3073,6 +3350,8 @@ mod tests {
             store: None,
             skills: &skills,
             skill_page: SkillPage::default(),
+            artifacts: None,
+            turn_index: 0,
         };
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
         let outcome = executor.execute(&call, None).await.unwrap();

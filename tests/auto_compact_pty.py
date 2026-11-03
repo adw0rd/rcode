@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -66,7 +67,11 @@ def main(binary):
             terminal.expect('Автокомпакт', mark)
             terminal.assert_footer()
             percent = chars * 100 // 180000
-            assert f'{percent}% лок.' in terminal.grid.rows()[-1], terminal.dump()
+            # The footer counts host schema overhead as well as saved history.
+            # Exact schema/budget arithmetic is covered by Rust unit/wire tests;
+            # this PTY contract catches a stale full-context footer after restore.
+            shown = re.search(r'(\d+)% лок\.', terminal.grid.rows()[-1])
+            assert shown and percent <= int(shown.group(1)) <= percent + 3, terminal.dump()
             assert 'restricted_receipts' not in terminal.text(mark), 'Internal memory JSON leaked into restored UI'
 
         first, first_path = full_session()

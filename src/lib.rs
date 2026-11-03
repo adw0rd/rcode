@@ -40,3 +40,19 @@ mod input_history;
 pub mod interactive;
 
 pub mod screen;
+
+pub mod redaction;
+
+pub mod patch;
+
+pub mod shell_policy;
+pub mod task_state;
+
+pub mod instructions;
+pub mod sandbox;
+
+pub mod artifacts;
+
+mod artifact_tool;
+
+pub mod diagnostics;

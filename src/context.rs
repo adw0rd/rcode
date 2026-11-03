@@ -298,6 +298,10 @@ const ESSENTIAL: &[&str] = &[
     "next_offset",
     "skill",
     "partial_line",
+    "artifact_id",
+    "artifact_bytes",
+    "artifact_sha256",
+    "artifact_truncated",
 ];
 const ESSENTIAL_CHARS: usize = 400;
 /// Head of a non-JSON result kept by the last-resort receipt.
@@ -312,7 +316,7 @@ fn truncation_hint(tool: &str) -> &'static str {
             "Host shortened this skill page to fit the local model context; see rcode_truncated.fields.content. With complete_lines, every shown line is whole: continue with load_skill with the same name and file and start_line=next_line. With partial_line, that single line is longer than the context allows and its omitted part cannot be obtained by paging (next_line, if any, is the following line). Do not reload the same range."
         }
         "run_command" => {
-            "Host shortened this output to fit the local model context; the command ran once and was not repeated. Do not re-run it to see the omitted lines: for a file use read_file with start_line/max_lines or search; otherwise use a narrower side-effect-free command (grep -n, sed -n 'A,Bp')."
+            "Host shortened this output; the command ran once. With artifact_id, read_tool_output retrieves the saved result without rerunning it. Use start_line/max_lines or query; offset/max_bytes reads long lines. Without an artifact, use a narrower side-effect-free inspection; never repeat side effects to retrieve output."
         }
         _ => {
             "Host shortened this result to fit the local model context. Narrow the request (path, pattern, offset, max_results) instead of repeating it."
@@ -577,9 +581,30 @@ pub fn bound_receipt(
     limit: usize,
     is_error: bool,
 ) -> String {
+    bound_receipt_inner(budget, tool, content, limit, is_error, true)
+}
+
+pub fn preview_receipt(
+    budget: &ContextBudget,
+    tool: &str,
+    content: &str,
+    limit: usize,
+    is_error: bool,
+) -> String {
+    bound_receipt_inner(budget, tool, content, limit, is_error, false)
+}
+
+fn bound_receipt_inner(
+    budget: &ContextBudget,
+    tool: &str,
+    content: &str,
+    limit: usize,
+    is_error: bool,
+    protect_restricted: bool,
+) -> String {
     let cost = |text: &str| budget.measure(&Message::text("tool", text));
     let total = cost(content);
-    if total <= limit || is_restricted_receipt(content) {
+    if total <= limit || (protect_restricted && is_restricted_receipt(content)) {
         return content.to_owned();
     }
     let original = content.chars().count();

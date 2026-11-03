@@ -22,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+aho-corasick = "1"
 base64 = "0.22"
 cap-std = "4"
 # Level-triggered TTY polling preserves simultaneous SIGWINCH and paste on macOS.
@@ -49,6 +50,7 @@ unicode-segmentation = "1.13"
 uuid = { version = "1", features = ["v4", "serde"] }
 fs2 = "0.4"
 pulldown-cmark = { version = "0.13.5", default-features = false }
+cap-fs-ext = { version = "4", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"
