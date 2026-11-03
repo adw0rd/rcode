@@ -1019,6 +1019,7 @@ pub(crate) async fn run(
     client: &mut ProviderClient,
     events: &mut Events,
     skills: SkillCatalog,
+    execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
     let rich = events.display.is_rich();
     let _screen = if rich {
@@ -1242,7 +1243,7 @@ pub(crate) async fn run(
                     // Checked locally first: an unknown id never reaches the model.
                     let prompt=skill_request(&skills,rest)?;
                     if rich{notice!("\n{} {}",presentation::tone("❯","1;38;5;110",true),ui::safe(&redacted));}
-                    turn(session,store,tools,client,events,&runtime,&prompt,plan,&skills).await.map(drop)
+                    turn(session,store,tools,client,events,&runtime,&prompt,plan,&skills,execution).await.map(drop)
                 },
                 "/export"=>{
                     let path=crate::export::write(session,input.strip_prefix(command).unwrap_or_default(),|text|events.redact(text))?;
@@ -1253,7 +1254,15 @@ pub(crate) async fn run(
                 "/diff"=>{notice!("{}",ui::safe(&tools.diff()?));Ok(())},
                 "/undo"=>{let text=tools.undo()?;notice!("{}",ui::safe(&text));let mut message=Message::user(format!("Пользователь выполнил /undo: {text}. Перечитай файлы перед изменениями."));message.provider_meta=Some(ProviderMeta{kind:"rcode_runtime".into(),data:json!({"undo":true})});session.messages.push(message);session.save(store)},
                 "/compact"=>{let saved=session.compact_within(&budget)?;session.save(store)?;notice!("✓ История сокращена на {saved} {}",budget.unit_label());Ok(())},
-                "/clear"|"/new"=>{*session=Session::new(&session.root,session.provider.clone())?;session.save(store)?;*tools=configured_tools(&session.root,&session.dir(store).join("checkpoints"),&runtime)?;notice!("✓ Новая сессия: {}",session.id);Ok(())},
+                "/clear"|"/new"=>{
+                    let mut next=Session::new(&session.root,session.provider.clone())?;
+                    next.save(store)?;
+                    let next_tools=configured_tools(&next.root,&next.dir(store).join("checkpoints"),&runtime)?;
+                    let next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secrets.clone())?;
+                    execution.shutdown().await?;
+                    *session=next;*tools=next_tools;*execution=next_execution;
+                    notice!("✓ Новая сессия: {}",session.id);Ok(())
+                },
                 "/resume"=>{
                     let id=if let Some(id)=args.first(){Some((*id).to_owned())}else{
                         let saved=Session::list(store)?.into_iter().filter(|s|s.root==session.root).collect::<Vec<_>>();
@@ -1266,7 +1275,9 @@ pub(crate) async fn run(
                         let mut restored=Session::load(store,&id,&session.root)?;
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        let next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secrets.clone())?;
+                        execution.shutdown().await?;
+                        *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _ if custom.is_some() => {
@@ -1288,7 +1299,7 @@ pub(crate) async fn run(
                             ui::safe(&redacted)
                         );
                     }
-                    turn(session, store, tools, client, events, &runtime, &prompt, plan, &skills)
+                    turn(session, store, tools, client, events, &runtime, &prompt, plan, &skills, execution)
                         .await
                         .map(drop)
                 }
@@ -1318,7 +1329,7 @@ pub(crate) async fn run(
             );
         }
         if let Err(e) = turn(
-            session, store, tools, client, events, &runtime, input, plan, &skills,
+            session, store, tools, client, events, &runtime, input, plan, &skills, execution,
         )
         .await
         {

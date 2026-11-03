@@ -258,6 +258,7 @@ struct Registry {
     running: usize,
     closing: bool,
     sticky_unknown: bool,
+    closed_through: Option<u64>,
 }
 struct Core {
     session: String,
@@ -271,6 +272,27 @@ struct Core {
 }
 pub struct JobsSupervisor {
     core: Arc<Core>,
+}
+/// Cloneable cancellation authority for a host-owned turn guard, without
+/// duplicating JobsSupervisor's emergency Drop ownership.
+pub(crate) struct TurnControl {
+    core: Arc<Core>,
+    turn: u64,
+}
+impl TurnControl {
+    pub(crate) fn cancel(&self) {
+        close_turn(&mut lock(&self.core.state), self.turn, true);
+    }
+}
+fn close_turn(state: &mut Registry, turn: u64, cancel_main: bool) {
+    state.closed_through = Some(state.closed_through.map_or(turn, |last| last.max(turn)));
+    for r in state
+        .records
+        .values_mut()
+        .filter(|r| r.view.origin.turn == turn && (cancel_main || r.view.owner.is_some()))
+    {
+        request(r, JobStatus::Cancelled, "origin turn finished");
+    }
 }
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -449,6 +471,7 @@ impl JobsSupervisor {
                     running: 0,
                     closing: false,
                     sticky_unknown: false,
+                    closed_through: None,
                 }),
                 cancel: CancellationToken::new(),
                 changed: Notify::new(),
@@ -480,6 +503,12 @@ impl JobsSupervisor {
             ensure!(
                 !state.closing && !self.core.cancel.is_cancelled(),
                 "supervisor closing"
+            );
+            ensure!(
+                state
+                    .closed_through
+                    .is_none_or(|last| spec.origin.turn > last),
+                "origin turn closed"
             );
             ensure!(
                 state.records.values().filter(|r| r.resource).count() < 4,
@@ -678,6 +707,8 @@ impl JobsSupervisor {
             ownership_epoch: expected_epoch.saturating_add(1),
         };
         let mut state = lock(&self.core.state);
+        let closed_through = state.closed_through;
+        let closing = state.closing;
         let r = state
             .records
             .get_mut(id)
@@ -687,7 +718,9 @@ impl JobsSupervisor {
             return Ok(receipt.clone());
         }
         ensure!(
-            r.view.kind == JobKind::Managed
+            !closing
+                && closed_through.is_none_or(|last| r.view.origin.turn > last)
+                && r.view.kind == JobKind::Managed
                 && r.view.owner.as_deref() == Some(actor)
                 && r.view.ownership_epoch == expected_epoch
                 && expected_epoch == 0
@@ -751,6 +784,48 @@ impl JobsSupervisor {
         .await
         .map_err(|_| anyhow::anyhow!("stop deadline; cleanup unconfirmed"))?
     }
+    /// Host-only parent-turn boundary. A handed-off job has owner=None and
+    /// survives ordinary worker completion. Real turn cancellation closes all
+    /// jobs created by that turn, regardless of their current owner.
+    pub(crate) async fn finish_turn(&self, turn: u64, cancel_main: bool) -> Result<()> {
+        let selected =
+            |r: &Record| r.view.origin.turn == turn && (cancel_main || r.view.owner.is_some());
+        {
+            let mut state = lock(&self.core.state);
+            close_turn(&mut state, turn, cancel_main);
+        }
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let notified = self.core.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let state = lock(&self.core.state);
+                    let mut pending = false;
+                    for r in state.records.values().filter(|r| selected(r)) {
+                        pending |= !r.done;
+                        if r.done {
+                            ensure!(r.view.cleanup_complete, "turn cleanup unconfirmed");
+                        }
+                    }
+                    if !pending {
+                        return Ok(());
+                    }
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("turn cleanup deadline; cleanup unconfirmed"))?
+    }
+
+    pub(crate) fn turn_control(&self, turn: u64) -> TurnControl {
+        TurnControl {
+            core: self.core.clone(),
+            turn,
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         lock(&self.core.state).closing = true;
         self.core.cancel.cancel();

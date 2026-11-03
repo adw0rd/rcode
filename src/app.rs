@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 pub struct Events {
     pub json: bool,
-    secrets: Vec<String>,
+    pub(crate) secrets: Vec<String>,
     pub(crate) display: crate::presentation::Human,
 }
 impl Events {
@@ -411,8 +411,13 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         session.compact_within(&context_budget(&client, &session, cli, cli.plan, &skills))?;
         session.save(&store)?;
     }
-    if let Some(Command::Exec { prompt }) = &cli.command {
-        return turn(
+    let mut execution = crate::session_runtime::SessionRuntime::new(
+        &session.dir(&store),
+        &session.id,
+        events.secrets.clone(),
+    )?;
+    let result = if let Some(Command::Exec { prompt }) = &cli.command {
+        turn(
             &mut session,
             &store,
             &mut tools,
@@ -422,23 +427,36 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
             &prompt.join(" "),
             cli.plan,
             &skills,
+            &mut execution,
         )
-        .await;
+        .await
+    } else if !ui::terminal() {
+        Err(anyhow::anyhow!(
+            "Для задачи без терминала используйте rcode exec 'запрос'"
+        ))
+    } else {
+        crate::interactive::run(
+            cli,
+            &store,
+            &mut settings,
+            &mut session,
+            &mut tools,
+            &mut client,
+            events,
+            skills,
+            &mut execution,
+        )
+        .await
+    };
+    // Neither ordinary errors nor an interactive /exit skip asynchronous cleanup.
+    let cleanup = execution.shutdown().await;
+    match (result, cleanup) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("Завершение процессов сессии: {cleanup:#}")))
+        }
     }
-    if !ui::terminal() {
-        bail!("Для задачи без терминала используйте rcode exec 'запрос'");
-    }
-    crate::interactive::run(
-        cli,
-        &store,
-        &mut settings,
-        &mut session,
-        &mut tools,
-        &mut client,
-        events,
-        skills,
-    )
-    .await
 }
 
 /// Disk-only snapshot of the skills visible to this project (DESIGN §6.1).
@@ -2055,7 +2073,14 @@ pub(crate) async fn turn(
     prompt: &str,
     plan: bool,
     skills: &SkillCatalog,
+    execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
+    anyhow::ensure!(
+        execution.session_id() == session.id,
+        "Runtime относится к другой сессии"
+    );
+    let cancel = CancellationToken::new();
+    let _interrupt = TurnInterrupt::bind(cancel.clone())?;
     session.repair_pending()?;
     let prompt = events.redact(prompt);
     let mut message = crate::images::user_message(&prompt, &session.root)?;
@@ -2085,8 +2110,6 @@ pub(crate) async fn turn(
     for image in &message.images {
         events.emit("image", json!({"name": image.name, "bytes": image.bytes}));
     }
-    let cancel = CancellationToken::new();
-    let _interrupt = TurnInterrupt::bind(cancel.clone())?;
     if !message.images.is_empty() && !client.declares_images().await {
         match crate::vision::resolve(store)? {
             Some(reader) => {
@@ -2115,7 +2138,8 @@ pub(crate) async fn turn(
             }
         }
     }
-    let artifacts = crate::artifacts::ArtifactStore::open(&session.dir(store), &session.id)?;
+    let job_scope = execution.begin_turn(session.turn_index, &cancel)?;
+    let artifacts = execution.artifacts();
     let mut next_task = session.task_state.clone();
     if next_task.goal().is_empty() && !session.messages.is_empty() {
         // Recover an actual prior user message, never a runtime instruction or
@@ -2131,7 +2155,7 @@ pub(crate) async fn turn(
             .filter(|s| !s.trim().is_empty())
         {
             persist_user_request(
-                &artifacts,
+                artifacts,
                 &mut next_task,
                 &events.redact(original),
                 0,
@@ -2144,7 +2168,7 @@ pub(crate) async fn turn(
         }
     }
     persist_user_request(
-        &artifacts,
+        artifacts,
         &mut next_task,
         &prompt,
         session.turn_index,
@@ -2192,7 +2216,7 @@ pub(crate) async fn turn(
         store: Some(store),
         skills,
         skill_page: SkillPage::default(),
-        artifacts: Some(&artifacts),
+        artifacts: Some(artifacts),
         turn_index: session.turn_index,
     };
     // All return/? paths from this block run the common worker finalizer below.
@@ -2421,6 +2445,8 @@ pub(crate) async fn turn(
         )
         .await
     }.await;
+    drop(executor);
+    let job_cleanup = execution.finish_turn(job_scope, result.is_err()).await;
     cancel.cancel();
     agents.shutdown().await;
     let cleanup: Result<()> = (|| {
@@ -2428,6 +2454,12 @@ pub(crate) async fn turn(
         session.repair_pending()?;
         session.save(store)
     })();
+    let cleanup = match (job_cleanup, cleanup) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("Сохранение состояния: {cleanup:#}")))
+        }
+    };
     match (result, cleanup) {
         (Ok(code), Ok(())) => Ok(code),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -2504,6 +2536,9 @@ mod tests {
         let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
         let mut client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
         let events = Events::new(true);
+        let mut execution =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
         let code = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             turn(
@@ -2516,6 +2551,7 @@ mod tests {
                 &"x".repeat(crate::state::CONTEXT_LIMIT + 1),
                 false,
                 &SkillCatalog::empty(),
+                &mut execution,
             ),
         )
         .await
@@ -2555,6 +2591,9 @@ mod tests {
         let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
         let mut client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
         let events = Events::new(true);
+        let mut execution =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
         let error = turn(
             &mut session,
             &store,
@@ -2565,6 +2604,7 @@ mod tests {
             "/attach screen.png Ещё одно изображение",
             false,
             &SkillCatalog::empty(),
+            &mut execution,
         )
         .await
         .unwrap_err();
