@@ -1,8 +1,8 @@
 //! Владение ресурсами одной сессии. Это host API, не разрешение на исполнение.
-use crate::{artifacts::ArtifactStore, jobs::JobsSupervisor};
+use crate::{artifacts::ArtifactStore, jobs::JobsSupervisor, operation_journal::OperationJournal};
 use anyhow::{Result, ensure};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,8 +14,10 @@ use tokio_util::sync::CancellationToken;
 pub struct SessionRuntime {
     incarnation: uuid::Uuid,
     session_id: String,
+    session_dir: PathBuf,
     artifacts: ArtifactStore,
     jobs: JobsSupervisor,
+    journal: Option<OperationJournal>,
     cancel: CancellationToken,
     active: Arc<AtomicBool>,
     last_turn: Option<u64>,
@@ -57,8 +59,10 @@ impl SessionRuntime {
         Ok(Self {
             incarnation: uuid::Uuid::new_v4(),
             session_id: session_id.into(),
+            session_dir: session_dir.to_path_buf(),
             artifacts: ArtifactStore::open(session_dir, session_id)?,
-            jobs: JobsSupervisor::new(session_id, secrets)?,
+            jobs: JobsSupervisor::new_for_session(session_id, secrets)?,
+            journal: None,
             cancel: CancellationToken::new(),
             active: Arc::new(AtomicBool::new(false)),
             last_turn: None,
@@ -75,12 +79,31 @@ impl SessionRuntime {
         &self.jobs
     }
 
+    /// Подготовка replacement не забирает lease старой сессии. Активация
+    /// выполняется после её shutdown и до записи истории/нового исполнения.
+    pub fn activate(&mut self) -> Result<()> {
+        ensure!(!self.closed, "Исполнение сессии завершено");
+        // Legacy CLI remains available where the new durable backend is not
+        // implemented. New managed tools must require an active journal.
+        if !cfg!(unix) {
+            return Ok(());
+        }
+        if let Some(journal) = &self.journal {
+            return journal.check_active();
+        }
+        let journal = OperationJournal::open(&self.session_dir, &self.session_id, &self.artifacts)?;
+        self.jobs.attach_cleanup_guard(journal.cleanup_guard())?;
+        self.journal = Some(journal);
+        Ok(())
+    }
+
     pub fn begin_turn(&mut self, turn: u64, interrupt: &CancellationToken) -> Result<TurnScope> {
         ensure!(!self.closed, "Исполнение сессии завершено");
         ensure!(
             self.last_turn.is_none_or(|last| turn > last),
             "Номер хода уже использован"
         );
+        self.activate()?;
         ensure!(
             self.active
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -148,7 +171,11 @@ impl SessionRuntime {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.closed = true;
         self.cancel.cancel();
-        self.jobs.shutdown().await
+        let result = self.jobs.shutdown().await;
+        if result.is_ok() {
+            self.journal.take();
+        }
+        result
     }
 }
 impl Drop for SessionRuntime {

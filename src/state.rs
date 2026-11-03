@@ -1,13 +1,15 @@
 use crate::{
-    config::{ConfigStore, ProviderSettings, write_private_json},
+    config::{ConfigStore, ProviderSettings, write_private_bytes},
     context::{ContextBudget, is_restricted_receipt, message_chars},
     protocol::{Message, ProviderMeta, ToolCall, Usage},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -131,6 +133,10 @@ pub struct Session {
     pub agents: Vec<crate::agents::AgentRecord>,
     #[serde(default)]
     pub task_state: crate::task_state::TaskState,
+    /// Host observation of the exact file read/saved, never serialized or
+    /// supplied by the model. A prepared stale snapshot cannot replace a newer one.
+    #[serde(skip)]
+    saved_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -164,6 +170,7 @@ impl Session {
             last_usage: Usage::default(),
             agents: Vec::new(),
             task_state: crate::task_state::TaskState::default(),
+            saved_sha256: None,
         })
     }
     pub fn dir(&self, store: &ConfigStore) -> PathBuf {
@@ -171,22 +178,73 @@ impl Session {
     }
     pub fn save(&mut self, store: &ConfigStore) -> Result<()> {
         self.task_state.validate_session(&self.id)?;
-        crate::images::save(&self.messages, &self.dir(store))?;
+        let path = self.dir(store).join("session.json");
+        self.check_saved_snapshot(&path)?;
         self.updated_at = now();
-        write_private_json(&self.dir(store).join("session.json"), self)
+        let mut bytes = serde_json::to_vec_pretty(self)?;
+        bytes.push(b'\n');
+        ensure!(
+            bytes.len() <= 8 * 1024 * 1024,
+            "Слишком большой файл сессии"
+        );
+        crate::images::save(&self.messages, &self.dir(store))?;
+        self.check_saved_snapshot(&path)?;
+        // The runtime lease excludes cooperating writers. This repeated content
+        // check also refuses an observed external edit; it is not filesystem CAS
+        // against a same-UID writer racing the final atomic replacement.
+        write_private_bytes(&path, &bytes)?;
+        self.saved_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+        Ok(())
     }
-    fn read(path: &Path) -> Result<Self> {
+    fn check_saved_snapshot(&self, path: &Path) -> Result<()> {
+        if let Some(expected) = &self.saved_sha256 {
+            let bytes = Self::read_bytes(path)
+                .context("Сохранённая сессия недоступна; перечитайте её через /resume")?;
+            ensure!(
+                format!("{:x}", Sha256::digest(&bytes)) == *expected,
+                "Сессия изменилась после чтения; данные не перезаписаны. Перечитайте её через /resume"
+            );
+        } else {
+            match fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e).context("Не удалось проверить новый файл сессии"),
+                Ok(_) => bail!("Файл сессии уже существует; загрузите его через /resume"),
+            }
+        }
+        Ok(())
+    }
+    fn read_bytes(path: &Path) -> Result<Vec<u8>> {
         let meta = fs::symlink_metadata(path)?;
         if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 8 * 1024 * 1024 {
             bail!("Небезопасный или слишком большой файл сессии");
         }
-        let session: Self =
-            serde_json::from_slice(&fs::read(path)?).context("Повреждённый файл сессии")?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path)?;
+        ensure!(file.metadata()?.is_file(), "Небезопасный файл сессии");
+        let mut bytes = Vec::new();
+        file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 8 * 1024 * 1024,
+            "Слишком большой файл сессии"
+        );
+        Ok(bytes)
+    }
+    fn read(path: &Path) -> Result<Self> {
+        let bytes = Self::read_bytes(path)?;
+        let mut session: Self =
+            serde_json::from_slice(&bytes).context("Повреждённый файл сессии")?;
         if session.version != 1 {
             bail!("Неподдерживаемая версия сессии {}", session.version);
         }
         uuid::Uuid::parse_str(&session.id).context("Некорректный ID сессии")?;
         session.task_state.validate_session(&session.id)?;
+        session.saved_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
         Ok(session)
     }
     pub fn load(store: &ConfigStore, id: &str, root: &Path) -> Result<Self> {
@@ -674,6 +732,49 @@ mod tests {
         );
         assert!(Session::load(&store, &session.id, &other).is_err());
         assert!(Session::load(&store, "../credentials", &project).is_err());
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_overwrite_a_newer_session_after_lease_handoff() {
+        let project = tempdir().unwrap();
+        let config = tempdir().unwrap();
+        let store = ConfigStore::at(config.path().join("state")).unwrap();
+        let mut owner =
+            Session::new(project.path(), ProviderSettings::new(ProviderKind::Custom)).unwrap();
+        owner.save(&store).unwrap();
+        let mut prepared = Session::load(&store, &owner.id, project.path()).unwrap();
+        owner
+            .messages
+            .push(Message::user("последний результат прежнего владельца"));
+        owner.save(&store).unwrap();
+        let path = owner.dir(&store).join("session.json");
+        let latest = fs::read(&path).unwrap();
+        prepared.messages.push(Message::user("устаревший снимок"));
+        assert!(prepared.save(&store).is_err());
+        assert_eq!(fs::read(&path).unwrap(), latest);
+        let mut fresh = Session::load(&store, &owner.id, project.path()).unwrap();
+        fresh
+            .messages
+            .push(Message::user("продолжение после перечитывания"));
+        fresh.save(&store).unwrap();
+        fresh.save(&store).unwrap();
+    }
+
+    #[test]
+    fn removed_or_foreign_session_file_is_not_recreated_by_an_old_owner() {
+        let project = tempdir().unwrap();
+        let config = tempdir().unwrap();
+        let store = ConfigStore::at(config.path().join("state")).unwrap();
+        let mut owner =
+            Session::new(project.path(), ProviderSettings::new(ProviderKind::Custom)).unwrap();
+        owner.save(&store).unwrap();
+        let path = owner.dir(&store).join("session.json");
+        fs::remove_file(&path).unwrap();
+        assert!(owner.save(&store).is_err());
+        assert!(!path.exists());
+        fs::write(&path, b"foreign contents").unwrap();
+        assert!(owner.save(&store).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"foreign contents");
     }
 
     #[test]

@@ -244,6 +244,44 @@ fn resume_local_session_uses_snapshot_endpoint_not_active_cloud() {
 }
 
 #[test]
+fn occupied_session_refuses_resume_and_compact_before_history_or_api_changes() {
+    let home = Home::new();
+    let local = local_server("local-model", "LEASE_TEST");
+    home.add("box", &local.base(), "openai", "local-model", &[]);
+    let project = home.project("lease-project");
+    let initial = home.exec(&project, &["--profile", "box"], "исходная задача");
+    assert!(initial.status.success(), "{}", text(&initial));
+    let session_dir = std::fs::read_dir(home.state.join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("session.json").is_file())
+        .unwrap();
+    let path = session_dir.join("session.json");
+    let before = std::fs::read(&path).unwrap();
+    let saved: Value = serde_json::from_slice(&before).unwrap();
+    let id = saved["id"].as_str().unwrap();
+    let artifacts = rcode::artifacts::ArtifactStore::open(&session_dir, id).unwrap();
+    let owner =
+        rcode::operation_journal::OperationJournal::open(&session_dir, id, &artifacts).unwrap();
+    let requests = local.requests().len();
+    for extra in [vec!["--resume", id], vec!["--resume", id, "--compact"]] {
+        let refused = home.exec(&project, &extra, "не должен быть сохранён");
+        assert!(!refused.status.success());
+        assert!(
+            text(&refused).contains("Журнал занят другой сессией исполнения"),
+            "{}",
+            text(&refused)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(local.requests().len(), requests);
+    }
+    drop(owner);
+    let resumed = home.exec(&project, &["--resume", id], "продолжить после освобождения");
+    assert!(resumed.status.success(), "{}", text(&resumed));
+    assert_eq!(local.generations().len(), 2);
+}
+
+#[test]
 fn resume_with_deleted_profile_noauth_continues_keyed_fails_clearly() {
     let home = Home::new();
     let open = local_server("m", "OPEN_OK");

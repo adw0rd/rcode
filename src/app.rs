@@ -394,6 +394,13 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         }
         return Ok(0);
     }
+    crate::config::ensure_private_directory(&session.dir(&store))?;
+    let mut execution = crate::session_runtime::SessionRuntime::new(
+        &session.dir(&store),
+        &session.id,
+        events.secrets.clone(),
+    )?;
+    execution.activate()?;
     let mut tools = configured_tools(&root, &session.dir(&store).join("checkpoints"), cli)?;
     session.save(&store)?;
     // One snapshot per process for exec; the interactive loop rediscovers
@@ -411,11 +418,6 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         session.compact_within(&context_budget(&client, &session, cli, cli.plan, &skills))?;
         session.save(&store)?;
     }
-    let mut execution = crate::session_runtime::SessionRuntime::new(
-        &session.dir(&store),
-        &session.id,
-        events.secrets.clone(),
-    )?;
     let result = if let Some(Command::Exec { prompt }) = &cli.command {
         turn(
             &mut session,
@@ -2081,6 +2083,7 @@ pub(crate) async fn turn(
     );
     let cancel = CancellationToken::new();
     let _interrupt = TurnInterrupt::bind(cancel.clone())?;
+    execution.activate()?;
     session.repair_pending()?;
     let prompt = events.redact(prompt);
     let mut message = crate::images::user_message(&prompt, &session.root)?;

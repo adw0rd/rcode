@@ -259,11 +259,13 @@ struct Registry {
     closing: bool,
     sticky_unknown: bool,
     closed_through: Option<u64>,
+    cleanup_guard: Option<Arc<dyn Send + Sync>>,
 }
 struct Core {
     session: String,
     secrets: Vec<String>,
     patterns: Vec<Vec<u8>>,
+    require_cleanup_guard: bool,
     state: Mutex<Registry>,
     cancel: CancellationToken,
     changed: Notify,
@@ -448,6 +450,14 @@ fn snapshot(r: &Record, out: usize, err: usize, maximum: usize) -> Result<JobSna
 }
 impl JobsSupervisor {
     pub fn new(session_id: &str, secrets: Vec<String>) -> Result<Self> {
+        Self::build(session_id, secrets, false)
+    }
+
+    pub(crate) fn new_for_session(session_id: &str, secrets: Vec<String>) -> Result<Self> {
+        Self::build(session_id, secrets, true)
+    }
+
+    fn build(session_id: &str, secrets: Vec<String>, require_cleanup_guard: bool) -> Result<Self> {
         ensure!(session_id.len() <= 256, "session identity too long");
         ensure!(
             secrets.len() <= 64
@@ -464,6 +474,7 @@ impl JobsSupervisor {
                 session: session_id.into(),
                 patterns,
                 secrets,
+                require_cleanup_guard,
                 state: Mutex::new(Registry {
                     records: HashMap::new(),
                     completed: VecDeque::new(),
@@ -472,6 +483,7 @@ impl JobsSupervisor {
                     closing: false,
                     sticky_unknown: false,
                     closed_through: None,
+                    cleanup_guard: None,
                 }),
                 cancel: CancellationToken::new(),
                 changed: Notify::new(),
@@ -480,6 +492,18 @@ impl JobsSupervisor {
             }),
         })
     }
+    /// Host lifetime guard only, installed before any process is admitted.
+    /// Worker cleanup owns the guard through Core even if the runtime drops.
+    pub(crate) fn attach_cleanup_guard(&self, guard: Arc<dyn Send + Sync>) -> Result<()> {
+        let mut state = lock(&self.core.state);
+        ensure!(
+            !state.closing && state.records.is_empty() && state.cleanup_guard.is_none(),
+            "session lease must be attached before job admission"
+        );
+        state.cleanup_guard = Some(guard);
+        Ok(())
+    }
+
     pub async fn start(&self, mut spec: JobSpec, cancel: CancellationToken) -> Result<JobSnapshot> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -503,6 +527,10 @@ impl JobsSupervisor {
             ensure!(
                 !state.closing && !self.core.cancel.is_cancelled(),
                 "supervisor closing"
+            );
+            ensure!(
+                !self.core.require_cleanup_guard || state.cleanup_guard.is_some(),
+                "session runtime is not activated"
             );
             ensure!(
                 state
@@ -834,15 +862,22 @@ impl JobsSupervisor {
                 let notified = self.core.changed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                {
-                    let state = lock(&self.core.state);
+                let finished = {
+                    let mut state = lock(&self.core.state);
                     if state.running == 0 {
                         ensure!(
                             !state.sticky_unknown && state.records.values().all(|r| !r.resource),
                             "sticky cleanup obligation remains"
                         );
-                        return Ok(());
+                        Some(state.cleanup_guard.take())
+                    } else {
+                        None
                     }
+                };
+                if let Some(guard) = finished {
+                    // Never run a host-owned destructor under the registry mutex.
+                    drop(guard);
+                    return Ok(());
                 }
                 notified.await;
             }

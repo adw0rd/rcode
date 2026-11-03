@@ -1036,6 +1036,25 @@ def main(binary):
                 plain.send("\x1b[A\x1b[A\r")
                 plain.expect("READY_CUSTOM",plain_mark)
                 assert fixture.recorded()[-1]["messages"][-1]["content"] == "PLAIN_HISTORY_ENTRY"
+                saved_before = set((home / "sessions").glob("*/session.json"))
+                requests_before = len(fixture.recorded())
+                plain_mark = plain.mark()
+                plain.send("/new\r")
+                plain.expect("Новая сессия:", plain_mark)
+                plain.expect("rcode ›", plain_mark)
+                created = set((home / "sessions").glob("*/session.json")) - saved_before
+                assert len(created) == 1, "New runtime did not publish exactly one session"
+                new_session = next(iter(created)).parent.name
+                plain_mark = plain.mark()
+                plain.send(f"/resume {new_session}\r")
+                plain.expect("Сессия восстановлена:", plain_mark)
+                plain.expect("rcode ›", plain_mark)
+                assert len(fixture.recorded()) == requests_before, "Session lease handoff triggered generation"
+                plain_mark = plain.mark()
+                plain.send("AFTER_SESSION_LEASE_HANDOFF\r")
+                plain.expect("READY_CUSTOM", plain_mark)
+                plain.expect("rcode ›", plain_mark)
+                assert fixture.recorded()[-1]["messages"][-1]["content"] == "AFTER_SESSION_LEASE_HANDOFF"
                 plain.send("/exit\r")
                 plain.until(lambda:plain.status is not None,"plain exit")
                 assert plain.status == 0

@@ -1021,6 +1021,7 @@ pub(crate) async fn run(
     skills: SkillCatalog,
     execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
+    execution.activate()?;
     let rich = events.display.is_rich();
     let _screen = if rich {
         Some(crate::screen::start(footer(
@@ -1150,6 +1151,15 @@ pub(crate) async fn run(
         if input.is_empty() {
             continue;
         }
+        let first_word = input.split_whitespace().next().unwrap_or_default();
+        if !matches!(
+            first_word,
+            "/new" | "/clear" | "/resume" | "/help" | "/status" | "/exit" | "/quit"
+        ) && let Err(error) = execution.activate()
+        {
+            events.emit("error", json!({"message":events.redact(&format!("{error:#}. Исполнение сессии недоступно; используйте /new или /resume."))}));
+            continue;
+        }
         if let Some(screen) = crate::screen::current() {
             screen.follow_tail();
         }
@@ -1174,7 +1184,6 @@ pub(crate) async fn run(
             events.pause();
             continue;
         }
-        let first_word = input.split_whitespace().next().unwrap_or_default();
         // /var/folders/.../screen.png is a user path, not a slash command.
         // /attach is parsed with the user prompt so its images reach the same turn.
         if input.starts_with('/')
@@ -1256,10 +1265,12 @@ pub(crate) async fn run(
                 "/compact"=>{let saved=session.compact_within(&budget)?;session.save(store)?;notice!("✓ История сокращена на {saved} {}",budget.unit_label());Ok(())},
                 "/clear"|"/new"=>{
                     let mut next=Session::new(&session.root,session.provider.clone())?;
-                    next.save(store)?;
-                    let next_tools=configured_tools(&next.root,&next.dir(store).join("checkpoints"),&runtime)?;
-                    let next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secrets.clone())?;
+                    crate::config::ensure_private_directory(&next.dir(store))?;
+                    let mut next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secrets.clone())?;
                     execution.shutdown().await?;
+                    next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
+                    let next_tools=configured_tools(&next.root,&next.dir(store).join("checkpoints"),&runtime)?;
+                    next.save(store)?;
                     *session=next;*tools=next_tools;*execution=next_execution;
                     notice!("✓ Новая сессия: {}",session.id);Ok(())
                 },
@@ -1274,9 +1285,10 @@ pub(crate) async fn run(
                         // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
                         let mut restored=Session::load(store,&id,&session.root)?;
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
-                        let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        let next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secrets.clone())?;
+                        let mut next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secrets.clone())?;
                         execution.shutdown().await?;
+                        next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
+                        let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
                         *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },

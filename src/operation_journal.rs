@@ -19,6 +19,7 @@ use std::{
     ffi::OsString,
     io::{Read, Write},
     path::Path,
+    sync::Arc,
 };
 use uuid::Uuid;
 
@@ -88,7 +89,7 @@ pub struct OperationJournal {
     session_name: OsString,
     session: Dir,
     dir: Dir,
-    lock: std::fs::File,
+    lock: Arc<JournalLease>,
     lock_meta: Metadata,
     expected: Option<ExpectedIndex>,
     index: Index,
@@ -99,12 +100,15 @@ pub struct OperationJournal {
     fault: Option<&'static str>,
 }
 
-impl Drop for OperationJournal {
+struct JournalLease {
+    file: std::fs::File,
+}
+impl Drop for JournalLease {
     fn drop(&mut self) {
         // CLOEXEC closes an inherited descriptor only after exec. Explicitly
         // release the shared open-file-description lock so unrelated concurrent
         // forks cannot retain our lease after the owning runtime has closed.
-        let _ = fs2::FileExt::unlock(&self.lock);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
@@ -234,6 +238,15 @@ fn origin_valid(origin: &ArtifactOrigin) -> Result<()> {
 }
 
 impl OperationJournal {
+    /// Lifetime only: this handle cannot inspect, write or authorize operations.
+    pub(crate) fn cleanup_guard(&self) -> Arc<dyn Send + Sync> {
+        self.lock.clone()
+    }
+
+    pub(crate) fn check_active(&self) -> Result<()> {
+        self.check()
+    }
+
     pub fn open(session_dir: &Path, session_id: &str, artifacts: &ArtifactStore) -> Result<Self> {
         ensure!(
             cfg!(unix),
@@ -292,7 +305,7 @@ impl OperationJournal {
             session_name: name,
             session,
             dir,
-            lock,
+            lock: Arc::new(JournalLease { file: lock }),
             lock_meta,
             expected: None,
             index: Index {
@@ -406,7 +419,7 @@ impl OperationJournal {
         );
         // Holding this handle (not a pathname) owns the OS lock until Drop.
         ensure!(
-            io(self.lock.metadata())?.len() == 0,
+            io(self.lock.file.metadata())?.len() == 0,
             "Блокировка журнала повреждена"
         );
         Ok(())
