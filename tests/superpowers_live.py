@@ -180,7 +180,7 @@ class SuperpowersLive(unittest.TestCase):
         self.assertTrue(any(arguments(e).get('role')=='reviewer' for e in spawns), 'no real reviewer dispatch')
         created = [receipt(e) for e in events if e['type']=='tool_result'
                    and e.get('name')=='spawn_agent' and not e.get('is_error')]
-        reviewer_ids = {r['id'] for r in created if r.get('role')=='reviewer' and r.get('id')}
+        reviewer_ids = {r['agent_id'] for r in created if r.get('role')=='reviewer' and r.get('agent_id')}
         self.assertTrue(reviewer_ids, 'reviewer creation did not succeed')
         completed = [receipt(e) for e in events if e['type']=='tool_result'
                      and e.get('name')=='wait_agent' and not e.get('is_error')]
