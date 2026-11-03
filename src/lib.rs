@@ -56,3 +56,5 @@ pub mod artifacts;
 mod artifact_tool;
 
 pub mod diagnostics;
+
+pub mod jobs;
