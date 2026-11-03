@@ -413,9 +413,14 @@ impl GitCommand {
 }
 
 fn search_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
+    search_path_in(program, &std::env::var_os("PATH")?)
+}
+
+fn search_path_in(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    for directory in std::env::split_paths(path) {
         let candidate = directory.join(program);
+        #[cfg(windows)]
+        let candidate = candidate.with_extension("exe");
         #[cfg(unix)]
         let executable = std::fs::metadata(&candidate)
             .map(|metadata| metadata.is_file() && is_executable(&metadata))
@@ -743,6 +748,16 @@ mod run_tests {
         dir
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn git_exe_is_discovered_without_changing_process_path() {
+        let dir = staging();
+        let executable = dir.join("git.exe");
+        std::fs::write(&executable, b"fixture; discovery only").unwrap();
+        assert_eq!(search_path_in("git", dir.as_os_str()), Some(executable));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn captures_rev_parse_stdout() {
         let repo = staging();
@@ -789,6 +804,7 @@ mod run_tests {
         let _ = std::fs::remove_dir_all(repo);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_captures_plain_stdout() {
         let dir = staging();
