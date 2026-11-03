@@ -24,7 +24,7 @@ const PAGE_MAX: usize = 64 * 1024;
 const META_MAX: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"ARTIF001";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactOrigin {
     pub actor: Option<String>,
@@ -32,7 +32,7 @@ pub struct ArtifactOrigin {
     pub tool: String,
     pub call_id: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactMeta {
     pub version: u32,
@@ -60,6 +60,7 @@ pub struct ArtifactBytePage {
 
 #[derive(Debug)]
 pub struct ArtifactStore {
+    parent: Dir,
     dir: Dir,
     session_id: String,
 }
@@ -124,6 +125,37 @@ fn redact_bounded(text: &str, secrets: &[String]) -> Result<(String, usize)> {
 }
 
 impl ArtifactStore {
+    /// Полная обязательная запись для intent/receipt: усечение и изменение
+    /// идентификаторов запрещены. Ошибку записи caller считает неопределённым
+    /// исходом хранения и не начинает зависимое внешнее действие.
+    /// До вызова владелец обязан durable-опубликовать каталог сессии и новых
+    /// предков: синхронизация самого session_dir не фиксирует его имя в родителе.
+    pub fn capture_required(
+        &self,
+        origin: ArtifactOrigin,
+        text: &str,
+        secrets: &[String],
+    ) -> Result<ArtifactMeta> {
+        ensure!(
+            cfg!(unix),
+            "Durable receipts пока поддерживаются только на Unix"
+        );
+        self.capture_inner(origin, text, secrets, true)
+    }
+
+    /// Внутреннее чтение хоста, не модельный инструмент и не разрешение.
+    /// Проверяет весь файл и точное metadata, затем синхронизирует файл/каталог.
+    /// Требует той же предварительной публикации session_dir, что capture_required.
+    pub fn verify_required(&self, meta: &ArtifactMeta) -> Result<String> {
+        ensure!(
+            cfg!(unix),
+            "Durable receipts пока поддерживаются только на Unix"
+        );
+        ensure!(!meta.truncated, "Обязательный артефакт усечён");
+        let _lock = self.lock()?;
+        Ok(self.load_checked(&meta.id, Some(meta))?.1)
+    }
+
     pub fn open(session_dir: &Path, session_id: &str) -> Result<Self> {
         ensure!(
             !session_id.is_empty() && session_id.len() <= 4096,
@@ -155,6 +187,7 @@ impl ArtifactStore {
             "Каталог артефактов изменился"
         );
         let store = Self {
+            parent,
             dir,
             session_id: session_id.into(),
         };
@@ -164,7 +197,24 @@ impl ArtifactStore {
         Ok(store)
     }
 
+    fn check_bound(&self) -> Result<()> {
+        let current = disk(self.parent.symlink_metadata("artifacts"))?;
+        ensure!(
+            current.is_dir()
+                && !current.file_type().is_symlink()
+                && same(&current, &disk(self.dir.dir_metadata())?),
+            "Каталог артефактов изменился"
+        );
+        #[cfg(unix)]
+        ensure!(
+            current.mode() & 0o7777 == 0o700,
+            "Небезопасные права каталога артефактов"
+        );
+        Ok(())
+    }
+
     fn checked_open(&self, name: &str) -> Result<cap_std::fs::File> {
+        self.check_bound()?;
         let before = disk(self.dir.symlink_metadata(name))?;
         private_file(&before)?;
         let mut opts = OpenOptions::new();
@@ -177,6 +227,7 @@ impl ArtifactStore {
     }
 
     fn lock(&self) -> Result<fs::File> {
+        self.check_bound()?;
         let mut opts = OpenOptions::new();
         opts.read(true)
             .write(true)
@@ -205,9 +256,18 @@ impl ArtifactStore {
     }
 
     fn load(&self, id: &str) -> Result<(ArtifactMeta, String, usize)> {
+        self.load_checked(id, None)
+    }
+
+    fn load_checked(
+        &self,
+        id: &str,
+        required: Option<&ArtifactMeta>,
+    ) -> Result<(ArtifactMeta, String, usize)> {
         valid_id(id)?;
         let mut f = self.checked_open(id)?;
-        let len = disk(f.metadata())?.len();
+        let opened = disk(f.metadata())?;
+        let len = opened.len();
         ensure!(
             len >= 12 && len <= (12 + META_MAX + ARTIFACT_MAX) as u64,
             "Недопустимый размер артефакта"
@@ -249,6 +309,25 @@ impl ArtifactStore {
         );
         let text = String::from_utf8(bytes)
             .map_err(|_| anyhow!("Артефакт содержит некорректный UTF-8"))?;
+        if let Some(expected) = required {
+            ensure!(
+                meta == *expected && !meta.truncated,
+                "Метаданные обязательного артефакта не совпадают"
+            );
+            disk(f.sync_all())?;
+            #[cfg(unix)]
+            {
+                disk(disk(self.dir.open("."))?.sync_all())?;
+                disk(disk(self.parent.open("."))?.sync_all())?;
+            }
+        }
+        self.check_bound()?;
+        let current = disk(self.dir.symlink_metadata(id))?;
+        private_file(&current)?;
+        ensure!(
+            same(&opened, &current) && current.len() == len,
+            "Артефакт изменился во время чтения"
+        );
         Ok((meta, text, len as usize))
     }
 
@@ -328,6 +407,16 @@ impl ArtifactStore {
         text: &str,
         secrets: &[String],
     ) -> Result<ArtifactMeta> {
+        self.capture_inner(origin, text, secrets, false)
+    }
+
+    fn capture_inner(
+        &self,
+        origin: ArtifactOrigin,
+        text: &str,
+        secrets: &[String],
+        required: bool,
+    ) -> Result<ArtifactMeta> {
         ensure!(
             origin.actor.as_ref().is_none_or(|a| !a.is_empty()
                 && a.len() <= 128
@@ -349,9 +438,25 @@ impl ArtifactStore {
             let (clean, _) = redact_bounded(actor, secrets)?;
             ensure!(clean == *actor, "Секрет в идентификаторе actor");
         }
-        origin.tool = redact_bounded(&origin.tool, secrets)?.0;
-        origin.call_id = redact_bounded(&origin.call_id, secrets)?.0;
+        let clean_tool = redact_bounded(&origin.tool, secrets)?.0;
+        let clean_call_id = redact_bounded(&origin.call_id, secrets)?.0;
+        if required {
+            ensure!(
+                !origin.tool.is_empty() && !origin.call_id.is_empty(),
+                "Пустой идентификатор обязательного receipt"
+            );
+            ensure!(
+                clean_tool == origin.tool && clean_call_id == origin.call_id,
+                "Секрет в идентификаторе обязательного receipt"
+            );
+        }
+        origin.tool = clean_tool;
+        origin.call_id = clean_call_id;
         let (mut content, original_len) = redact_bounded(text, secrets)?;
+        ensure!(
+            !required || content.len() == original_len,
+            "Обязательный артефакт превышает лимит размера"
+        );
         let _lock = self.lock()?;
         self.recover_staging()?;
         let available = SESSION_MAX - self.used()?;
@@ -380,6 +485,10 @@ impl ArtifactStore {
             if overhead + content.len() <= available {
                 break json;
             }
+            ensure!(
+                !required,
+                "Недостаточно квоты для полного обязательного артефакта"
+            );
             cut(&mut content, available - overhead);
         };
         let tmp = format!(".{}.tmp", Uuid::new_v4());
@@ -404,6 +513,7 @@ impl ArtifactStore {
             disk(self.dir.remove_file(&tmp))?;
             return Err(e);
         }
+        self.check_bound()?;
         // Linking publishes the complete blob atomically and cannot replace an existing ID.
         if let Err(e) = self.dir.hard_link(&tmp, &self.dir, &id) {
             disk(self.dir.remove_file(&tmp))?;
@@ -411,7 +521,12 @@ impl ArtifactStore {
         }
         disk(self.dir.remove_file(&tmp))?;
         #[cfg(unix)]
-        disk(disk(self.dir.open("."))?.sync_all())?;
+        {
+            disk(disk(self.dir.open("."))?.sync_all())?;
+            if required {
+                disk(disk(self.parent.open("."))?.sync_all())?;
+            }
+        }
         Ok(meta)
     }
 
@@ -538,6 +653,108 @@ mod tests {
     }
     fn receipt(s: &ArtifactStore, text: &str) -> ArtifactMeta {
         s.capture(origin(Some("worker")), text, &[]).unwrap()
+    }
+    #[test]
+    fn required_capture_preserves_origin_and_complete_redacted_content() {
+        let (t, s) = setup();
+        let secret = "private-required-secret".to_owned();
+        let supplied = origin(Some("worker"));
+        let m = s
+            .capture_required(
+                supplied.clone(),
+                &format!("ёж {secret}"),
+                std::slice::from_ref(&secret),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&m.origin).unwrap(),
+            serde_json::to_value(&supplied).unwrap()
+        );
+        assert!(!m.truncated);
+        let text = s.verify_required(&m).unwrap();
+        assert!(text.starts_with("ёж ") && !text.contains(&secret));
+        for field in ["actor", "tool", "call_id"] {
+            let mut o = origin(None);
+            match field {
+                "actor" => o.actor = Some(secret.clone()),
+                "tool" => o.tool = secret.clone(),
+                _ => o.call_id = secret.clone(),
+            }
+            assert!(
+                s.capture_required(o, "payload", std::slice::from_ref(&secret))
+                    .is_err()
+            );
+        }
+        let before = fs::read_dir(t.path().join("artifacts")).unwrap().count();
+        assert!(
+            s.capture_required(origin(None), &"я".repeat(ARTIFACT_MAX / 2 + 1), &[])
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(t.path().join("artifacts")).unwrap().count(),
+            before
+        );
+    }
+
+    #[test]
+    fn required_verifier_rejects_forged_metadata_and_truncation() {
+        let (t, s) = setup();
+        let m = s.capture_required(origin(None), "payload", &[]).unwrap();
+        for field in ["turn", "tool", "call_id", "sha256", "bytes", "truncated"] {
+            let mut forged = m.clone();
+            match field {
+                "turn" => forged.origin.turn += 1,
+                "tool" => forged.origin.tool.push('x'),
+                "call_id" => forged.origin.call_id.push('x'),
+                "sha256" => forged.sha256 = "0".repeat(64),
+                "bytes" => forged.bytes += 1,
+                _ => forged.truncated = true,
+            }
+            assert!(s.verify_required(&forged).is_err(), "{field}");
+        }
+        let truncated = s
+            .capture(origin(None), &"x".repeat(ARTIFACT_MAX + 1), &[])
+            .unwrap();
+        assert!(truncated.truncated);
+        assert!(s.verify_required(&truncated).is_err());
+        let path = t.path().join("artifacts").join(&m.id);
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() = b'x';
+        fs::write(path, bytes).unwrap();
+        assert!(s.verify_required(&m).is_err());
+    }
+
+    #[test]
+    fn required_capture_refuses_session_quota_without_publishing_partial_json() {
+        let (t, s) = setup();
+        let text = "x".repeat(ARTIFACT_MAX);
+        for _ in 0..7 {
+            s.capture_required(origin(None), &text, &[]).unwrap();
+        }
+        let before = fs::read_dir(t.path().join("artifacts")).unwrap().count();
+        assert!(s.capture_required(origin(None), &text, &[]).is_err());
+        assert_eq!(
+            fs::read_dir(t.path().join("artifacts")).unwrap().count(),
+            before
+        );
+        let m = s.capture(origin(None), &text, &[]).unwrap();
+        assert!(m.truncated);
+    }
+
+    #[test]
+    fn replaced_artifact_directory_invalidates_required_receipts() {
+        let (t, s) = setup();
+        let m = s.capture_required(origin(None), "payload", &[]).unwrap();
+        fs::rename(t.path().join("artifacts"), t.path().join("old-artifacts")).unwrap();
+        let _replacement = ArtifactStore::open(t.path(), "session").unwrap();
+        assert!(s.verify_required(&m).is_err());
+        assert!(s.capture_required(origin(None), "new", &[]).is_err());
+        assert_eq!(
+            fs::read_dir(t.path().join("old-artifacts"))
+                .unwrap()
+                .count(),
+            2
+        );
     }
     #[test]
     fn acl_and_session_binding() {
