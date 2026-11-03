@@ -325,7 +325,10 @@ fn plain(event: &Value) -> String {
     parts.join("  ")
 }
 
-fn confirm(json_mode: bool, details: &str) -> Result<()> {
+fn confirm(yes: bool, json_mode: bool, details: &str) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
     if json_mode || !std::io::stdin().is_terminal() {
         bail!("Подтвердите действие флагом --yes");
     }
@@ -572,6 +575,7 @@ async fn install(
     if needs_confirmation(source.kind) && !options.dry_run {
         confirm(
             options.yes,
+            cli.json,
             &format!(
                 "Установка набора скиллов\nИсточник: {} ({})\nРевизия: {}\nКаталог: {}\nДействие: git clone --depth 1 без субмодулей; скрипты установки и hooks набора не запускаются\nСкиллы появятся в списке для модели как {label}:<имя>. Их текст передаётся выбранному API и не меняет разрешений rcode.",
                 source.input,
@@ -782,6 +786,7 @@ async fn check(
     {
         confirm(
             yes,
+            cli.json,
             &format!(
                 "Проверить обновления {} источников по сети? ({})",
                 selected.len(),
@@ -952,6 +957,7 @@ async fn update(
     {
         confirm(
             options.yes,
+            cli.json,
             &format!(
                 "Обновить {} источников по сети? ({})",
                 selected.len(),
@@ -1151,6 +1157,7 @@ async fn remove(
     if !yes {
         confirm(
             yes,
+            cli.json,
             &format!(
                 "Удалить набор «{label}» и его файлы в {}?",
                 store.root().join("skill-sources").join(label).display()
