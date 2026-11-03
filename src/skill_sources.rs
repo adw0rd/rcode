@@ -199,6 +199,17 @@ pub(crate) fn parse_source(input: &str, rcode_home: &Path, project_root: &Path) 
             "URL с логином и паролем (userinfo) не принимается; используйте ssh-агент или credential helper"
         );
     }
+    #[cfg(windows)]
+    if let Some(std::path::Component::Prefix(prefix)) = Path::new(input).components().next()
+        && !matches!(
+            prefix.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+        )
+    {
+        bail!(
+            "Сетевые и device-пути не поддерживаются; используйте HTTPS, SSH или путь на локальном диске"
+        );
+    }
     let source = if let Some(url) = input.strip_prefix("https://") {
         Source {
             kind: SourceKind::GitHttps,
@@ -211,10 +222,29 @@ pub(crate) fn parse_source(input: &str, rcode_home: &Path, project_root: &Path) 
             input: input.to_owned(),
             url: format!("ssh://{url}"),
         }
-    } else if input.starts_with('/') || input.starts_with("./") || input.starts_with("../") {
+    } else if Path::new(input).is_absolute()
+        || input.starts_with('/')
+        || input.starts_with("./")
+        || input.starts_with("../")
+    {
         let path = Path::new(input);
-        let inside_home = rcode_home.starts_with(path) || path.starts_with(rcode_home);
-        let inside_project = project_root.starts_with(path) || path.starts_with(project_root);
+        let canonical_path = path
+            .canonicalize()
+            .context("Не удалось проверить локальный источник")?;
+        let canonical_home = rcode_home
+            .canonicalize()
+            .context("Не удалось проверить RCODE_HOME")?;
+        let canonical_project = project_root
+            .canonicalize()
+            .context("Не удалось проверить рабочую папку")?;
+        let inside_home = rcode_home.starts_with(path)
+            || path.starts_with(rcode_home)
+            || canonical_home.starts_with(&canonical_path)
+            || canonical_path.starts_with(&canonical_home);
+        let inside_project = project_root.starts_with(path)
+            || path.starts_with(project_root)
+            || canonical_project.starts_with(&canonical_path)
+            || canonical_path.starts_with(&canonical_project);
         if inside_home || inside_project {
             bail!("Источник не может находиться внутри RCODE_HOME или рабочей папки");
         }
@@ -863,6 +893,50 @@ mod run_tests {
         }
         let inside = parse_source("/tmp/rcode-home/skills", home, project);
         assert!(inside.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_sources_are_local_but_network_namespaces_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        let external = temp.path().join("external");
+        for dir in [&home, &project, &external] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let canonical = external.canonicalize().unwrap();
+        for input in [&external, &canonical] {
+            let input = input.to_str().unwrap();
+            let source = parse_source(input, &home, &project).unwrap();
+            assert!(matches!(source.kind, SourceKind::Dir));
+            assert_eq!(source.url, input);
+        }
+        for input in [
+            r"\\server\share\skills",
+            r"\\?\UNC\server\share\skills",
+            r"\\.\pipe\skills",
+        ] {
+            assert!(parse_source(input, &home, &project).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn canonical_spelling_cannot_bypass_home_and_project_source_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project = temp.path().join("project");
+        for dir in [&home, &project] {
+            let source = dir.join("skills");
+            std::fs::create_dir_all(&source).unwrap();
+            let canonical = source.canonicalize().unwrap();
+            assert!(parse_source(canonical.to_str().unwrap(), &home, &project).is_err());
+        }
+        let source = temp.path().join("external");
+        std::fs::create_dir(&source).unwrap();
+        let canonical = source.canonicalize().unwrap();
+        let missing_home = source.join("future-home");
+        assert!(parse_source(canonical.to_str().unwrap(), &missing_home, &project).is_err());
     }
 
     #[test]

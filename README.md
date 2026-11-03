@@ -41,7 +41,7 @@ brew upgrade adw0rd/tap/rcode
 Или установите из исходников с Rust **1.88+**:
 
 ```sh
-cargo install --git https://github.com/adw0rd/rcode.git --tag v0.6.2 --locked
+cargo install --git https://github.com/adw0rd/rcode.git --locked
 ```
 
 ## Начать работу
