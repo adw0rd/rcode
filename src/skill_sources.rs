@@ -628,7 +628,7 @@ pub(crate) fn tree_sha256(root: &Path) -> Result<String> {
         hasher.update(path.as_bytes());
         hasher.update([b' ', if executable { 1 } else { 0 }, b' ']);
         hasher.update(digest.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(b"\n");
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
