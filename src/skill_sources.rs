@@ -584,13 +584,16 @@ pub(crate) fn valid_label(label: &str) -> bool {
 }
 
 pub(crate) fn default_label(source: &Source) -> String {
-    let tail = source
-        .url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("skills")
-        .trim_end_matches(".git");
+    let tail = match source.kind {
+        SourceKind::Dir | SourceKind::GitLocal => Path::new(&source.url)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        SourceKind::GitHttps | SourceKind::GitSsh => {
+            source.url.trim_end_matches('/').rsplit('/').next()
+        }
+    }
+    .unwrap_or("skills")
+    .trim_end_matches(".git");
     let candidate: String = tail
         .chars()
         .map(|ch| {
@@ -937,6 +940,31 @@ mod run_tests {
         let canonical = source.canonicalize().unwrap();
         let missing_home = source.join("future-home");
         assert!(parse_source(canonical.to_str().unwrap(), &missing_home, &project).is_err());
+    }
+
+    #[test]
+    fn default_local_label_uses_the_native_directory_name() {
+        let path = std::env::temp_dir().join("Source.Repo.git");
+        for kind in [SourceKind::Dir, SourceKind::GitLocal] {
+            let source = Source {
+                kind,
+                input: path.display().to_string(),
+                url: path.display().to_string(),
+            };
+            assert_eq!(default_label(&source), "source-repo");
+        }
+        for url in [
+            "https://example.invalid/team/Source.Repo.git/",
+            "ssh://git@example.invalid/team/Source.Repo.git",
+            "git@example.invalid:team/Source.Repo.git",
+        ] {
+            let source = Source {
+                kind: SourceKind::GitSsh,
+                input: url.to_owned(),
+                url: url.to_owned(),
+            };
+            assert_eq!(default_label(&source), "source-repo");
+        }
     }
 
     #[test]
