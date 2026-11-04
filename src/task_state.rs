@@ -75,6 +75,16 @@ impl TaskReference {
     }
 }
 
+/// Ссылка на наблюдение хоста. Только commit журнала подтверждает публикацию;
+/// сама ссылка и статус плана не доказывают выполнение цели пользователя.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskOperation {
+    pub operation_id: String,
+    pub terminal: TaskReference,
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "WireState")]
 pub struct TaskState {
@@ -90,6 +100,8 @@ pub struct TaskState {
     current_source: Option<TaskReference>,
     #[serde(default)]
     request_journal: Option<TaskReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_operation: Option<TaskOperation>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +124,8 @@ struct WireState {
     current_source: Option<TaskReference>,
     #[serde(default)]
     request_journal: Option<TaskReference>,
+    #[serde(default)]
+    last_operation: Option<TaskOperation>,
 }
 
 impl TryFrom<WireState> for TaskState {
@@ -128,6 +142,7 @@ impl TryFrom<WireState> for TaskState {
             goal_source: raw.goal_source,
             current_source: raw.current_source,
             request_journal: raw.request_journal,
+            last_operation: raw.last_operation,
         };
         state.validate()?;
         Ok(state)
@@ -146,6 +161,7 @@ impl Default for TaskState {
             goal_source: None,
             current_source: None,
             request_journal: None,
+            last_operation: None,
         }
     }
 }
@@ -263,6 +279,72 @@ impl TaskState {
         Ok(())
     }
 
+    pub fn last_operation(&self) -> Option<&TaskOperation> {
+        self.last_operation.as_ref()
+    }
+
+    /// Резерв размера и ревизии до внешнего действия, без изменения задачи.
+    pub fn next_operation_revision(&self, session_id: &str) -> Result<u64> {
+        Ok(self.operation_capacity_state(session_id)?.revision)
+    }
+
+    pub(crate) fn operation_capacity_state(&self, session_id: &str) -> Result<Self> {
+        let mut next = self.clone();
+        next.record_operation(TaskOperation {
+            operation_id: "00000000-0000-4000-8000-000000000000".into(),
+            terminal: TaskReference {
+                artifact_id: "00000000-0000-4000-8000-000000000000".into(),
+                session_id: session_id.into(),
+                sha256: "f".repeat(64),
+                bytes: 256 * 1024,
+            },
+            revision: self
+                .revision
+                .checked_add(1)
+                .context("Исчерпаны версии состояния задачи")?,
+        })?;
+        next.validate_session(session_id)?;
+        Ok(next)
+    }
+
+    pub(crate) fn invalidate_operation(&mut self, id: &str) {
+        if self
+            .last_operation
+            .as_ref()
+            .is_some_and(|o| o.operation_id == id)
+        {
+            self.last_operation = None;
+        }
+    }
+
+    pub fn host_operation_saved(
+        &mut self,
+        prepared: &crate::operation_journal::PreparedTerminal,
+    ) -> Result<()> {
+        self.record_operation(TaskOperation {
+            operation_id: prepared.operation_id().into(),
+            terminal: TaskReference::from_artifact(prepared.artifact())?,
+            revision: prepared.task_revision(),
+        })
+    }
+
+    fn record_operation(&mut self, operation: TaskOperation) -> Result<()> {
+        ensure!(
+            !self.goal.is_empty(),
+            "Сначала должна быть задана задача пользователя"
+        );
+        let mut next = self.clone();
+        next.advance_revision()?;
+        ensure!(
+            operation.revision == next.revision,
+            "Ревизия результата устарела"
+        );
+        next.last_operation = Some(operation);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
     /// Completion here is a model declaration, not host verification.
     pub fn update_plan(&mut self, update: PlanUpdate) -> Result<()> {
         ensure!(
@@ -303,6 +385,7 @@ impl TaskState {
                     && self.goal_source.is_none()
                     && self.current_source.is_none()
                     && self.request_journal.is_none()
+                    && self.last_operation.is_none()
                     && self.revision == 0,
                 "Пустое состояние задачи содержит дополнительные данные"
             );
@@ -319,7 +402,11 @@ impl TaskState {
             &self.request_journal,
         ];
         let mut session = None;
-        for reference in references.into_iter().flatten() {
+        for reference in references
+            .into_iter()
+            .flatten()
+            .chain(self.last_operation.as_ref().map(|o| &o.terminal))
+        {
             reference.validate()?;
             if let Some(previous) = session {
                 ensure!(
@@ -328,6 +415,19 @@ impl TaskState {
                 );
             }
             session = Some(&reference.session_id);
+        }
+        if let Some(operation) = &self.last_operation {
+            let id = uuid::Uuid::parse_str(&operation.operation_id)?;
+            ensure!(
+                id.to_string() == operation.operation_id
+                    && id.get_version_num() == 4
+                    && id.get_variant() == uuid::Variant::RFC4122,
+                "Некорректная ссылка на операцию"
+            );
+            ensure!(
+                operation.revision > 0 && operation.revision <= self.revision,
+                "Ревизия операции не соответствует задаче"
+            );
         }
         ensure!(
             self.steps.len() <= MAX_STEPS,
@@ -376,6 +476,7 @@ impl TaskState {
         ]
         .into_iter()
         .flatten()
+        .chain(self.last_operation.as_ref().map(|o| &o.terminal))
         {
             ensure!(
                 reference.session_id == id,

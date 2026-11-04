@@ -1100,6 +1100,8 @@ impl Tools {
             content: json!({"path":display_path,"sha256":after_hash,"bytes":prepared.after.len()})
                 .to_string(),
             changed_paths: vec![display_path.to_string_lossy().into_owned()],
+            recorded_operation: None,
+            recorded_output: None,
         })
     }
 
@@ -1195,6 +1197,8 @@ impl Tools {
             is_error: reason.is_some() || !status.success(),
             content,
             changed_paths: vec![],
+            recorded_operation: None,
+            recorded_output: None,
         })
     }
 }

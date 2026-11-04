@@ -231,6 +231,8 @@ impl AgentPool {
                     is_error: failed,
                     content: serde_json::to_string(&record).expect("agent record serialization"),
                     changed_paths: vec![],
+                    recorded_operation: None,
+                    recorded_output: None,
                 }
             }
             "list_agents" => {

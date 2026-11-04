@@ -152,6 +152,17 @@ impl ArtifactStore {
             "Durable receipts пока поддерживаются только на Unix"
         );
         ensure!(!meta.truncated, "Обязательный артефакт усечён");
+        self.verify_output(meta)
+    }
+
+    /// Проверка сохранённого вывода хостом. Явно усечённый вывод допустим,
+    /// но его флаг, происхождение и все сохранённые байты должны совпасть.
+    /// Эта проверка не заменяет verify_required для intent/terminal.
+    pub fn verify_output(&self, meta: &ArtifactMeta) -> Result<String> {
+        ensure!(
+            cfg!(unix),
+            "Durable receipts пока поддерживаются только на Unix"
+        );
         let _lock = self.lock()?;
         Ok(self.load_checked(&meta.id, Some(meta))?.1)
     }
@@ -311,8 +322,8 @@ impl ArtifactStore {
             .map_err(|_| anyhow!("Артефакт содержит некорректный UTF-8"))?;
         if let Some(expected) = required {
             ensure!(
-                meta == *expected && !meta.truncated,
-                "Метаданные обязательного артефакта не совпадают"
+                meta == *expected,
+                "Метаданные сохранённого артефакта не совпадают"
             );
             disk(f.sync_all())?;
             #[cfg(unix)]
@@ -722,6 +733,28 @@ mod tests {
         *bytes.last_mut().unwrap() = b'x';
         fs::write(path, bytes).unwrap();
         assert!(s.verify_required(&m).is_err());
+    }
+
+    #[test]
+    fn output_verification_preserves_truncation_and_rejects_forgery_or_corruption() {
+        let (t, s) = setup();
+        let meta = s
+            .capture(origin(Some("worker")), &"x".repeat(ARTIFACT_MAX + 1), &[])
+            .unwrap();
+        assert!(meta.truncated);
+        assert_eq!(s.verify_output(&meta).unwrap().len(), ARTIFACT_MAX);
+        assert!(s.verify_required(&meta).is_err());
+        let mut forged = meta.clone();
+        forged.truncated = false;
+        assert!(s.verify_output(&forged).is_err());
+        forged = meta.clone();
+        forged.origin.actor = None;
+        assert!(s.verify_output(&forged).is_err());
+        let path = t.path().join("artifacts").join(&meta.id);
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() = b'y';
+        fs::write(path, bytes).unwrap();
+        assert!(s.verify_output(&meta).is_err());
     }
 
     #[test]

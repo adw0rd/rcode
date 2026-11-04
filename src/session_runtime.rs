@@ -75,6 +75,25 @@ impl SessionRuntime {
     pub fn artifacts(&self) -> &ArtifactStore {
         &self.artifacts
     }
+    pub(crate) fn receipt_resources(
+        &mut self,
+    ) -> Result<(&ArtifactStore, Option<&mut OperationJournal>)> {
+        self.activate()?;
+        Ok((&self.artifacts, self.journal.as_mut()))
+    }
+
+    pub(crate) fn reconcile_receipts(&mut self, session: &mut crate::state::Session) -> Result<()> {
+        anyhow::ensure!(
+            session.id == self.session_id,
+            "Runtime относится к другой сессии"
+        );
+        let (artifacts, journal) = self.receipt_resources()?;
+        if let Some(journal) = journal {
+            crate::operation_receipts::reconcile(journal, artifacts, session)?;
+        }
+        Ok(())
+    }
+
     pub fn jobs(&self) -> &JobsSupervisor {
         &self.jobs
     }

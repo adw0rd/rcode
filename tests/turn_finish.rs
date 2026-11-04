@@ -108,6 +108,102 @@ fn saved(state: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(dir.join("session.json")).unwrap()).unwrap()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn mutating_receipt_is_committed_before_next_model_request() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let state = temp.path().join("state");
+    std::fs::create_dir(&project).unwrap();
+    let checked = state.clone();
+    let server = Server::start(move |request, _| {
+        if is_summary(&request.json()) {
+            let session = saved(&checked);
+            let index: Value = serde_json::from_slice(
+                &std::fs::read(
+                    checked
+                        .join("sessions")
+                        .join(session["id"].as_str().unwrap())
+                        .join("operations/index.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let record = &index["records"][0];
+            assert!(record["terminal"]["id"].is_string());
+            let last = &session["task_state"]["last_operation"];
+            assert_eq!(last["operation_id"], record["operation_id"]);
+            assert_eq!(last["terminal"]["artifact_id"], record["terminal"]["id"]);
+            let tool_message = session["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap();
+            assert_eq!(tool_message["host_operation"], record["operation_id"]);
+            assert!(
+                request.json()["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|m| m.get("host_operation").is_none())
+            );
+            summary("Файл записан; результат сохранён.")
+        } else {
+            tool(
+                "write_file",
+                json!({"path":"proof.txt","content":"persisted"}),
+            )
+        }
+    });
+    let output = run(&project, &state, &server).await;
+    assert_eq!(output.status.code(), Some(1)); // max_steps summary
+    assert_eq!(
+        std::fs::read_to_string(project.join("proof.txt")).unwrap(),
+        "persisted"
+    );
+    let events = events(&output);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "tool_result" && e["is_error"] == false)
+    );
+    assert_eq!(events.last().unwrap()["type"], "done");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_intent_storage_blocks_effect_and_success_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let state = temp.path().join("state");
+    std::fs::create_dir(&project).unwrap();
+    let checked = state.clone();
+    let server = Server::start(move |_, _| {
+        let session = saved(&checked);
+        let index = checked
+            .join("sessions")
+            .join(session["id"].as_str().unwrap())
+            .join("operations/index.json");
+        std::fs::write(index, "corrupted before action").unwrap();
+        tool(
+            "write_file",
+            json!({"path":"must-not-exist.txt","content":"bad"}),
+        )
+    });
+    let output = run(&project, &state, &server).await;
+    assert!(!output.status.success());
+    assert!(!project.join("must-not-exist.txt").exists());
+    assert_eq!(server.generations().len(), 1);
+    let events = events(&output);
+    assert!(events.iter().any(|e| e["type"] == "error"));
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["type"] == "done" || e["type"] == "tool_result")
+    );
+}
+
 #[tokio::test]
 async fn final_summary_accounts_for_cached_tokens_and_sends_no_tools() {
     let temp = tempfile::tempdir().unwrap();

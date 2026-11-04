@@ -401,6 +401,7 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         events.secrets.clone(),
     )?;
     execution.activate()?;
+    execution.reconcile_receipts(&mut session)?;
     let mut tools = configured_tools(&root, &session.dir(&store).join("checkpoints"), cli)?;
     session.save(&store)?;
     // One snapshot per process for exec; the interactive loop rediscovers
@@ -685,6 +686,7 @@ struct ToolExecutor<'a> {
     skill_page: SkillPage,
     artifacts: Option<&'a crate::artifacts::ArtifactStore>,
     turn_index: u64,
+    journal: Option<&'a mut crate::operation_journal::OperationJournal>,
 }
 
 #[derive(Default)]
@@ -1167,8 +1169,7 @@ async fn graceful_finish(
     events: &Events,
     agents: &mut AgentPool,
     cancel: &CancellationToken,
-    previous_input: u64,
-    previous_output: u64,
+    done: &mut Option<bool>,
     reason: &str,
     exit_code: i32,
 ) -> Result<i32> {
@@ -1279,7 +1280,7 @@ async fn graceful_finish(
             context_budget(client, session, cli, plan, skills).request_used(&session.messages),
         );
     }
-    events.emit("done", json!({"session_id":session.id,"input_tokens":session.usage.input_tokens,"output_tokens":session.usage.output_tokens,"turn_input_tokens":session.usage.input_tokens.saturating_sub(previous_input),"turn_output_tokens":session.usage.output_tokens.saturating_sub(previous_output),"exit_code":exit_code,"summary":true}));
+    *done = Some(true);
     Ok(exit_code)
 }
 
@@ -1347,6 +1348,11 @@ impl ToolExecutor<'_> {
         let Some(store) = self.artifacts else {
             return Ok(outcome);
         };
+        if let Some(meta) = &outcome.recorded_output {
+            outcome.content =
+                crate::operation_receipts::preview(&outcome.content, meta, outcome.is_error);
+            return Ok(outcome);
+        }
         if call.function.name == "read_tool_output" {
             return Ok(outcome);
         }
@@ -1387,7 +1393,7 @@ impl ToolExecutor<'_> {
         client: &ProviderClient,
     ) -> Result<ToolOutcome> {
         if call.function.name != "update_plan" {
-            return self.execute(call, None).await;
+            return self.execute(call, None, Some(session)).await;
         }
         self.events.emit(
             "tool_start",
@@ -1432,6 +1438,7 @@ impl ToolExecutor<'_> {
         &mut self,
         call: &ToolCall,
         actor: Option<&AgentRequest>,
+        session: Option<&mut Session>,
     ) -> Result<ToolOutcome> {
         let name = call.function.name.as_str();
         let cancel = actor.map_or(self.cancel, |request| &request.cancel);
@@ -1533,7 +1540,8 @@ impl ToolExecutor<'_> {
                         "{\"error\":\"denied\",\"message\":\"Read-only role or plan mode: action was not executed\"}",
                     )
                 } else {
-                    self.execute_checked(name, &args, cancel, actor).await?
+                    self.execute_checked(call, &args, cancel, actor, session)
+                        .await?
                 }
             }
         };
@@ -1550,11 +1558,13 @@ impl ToolExecutor<'_> {
 
     async fn execute_checked(
         &mut self,
-        name: &str,
+        call: &ToolCall,
         args: &Value,
         cancel: &CancellationToken,
         actor: Option<&AgentRequest>,
+        session: Option<&mut Session>,
     ) -> Result<ToolOutcome> {
+        let name = call.function.name.as_str();
         let write = matches!(name, "write_file" | "edit_file");
         let shell = name == "run_command";
         let full_access = self.cli.permissions() == ApprovalMode::FullAccess;
@@ -1783,9 +1793,56 @@ impl ToolExecutor<'_> {
             || format!("Выполняю {name}"),
             |request| format!("Субагент {} · {name}", ui::safe(&request.name)),
         ));
-        self.tools
-            .execute_for(name, args, cancel, actor.map(|r| r.agent_id.as_str()))
-            .await
+        let durable = if write || shell {
+            if let Some(journal) = self.journal.as_deref_mut() {
+                let session =
+                    session.ok_or_else(|| anyhow::anyhow!("Состояние задачи недоступно"))?;
+                let artifacts = self
+                    .artifacts
+                    .ok_or_else(|| anyhow::anyhow!("Хранилище результатов недоступно"))?;
+                let store = self
+                    .store
+                    .ok_or_else(|| anyhow::anyhow!("Хранилище сессии недоступно"))?;
+                let pending = crate::operation_receipts::begin(
+                    journal,
+                    artifacts,
+                    session,
+                    store,
+                    call,
+                    actor.map(|r| r.agent_id.as_str()),
+                    args,
+                    &self.events.secrets,
+                )?;
+                Some((pending, session, artifacts, store))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Persistence can take time; cancellation is checked again immediately
+        // before dispatch. A known result is still saved if delivery is cancelled.
+        let outcome = if cancel.is_cancelled() || actor.is_some_and(|r| r.reply.is_closed()) {
+            ToolOutcome::error("Задача отменена; действие не исполнялось")
+        } else {
+            self.tools
+                .execute_for(name, args, cancel, actor.map(|r| r.agent_id.as_str()))
+                .await?
+        };
+        if let Some((pending, session, artifacts, store)) = durable {
+            crate::operation_receipts::finish(
+                pending,
+                self.journal.as_deref_mut().expect("journal retained"),
+                artifacts,
+                session,
+                store,
+                call,
+                outcome,
+                &self.events.secrets,
+            )
+        } else {
+            Ok(outcome)
+        }
     }
 
     /// Удаления внутри уже выданных скоупов больше не спрашиваются.
@@ -1816,12 +1873,14 @@ impl ToolExecutor<'_> {
             .is_some_and(|store| store.shell_rules(self.tools.root()).contains(&token))
     }
 
-    async fn serve(&mut self, request: AgentRequest) -> Result<()> {
+    async fn serve(&mut self, request: AgentRequest, session: &mut Session) -> Result<()> {
         if self.cancel.is_cancelled() || request.cancel.is_cancelled() || request.reply.is_closed()
         {
             return Ok(());
         }
-        let outcome = self.execute(&request.call, Some(&request)).await?;
+        let outcome = self
+            .execute(&request.call, Some(&request), Some(session))
+            .await?;
         let _ = request.reply.send(outcome);
         Ok(())
     }
@@ -1952,6 +2011,7 @@ async fn drive_with_agents<T>(
     future: impl Future<Output = Result<T>>,
     inbox: &mut mpsc::Receiver<AgentRequest>,
     executor: &mut ToolExecutor<'_>,
+    session: &mut Session,
 ) -> Result<T> {
     tokio::pin!(future);
     let mut open = true;
@@ -1959,7 +2019,7 @@ async fn drive_with_agents<T>(
         tokio::select! {
             _ = executor.cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "Ход прерван; дочерние задачи отменены").into()),
             request = inbox.recv(), if open => match request {
-                Some(request) => executor.serve(request).await?,
+                Some(request) => executor.serve(request, session).await?,
                 None => open = false,
             },
             result = &mut future => return result,
@@ -2084,6 +2144,7 @@ pub(crate) async fn turn(
     let cancel = CancellationToken::new();
     let _interrupt = TurnInterrupt::bind(cancel.clone())?;
     execution.activate()?;
+    execution.reconcile_receipts(session)?;
     session.repair_pending()?;
     let prompt = events.redact(prompt);
     let mut message = crate::images::user_message(&prompt, &session.root)?;
@@ -2142,7 +2203,7 @@ pub(crate) async fn turn(
         }
     }
     let job_scope = execution.begin_turn(session.turn_index, &cancel)?;
-    let artifacts = execution.artifacts();
+    let (artifacts, journal) = execution.receipt_resources()?;
     let mut next_task = session.task_state.clone();
     if next_task.goal().is_empty() && !session.messages.is_empty() {
         // Recover an actual prior user message, never a runtime instruction or
@@ -2221,7 +2282,9 @@ pub(crate) async fn turn(
         skill_page: SkillPage::default(),
         artifacts: Some(artifacts),
         turn_index: session.turn_index,
+        journal,
     };
+    let mut done = None;
     // All return/? paths from this block run the common worker finalizer below.
     let result = async {
         let mut recovery_used = false;
@@ -2244,7 +2307,7 @@ pub(crate) async fn turn(
                 if !clean.is_empty() { events.emit("text", json!({"text":clean})); }
             };
             let completion = drive_with_agents(
-                client.complete(&messages, &definitions, &mut emit), &mut inbox, &mut executor,
+                client.complete(&messages, &definitions, &mut emit), &mut inbox, &mut executor, session,
             ).await;
             let rest = if completion.is_ok() {guard.push("", true)} else {guard.abort()};
             if !rest.is_empty() { events.emit("text", json!({"text":rest})); }
@@ -2302,7 +2365,7 @@ pub(crate) async fn turn(
                     continue;
                 }
                 let code = if executor.denied || executor.last_error {1} else {0};
-                events.emit("done",json!({"session_id":session.id,"input_tokens":session.usage.input_tokens,"output_tokens":session.usage.output_tokens,"turn_input_tokens":session.usage.input_tokens.saturating_sub(previous_input),"turn_output_tokens":session.usage.output_tokens.saturating_sub(previous_output),"exit_code":code}));
+                done = Some(false);
                 return Ok(code);
             }
             let mut outside_path_failed = false;
@@ -2322,7 +2385,7 @@ pub(crate) async fn turn(
                 let outcome = if AgentPool::is_tool(name) {
                     events.emit("tool_start",json!({"id":call.id,"name":name,"arguments":call.function.arguments}));
                     let outcome = match serde_json::from_str::<Value>(&call.function.arguments) {
-                        Ok(args) => drive_with_agents(async { Ok(agents.execute(name,&args).await) }, &mut inbox, &mut executor).await?,
+                        Ok(args) => drive_with_agents(async { Ok(agents.execute(name,&args).await) }, &mut inbox, &mut executor, session).await?,
                         Err(_) => ToolOutcome::error("Некорректный JSON аргументов; исправь вызов"),
                     };
                     let mut outcome = outcome;
@@ -2363,12 +2426,12 @@ pub(crate) async fn turn(
                     &budget,
                     receipt_limit,
                     name,
-                    outcome.content,
+                    outcome.content.clone(),
                     outcome.is_error,
                     events,
                 );
                 let event_receipt = receipt.clone();
-                session.messages.push(Message::tool(call, receipt));
+                crate::operation_receipts::put_message(session, call, &outcome, receipt)?;
                 sync_agents(session, &mut agents, events)?;
                 session.save(store)?;
                 if name == "update_plan" && !outcome.is_error {
@@ -2412,7 +2475,7 @@ pub(crate) async fn turn(
                 } else {
                     return graceful_finish(
                         client, session, store, cli, plan, skills, events, &mut agents,
-                        &cancel, previous_input, previous_output, &reason, 1,
+                        &cancel, &mut done, &reason, 1,
                     )
                     .await;
                 }
@@ -2442,7 +2505,7 @@ pub(crate) async fn turn(
         // текстовое резюме (что сделано, что осталось), как в opencode.
         graceful_finish(
             client, session, store, cli, plan, skills, events, &mut agents, &cancel,
-            previous_input, previous_output,
+            &mut done,
             &format!("достигнут лимит шагов ({})", cli.max_steps),
             1,
         )
@@ -2464,7 +2527,16 @@ pub(crate) async fn turn(
         }
     };
     match (result, cleanup) {
-        (Ok(code), Ok(())) => Ok(code),
+        (Ok(code), Ok(())) => {
+            if let Some(summary) = done {
+                let mut data = json!({"session_id":session.id,"input_tokens":session.usage.input_tokens,"output_tokens":session.usage.output_tokens,"turn_input_tokens":session.usage.input_tokens.saturating_sub(previous_input),"turn_output_tokens":session.usage.output_tokens.saturating_sub(previous_output),"exit_code":code});
+                if summary {
+                    data["summary"] = json!(true);
+                }
+                events.emit("done", data);
+            }
+            Ok(code)
+        }
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => {
             Err(error.context(format!("Не удалось сохранить итог задач: {cleanup:#}")))
@@ -2803,9 +2875,10 @@ mod tests {
             skill_page: SkillPage::default(),
             artifacts: None,
             turn_index: 0,
+            journal: None,
         };
         let read = ToolCall::new("read_file", json!({"path":"a.txt"}));
-        assert!(!executor.execute(&read, None).await.unwrap().is_error);
+        assert!(!executor.execute(&read, None, None).await.unwrap().is_error);
         for (id, role, call, expected_error) in [
             ("reviewer", AgentRole::Reviewer, read.clone(), false),
             (
@@ -2852,14 +2925,20 @@ mod tests {
                 cancel: cancel.child_token(),
                 reply,
             };
-            let out = executor.execute(&call, Some(&request)).await.unwrap();
+            let out = executor.execute(&call, Some(&request), None).await.unwrap();
             assert_eq!(out.is_error, expected_error, "{id}: {}", out.content);
         }
         let root_write = ToolCall::new(
             "write_file",
             json!({"path":"a.txt","content":"stale root change"}),
         );
-        assert!(executor.execute(&root_write, None).await.unwrap().is_error);
+        assert!(
+            executor
+                .execute(&root_write, None, None)
+                .await
+                .unwrap()
+                .is_error
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "worker change"
@@ -2896,6 +2975,7 @@ mod tests {
                 skill_page: SkillPage::default(),
                 artifacts: None,
                 turn_index: 0,
+                journal: None,
             };
             for call in [
                 ToolCall::new(
@@ -2917,7 +2997,7 @@ mod tests {
                     cancel: cancel.child_token(),
                     reply,
                 };
-                let outcome = executor.execute(&call, Some(&request)).await.unwrap();
+                let outcome = executor.execute(&call, Some(&request), None).await.unwrap();
                 assert!(
                     outcome.is_error,
                     "full-access must not override explicit read-only mode"
@@ -2954,6 +3034,7 @@ mod tests {
             skill_page: SkillPage::default(),
             artifacts: None,
             turn_index: 0,
+            journal: None,
         };
         for closed_reply in [false, true] {
             let child_cancel = cancel.child_token();
@@ -2965,17 +3046,24 @@ mod tests {
                 child_cancel.cancel();
             }
             executor
-                .serve(AgentRequest {
-                    agent_id: "cancelled-worker".into(),
-                    name: "cancelled".into(),
-                    role: AgentRole::Worker,
-                    call: ToolCall::new(
-                        "write_file",
-                        json!({"path":"must-not-exist.txt","content":"unapproved late write"}),
-                    ),
-                    cancel: child_cancel,
-                    reply,
-                })
+                .serve(
+                    AgentRequest {
+                        agent_id: "cancelled-worker".into(),
+                        name: "cancelled".into(),
+                        role: AgentRole::Worker,
+                        call: ToolCall::new(
+                            "write_file",
+                            json!({"path":"must-not-exist.txt","content":"unapproved late write"}),
+                        ),
+                        cancel: child_cancel,
+                        reply,
+                    },
+                    &mut Session::new(
+                        &root,
+                        crate::config::ProviderSettings::new(ProviderKind::Custom),
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap();
             assert!(!root.join("must-not-exist.txt").exists());
@@ -3010,19 +3098,27 @@ mod tests {
             skill_page: SkillPage::default(),
             artifacts: None,
             turn_index: 0,
+            journal: None,
         };
         executor
-            .serve(AgentRequest {
-                agent_id: "worker".into(),
-                name: "worker".into(),
-                role: AgentRole::Worker,
-                call: ToolCall::new(
-                    "write_file",
-                    json!({"path":"safe.txt","content":"unit-child-api-secret"}),
-                ),
-                cancel: cancel.child_token(),
-                reply,
-            })
+            .serve(
+                AgentRequest {
+                    agent_id: "worker".into(),
+                    name: "worker".into(),
+                    role: AgentRole::Worker,
+                    call: ToolCall::new(
+                        "write_file",
+                        json!({"path":"safe.txt","content":"unit-child-api-secret"}),
+                    ),
+                    cancel: cancel.child_token(),
+                    reply,
+                },
+                &mut Session::new(
+                    &root,
+                    crate::config::ProviderSettings::new(ProviderKind::Custom),
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         assert!(!receiver.await.unwrap().is_error);
@@ -3395,9 +3491,10 @@ mod tests {
             skill_page: SkillPage::default(),
             artifacts: None,
             turn_index: 0,
+            journal: None,
         };
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
-        let outcome = executor.execute(&call, None).await.unwrap();
+        let outcome = executor.execute(&call, None, None).await.unwrap();
         assert!(!outcome.is_error, "{}", outcome.content);
         let value: Value = serde_json::from_str(&outcome.content).unwrap();
         assert_eq!(value["content"], "# guide\nBody of guide.\n");
@@ -3405,13 +3502,13 @@ mod tests {
         assert!(!executor.denied && !executor.last_error);
         // Skill text grants nothing: plan mode still denies writes.
         let write = ToolCall::new("write_file", json!({"path":"blocked.txt","content":"x"}));
-        assert!(executor.execute(&write, None).await.unwrap().is_error);
+        assert!(executor.execute(&write, None, None).await.unwrap().is_error);
         assert!(executor.denied && !root.join("blocked.txt").exists());
         executor.denied = false;
         // The skill directory was not granted to the file tools.
         let skill_file = skills_dir.path().join("home/skills/guide/SKILL.md");
         let read = ToolCall::new("read_file", json!({"path": skill_file}));
-        let outcome = executor.execute(&read, None).await.unwrap();
+        let outcome = executor.execute(&read, None, None).await.unwrap();
         assert!(outcome.is_error && !outcome.content.contains("Body of guide"));
         executor.plan = false;
         for role in [AgentRole::Worker, AgentRole::Explorer, AgentRole::Reviewer] {
@@ -3424,7 +3521,7 @@ mod tests {
                 cancel: cancel.child_token(),
                 reply,
             };
-            let outcome = executor.execute(&call, Some(&request)).await.unwrap();
+            let outcome = executor.execute(&call, Some(&request), None).await.unwrap();
             assert!(outcome.is_error);
             assert!(outcome.content.contains("только основному агенту"));
             assert!(!outcome.content.contains("Body of guide"));

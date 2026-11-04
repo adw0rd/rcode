@@ -2,6 +2,9 @@
 //! reconciliation; a successful start receipt does not mean a process has exited.
 //! The exclusive lease must be released before activating a replacement runtime.
 //! Advisory locking cannot provide filesystem CAS against a hostile same-UID writer.
+//! Двухфазная публикация: prepare_finish сохраняет обязательный артефакт;
+//! затем хост сохраняет ссылку и ревизию задачи/сессии; commit_finish публикует
+//! маркер журнала. Событие и модель обновляются только после commit_finish.
 use crate::artifacts::{ArtifactMeta, ArtifactOrigin, ArtifactStore};
 use anyhow::{Result, anyhow, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt};
@@ -15,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     io::{Read, Write},
     path::Path,
@@ -46,6 +49,31 @@ pub struct OperationRecord {
     pub task_revision: Option<u64>,
 }
 
+/// Подготовленный артефакт ещё не является опубликованным результатом.
+/// Токен действителен только для создавшего его экземпляра журнала.
+pub struct PreparedTerminal {
+    incarnation: Arc<()>,
+    position: usize,
+    operation_id: String,
+    origin: ArtifactOrigin,
+    intent: ArtifactMeta,
+    artifact: ArtifactMeta,
+    task_revision: u64,
+}
+impl PreparedTerminal {
+    pub fn artifact(&self) -> &ArtifactMeta {
+        &self.artifact
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -68,7 +96,7 @@ struct Intent {
     operation_id: String,
     request: Value,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Terminal {
     version: u32,
@@ -93,6 +121,9 @@ pub struct OperationJournal {
     lock_meta: Metadata,
     expected: Option<ExpectedIndex>,
     index: Index,
+    incarnation: Arc<()>,
+    // Только успешные begin текущего открытия; значения содержат лишь метаданные.
+    admitted: HashMap<String, Option<ArtifactMeta>>,
     poisoned: bool,
     index_limit: usize,
     operation_limit: usize,
@@ -313,6 +344,8 @@ impl OperationJournal {
                 session_id: session_id.into(),
                 records: Vec::new(),
             },
+            incarnation: Arc::new(()),
+            admitted: HashMap::new(),
             poisoned: false,
             index_limit: INDEX_MAX,
             operation_limit: OPERATIONS_MAX,
@@ -515,20 +548,24 @@ impl OperationJournal {
                 "Повторный ID операции в журнале"
             );
             origin_valid(&record.origin)?;
-            self.check_meta(&record.intent, &record.origin)?;
-            let text = artifacts.verify_required(&record.intent)?;
-            let intent: Intent = serde_json::from_str(&text)
-                .map_err(|_| anyhow!("Повреждено намерение операции"))?;
-            ensure!(
-                text.len() <= ENVELOPE_MAX
-                    && intent.version == 1
-                    && intent.operation_id == record.operation_id,
-                "Намерение не соответствует операции"
-            );
+            self.intent(record, artifacts)?;
             if let Some(meta) = &record.terminal {
                 self.terminal(record, meta, artifacts)?;
             }
         }
+        Ok(())
+    }
+    fn intent(&self, record: &Record, artifacts: &ArtifactStore) -> Result<()> {
+        self.check_meta(&record.intent, &record.origin)?;
+        let text = artifacts.verify_required(&record.intent)?;
+        let intent: Intent =
+            serde_json::from_str(&text).map_err(|_| anyhow!("Повреждено намерение операции"))?;
+        ensure!(
+            text.len() <= ENVELOPE_MAX
+                && intent.version == 1
+                && intent.operation_id == record.operation_id,
+            "Намерение не соответствует операции"
+        );
         Ok(())
     }
     fn check_meta(&self, meta: &ArtifactMeta, origin: &ArtifactOrigin) -> Result<()> {
@@ -607,7 +644,6 @@ impl OperationJournal {
         artifacts: &ArtifactStore,
         secrets: &[String],
     ) -> Result<ArtifactMeta> {
-        self.check()?;
         self.identity(operation_id, &origin, secrets)?;
         ensure!(
             !self
@@ -651,6 +687,7 @@ impl OperationJournal {
         });
         self.reserve(&next)?;
         let result = (|| {
+            self.check()?;
             let meta = artifacts.capture_required(origin, &raw, secrets)?;
             self.check_meta(
                 &meta,
@@ -662,6 +699,7 @@ impl OperationJournal {
                 .intent = meta.clone();
             self.persist(&next)?;
             self.index = next;
+            self.admitted.insert(operation_id.to_owned(), None);
             Ok(meta)
         })();
         if result.is_err() {
@@ -669,6 +707,8 @@ impl OperationJournal {
         }
         result
     }
+    /// Совместимый одноступенчатый интерфейс. Для сохранения ссылки в состоянии
+    /// задачи между фазами следует вызывать prepare_finish и commit_finish явно.
     pub fn finish(
         &mut self,
         operation_id: &str,
@@ -678,21 +718,67 @@ impl OperationJournal {
         artifacts: &ArtifactStore,
         secrets: &[String],
     ) -> Result<ArtifactMeta> {
-        self.check()?;
+        let prepared = self.prepare_finish(
+            operation_id,
+            outcome,
+            payload,
+            task_revision,
+            artifacts,
+            secrets,
+        )?;
+        self.commit_finish(&prepared, artifacts)
+    }
+
+    // Ошибки обязательных проверок и ввода-вывода запрещают дальнейшую работу.
+    // Проверки аргументов, лимитов и конфликтов выполняются вне этой границы.
+    fn required<T>(&mut self, action: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let result = action(self);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn terminal_token(
+        &self,
+        position: usize,
+        artifact: ArtifactMeta,
+        task_revision: u64,
+    ) -> PreparedTerminal {
+        let record = &self.index.records[position];
+        PreparedTerminal {
+            incarnation: self.incarnation.clone(),
+            position,
+            operation_id: record.operation_id.clone(),
+            origin: record.origin.clone(),
+            intent: record.intent.clone(),
+            artifact,
+            task_revision,
+        }
+    }
+
+    /// Долговечно сохраняет результат, не публикуя маркер завершения.
+    /// Перед commit_finish хост должен сохранить ссылку и ревизию задачи/сессии.
+    pub fn prepare_finish(
+        &mut self,
+        operation_id: &str,
+        outcome: Outcome,
+        payload: &Value,
+        task_revision: u64,
+        artifacts: &ArtifactStore,
+        secrets: &[String],
+    ) -> Result<PreparedTerminal> {
         let position = self
             .index
             .records
             .iter()
             .position(|r| r.operation_id == operation_id)
             .ok_or_else(|| anyhow!("Операция отсутствует в журнале"))?;
-        let record = &self.index.records[position];
+        let record = self.index.records[position].clone();
         self.identity(operation_id, &record.origin, secrets)?;
-        self.check_meta(&record.intent, &record.origin)?;
-        let intent: Intent = serde_json::from_str(&artifacts.verify_required(&record.intent)?)
-            .map_err(|_| anyhow!("Повреждено намерение операции"))?;
         ensure!(
-            intent.version == 1 && intent.operation_id == operation_id,
-            "Намерение не соответствует операции"
+            record.terminal.is_some() || self.admitted.contains_key(operation_id),
+            "Незавершённая операция предыдущего открытия остаётся неизвестной"
         );
         encode(payload, ENVELOPE_MAX)?;
         let terminal = Terminal {
@@ -714,29 +800,134 @@ impl OperationJournal {
                 && clean.task_revision == task_revision,
             "Секрет затронул идентификаторы результата"
         );
-        if let Some(meta) = &record.terminal {
-            let existing = self.terminal(record, meta, artifacts)?;
+        self.reserve(&self.index)?;
+        let previous = record.terminal.clone().or_else(|| {
+            self.admitted
+                .get(operation_id)
+                .and_then(|meta| meta.clone())
+        });
+        let existing = self.required(|this| {
+            this.check()?;
+            this.intent(&record, artifacts)?;
+            previous
+                .as_ref()
+                .map(|meta| this.terminal(&record, meta, artifacts))
+                .transpose()
+        })?;
+        if let Some(meta) = previous {
             ensure!(
-                serde_json::to_value(existing)? == serde_json::to_value(clean)?,
-                "Операция уже завершена другим результатом"
+                existing.as_ref() == Some(&clean),
+                "Операция уже подготовлена или завершена другим результатом"
             );
-            return Ok(meta.clone());
+            return Ok(self.terminal_token(position, meta, task_revision));
         }
-        let origin = record.origin.clone();
-        let result = (|| {
-            let meta = artifacts.capture_required(origin.clone(), &raw, secrets)?;
-            self.check_meta(&meta, &origin)?;
-            let mut next = self.index.clone();
-            next.records[position].terminal = Some(meta.clone());
-            self.persist(&next)?;
-            self.index = next;
+        let meta = self.required(|this| {
+            let meta = artifacts.capture_required(record.origin.clone(), &raw, secrets)?;
+            this.check_meta(&meta, &record.origin)?;
             Ok(meta)
-        })();
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+        })?;
+        self.admitted
+            .insert(operation_id.to_owned(), Some(meta.clone()));
+        Ok(self.terminal_token(position, meta, task_revision))
     }
+
+    /// Публикует маркер после сохранения хостом ссылки и ревизии.
+    /// Тот же токен допускает точный повтор без нового артефакта или записи индекса.
+    pub fn commit_finish(
+        &mut self,
+        prepared: &PreparedTerminal,
+        artifacts: &ArtifactStore,
+    ) -> Result<ArtifactMeta> {
+        ensure!(
+            Arc::ptr_eq(&self.incarnation, &prepared.incarnation),
+            "Токен принадлежит другому открытию журнала"
+        );
+        let record = self
+            .index
+            .records
+            .get(prepared.position)
+            .ok_or_else(|| anyhow!("Запись подготовленной операции отсутствует"))?
+            .clone();
+        ensure!(
+            record.operation_id == prepared.operation_id
+                && record.origin == prepared.origin
+                && record.intent == prepared.intent,
+            "Токен не соответствует исходной записи и намерению"
+        );
+        if let Some(meta) = &record.terminal {
+            ensure!(
+                meta == &prepared.artifact,
+                "Операция завершена другим артефактом"
+            );
+        } else {
+            ensure!(
+                self.admitted
+                    .get(&prepared.operation_id)
+                    .and_then(|meta| meta.as_ref())
+                    == Some(&prepared.artifact),
+                "Результат не подготовлен текущим экземпляром журнала"
+            );
+        }
+        let next = if record.terminal.is_none() {
+            let mut next = self.index.clone();
+            next.records[prepared.position].terminal = Some(prepared.artifact.clone());
+            self.reserve(&next)?;
+            Some(next)
+        } else {
+            None
+        };
+        self.required(|this| {
+            this.check()?;
+            this.intent(&record, artifacts)?;
+            let terminal = this.terminal(&record, &prepared.artifact, artifacts)?;
+            ensure!(
+                terminal.task_revision == prepared.task_revision,
+                "Ревизия результата не соответствует токену"
+            );
+            if let Some(next) = next {
+                this.persist(&next)?;
+                this.index = next;
+            }
+            Ok(prepared.artifact.clone())
+        })
+    }
+    pub fn intent_payload(&self, operation_id: &str, artifacts: &ArtifactStore) -> Result<Value> {
+        self.check()?;
+        let record = self
+            .index
+            .records
+            .iter()
+            .find(|r| r.operation_id == operation_id)
+            .ok_or_else(|| anyhow!("Операция отсутствует в журнале"))?;
+        self.intent(record, artifacts)?;
+        let intent: Intent = serde_json::from_str(&artifacts.verify_required(&record.intent)?)?;
+        Ok(intent.request)
+    }
+
+    /// Payload доступен только после commit; pending не является инструкцией повтора.
+    pub fn terminal_payload(
+        &self,
+        operation_id: &str,
+        artifacts: &ArtifactStore,
+    ) -> Result<Option<Value>> {
+        self.check()?;
+        let record = self
+            .index
+            .records
+            .iter()
+            .find(|r| r.operation_id == operation_id)
+            .ok_or_else(|| anyhow!("Операция отсутствует в журнале"))?;
+        self.intent(record, artifacts)?;
+        record
+            .terminal
+            .as_ref()
+            .map(|meta| {
+                self.terminal(record, meta, artifacts)
+                    .map(|terminal| terminal.payload)
+            })
+            .transpose()
+    }
+
     /// Pending means unknown, never a retry instruction or proof of failure.
     pub fn records(&self, artifacts: &ArtifactStore) -> Result<Vec<OperationRecord>> {
         self.check()?;
@@ -951,7 +1142,7 @@ mod tests {
         }
     }
     #[test]
-    fn every_required_index_fault_poison_and_reopen_never_replays() {
+    fn every_required_commit_fault_poison_and_reopen_never_replays() {
         for point in [
             "write",
             "file_sync",
@@ -961,11 +1152,14 @@ mod tests {
         ] {
             let (t, a, mut j) = setup();
             let id = begin(&mut j, &a);
+            let prepared = j
+                .prepare_finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
+                .unwrap();
+            let count = fs::read_dir(t.path().join("artifacts")).unwrap().count();
             j.fault = Some(point);
-            assert!(
-                j.finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
-                    .is_err()
-            );
+            assert!(j.commit_finish(&prepared, &a).is_err());
+            assert!(j.poisoned);
+            assert!(j.commit_finish(&prepared, &a).is_err());
             assert!(
                 j.finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
                     .is_err()
@@ -974,11 +1168,13 @@ mod tests {
                 j.begin(&Uuid::new_v4().to_string(), origin(), &Value::Null, &a, &[])
                     .is_err()
             );
+            assert_eq!(
+                fs::read_dir(t.path().join("artifacts")).unwrap().count(),
+                count
+            );
             drop(j);
-            let restored = OperationJournal::open(t.path(), "test-session", &a)
-                .unwrap()
-                .records(&a)
-                .unwrap();
+            let mut reopened = OperationJournal::open(t.path(), "test-session", &a).unwrap();
+            let restored = reopened.records(&a).unwrap();
             assert_eq!(restored.len(), 1);
             let published = matches!(point, "after_rename" | "directory_sync");
             assert_eq!(restored[0].terminal.is_some(), published);
@@ -990,6 +1186,20 @@ mod tests {
                     Outcome::Unknown
                 }
             );
+            assert!(reopened.commit_finish(&prepared, &a).is_err());
+            assert!(!reopened.poisoned);
+            let retry = reopened.finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[]);
+            if published {
+                assert_eq!(retry.unwrap(), *prepared.artifact());
+            } else {
+                assert!(retry.is_err());
+            }
+            assert!(!reopened.poisoned);
+            assert_eq!(
+                fs::read_dir(t.path().join("artifacts")).unwrap().count(),
+                count
+            );
+            begin(&mut reopened, &a);
         }
     }
     #[test]
@@ -1046,6 +1256,215 @@ mod tests {
     }
 
     #[test]
+    fn prepared_terminal_is_hidden_and_restart_cannot_adopt_pending() {
+        let (t, a, mut j) = setup();
+        let id = begin(&mut j, &a);
+        let unprepared = begin(&mut j, &a);
+        let before = fs::read(t.path().join("operations/index.json")).unwrap();
+        let prepared = j
+            .prepare_finish(&id, Outcome::Succeeded, &Value::Null, 7, &a, &[])
+            .unwrap();
+        assert_eq!(prepared.operation_id(), id.as_str());
+        assert_eq!(prepared.task_revision(), 7);
+        a.verify_required(prepared.artifact()).unwrap();
+        assert_eq!(
+            fs::read(t.path().join("operations/index.json")).unwrap(),
+            before
+        );
+        assert!(j.records(&a).unwrap().iter().all(|record| {
+            record.outcome == Outcome::Unknown
+                && record.terminal.is_none()
+                && record.task_revision.is_none()
+        }));
+        let count = fs::read_dir(t.path().join("artifacts")).unwrap().count();
+        drop(j);
+        let mut j = OperationJournal::open(t.path(), "test-session", &a).unwrap();
+        assert!(j.commit_finish(&prepared, &a).is_err());
+        for pending in [&id, &unprepared] {
+            assert!(
+                j.prepare_finish(pending, Outcome::Succeeded, &Value::Null, 7, &a, &[])
+                    .is_err()
+            );
+            assert!(
+                j.finish(pending, Outcome::Succeeded, &Value::Null, 7, &a, &[])
+                    .is_err()
+            );
+            assert!(j.begin(pending, origin(), &Value::Null, &a, &[]).is_err());
+        }
+        assert!(!j.poisoned);
+        assert!(
+            j.records(&a)
+                .unwrap()
+                .iter()
+                .all(|record| { record.outcome == Outcome::Unknown && record.terminal.is_none() })
+        );
+        assert_eq!(
+            fs::read(t.path().join("operations/index.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_dir(t.path().join("artifacts")).unwrap().count(),
+            count
+        );
+        begin(&mut j, &a);
+    }
+
+    #[test]
+    fn prepared_exact_redacted_retry_reuses_artifact_and_rejects_conflicts() {
+        let (t, a, mut j) = setup();
+        let id = begin(&mut j, &a);
+        let secret = "private-terminal-value".to_owned();
+        let payload = Value::String(secret.clone());
+        let before = fs::read(t.path().join("operations/index.json")).unwrap();
+        let prepared = j
+            .prepare_finish(
+                &id,
+                Outcome::Succeeded,
+                &payload,
+                7,
+                &a,
+                std::slice::from_ref(&secret),
+            )
+            .unwrap();
+        let text = a.verify_required(prepared.artifact()).unwrap();
+        assert!(!text.contains(&secret));
+        let redacted: Terminal = serde_json::from_str(&text).unwrap();
+        let count = fs::read_dir(t.path().join("artifacts")).unwrap().count();
+        for _ in 0..3 {
+            let repeated = j
+                .prepare_finish(
+                    &id,
+                    Outcome::Succeeded,
+                    &payload,
+                    7,
+                    &a,
+                    std::slice::from_ref(&secret),
+                )
+                .unwrap();
+            assert_eq!(repeated.artifact(), prepared.artifact());
+            let already_redacted = j
+                .prepare_finish(&id, Outcome::Succeeded, &redacted.payload, 7, &a, &[])
+                .unwrap();
+            assert_eq!(already_redacted.artifact(), prepared.artifact());
+        }
+        for (outcome, payload, revision) in [
+            (Outcome::Failed, &redacted.payload, 7),
+            (Outcome::Succeeded, &redacted.payload, 8),
+            (Outcome::Succeeded, &Value::Null, 7),
+        ] {
+            assert!(
+                j.prepare_finish(&id, outcome, payload, revision, &a, &[])
+                    .is_err()
+            );
+            assert!(!j.poisoned);
+        }
+        assert!(j.records(&a).unwrap()[0].terminal.is_none());
+        assert_eq!(
+            fs::read(t.path().join("operations/index.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            j.commit_finish(&prepared, &a).unwrap(),
+            *prepared.artifact()
+        );
+        let committed = fs::read(t.path().join("operations/index.json")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                j.commit_finish(&prepared, &a).unwrap(),
+                *prepared.artifact()
+            );
+            assert_eq!(
+                j.finish(&id, Outcome::Succeeded, &redacted.payload, 7, &a, &[])
+                    .unwrap(),
+                *prepared.artifact()
+            );
+        }
+        assert_eq!(
+            fs::read(t.path().join("operations/index.json")).unwrap(),
+            committed
+        );
+        assert_eq!(
+            fs::read_dir(t.path().join("artifacts")).unwrap().count(),
+            count
+        );
+    }
+
+    #[test]
+    fn foreign_and_reopened_tokens_are_rejected_even_for_committed_results() {
+        let (t, a, mut j) = setup();
+        let id = begin(&mut j, &a);
+        let prepared = j
+            .prepare_finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
+            .unwrap();
+        let (_other_t, other_a, mut other) = setup();
+        other
+            .begin(&id, origin(), &Value::Null, &other_a, &[])
+            .unwrap();
+        assert!(other.commit_finish(&prepared, &other_a).is_err());
+        assert!(!other.poisoned);
+        assert!(other.records(&other_a).unwrap()[0].terminal.is_none());
+        other
+            .finish(&id, Outcome::Succeeded, &Value::Null, 1, &other_a, &[])
+            .unwrap();
+        j.commit_finish(&prepared, &a).unwrap();
+        drop(j);
+        let mut reopened = OperationJournal::open(t.path(), "test-session", &a).unwrap();
+        assert!(reopened.commit_finish(&prepared, &a).is_err());
+        assert!(!reopened.poisoned);
+        let fresh = reopened
+            .prepare_finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
+            .unwrap();
+        assert_eq!(fresh.artifact(), prepared.artifact());
+        assert_eq!(
+            reopened.commit_finish(&fresh, &a).unwrap(),
+            *prepared.artifact()
+        );
+        assert_eq!(
+            reopened
+                .finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
+                .unwrap(),
+            *prepared.artifact()
+        );
+    }
+
+    #[test]
+    fn commit_revalidates_artifact_and_intent_and_poison_is_sticky() {
+        for target in ["terminal", "intent", "committed_intent"] {
+            let (t, a, mut j) = setup();
+            let id = begin(&mut j, &a);
+            let prepared = j
+                .prepare_finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
+                .unwrap();
+            if target == "committed_intent" {
+                j.commit_finish(&prepared, &a).unwrap();
+            }
+            let meta = if target == "terminal" {
+                prepared.artifact().clone()
+            } else {
+                j.records(&a).unwrap().remove(0).intent
+            };
+            let path = t.path().join("artifacts").join(meta.id);
+            let original = fs::read(&path).unwrap();
+            let mut corrupt = original.clone();
+            *corrupt.last_mut().unwrap() = b'x';
+            fs::write(&path, corrupt).unwrap();
+            assert!(j.commit_finish(&prepared, &a).is_err());
+            assert!(j.poisoned);
+            fs::write(&path, original).unwrap();
+            assert!(j.commit_finish(&prepared, &a).is_err());
+            assert!(j.records(&a).is_err());
+            drop(j);
+            let mut reopened = OperationJournal::open(t.path(), "test-session", &a).unwrap();
+            assert_eq!(
+                reopened.records(&a).unwrap()[0].terminal.is_some(),
+                target == "committed_intent"
+            );
+            assert!(reopened.commit_finish(&prepared, &a).is_err());
+            assert!(!reopened.poisoned);
+        }
+    }
+
+    #[test]
     fn byte_limit_reserves_room_for_the_terminal_record() {
         let (t, a, mut j) = setup();
         let id = Uuid::new_v4().to_string();
@@ -1084,16 +1503,28 @@ mod tests {
     #[test]
     fn interrupted_index_publications_do_not_accumulate_staging() {
         let (t, a, mut j) = setup();
-        let id = begin(&mut j, &a);
-        for _ in 0..4 {
+        for attempt in 0..4 {
+            let id = begin(&mut j, &a);
             j.fault = Some("before_rename");
             assert!(
                 j.finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
                     .is_err()
             );
+            assert!(j.poisoned);
             drop(j);
             j = OperationJournal::open(t.path(), "test-session", &a).unwrap();
-            assert_eq!(j.records(&a).unwrap()[0].outcome, Outcome::Unknown);
+            let records = j.records(&a).unwrap();
+            assert_eq!(records.len(), attempt + 1);
+            assert!(
+                records.iter().all(|record| {
+                    record.outcome == Outcome::Unknown && record.terminal.is_none()
+                })
+            );
+            assert!(
+                j.finish(&id, Outcome::Succeeded, &Value::Null, 1, &a, &[])
+                    .is_err()
+            );
+            assert!(!j.poisoned);
             assert_eq!(
                 fs::read_dir(t.path().join("operations")).unwrap().count(),
                 2

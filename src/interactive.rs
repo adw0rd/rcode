@@ -1022,6 +1022,7 @@ pub(crate) async fn run(
     execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
     execution.activate()?;
+    execution.reconcile_receipts(session)?;
     let rich = events.display.is_rich();
     let _screen = if rich {
         Some(crate::screen::start(footer(
@@ -1288,6 +1289,7 @@ pub(crate) async fn run(
                         let mut next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secrets.clone())?;
                         execution.shutdown().await?;
                         next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
+                        next_execution.reconcile_receipts(&mut restored)?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
                         *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())

@@ -4,6 +4,9 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Message {
+    /// Выдаётся только хостом; provider adapters не копируют сюда metadata модели.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_operation: Option<String>,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -169,6 +172,10 @@ pub struct ProviderFailure {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolOutcome {
+    #[serde(skip)]
+    pub(crate) recorded_operation: Option<String>,
+    #[serde(skip)]
+    pub(crate) recorded_output: Option<crate::artifacts::ArtifactMeta>,
     pub is_error: bool,
     pub content: String,
     pub changed_paths: Vec<String>,
@@ -180,6 +187,8 @@ impl ToolOutcome {
             is_error: false,
             content: content.into(),
             changed_paths: vec![],
+            recorded_operation: None,
+            recorded_output: None,
         }
     }
     pub fn error(content: impl Into<String>) -> Self {
@@ -187,6 +196,8 @@ impl ToolOutcome {
             is_error: true,
             content: content.into(),
             changed_paths: vec![],
+            recorded_operation: None,
+            recorded_output: None,
         }
     }
 }
