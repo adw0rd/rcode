@@ -230,6 +230,31 @@ impl Payload {
         capacity
     }
 }
+// Host-only adapter: the refresh coordinator must gate the whole payload
+// during a pass. This adapter alone does not provide an epoch/publication gate.
+impl crate::retained_redaction::RetainedText for Payload {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn byte(&self, index: usize) -> Option<u8> {
+        (index < self.len).then(|| self.byte(index))
+    }
+    fn mask(&mut self, range: std::ops::Range<usize>) -> crate::retained_redaction::Result<()> {
+        use crate::retained_redaction::RemaskError;
+        if range.start >= range.end
+            || range.end > self.len
+            || range.len() > 4
+            || !self.boundary(range.start)
+            || !self.boundary(range.end)
+        {
+            return Err(RemaskError::InvalidMaskBounds);
+        }
+        for index in range {
+            self.blocks[index / BLOCK][index % BLOCK] = b'*';
+        }
+        Ok(())
+    }
+}
 struct Record {
     view: JobSnapshot,
     out: Payload,
@@ -1899,6 +1924,73 @@ mod tests {
         .await
         .unwrap()
     }
+
+    #[tokio::test]
+    async fn retained_remask_preserves_native_output_pages_and_allocations() {
+        use crate::redaction::SecretDictionary;
+        use crate::retained_redaction::RetainedDictionary;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = format!("{}key/猫-tail!\n", "x".repeat(BLOCK - 4));
+        std::fs::write(dir.path().join("fixture.txt"), &raw).unwrap();
+        let supervisor = JobsSupervisor::new("retained-remask", vec![]).unwrap();
+        let started = supervisor
+            .start(
+                spec(dir.path(), "cat fixture.txt"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let before = terminal(&supervisor, &started.id).await;
+        assert_eq!(before.status, JobStatus::Exited);
+        assert!(before.cleanup_complete);
+        assert_eq!(before.stdout, raw);
+        let credentials = SecretDictionary::new(&["key/猫-tail".into()]).unwrap();
+        let dictionary = RetainedDictionary::new(&credentials).unwrap();
+        let (length, allocated, blocks) = {
+            let state = lock(&supervisor.core.state);
+            (
+                state.records[&started.id].out.len,
+                state.allocated,
+                state.records[&started.id].out.blocks.len(),
+            )
+        };
+        let mut cursor = dictionary.cursor(length, &[]).unwrap();
+        loop {
+            let done = {
+                let mut state = lock(&supervisor.core.state);
+                cursor
+                    .step(&mut state.records.get_mut(&started.id).unwrap().out, 17)
+                    .unwrap()
+            };
+            if done {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let expected = format!(
+            "{}{}!\n",
+            "x".repeat(BLOCK - 4),
+            "*".repeat("key/猫-tail".len())
+        );
+        let after = terminal(&supervisor, &started.id).await;
+        assert_eq!(after.stdout, expected);
+        assert_eq!(after.next_stdout_offset, before.next_stdout_offset);
+        assert_eq!(after.ownership_epoch, before.ownership_epoch);
+        for offset in raw.char_indices().map(|(i, _)| i).chain([raw.len()]) {
+            let page = supervisor
+                .poll(None, &started.id, offset, 0, 7)
+                .await
+                .unwrap();
+            assert_eq!(page.stdout, expected[offset..page.next_stdout_offset]);
+        }
+        {
+            let state = lock(&supervisor.core.state);
+            assert_eq!(state.allocated, allocated);
+            assert_eq!(state.records[&started.id].out.blocks.len(), blocks);
+        }
+        supervisor.shutdown().await.unwrap();
+    }
+
     #[test]
     fn host_session_identity_cannot_serialize_a_known_secret() {
         for value in ["abcdef", "%61%62%63%64%65%66"] {

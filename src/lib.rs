@@ -42,6 +42,7 @@ pub mod interactive;
 pub mod screen;
 
 pub mod redaction;
+pub mod retained_redaction;
 
 pub mod patch;
 
