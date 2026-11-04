@@ -12,7 +12,7 @@
 //! Linux admission requires an unrestricted procfs for the current PID namespace.
 //! The host must not change mounts/namespaces concurrently with admission or cleanup;
 //! descendants must remain in that PID namespace as well as the original group.
-use crate::redaction::StreamingRedactor;
+use crate::job_output::{OutputChunk, OutputStream};
 use anyhow::Context as _;
 use anyhow::{Result, bail, ensure};
 use serde::Serialize;
@@ -28,8 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    sync::{Notify, Semaphore, mpsc},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    sync::{Notify, Semaphore, mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +37,7 @@ const STREAM: usize = 16 * 1024 * 1024;
 const GLOBAL: usize = 32 * 1024 * 1024;
 const BLOCK: usize = 4096;
 const INPUT: usize = 16 * 1024;
+const INPUT_LOOKBEHIND: usize = 8192 * 6 - 1;
 const PAGE: usize = 64 * 1024;
 const HISTORY: usize = 128;
 const TICK: Duration = Duration::from_millis(20);
@@ -135,6 +136,7 @@ pub struct JobSnapshot {
     pub origin: JobOrigin,
     pub owner: Option<String>,
     pub ownership_epoch: u64,
+    pub credential_epoch: u64,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
@@ -159,16 +161,62 @@ pub struct HandoffReceipt {
     pub expected_epoch: u64,
     pub ownership_epoch: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputStatus {
+    Delivered,
+    Rejected,
+    Cancelled,
+    IoError,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct InputDelivery {
+    pub written: usize,
+    pub total: usize,
+    pub status: InputStatus,
+}
+/// Admission is not delivery. The host retains this ticket until its receipt is durable.
+pub struct InputTicket {
+    completion: oneshot::Receiver<InputDelivery>,
+}
+impl InputTicket {
+    pub async fn wait(self) -> Result<InputDelivery> {
+        self.completion
+            .await
+            .map_err(|_| anyhow::anyhow!("input delivery unavailable"))
+    }
+}
 struct Input {
     bytes: Vec<u8>,
+    written: usize,
+    checked_epoch: Option<u64>,
     close: bool,
+    completion: Option<oneshot::Sender<InputDelivery>>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+impl Input {
+    fn complete(&mut self, status: InputStatus) {
+        if let Some(sender) = self.completion.take() {
+            let _ = sender.send(InputDelivery {
+                written: self.written,
+                total: self.bytes.len(),
+                status,
+            });
+        }
+    }
+}
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.complete(InputStatus::Cancelled);
+    }
 }
 // Payload allocation, not just length, is charged in BLOCK-byte units. Vec
 // descriptors are separately bounded: <=4096 boxes/stream, <=132 records.
 #[derive(Default)]
 struct Payload {
     blocks: Vec<Box<[u8; BLOCK]>>,
+    // One bit per 64 retained bytes; bounded local conservative provenance.
+    marks: Vec<u64>,
     len: usize,
 }
 impl Payload {
@@ -190,6 +238,7 @@ impl Payload {
                     break;
                 }
                 self.blocks.push(Box::new([0; BLOCK]));
+                self.marks.push(0);
                 *allocated += BLOCK;
             }
             let take = (BLOCK - offset).min(n - copied);
@@ -224,6 +273,23 @@ impl Payload {
         }
         Ok((String::from_utf8(bytes).expect("stored UTF-8"), end))
     }
+    fn mark(&mut self, range: std::ops::Range<usize>) {
+        let end = range.end.min(self.len);
+        if range.start >= end {
+            return;
+        }
+        for unit in range.start / 64..=(end - 1) / 64 {
+            self.marks[unit / 64] |= 1_u64 << (unit % 64);
+        }
+    }
+    fn append_chunk(&mut self, chunk: &OutputChunk, allocated: &mut usize) -> usize {
+        let offset = self.len;
+        let n = self.append(chunk.text.as_bytes(), allocated);
+        for span in &chunk.sensitive {
+            self.mark(offset + span.start.min(n)..offset + span.end.min(n));
+        }
+        n
+    }
     fn release(&mut self) -> usize {
         let capacity = self.blocks.len() * BLOCK;
         *self = Self::default();
@@ -249,6 +315,7 @@ impl crate::retained_redaction::RetainedText for Payload {
         {
             return Err(RemaskError::InvalidMaskBounds);
         }
+        self.mark(range.clone());
         for index in range {
             self.blocks[index / BLOCK][index % BLOCK] = b'*';
         }
@@ -259,6 +326,7 @@ struct Record {
     view: JobSnapshot,
     out: Payload,
     err: Payload,
+    streams: [Option<OutputStream>; 2],
     scope: CancellationToken,
     stop: bool,
     cause: Option<JobStatus>,
@@ -266,6 +334,8 @@ struct Record {
     input: Option<mpsc::Sender<Input>>,
     input_budget: Arc<Semaphore>,
     input_tail: Vec<u8>,
+    input_written: VecDeque<u8>,
+    input_closing: bool,
     receipt: Option<HandoffReceipt>,
     done: bool,
     // A slot survives task completion whenever cleanup remains unconfirmed.
@@ -277,6 +347,10 @@ struct Record {
     panic_run: bool,
 }
 struct Registry {
+    credentials: Arc<crate::redaction::SecretDictionary>,
+    credential_epoch: u64,
+    refreshing: bool,
+    credential_failed: bool,
     records: HashMap<String, Record>,
     completed: VecDeque<String>,
     allocated: usize,
@@ -288,13 +362,65 @@ struct Registry {
 }
 struct Core {
     session: String,
-    credentials: crate::redaction::SecretDictionary,
     require_cleanup_guard: bool,
     state: Mutex<Registry>,
     cancel: CancellationToken,
     changed: Notify,
+    refresh_serial: tokio::sync::Mutex<()>,
+    publication: tokio::sync::RwLock<()>,
     #[cfg(test)]
     finalization_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(test)]
+    refresh_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+}
+struct RefreshGuard {
+    core: Arc<Core>,
+    armed: bool,
+}
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = lock(&self.core.state);
+        state.credential_failed = true;
+        state.refreshing = false;
+        for r in state.records.values_mut().filter(|r| !r.done) {
+            request(r, JobStatus::Failed, "credential refresh failed");
+        }
+        drop(state);
+        self.core.changed.notify_waiters();
+    }
+}
+fn provenance_spans(marks: &[u64], length: usize, boundary: usize) -> Vec<std::ops::Range<usize>> {
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    for (block, &bits) in marks.iter().enumerate() {
+        for bit in 0..64 {
+            if bits & (1_u64 << bit) == 0 {
+                continue;
+            }
+            let start = block * BLOCK + bit * 64;
+            let end = (start + 64).min(length);
+            if start >= end {
+                continue;
+            }
+            if let Some(last) = spans.last_mut()
+                && last.end == start
+            {
+                last.end = end;
+                continue;
+            }
+            spans.push(start..end);
+        }
+    }
+    if boundary > 0 && length > 0 {
+        let start = length.saturating_sub(boundary);
+        let first = spans.partition_point(|span| span.end < start);
+        let start = spans.get(first).map_or(start, |span| start.min(span.start));
+        spans.truncate(first);
+        spans.push(start..length);
+    }
+    spans
 }
 pub struct JobsSupervisor {
     core: Arc<Core>,
@@ -332,6 +458,22 @@ fn request(r: &mut Record, status: JobStatus, reason: &str) {
         r.view.reason = Some(reason.into());
     }
     r.stop = true;
+}
+fn require_credentials(state: &Registry) -> Result<()> {
+    ensure!(
+        !state.credential_failed,
+        "credential refresh failed; output and input blocked"
+    );
+    ensure!(!state.refreshing, "credential refresh in progress");
+    Ok(())
+}
+// Already written bytes cannot be recalled. Reject only matches using NEW bytes.
+fn new_input_contains_secret(bytes: &[u8], tail_len: usize, patterns: &[Vec<u8>]) -> bool {
+    patterns.iter().any(|p| {
+        bytes[tail_len.saturating_sub(p.len().saturating_sub(1))..]
+            .windows(p.len())
+            .any(|window| window == p)
+    })
 }
 fn has_secret(bytes: &[u8], patterns: &[Vec<u8>]) -> bool {
     patterns
@@ -472,9 +614,12 @@ impl JobsSupervisor {
         Ok(Self {
             core: Arc::new(Core {
                 session: session_id.into(),
-                credentials,
                 require_cleanup_guard,
                 state: Mutex::new(Registry {
+                    credentials: Arc::new(credentials),
+                    credential_epoch: 0,
+                    refreshing: false,
+                    credential_failed: false,
                     records: HashMap::new(),
                     completed: VecDeque::new(),
                     allocated: 0,
@@ -486,8 +631,12 @@ impl JobsSupervisor {
                 }),
                 cancel: CancellationToken::new(),
                 changed: Notify::new(),
+                refresh_serial: tokio::sync::Mutex::new(()),
+                publication: tokio::sync::RwLock::new(()),
                 #[cfg(test)]
                 finalization_gate: Mutex::new(None),
+                #[cfg(test)]
+                refresh_gate: Mutex::new(None),
             }),
         })
     }
@@ -503,6 +652,176 @@ impl JobsSupervisor {
         Ok(())
     }
 
+    /// Host-only monotone refresh. Call before exposing newly accepted credentials
+    /// to a live session. A failed/abandoned refresh blocks output and new I/O;
+    /// stop/cancellation/shutdown retain their independent cleanup authority.
+    pub async fn refresh_credentials(&self, additions: &[String]) -> Result<u64> {
+        let _serial = self.core.refresh_serial.lock().await;
+        let (previous, epoch) = {
+            let state = lock(&self.core.state);
+            require_credentials(&state)?;
+            ensure!(!state.closing, "supervisor closing");
+            (Arc::clone(&state.credentials), state.credential_epoch)
+        };
+        let mut guard = RefreshGuard {
+            core: Arc::clone(&self.core),
+            armed: true,
+        };
+        ensure!(
+            additions.len() <= 64 && additions.iter().map(String::len).sum::<usize>() <= INPUT,
+            "invalid secret additions"
+        );
+        let additions = additions.to_vec();
+        let old = Arc::clone(&previous);
+        let (candidate, matcher) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let candidate = old.extended(&additions)?;
+            ensure!(
+                candidate.key_count() <= 64
+                    && candidate.key_bytes() <= INPUT
+                    && candidate.max_pattern_len() <= INPUT_LOOKBEHIND + 1,
+                "invalid secret union"
+            );
+            let matcher = crate::retained_redaction::RetainedDictionary::new(&candidate)?;
+            Ok((Arc::new(candidate), matcher))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("credential preparation failed"))??;
+        if candidate.patterns() == previous.patterns() {
+            guard.armed = false;
+            return Ok(epoch);
+        }
+        let next_epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("credential epoch exhausted"))?;
+        // Existing publication may finish before this barrier. Copied snapshots
+        // waiting to publish afterwards must pass the epoch check below.
+        let _publication = self.core.publication.write().await;
+        let records = {
+            let mut state = lock(&self.core.state);
+            require_credentials(&state)?;
+            ensure!(!state.closing, "supervisor closing");
+            validate_identity(&self.core.session, candidate.patterns())?;
+            for (id, r) in &state.records {
+                validate_identity(id, candidate.patterns())?;
+                for identity in [r.view.owner.as_deref(), r.view.origin.actor.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_identity(identity, candidate.patterns())?;
+                }
+                if let Some(receipt) = &r.receipt {
+                    for identity in [
+                        &receipt.operation_id,
+                        &receipt.actor,
+                        &receipt.parent_scope_id,
+                    ] {
+                        validate_identity(identity, candidate.patterns())?;
+                    }
+                }
+            }
+            state.refreshing = true;
+            state.records.keys().cloned().collect::<Vec<_>>()
+        };
+        self.core.changed.notify_waiters();
+        #[cfg(test)]
+        {
+            let gate = lock(&self.core.refresh_gate).take();
+            if let Some((ready, release)) = gate {
+                ready.notify_one();
+                release.notified().await;
+            }
+        }
+        let maximum = candidate.max_pattern_len();
+        for id in records {
+            for index in 0..2 {
+                let saved = {
+                    let state = lock(&self.core.state);
+                    let r = &state.records[&id];
+                    if r.view.payload_unavailable {
+                        None
+                    } else {
+                        let payload = if index == 0 { &r.out } else { &r.err };
+                        Some((payload.len, payload.marks.clone()))
+                    }
+                };
+                if let Some((length, marks)) = saved {
+                    // Clone only bounded bitmap metadata under the lock. Expanded
+                    // ranges and cursor allocation happen outside the registry.
+                    let provenance = provenance_spans(&marks, length, maximum.saturating_sub(1));
+                    let mut cursor = matcher.cursor(length, &provenance)?;
+                    loop {
+                        let complete = {
+                            let mut state = lock(&self.core.state);
+                            let r = state.records.get_mut(&id).expect("paused record retained");
+                            cursor.step(if index == 0 { &mut r.out } else { &mut r.err }, 1024)?
+                        };
+                        if complete {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let present = lock(&self.core.state).records[&id].streams[index].is_some();
+                if present {
+                    let dictionary = Arc::clone(&candidate);
+                    let prepared = tokio::task::spawn_blocking(move || dictionary.stream())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("stream preparation failed"))??;
+                    let mut state = lock(&self.core.state);
+                    // A cancelled process may finalize during preparation. It
+                    // discards its private tails, but never mutates retained bytes.
+                    let r = state.records.get_mut(&id).expect("paused record retained");
+                    if let Some(stream) = r.streams[index].as_mut() {
+                        let chunk = stream.cutover(prepared, maximum)?;
+                        sink(&mut state, &id, index == 1, chunk);
+                    }
+                }
+            }
+        }
+        {
+            let mut state = lock(&self.core.state);
+            ensure!(!state.credential_failed, "credential refresh failed");
+            state.credentials = candidate;
+            state.credential_epoch = next_epoch;
+            state.refreshing = false;
+            for r in state.records.values_mut() {
+                r.view.credential_epoch = next_epoch;
+                r.input_tail = r.input_written.iter().copied().collect();
+            }
+        }
+        guard.armed = false;
+        self.core.changed.notify_waiters();
+        Ok(next_epoch)
+    }
+
+    /// All external artifact/event/model sinks must use this gate. A stale
+    /// copied page is rejected; the host may poll again using its original offsets.
+    /// The callback must synchronously hand off the response, not enqueue a raw
+    /// snapshot for unguarded later publication. No registry lock is held in it.
+    pub async fn publish_snapshot<R>(
+        &self,
+        snapshot: &JobSnapshot,
+        publish: impl FnOnce(&JobSnapshot) -> Result<R>,
+    ) -> Result<R> {
+        let _publication = self.core.publication.read().await;
+        {
+            let state = lock(&self.core.state);
+            require_credentials(&state)?;
+            let record = state
+                .records
+                .get(&snapshot.id)
+                .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+            ensure!(
+                snapshot.session_id == self.core.session
+                    && snapshot.credential_epoch == state.credential_epoch
+                    && snapshot.ownership_epoch == record.view.ownership_epoch
+                    && snapshot.owner == record.view.owner,
+                "stale job snapshot"
+            );
+        }
+        publish(snapshot)
+    }
+
     pub async fn start(&self, mut spec: JobSpec, cancel: CancellationToken) -> Result<JobSnapshot> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -513,16 +832,26 @@ impl JobsSupervisor {
         {
             ensure!(!cancel.is_cancelled(), "scope cancelled");
             ensure!(!self.core.cancel.is_cancelled(), "supervisor closing");
-            validate(&mut spec, self.core.credentials.patterns())?;
+            let (credentials, credential_epoch) = {
+                let state = lock(&self.core.state);
+                require_credentials(&state)?;
+                (Arc::clone(&state.credentials), state.credential_epoch)
+            };
+            validate(&mut spec, credentials.patterns())?;
             ensure!(!cancel.is_cancelled(), "scope cancelled");
             // Includes actual Linux mount/namespace visibility validation before spawn.
             platform::members_gone(0, Instant::now() + CLEANUP)?;
-            let out_redactor = self.core.credentials.stream()?;
-            let err_redactor = self.core.credentials.stream()?;
+            let out_redactor = credentials.stream()?;
+            let err_redactor = credentials.stream()?;
             let id = uuid::Uuid::new_v4().to_string();
-            validate_identity(&id, self.core.credentials.patterns())?;
+            validate_identity(&id, credentials.patterns())?;
             let (tx, rx) = mpsc::channel(1);
             let mut state = lock(&self.core.state);
+            require_credentials(&state)?;
+            ensure!(
+                state.credential_epoch == credential_epoch,
+                "credentials changed before spawn"
+            );
             ensure!(
                 !state.closing && !self.core.cancel.is_cancelled(),
                 "supervisor closing"
@@ -567,6 +896,7 @@ impl JobsSupervisor {
                 origin: spec.origin.clone(),
                 owner: spec.origin.actor.clone(),
                 ownership_epoch: 0,
+                credential_epoch,
                 status: JobStatus::Running,
                 exit_code: None,
                 signal: None,
@@ -594,6 +924,10 @@ impl JobsSupervisor {
                     view: view.clone(),
                     out: Payload::default(),
                     err: Payload::default(),
+                    streams: [
+                        Some(OutputStream::new(out_redactor)),
+                        Some(OutputStream::new(err_redactor)),
+                    ],
                     scope: cancel,
                     stop: false,
                     cause: None,
@@ -601,6 +935,8 @@ impl JobsSupervisor {
                     input: spec.stdin.then_some(tx),
                     input_budget: Arc::new(Semaphore::new(INPUT)),
                     input_tail: Vec::new(),
+                    input_written: VecDeque::with_capacity(INPUT_LOOKBEHIND),
+                    input_closing: false,
                     receipt: None,
                     done: false,
                     resource: true,
@@ -615,16 +951,7 @@ impl JobsSupervisor {
             let core = self.core.clone();
             // Spawn and ownership installation have no intervening await.
             tokio::spawn(async move {
-                let result = Catch::new(platform::run(
-                    &mut process,
-                    &spec,
-                    &core,
-                    &id,
-                    rx,
-                    out_redactor,
-                    err_redactor,
-                ))
-                .await;
+                let result = Catch::new(platform::run(&mut process, &spec, &core, &id, rx)).await;
                 let outcome = match result {
                     Ok(outcome) => outcome,
                     Err(()) => {
@@ -644,12 +971,12 @@ impl JobsSupervisor {
                         let _recovered = platform::cleanup(&mut process, &core, &id).await;
                         RunOutcome {
                             cleanup_complete: false,
-                            tails: [None, None],
+                            tails: [false, false],
                         }
                     }
                 };
                 drop(process); // kill-before-child-drop fallback; never writes to a terminal
-                finalize(&core, id, outcome);
+                finalize(&core, id, outcome).await;
             });
             Ok(view)
         }
@@ -662,8 +989,10 @@ impl JobsSupervisor {
         stderr_offset: usize,
         max_bytes: usize,
     ) -> Result<JobSnapshot> {
+        let mut state = lock(&self.core.state);
+        require_credentials(&state)?;
         snapshot(
-            authorized(&mut lock(&self.core.state), actor, id)?,
+            authorized(&mut state, actor, id)?,
             stdout_offset,
             stderr_offset,
             max_bytes,
@@ -675,18 +1004,24 @@ impl JobsSupervisor {
         id: &str,
         bytes: &[u8],
         close: bool,
-    ) -> Result<()> {
+    ) -> Result<InputTicket> {
         ensure!(bytes.len() <= INPUT, "input too large");
         let mut state = lock(&self.core.state);
+        require_credentials(&state)?;
+        ensure!(
+            !state.closing && !self.core.cancel.is_cancelled(),
+            "supervisor closing"
+        );
+        let credentials = Arc::clone(&state.credentials);
         let r = authorized(&mut state, actor, id)?;
         ensure!(
-            !r.done && !r.stop && !r.scope.is_cancelled(),
+            !r.done && !r.stop && !r.input_closing && !r.scope.is_cancelled(),
             "job not accepting input"
         );
         let mut check = r.input_tail.clone();
         check.extend_from_slice(bytes);
         ensure!(
-            !has_secret(&check, self.core.credentials.patterns()),
+            !new_input_contains_secret(&check, r.input_tail.len(), credentials.patterns()),
             "input rejected"
         );
         let permit = if bytes.is_empty() {
@@ -699,21 +1034,27 @@ impl JobsSupervisor {
                     .map_err(|_| anyhow::anyhow!("input quota"))?,
             )
         };
+        let (completion, delivery) = oneshot::channel();
         r.input
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("input closed"))?
             .try_send(Input {
                 bytes: bytes.to_vec(),
+                written: 0,
+                checked_epoch: None,
+                completion: Some(completion),
                 close,
                 _permit: permit,
             })
             .map_err(|_| anyhow::anyhow!("input queue unavailable"))?;
-        let tail = self.core.credentials.max_pattern_len().saturating_sub(1);
+        let tail = INPUT_LOOKBEHIND;
         r.input_tail = check[check.len().saturating_sub(tail)..].to_vec();
         if close {
-            r.input = None;
+            r.input_closing = true;
         }
-        Ok(())
+        Ok(InputTicket {
+            completion: delivery,
+        })
     }
     /// Scope IDs and operation IDs are trusted host identities, not model inputs.
     /// The exact retry is recognized before ACL checking; no other former-owner operation is allowed.
@@ -726,8 +1067,15 @@ impl JobsSupervisor {
         parent_scope_id: &str,
         parent_cancel: CancellationToken,
     ) -> Result<HandoffReceipt> {
+        let _publication = self
+            .core
+            .publication
+            .try_write()
+            .map_err(|_| anyhow::anyhow!("job publication in progress"))?;
+        let mut state = lock(&self.core.state);
+        require_credentials(&state)?;
         for value in [actor, operation_id, parent_scope_id] {
-            validate_identity(value, self.core.credentials.patterns())?;
+            validate_identity(value, state.credentials.patterns())?;
         }
         let proposed = HandoffReceipt {
             actor: actor.into(),
@@ -736,7 +1084,6 @@ impl JobsSupervisor {
             expected_epoch,
             ownership_epoch: expected_epoch.saturating_add(1),
         };
-        let mut state = lock(&self.core.state);
         let closed_through = state.closed_through;
         let closing = state.closing;
         let r = state
@@ -777,6 +1124,7 @@ impl JobsSupervisor {
     /// Cleanup failures and resource obligations are never acknowledged away.
     pub fn acknowledge_payload(&self, actor: Option<&str>, id: &str) -> Result<JobSnapshot> {
         let mut state = lock(&self.core.state);
+        require_credentials(&state)?;
         let r = authorized(&mut state, actor, id)?;
         ensure!(r.done, "job still running");
         let (out_len, err_len) = (r.out.len, r.err.len);
@@ -803,8 +1151,16 @@ impl JobsSupervisor {
                 notified.as_mut().enable();
                 {
                     let mut state = lock(&self.core.state);
+                    let blocked = state.refreshing || state.credential_failed;
                     let r = authorized(&mut state, actor, id)?;
                     if r.done {
+                        if blocked {
+                            let mut view = r.view.clone();
+                            view.payload_unavailable = true;
+                            view.next_stdout_offset = r.out.len;
+                            view.next_stderr_offset = r.err.len;
+                            return Ok(view);
+                        }
                         return snapshot(r, 0, 0, PAGE);
                     }
                 }
@@ -940,61 +1296,45 @@ impl<F: Future> Future for Catch<F> {
         }
     }
 }
-#[derive(Default)]
-struct Decoder {
-    pending: Vec<u8>,
-}
-impl Decoder {
-    fn decode(&mut self, bytes: &[u8], eof: bool) -> (String, bool) {
-        self.pending.extend_from_slice(bytes);
-        let mut text = String::new();
-        let mut consumed = 0;
-        let mut lossy = false;
-        while consumed < self.pending.len() {
-            match std::str::from_utf8(&self.pending[consumed..]) {
-                Ok(s) => {
-                    text.push_str(s);
-                    consumed = self.pending.len();
-                }
-                Err(e) => {
-                    let end = consumed + e.valid_up_to();
-                    text.push_str(
-                        std::str::from_utf8(&self.pending[consumed..end]).expect("valid prefix"),
-                    );
-                    consumed = end;
-                    match e.error_len() {
-                        Some(n) => {
-                            text.push('\u{fffd}');
-                            lossy = true;
-                            consumed += n;
-                        }
-                        None if eof => {
-                            text.push('\u{fffd}');
-                            lossy = true;
-                            consumed = self.pending.len();
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        self.pending.drain(..consumed);
-        (text, lossy)
-    }
-}
-fn sink(core: &Core, id: &str, stderr: bool, decoder: &mut Decoder, bytes: &[u8], eof: bool) {
-    let (text, lossy) = decoder.decode(bytes, eof);
-    let mut state = lock(&core.state);
+fn sink(state: &mut Registry, id: &str, stderr: bool, chunk: OutputChunk) {
     let Registry {
         records, allocated, ..
-    } = &mut *state;
+    } = state;
     let r = records.get_mut(id).expect("record retained");
-    r.view.utf8_lossy |= lossy;
+    r.view.utf8_lossy |= chunk.lossy;
     let target = if stderr { &mut r.err } else { &mut r.out };
-    let n = target.append(text.as_bytes(), allocated);
-    if n < text.len() {
+    let n = target.append_chunk(&chunk, allocated);
+    if n < chunk.text.len() {
         r.view.output_truncated = true;
         request(r, JobStatus::Cancelled, "retained output quota");
+    }
+}
+async fn ingest(core: &Core, id: &str, stderr: bool, raw: &[u8]) -> Result<()> {
+    loop {
+        let changed = core.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        {
+            let mut state = lock(&core.state);
+            let refreshing = state.refreshing;
+            let failed = state.credential_failed;
+            let r = state.records.get_mut(id).expect("record retained");
+            if failed || r.stop || r.scope.is_cancelled() || core.cancel.is_cancelled() {
+                // Continue draining after cancellation so paused redaction cannot
+                // turn known process/pipe cleanup into an unknown obligation.
+                r.view.redaction_incomplete = true;
+                return Ok(());
+            }
+            if !refreshing {
+                let chunk = r.streams[usize::from(stderr)]
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("output stream unavailable"))?
+                    .push(raw)?;
+                sink(&mut state, id, stderr, chunk);
+                return Ok(());
+            }
+        }
+        tokio::select! { _ = &mut changed => (), _ = tokio::time::sleep(TICK) => () }
     }
 }
 #[cfg(test)]
@@ -1006,21 +1346,10 @@ async fn finalization_gate(core: &Core) {
     }
 }
 
-// Private, deliberately neither Debug nor Serialize: EOF is not a process outcome.
-struct OutputTail {
-    redactor: StreamingRedactor,
-    decoder: Decoder,
-}
-impl OutputTail {
-    fn prepare(mut self) -> Result<(String, bool)> {
-        let bytes = self.redactor.finish()?;
-        Ok(self.decoder.decode(&bytes, true))
-    }
-}
 struct RunOutcome {
     cleanup_complete: bool,
-    // These buffers are private until one atomic terminal publication.
-    tails: [Option<OutputTail>; 2],
+    // Reader EOF is private; stream state remains under the registry barrier.
+    tails: [bool; 2],
 }
 fn tail_capacity(payload: &Payload, bytes: usize) -> Option<usize> {
     let len = payload.len.checked_add(bytes)?;
@@ -1029,12 +1358,36 @@ fn tail_capacity(payload: &Payload, bytes: usize) -> Option<usize> {
     }
     Some(len.div_ceil(BLOCK).saturating_sub(payload.blocks.len()) * BLOCK)
 }
-fn finalize(core: &Core, id: String, mut outcome: RunOutcome) {
+async fn finalize(core: &Core, id: String, outcome: RunOutcome) {
+    loop {
+        let changed = core.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if finalize_ready(core, &id, &outcome) {
+            return;
+        }
+        tokio::select! { _ = &mut changed => (), _ = tokio::time::sleep(TICK) => () }
+    }
+}
+fn finalize_ready(core: &Core, id: &str, outcome: &RunOutcome) -> bool {
     let mut state = lock(&core.state);
+    let r = &state.records[id];
+    if state.refreshing
+        && !state.credential_failed
+        && !r.stop
+        && !r.scope.is_cancelled()
+        && !core.cancel.is_cancelled()
+    {
+        return false;
+    }
+    let failed = state.credential_failed;
     let Registry {
         records, allocated, ..
     } = &mut *state;
-    let r = records.get_mut(&id).expect("live record retained");
+    let r = records.get_mut(id).expect("live record retained");
+    if failed {
+        request(r, JobStatus::Failed, "credential refresh failed");
+    }
     let confirmed = outcome.cleanup_complete && !r.cleanup_uncertain;
     if core.cancel.is_cancelled() || r.scope.is_cancelled() {
         request(r, JobStatus::Cancelled, "scope cancelled");
@@ -1046,12 +1399,16 @@ fn finalize(core: &Core, id: String, mut outcome: RunOutcome) {
         && r.view.signal.is_none();
     let mut published = false;
     if clean {
-        let prepared = outcome
-            .tails
-            .each_mut()
-            .map(|tail| tail.take().map(OutputTail::prepare));
-        if let [Some(Ok((out, out_lossy))), Some(Ok((err, err_lossy)))] = prepared {
-            let capacity = tail_capacity(&r.out, out.len()).zip(tail_capacity(&r.err, err.len()));
+        let prepared = std::array::from_fn::<_, 2, _>(|i| {
+            if outcome.tails[i] {
+                r.streams[i].take().map(OutputStream::finish)
+            } else {
+                None
+            }
+        });
+        if let [Some(Ok(out)), Some(Ok(err))] = prepared {
+            let capacity =
+                tail_capacity(&r.out, out.text.len()).zip(tail_capacity(&r.err, err.text.len()));
             let fits = capacity.is_some_and(|(a, b)| a + b <= GLOBAL - *allocated);
             // This observation is the cancellation acceptance boundary. stop() uses
             // this same mutex; cancellation after this point sees a terminal record.
@@ -1062,10 +1419,10 @@ fn finalize(core: &Core, id: String, mut outcome: RunOutcome) {
                 r.view.output_truncated = true;
                 request(r, JobStatus::Cancelled, "retained output quota");
             } else {
-                let out_written = r.out.append(out.as_bytes(), allocated);
-                let err_written = r.err.append(err.as_bytes(), allocated);
-                debug_assert_eq!((out_written, err_written), (out.len(), err.len()));
-                r.view.utf8_lossy |= out_lossy || err_lossy;
+                let out_written = r.out.append_chunk(&out, allocated);
+                let err_written = r.err.append_chunk(&err, allocated);
+                debug_assert_eq!((out_written, err_written), (out.text.len(), err.text.len()));
+                r.view.utf8_lossy |= out.lossy || err.lossy;
                 published = true;
             }
         } else {
@@ -1073,10 +1430,12 @@ fn finalize(core: &Core, id: String, mut outcome: RunOutcome) {
         }
     }
     // Dropping uncommitted tails discards private redactor/UTF8 lookbehind.
+    r.streams = [None, None];
     r.view.redaction_incomplete |= !published;
     r.done = true;
     r.input = None;
-    r.input_tail.clear();
+    r.input_tail = Vec::new();
+    r.input_written = VecDeque::new();
     r.view.cleanup_complete = confirmed;
     r.resource = !confirmed;
     r.view.status = if confirmed {
@@ -1092,18 +1451,17 @@ fn finalize(core: &Core, id: String, mut outcome: RunOutcome) {
     }
     state.sticky_unknown |= !confirmed;
     state.running -= 1;
-    state.completed.push_back(id);
+    state.completed.push_back(id.to_owned());
     drop(state);
     core.changed.notify_waiters();
+    true
 }
 async fn drain<R: AsyncRead + Unpin>(
     mut pipe: R,
-    mut redactor: StreamingRedactor,
     core: &Core,
     id: &str,
     stderr: bool,
-) -> Result<OutputTail> {
-    let mut decoder = Decoder::default();
+) -> Result<()> {
     let mut buffer = [0; BLOCK];
     let mut total = 0usize;
     let result: Result<()> = async {
@@ -1122,16 +1480,12 @@ async fn drain<R: AsyncRead + Unpin>(
                 .last_activity = Instant::now();
             total = total.saturating_add(n);
             ensure!(total <= STREAM, "raw output quota");
-            let bytes = redactor
-                .push(&buffer[..n])
-                .map_err(|_| anyhow::anyhow!("output redaction failure"))?;
-            sink(core, id, stderr, &mut decoder, &bytes, false);
+            ingest(core, id, stderr, &buffer[..n]).await?;
         }
         Ok(())
     }
     .await;
     if result.is_err() {
-        let _ = redactor.abort();
         let mut state = lock(&core.state);
         let r = state.records.get_mut(id).expect("record retained");
         r.view.redaction_incomplete = true;
@@ -1145,7 +1499,103 @@ async fn drain<R: AsyncRead + Unpin>(
         );
     }
     result?;
-    Ok(OutputTail { redactor, decoder })
+    Ok(())
+}
+
+// One poll_write and its actual-byte accounting share the credential barrier.
+// Pending readiness never retains the registry mutex. Refresh notifications wake
+// a blocked pipe so an unsafe in-flight remainder is rejected even without I/O readiness.
+async fn deliver_input<W: AsyncWrite + Unpin>(
+    pipe: &mut W,
+    packet: &mut Input,
+    core: &Core,
+    id: &str,
+) -> std::io::Result<()> {
+    loop {
+        let changed = core.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let progress = std::future::poll_fn(|cx| {
+            let mut state = lock(&core.state);
+            if state.refreshing {
+                return Poll::Pending;
+            }
+            let epoch = state.credential_epoch;
+            let failed = state.credential_failed;
+            let credentials = Arc::clone(&state.credentials);
+            let r = state.records.get_mut(id).expect("record retained");
+            if r.stop || r.scope.is_cancelled() || core.cancel.is_cancelled() {
+                packet.complete(InputStatus::Cancelled);
+                return Poll::Ready(Ok(true));
+            }
+            if packet.checked_epoch != Some(epoch) || failed {
+                let mut check: Vec<u8> = r.input_written.iter().copied().collect();
+                let prefix = check.len();
+                check.extend_from_slice(&packet.bytes[packet.written..]);
+                if failed || new_input_contains_secret(&check, prefix, credentials.patterns()) {
+                    if packet.close {
+                        r.input_closing = false;
+                    }
+                    // Accepted-but-unwritten history is advisory. The writer checks
+                    // every following packet against the actual stream before writing.
+                    r.input_tail = r.input_written.iter().copied().collect();
+                    packet.complete(InputStatus::Rejected);
+                    return Poll::Ready(Ok(true));
+                }
+                packet.checked_epoch = Some(epoch);
+            }
+            if packet.written < packet.bytes.len() {
+                let end = packet.bytes.len().min(packet.written + BLOCK);
+                match Pin::new(&mut *pipe).poll_write(cx, &packet.bytes[packet.written..end]) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        packet.complete(InputStatus::IoError);
+                        Poll::Ready(Err(error))
+                    }
+                    Poll::Ready(Ok(0)) => {
+                        packet.complete(InputStatus::IoError);
+                        Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero)))
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        for byte in &packet.bytes[packet.written..packet.written + n] {
+                            if r.input_written.len() == INPUT_LOOKBEHIND {
+                                r.input_written.pop_front();
+                            }
+                            r.input_written.push_back(*byte);
+                        }
+                        packet.written += n;
+                        r.last_activity = Instant::now();
+                        Poll::Ready(Ok(false))
+                    }
+                }
+            } else if packet.close {
+                match Pin::new(&mut *pipe).poll_shutdown(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        packet.complete(InputStatus::IoError);
+                        Poll::Ready(Err(error))
+                    }
+                    Poll::Ready(Ok(())) => {
+                        r.input = None;
+                        packet.complete(InputStatus::Delivered);
+                        Poll::Ready(Ok(true))
+                    }
+                }
+            } else {
+                packet.complete(InputStatus::Delivered);
+                Poll::Ready(Ok(true))
+            }
+        });
+        let done = tokio::select! {
+            biased;
+            _ = &mut changed => continue,
+            result = progress => result?,
+        };
+        if done {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1760,38 +2210,31 @@ mod platform {
         core: &Core,
         id: &str,
         mut input: mpsc::Receiver<Input>,
-        out_redactor: StreamingRedactor,
-        err_redactor: StreamingRedactor,
     ) -> RunOutcome {
         let out = process.child.stdout.take().expect("piped stdout");
         let err = process.child.stderr.take().expect("piped stderr");
         let stdin = process.child.stdin.take();
         let writer_cancel = CancellationToken::new();
         let writer_token = writer_cancel.clone();
-        let out_tail = Mutex::new(None);
-        let err_tail = Mutex::new(None);
+        let out_tail = Mutex::new(false);
+        let err_tail = Mutex::new(false);
         let reader_out = async {
-            let tail = drain(out, out_redactor, core, id, false).await?;
-            *lock(&out_tail) = Some(tail);
+            drain(out, core, id, false).await?;
+            *lock(&out_tail) = true;
             Ok::<(), anyhow::Error>(())
         };
         let reader_err = async {
-            let tail = drain(err, err_redactor, core, id, true).await?;
-            *lock(&err_tail) = Some(tail);
+            drain(err, core, id, true).await?;
+            *lock(&err_tail) = true;
             Ok::<(), anyhow::Error>(())
         };
         let writer = async {
             let work = async {
                 if let Some(mut pipe) = stdin {
-                    while let Some(packet) = input.recv().await {
-                        pipe.write_all(&packet.bytes).await?;
-                        lock(&core.state)
-                            .records
-                            .get_mut(id)
-                            .expect("record retained")
-                            .last_activity = Instant::now();
-                        if packet.close {
-                            pipe.shutdown().await?;
+                    while let Some(mut packet) = input.recv().await {
+                        deliver_input(&mut pipe, &mut packet, core, id).await?;
+                        // A rejected close packet must not close interactive stdin.
+                        if lock(&core.state).records[id].input.is_none() {
                             break;
                         }
                     }
@@ -1885,7 +2328,7 @@ mod platform {
         // Returning drops unfinished readers before the terminal commit.
         RunOutcome {
             cleanup_complete: group_ok && joined && io_ok,
-            tails: [lock(&out_tail).take(), lock(&err_tail).take()],
+            tails: [*lock(&out_tail), *lock(&err_tail)],
         }
     }
 }
@@ -1989,6 +2432,390 @@ mod tests {
             assert_eq!(state.records[&started.id].out.blocks.len(), blocks);
         }
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_retained_history_preserves_cursors_and_rejects_stale_publication() {
+        let d = tempfile::tempdir().unwrap();
+        let original = format!(
+            "{} leftOLDTOKENright new/key猫 {}",
+            "q".repeat(2000),
+            "z".repeat(2000)
+        );
+        std::fs::write(d.path().join("fixture"), &original).unwrap();
+        let s = JobsSupervisor::new("refresh-history", vec!["OLDTOKEN".into()]).unwrap();
+        let start = s
+            .start(spec(d.path(), "cat fixture"), CancellationToken::new())
+            .await
+            .unwrap();
+        let before = terminal(&s, &start.id).await;
+        assert!(before.stdout.contains("left[REDACTED]right"));
+        let allocated = lock(&s.core.state).allocated;
+        let epoch = s
+            .refresh_credentials(&["leftOLDTOKENright".into(), "new/key猫".into()])
+            .await
+            .unwrap();
+        assert_eq!(epoch, 1);
+        assert_eq!(
+            s.refresh_credentials(&["new/key猫".into()]).await.unwrap(),
+            epoch
+        );
+        assert_eq!(s.refresh_credentials(&[]).await.unwrap(), epoch);
+        let after = s.poll(None, &start.id, 0, 0, PAGE).await.unwrap();
+        assert_eq!(after.stdout.len(), before.stdout.len());
+        assert_eq!(after.next_stdout_offset, before.next_stdout_offset);
+        assert_eq!(after.ownership_epoch, before.ownership_epoch);
+        assert_eq!(lock(&s.core.state).allocated, allocated);
+        assert!(after.stdout.starts_with(&"q".repeat(1000)));
+        assert!(after.stdout.contains(&"z".repeat(1000)));
+        for forbidden in ["left", "right", "new/key猫"] {
+            assert!(!after.stdout.contains(forbidden));
+        }
+        for offset in before
+            .stdout
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain([before.stdout.len()])
+        {
+            s.poll(None, &start.id, offset, 0, 9).await.unwrap();
+        }
+        let published = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            s.publish_snapshot(&before, |_| {
+                published.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .is_err()
+        );
+        assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
+        s.publish_snapshot(&after, |_| {
+            published.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(published.load(std::sync::atomic::Ordering::SeqCst));
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_safe_interactive_stdin_and_blocks_new_secret_continuation() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("refresh-stdin", vec![]).unwrap();
+        let mut job = spec(
+            d.path(),
+            "while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
+        );
+        job.stdin = true;
+        let start = s.start(job, CancellationToken::new()).await.unwrap();
+        let first = s
+            .send_input(None, &start.id, b"new-", false)
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(first.status, InputStatus::Delivered);
+        assert_eq!(first.written, 4);
+        s.refresh_credentials(&["new-secret".into()]).await.unwrap();
+        assert!(
+            s.send_input(None, &start.id, b"secret\n", true)
+                .await
+                .is_err()
+        );
+        let safe = format!("safe{}\n", "x".repeat(100));
+        assert_eq!(
+            s.send_input(None, &start.id, safe.as_bytes(), false)
+                .await
+                .unwrap()
+                .wait()
+                .await
+                .unwrap()
+                .status,
+            InputStatus::Delivered
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if s.poll(None, &start.id, 0, 0, PAGE)
+                    .await
+                    .unwrap()
+                    .next_stdout_offset
+                    > 50
+                {
+                    break;
+                }
+                tokio::time::sleep(TICK).await;
+            }
+        })
+        .await
+        .unwrap();
+        let last = s
+            .send_input(None, &start.id, b"AFTER\n", true)
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(last.status, InputStatus::Delivered);
+        let done = terminal(&s, &start.id).await;
+        assert!(done.cleanup_complete);
+        assert_eq!(done.exit_code, Some(0));
+        assert!(done.stdout.ends_with("AFTER\n"), "{}", done.stdout);
+        assert!(!done.stdout.contains("new-secret"));
+        s.shutdown().await.unwrap();
+    }
+
+    struct LimitedWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        limit: usize,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl AsyncWrite for LimitedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut bytes = lock(&self.bytes);
+            if bytes.len() == self.limit {
+                return Poll::Pending;
+            }
+            let n = input.len().min(self.limit - bytes.len());
+            bytes.extend_from_slice(&input[..n]);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn refresh_rechecks_inflight_partial_packet_without_closing_stdin() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Arc::new(JobsSupervisor::new("refresh-packet", vec![]).unwrap());
+        let mut job = spec(d.path(), "sleep 20");
+        job.stdin = true;
+        let start = s.start(job, CancellationToken::new()).await.unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut writer = LimitedWriter {
+            bytes: Arc::clone(&bytes),
+            limit: 4,
+            closed: Arc::clone(&closed),
+        };
+        let (completion, receipt) = oneshot::channel();
+        let mut packet = Input {
+            bytes: b"new-secret".to_vec(),
+            written: 0,
+            checked_epoch: None,
+            close: true,
+            completion: Some(completion),
+            _permit: None,
+        };
+        let core = Arc::clone(&s.core);
+        let id = start.id.clone();
+        let writing = tokio::spawn(async move {
+            deliver_input(&mut writer, &mut packet, &core, &id)
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lock(&bytes).len() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        s.refresh_credentials(&["new-secret".into()]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), writing)
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt = receipt.await.unwrap();
+        assert_eq!(
+            (receipt.status, receipt.written),
+            (InputStatus::Rejected, 4)
+        );
+        assert_eq!(&*lock(&bytes), b"new-");
+        assert!(!closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(lock(&s.core.state).records[&start.id].input.is_some());
+        assert!(s.stop(None, &start.id).await.unwrap().cleanup_complete);
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_and_cancel_remain_live_during_refresh_and_abandonment_fails_closed() {
+        for abandon in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let s = Arc::new(JobsSupervisor::new("refresh-stop", vec![]).unwrap());
+            let start = s
+                .start(
+                    spec(d.path(), "printf ready; sleep 20"),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let ready = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *lock(&s.core.refresh_gate) = Some((Arc::clone(&ready), Arc::clone(&release)));
+            let copy = Arc::clone(&s);
+            let refreshing =
+                tokio::spawn(async move { copy.refresh_credentials(&["new-key".into()]).await });
+            tokio::time::timeout(Duration::from_secs(3), ready.notified())
+                .await
+                .unwrap();
+            assert!(s.poll(None, &start.id, 0, 0, PAGE).await.is_err());
+            if abandon {
+                refreshing.abort();
+            }
+            let stopped = tokio::time::timeout(Duration::from_secs(3), s.stop(None, &start.id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stopped.cleanup_complete);
+            assert!(stopped.stdout.is_empty());
+            assert!(!lock(&s.core.state).sticky_unknown);
+            if abandon {
+                assert!(refreshing.await.unwrap_err().is_cancelled());
+                assert!(s.poll(None, &start.id, 0, 0, PAGE).await.is_err());
+                assert!(
+                    s.start(spec(d.path(), "true"), CancellationToken::new())
+                        .await
+                        .is_err()
+                );
+            } else {
+                release.notify_one();
+                assert_eq!(refreshing.await.unwrap().unwrap(), 1);
+            }
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn old_written_match_does_not_poison_safe_future_input() {
+        let patterns = vec![b"new-secret".to_vec()];
+        assert!(!new_input_contains_secret(b"new-secretSAFE", 10, &patterns));
+        assert!(new_input_contains_secret(b"new-secret", 4, &patterns));
+        assert!(!new_input_contains_secret(b"new-secret", 10, &patterns));
+        assert!(new_input_contains_secret(b"safe new-secret", 5, &patterns));
+    }
+
+    #[tokio::test]
+    async fn refresh_protects_real_output_crossing_cutover_and_then_releases_normal_text() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("refresh-output", vec![]).unwrap();
+        let script = "printf new-; while [ ! -f continue ]; do sleep 0.01; done; printf secret; i=0; while [ $i -lt 100 ]; do printf .; i=$((i+1)); done; while [ ! -f finish ]; do sleep 0.01; done; printf VISIBLE";
+        let start = s
+            .start(spec(d.path(), script), CancellationToken::new())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if s.poll(None, &start.id, 0, 0, PAGE).await.unwrap().stdout == "new-" {
+                    break;
+                }
+                tokio::time::sleep(TICK).await;
+            }
+        })
+        .await
+        .unwrap();
+        s.refresh_credentials(&["new-secret".into()]).await.unwrap();
+        std::fs::write(d.path().join("continue"), b"go").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if s.poll(None, &start.id, 0, 0, PAGE)
+                    .await
+                    .unwrap()
+                    .next_stdout_offset
+                    >= 110
+                {
+                    break;
+                }
+                tokio::time::sleep(TICK).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::fs::write(d.path().join("finish"), b"go").unwrap();
+        let done = terminal(&s, &start.id).await;
+        assert!(done.cleanup_complete);
+        assert_eq!(done.exit_code, Some(0));
+        assert!(done.stdout.starts_with("****"));
+        assert!(!done.stdout.contains("secret"));
+        assert!(done.stdout.ends_with("VISIBLE"));
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_commit_waits_for_existing_publication_without_blocking_cleanup() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Arc::new(JobsSupervisor::new("refresh-publication", vec![]).unwrap());
+        let start = s
+            .start(spec(d.path(), "printf gate-key"), CancellationToken::new())
+            .await
+            .unwrap();
+        let before = terminal(&s, &start.id).await;
+        let entered = Arc::new(Notify::new());
+        let (release, wait) = std::sync::mpsc::channel();
+        let copy = Arc::clone(&s);
+        let signal = Arc::clone(&entered);
+        let publishing = tokio::spawn(async move {
+            copy.publish_snapshot(&before, move |_| {
+                signal.notify_one();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let copy = Arc::clone(&s);
+        let refreshing =
+            tokio::spawn(async move { copy.refresh_credentials(&["gate-key".into()]).await });
+        // A queued writer excludes fresh read permits: prove refresh has reached
+        // the publication barrier, rather than assuming scheduling from a sleep.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while s.core.publication.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!refreshing.is_finished());
+        assert!(!lock(&s.core.state).refreshing);
+        assert!(s.stop(None, &start.id).await.unwrap().cleanup_complete);
+        release.send(()).unwrap();
+        publishing.await.unwrap();
+        assert_eq!(refreshing.await.unwrap().unwrap(), 1);
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_credential_union_blocks_io_but_preserves_cleanup_proof() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("refresh-invalid", vec![]).unwrap();
+        let mut job = spec(d.path(), "sleep 20");
+        job.stdin = true;
+        let start = s.start(job, CancellationToken::new()).await.unwrap();
+        let error = s
+            .refresh_credentials(&["private-oversized-marker".repeat(INPUT)])
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("private-oversized-marker"));
+        assert!(s.poll(None, &start.id, 0, 0, PAGE).await.is_err());
+        assert!(s.send_input(None, &start.id, b"safe", false).await.is_err());
+        assert!(s.publish_snapshot(&start, |_| Ok(())).await.is_err());
+        let done = s.stop(None, &start.id).await.unwrap();
+        assert!(done.cleanup_complete);
+        assert_eq!(done.status, JobStatus::Failed);
+        assert!(!lock(&s.core.state).sticky_unknown);
+        s.shutdown().await.unwrap();
     }
 
     #[test]
@@ -2475,17 +3302,7 @@ mod tests {
             .start(spec(d.path(), "sleep 20"), CancellationToken::new())
             .await
             .unwrap();
-        assert!(
-            drain(
-                Broken,
-                StreamingRedactor::new(&[]).unwrap(),
-                &s.core,
-                &v.id,
-                false
-            )
-            .await
-            .is_err()
-        );
+        assert!(drain(Broken, &s.core, &v.id, false).await.is_err());
         assert!(lock(&s.core.state).records[&v.id].stop);
         let done = terminal(&s, &v.id).await;
         assert_eq!(done.status, JobStatus::Failed);

@@ -322,6 +322,13 @@ impl SecretDictionary {
             .any(|p| bytes.windows(p.len()).any(|w| w == p))
     }
 
+    pub(crate) fn key_count(&self) -> usize {
+        self.secrets.len()
+    }
+    pub(crate) fn key_bytes(&self) -> usize {
+        self.secrets.iter().map(String::len).sum()
+    }
+
     pub fn patterns(&self) -> &[Vec<u8>] {
         &self.patterns
     }
@@ -485,6 +492,16 @@ impl StreamingRedactor {
         self.pending.clear();
         self.consumed = self.end;
         PENDING_MASK.to_vec()
+    }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    // Host-only transfer to a prepared union matcher. Never expose these bytes
+    // to a sink or finalize them using the old dictionary during cutover.
+    pub(crate) fn into_pending_for_cutover(self) -> Vec<u8> {
+        self.pending.into_iter().collect()
     }
 
     pub fn redaction_incomplete(&self) -> bool {
