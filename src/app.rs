@@ -452,7 +452,9 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         .await
     };
     // Neither ordinary errors nor an interactive /exit skip asynchronous cleanup.
-    let cleanup = execution.shutdown().await;
+    let cleanup = execution
+        .shutdown_saved(&mut session, &store, &events.secrets)
+        .await;
     match (result, cleanup) {
         (Ok(code), Ok(())) => Ok(code),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -2144,6 +2146,9 @@ pub(crate) async fn turn(
     let cancel = CancellationToken::new();
     let _interrupt = TurnInterrupt::bind(cancel.clone())?;
     execution.activate()?;
+    execution
+        .settle_jobs(session, store, &events.secrets)
+        .await?;
     execution.reconcile_receipts(session)?;
     session.repair_pending()?;
     let prompt = events.redact(prompt);
@@ -2512,7 +2517,9 @@ pub(crate) async fn turn(
         .await
     }.await;
     drop(executor);
-    let job_cleanup = execution.finish_turn(job_scope, result.is_err()).await;
+    let job_cleanup = execution
+        .finish_turn_saved(job_scope, result.is_err(), session, store, &events.secrets)
+        .await;
     cancel.cancel();
     agents.shutdown().await;
     let cleanup: Result<()> = (|| {

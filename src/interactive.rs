@@ -1268,7 +1268,7 @@ pub(crate) async fn run(
                     let mut next=Session::new(&session.root,session.provider.clone())?;
                     crate::config::ensure_private_directory(&next.dir(store))?;
                     let mut next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secrets.clone())?;
-                    execution.shutdown().await?;
+                    execution.shutdown_saved(session,store,&events.secrets).await?;
                     next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                     let next_tools=configured_tools(&next.root,&next.dir(store).join("checkpoints"),&runtime)?;
                     next.save(store)?;
@@ -1287,7 +1287,7 @@ pub(crate) async fn run(
                         let mut restored=Session::load(store,&id,&session.root)?;
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
                         let mut next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secrets.clone())?;
-                        execution.shutdown().await?;
+                        execution.shutdown_saved(session,store,&events.secrets).await?;
                         next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                         next_execution.reconcile_receipts(&mut restored)?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;

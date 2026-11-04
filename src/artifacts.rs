@@ -24,6 +24,9 @@ const PAGE_MAX: usize = 64 * 1024;
 const META_MAX: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"ARTIF001";
 
+#[cfg(test)]
+thread_local! { static FAIL_AFTER_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactOrigin {
@@ -63,6 +66,24 @@ pub struct ArtifactStore {
     parent: Dir,
     dir: Dir,
     session_id: String,
+    quota: std::sync::Arc<crate::artifact_quota::Pool>,
+    reservation: Option<Uuid>,
+}
+
+/// Резерв квоты хоста, не физическое резервирование диска. Все экземпляры store
+/// этого процесса учитывают его; runtime дополнительно держит session lease.
+pub struct ArtifactReservation(crate::artifact_quota::Reservation);
+
+/// Borrow не позволяет вернуть остаток резерва до завершения всех записей view.
+pub struct ReservedArtifacts<'a> {
+    store: ArtifactStore,
+    _reservation: &'a ArtifactReservation,
+}
+impl std::ops::Deref for ReservedArtifacts<'_> {
+    type Target = ArtifactStore;
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
 }
 
 fn disk<T>(r: std::io::Result<T>) -> Result<T> {
@@ -197,15 +218,57 @@ impl ArtifactStore {
             same(&before, &disk(dir.dir_metadata())?),
             "Каталог артефактов изменился"
         );
+        let metadata = disk(dir.dir_metadata())?;
+        let quota = crate::artifact_quota::shared((
+            MetadataExt::dev(&metadata),
+            MetadataExt::ino(&metadata),
+        ))?;
         let store = Self {
             parent,
             dir,
             session_id: session_id.into(),
+            quota,
+            reservation: None,
         };
         let _lock = store.lock()?;
         store.recover_staging()?;
         store.used()?;
         Ok(store)
+    }
+
+    pub fn reserve_capacity(&self, bytes: usize) -> Result<ArtifactReservation> {
+        ensure!(
+            self.reservation.is_none(),
+            "Нельзя создавать резерв из reserved view"
+        );
+        let _lock = self.lock()?;
+        self.recover_staging()?;
+        Ok(ArtifactReservation(self.quota.reserve(
+            self.used()?,
+            bytes,
+            SESSION_MAX,
+        )?))
+    }
+
+    pub fn reserved<'a>(
+        &self,
+        reservation: &'a ArtifactReservation,
+    ) -> Result<ReservedArtifacts<'a>> {
+        ensure!(
+            reservation.0.belongs_to(&self.quota),
+            "Резерв принадлежит другому хранилищу"
+        );
+        self.check_bound()?;
+        Ok(ReservedArtifacts {
+            store: Self {
+                parent: disk(self.parent.try_clone())?,
+                dir: disk(self.dir.try_clone())?,
+                session_id: self.session_id.clone(),
+                quota: self.quota.clone(),
+                reservation: Some(reservation.0.id()),
+            },
+            _reservation: reservation,
+        })
     }
 
     fn check_bound(&self) -> Result<()> {
@@ -470,7 +533,9 @@ impl ArtifactStore {
         );
         let _lock = self.lock()?;
         self.recover_staging()?;
-        let available = SESSION_MAX - self.used()?;
+        let available = self
+            .quota
+            .available(self.used()?, SESSION_MAX, self.reservation)?;
         let id = Uuid::new_v4().to_string();
         let mut meta = ArtifactMeta {
             version: 1,
@@ -530,6 +595,15 @@ impl ArtifactStore {
             disk(self.dir.remove_file(&tmp))?;
             return disk::<ArtifactMeta>(Err(e));
         }
+        if let Some(reservation) = self.reservation {
+            self.quota
+                .consume(reservation, 12 + json.len() + content.len())?;
+        }
+        #[cfg(test)]
+        ensure!(
+            !FAIL_AFTER_PUBLISH.with(|fault| fault.replace(false)),
+            "Ошибка после публикации артефакта"
+        );
         disk(self.dir.remove_file(&tmp))?;
         #[cfg(unix)]
         {
@@ -664,6 +738,42 @@ mod tests {
     }
     fn receipt(s: &ArtifactStore, text: &str) -> ArtifactMeta {
         s.capture(origin(Some("worker")), text, &[]).unwrap()
+    }
+    #[test]
+    fn reservation_protects_output_budget_across_store_handles_and_releases_unused_bytes() {
+        let (t, s) = setup();
+        let reserved = s.reserve_capacity(SESSION_MAX - 4096).unwrap();
+        let other = ArtifactStore::open(t.path(), "session").unwrap();
+        let large = "x".repeat(8192);
+        assert!(other.capture_required(origin(None), &large, &[]).is_err());
+        let (_foreign_dir, foreign) = setup();
+        assert!(foreign.reserved(&reserved).is_err());
+        {
+            let view = s.reserved(&reserved).unwrap();
+            let meta = view.capture_required(origin(None), &large, &[]).unwrap();
+            assert_eq!(s.verify_required(&meta).unwrap(), large);
+            assert!(other.capture_required(origin(None), &large, &[]).is_err());
+        }
+        drop(reserved);
+        other.capture_required(origin(None), &large, &[]).unwrap();
+    }
+
+    #[test]
+    fn failed_post_publish_sync_does_not_spend_another_reservation() {
+        let (_temp, s) = setup();
+        let first = s.reserve_capacity(SESSION_MAX - 4096).unwrap();
+        let second = s.reserve_capacity(4096).unwrap();
+        let view = s.reserved(&first).unwrap();
+        FAIL_AFTER_PUBLISH.with(|fault| fault.set(true));
+        assert!(
+            view.capture_required(origin(None), &"x".repeat(1024), &[])
+                .is_err()
+        );
+        let other = s.reserved(&second).unwrap();
+        let meta = other
+            .capture_required(origin(None), &"y".repeat(3500), &[])
+            .unwrap();
+        assert_eq!(other.verify_required(&meta).unwrap(), "y".repeat(3500));
     }
     #[test]
     fn required_capture_preserves_origin_and_complete_redacted_content() {

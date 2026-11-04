@@ -18,6 +18,7 @@ pub struct SessionRuntime {
     artifacts: ArtifactStore,
     jobs: JobsSupervisor,
     journal: Option<OperationJournal>,
+    managed: crate::managed_jobs::ManagedJobs,
     cancel: CancellationToken,
     active: Arc<AtomicBool>,
     last_turn: Option<u64>,
@@ -63,6 +64,7 @@ impl SessionRuntime {
             artifacts: ArtifactStore::open(session_dir, session_id)?,
             jobs: JobsSupervisor::new_for_session(session_id, secrets)?,
             journal: None,
+            managed: Default::default(),
             cancel: CancellationToken::new(),
             active: Arc::new(AtomicBool::new(false)),
             last_turn: None,
@@ -82,20 +84,170 @@ impl SessionRuntime {
         Ok((&self.artifacts, self.journal.as_mut()))
     }
 
-    pub(crate) fn reconcile_receipts(&mut self, session: &mut crate::state::Session) -> Result<()> {
+    pub fn reconcile_receipts(&mut self, session: &mut crate::state::Session) -> Result<()> {
         anyhow::ensure!(
             session.id == self.session_id,
             "Runtime относится к другой сессии"
         );
-        let (artifacts, journal) = self.receipt_resources()?;
-        if let Some(journal) = journal {
-            crate::operation_receipts::reconcile(journal, artifacts, session)?;
+        self.activate()?;
+        if let Some(journal) = self.journal.as_ref() {
+            if self.managed.pending() {
+                crate::operation_receipts::reconcile_background(
+                    journal,
+                    &self.artifacts,
+                    session,
+                    &self.managed.owned(),
+                )?;
+            } else {
+                crate::operation_receipts::reconcile(journal, &self.artifacts, session)?;
+            }
         }
         Ok(())
     }
 
     pub fn jobs(&self) -> &JobsSupervisor {
         &self.jobs
+    }
+
+    /// Host-only: permission and role checks precede this call. Model arguments
+    /// must not supply JobSpec's argv/environment/origin/cancellation authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_approved_job(
+        &mut self,
+        session: &mut crate::state::Session,
+        store: &crate::config::ConfigStore,
+        call: &crate::protocol::ToolCall,
+        args: &serde_json::Value,
+        spec: crate::jobs::JobSpec,
+        cancel: CancellationToken,
+        secrets: &[String],
+    ) -> Result<crate::jobs::JobSnapshot> {
+        self.activate()?;
+        ensure!(
+            session.id == self.session_id
+                && self.active.load(Ordering::Acquire)
+                && self.last_turn == Some(session.turn_index)
+                && spec.origin.turn == session.turn_index,
+            "Запуск не принадлежит активному ходу сессии"
+        );
+        self.jobs.refresh_credentials(secrets).await?;
+        let journal = self
+            .journal
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Durable запуск недоступен на этой платформе"))?;
+        self.managed
+            .start(
+                &self.jobs,
+                journal,
+                &self.artifacts,
+                session,
+                store,
+                call,
+                args,
+                spec,
+                cancel,
+                secrets,
+            )
+            .await
+    }
+
+    pub async fn settle_jobs(
+        &mut self,
+        session: &mut crate::state::Session,
+        store: &crate::config::ConfigStore,
+        secrets: &[String],
+    ) -> Result<Vec<crate::operation_receipts::BackgroundReceipt>> {
+        ensure!(
+            session.id == self.session_id,
+            "Runtime относится к другой сессии"
+        );
+        if !self.managed.pending() {
+            return Ok(Vec::new());
+        }
+        ensure!(!self.closed, "Исполнение сессии завершено");
+        self.jobs.refresh_credentials(secrets).await?;
+        self.persist_jobs(session, store, secrets).await
+    }
+
+    async fn persist_jobs(
+        &mut self,
+        session: &mut crate::state::Session,
+        store: &crate::config::ConfigStore,
+        secrets: &[String],
+    ) -> Result<Vec<crate::operation_receipts::BackgroundReceipt>> {
+        if !self.managed.pending() {
+            return Ok(Vec::new());
+        }
+        let journal = self
+            .journal
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Потерян журнал процессов"))?;
+        self.managed
+            .settle(
+                &self.jobs,
+                journal,
+                &self.artifacts,
+                session,
+                store,
+                secrets,
+            )
+            .await
+    }
+
+    pub async fn finish_turn_saved(
+        &mut self,
+        scope: TurnScope,
+        failed: bool,
+        session: &mut crate::state::Session,
+        store: &crate::config::ConfigStore,
+        secrets: &[String],
+    ) -> Result<()> {
+        ensure!(
+            session.id == self.session_id,
+            "Runtime относится к другой сессии"
+        );
+        let cleanup = self.finish_turn(scope, failed).await;
+        let persistence = self.settle_jobs(session, store, secrets).await.map(|_| ());
+        combine(cleanup, persistence)
+    }
+
+    pub async fn shutdown_saved(
+        &mut self,
+        session: &mut crate::state::Session,
+        store: &crate::config::ConfigStore,
+        secrets: &[String],
+    ) -> Result<()> {
+        ensure!(
+            session.id == self.session_id,
+            "Runtime относится к другой сессии"
+        );
+        let refresh = if self.managed.pending() {
+            if self.closed {
+                Err(anyhow::anyhow!(
+                    "Закрытые процессы требуют восстановления; публикация без обновления ключей запрещена"
+                ))
+            } else {
+                self.jobs.refresh_credentials(secrets).await.map(|_| ())
+            }
+        } else {
+            Ok(())
+        };
+        self.closed = true;
+        self.cancel.cancel();
+        let cleanup = self.jobs.shutdown().await;
+        let persistence = if refresh.is_ok() {
+            self.persist_jobs(session, store, secrets).await.map(|_| ())
+        } else {
+            if let Some(journal) = self.journal.as_mut() {
+                journal.fail_closed();
+            }
+            Ok(())
+        };
+        let result = combine(combine(refresh, cleanup), persistence);
+        if result.is_ok() {
+            self.journal.take();
+        }
+        result
     }
 
     /// Подготовка replacement не забирает lease старой сессии. Активация
@@ -188,6 +340,10 @@ impl SessionRuntime {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        ensure!(
+            !self.managed.pending(),
+            "Результаты процессов нужно сохранить через shutdown_saved"
+        );
         self.closed = true;
         self.cancel.cancel();
         let result = self.jobs.shutdown().await;
@@ -195,6 +351,14 @@ impl SessionRuntime {
             self.journal.take();
         }
         result
+    }
+}
+fn combine(cleanup: Result<()>, persistence: Result<()>) -> Result<()> {
+    match (cleanup, persistence) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(error), Err(save)) => {
+            Err(error.context(format!("Сохранение результатов процессов: {save:#}")))
+        }
     }
 }
 impl Drop for SessionRuntime {

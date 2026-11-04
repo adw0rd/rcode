@@ -425,6 +425,18 @@ fn provenance_spans(marks: &[u64], length: usize, boundary: usize) -> Vec<std::o
 pub struct JobsSupervisor {
     core: Arc<Core>,
 }
+
+/// Одноразовый host ID до durable intent. Не резервирует процесс или ресурсный
+/// слот; не восстанавливается из строки и не переносится в другой supervisor.
+pub struct StartReservation {
+    id: String,
+    core: std::sync::Weak<Core>,
+}
+impl StartReservation {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
 /// Cloneable cancellation authority for a host-owned turn guard, without
 /// duplicating JobsSupervisor's emergency Drop ownership.
 pub(crate) struct TurnControl {
@@ -822,7 +834,36 @@ impl JobsSupervisor {
         publish(snapshot)
     }
 
-    pub async fn start(&self, mut spec: JobSpec, cancel: CancellationToken) -> Result<JobSnapshot> {
+    pub fn reserve_start(&self) -> Result<StartReservation> {
+        let state = lock(&self.core.state);
+        require_credentials(&state)?;
+        ensure!(
+            !state.closing && !self.core.cancel.is_cancelled(),
+            "supervisor closing"
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        validate_identity(&id, state.credentials.patterns())?;
+        Ok(StartReservation {
+            id,
+            core: Arc::downgrade(&self.core),
+        })
+    }
+
+    pub async fn start(&self, spec: JobSpec, cancel: CancellationToken) -> Result<JobSnapshot> {
+        self.start_reserved(self.reserve_start()?, spec, cancel)
+            .await
+    }
+
+    pub async fn start_reserved(
+        &self,
+        reservation: StartReservation,
+        mut spec: JobSpec,
+        cancel: CancellationToken,
+    ) -> Result<JobSnapshot> {
+        ensure!(
+            reservation.core.ptr_eq(&Arc::downgrade(&self.core)),
+            "foreign start reservation"
+        );
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (&mut spec, cancel);
@@ -843,11 +884,12 @@ impl JobsSupervisor {
             platform::members_gone(0, Instant::now() + CLEANUP)?;
             let out_redactor = credentials.stream()?;
             let err_redactor = credentials.stream()?;
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = reservation.id;
             validate_identity(&id, credentials.patterns())?;
             let (tx, rx) = mpsc::channel(1);
             let mut state = lock(&self.core.state);
             require_credentials(&state)?;
+            ensure!(!state.records.contains_key(&id), "job ID already used");
             ensure!(
                 state.credential_epoch == credential_epoch,
                 "credentials changed before spawn"
@@ -982,6 +1024,18 @@ impl JobsSupervisor {
         }
     }
     pub async fn poll(
+        &self,
+        actor: Option<&str>,
+        id: &str,
+        stdout_offset: usize,
+        stderr_offset: usize,
+        max_bytes: usize,
+    ) -> Result<JobSnapshot> {
+        self.poll_snapshot(actor, id, stdout_offset, stderr_offset, max_bytes)
+    }
+
+    // Used by the host's synchronous persistence callback under publish_snapshot.
+    pub(crate) fn poll_snapshot(
         &self,
         actor: Option<&str>,
         id: &str,
@@ -2366,6 +2420,54 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reserved_start_uses_preallocated_id_and_rejects_foreign_or_cancelled_capability() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("reserved-session", vec![]).unwrap();
+        let foreign = JobsSupervisor::new("reserved-session", vec![]).unwrap();
+        let reservation = s.reserve_start().unwrap();
+        assert!(
+            foreign
+                .start_reserved(
+                    reservation,
+                    spec(d.path(), "touch forbidden"),
+                    CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        assert!(!d.path().join("forbidden").exists());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            s.start_reserved(
+                s.reserve_start().unwrap(),
+                spec(d.path(), "touch forbidden"),
+                cancel
+            )
+            .await
+            .is_err()
+        );
+        assert!(!d.path().join("forbidden").exists());
+        let reservation = s.reserve_start().unwrap();
+        let id = reservation.id().to_owned();
+        let started = s
+            .start_reserved(
+                reservation,
+                spec(d.path(), "printf reserved"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.id, id);
+        let done = terminal(&s, &id).await;
+        assert_eq!(done.stdout, "reserved");
+        assert!(done.cleanup_complete);
+        s.shutdown().await.unwrap();
+        foreign.shutdown().await.unwrap();
+        assert!(s.reserve_start().is_err());
     }
 
     #[tokio::test]

@@ -52,15 +52,18 @@ pub mod task_state;
 pub mod instructions;
 pub mod sandbox;
 
+mod artifact_quota;
 pub mod artifacts;
 
 mod artifact_tool;
 
 pub mod diagnostics;
 
+mod job_manifest;
 mod job_output;
 pub mod job_tools;
 pub mod jobs;
+mod managed_jobs;
 pub mod operation_journal;
 pub mod operation_receipts;
 pub mod session_runtime;

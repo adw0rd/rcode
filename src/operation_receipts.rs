@@ -50,6 +50,26 @@ struct SavedResult {
     output: ArtifactMeta,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous: Option<crate::task_state::TaskOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_format: Option<OutputFormat>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OutputFormat {
+    CommandManifestV1,
+}
+
+fn verify_saved_output(artifacts: &ArtifactStore, saved: &SavedResult) -> Result<String> {
+    let text = if saved.output_format.is_some() {
+        artifacts.verify_required(&saved.output)?
+    } else {
+        artifacts.verify_output(&saved.output)?
+    };
+    if let Some(OutputFormat::CommandManifestV1) = saved.output_format {
+        crate::job_manifest::verify(artifacts, &text, &saved.output.session_id)?;
+    }
+    Ok(text)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -261,6 +281,7 @@ pub(crate) fn finish(
         is_error: outcome.is_error,
         output: output.clone(),
         previous: session.task_state.last_operation().cloned(),
+        output_format: None,
     };
     let payload = serde_json::to_value(payload)?;
     let prepared = journal.prepare_finish(
@@ -355,6 +376,44 @@ pub fn finish_background(
     outcome: ToolOutcome,
     secrets: &[String],
 ) -> Result<BackgroundReceipt> {
+    finish_background_inner(
+        operation, journal, artifacts, session, store, outcome, secrets, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_command_manifest(
+    operation: &BackgroundOperation,
+    journal: &mut OperationJournal,
+    artifacts: &ArtifactStore,
+    session: &mut Session,
+    store: &ConfigStore,
+    outcome: ToolOutcome,
+    secrets: &[String],
+) -> Result<BackgroundReceipt> {
+    finish_background_inner(
+        operation,
+        journal,
+        artifacts,
+        session,
+        store,
+        outcome,
+        secrets,
+        Some(OutputFormat::CommandManifestV1),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_background_inner(
+    operation: &BackgroundOperation,
+    journal: &mut OperationJournal,
+    artifacts: &ArtifactStore,
+    session: &mut Session,
+    store: &ConfigStore,
+    outcome: ToolOutcome,
+    secrets: &[String],
+    output_format: Option<OutputFormat>,
+) -> Result<BackgroundReceipt> {
     // Validate capabilities before writing artifacts, even if a caller retained
     // an opaque handle after reopening the same session or passed a wrong one.
     journal.check_pending(&operation.pending, &session.id, artifacts)?;
@@ -374,18 +433,33 @@ pub fn finish_background(
             );
         }
         let revision = session.task_state.next_operation_revision(&session.id)?;
-        let output = artifacts.capture(
-            operation.pending.origin().clone(),
-            &outcome.content,
-            secrets,
-        )?;
-        artifacts.verify_output(&output)?;
-        let payload = serde_json::to_value(SavedResult {
+        let output = if output_format.is_some() {
+            let meta = artifacts.capture_required(
+                operation.pending.origin().clone(),
+                &outcome.content,
+                secrets,
+            )?;
+            ensure!(
+                artifacts.verify_required(&meta)? == outcome.content,
+                "Удаление секрета изменило manifest процесса"
+            );
+            meta
+        } else {
+            artifacts.capture(
+                operation.pending.origin().clone(),
+                &outcome.content,
+                secrets,
+            )?
+        };
+        let saved = SavedResult {
             version: 1,
             is_error: outcome.is_error,
             output: output.clone(),
             previous: session.task_state.last_operation().cloned(),
-        })?;
+            output_format,
+        };
+        verify_saved_output(artifacts, &saved)?;
+        let payload = serde_json::to_value(saved)?;
         let prepared = journal.prepare_finish(
             operation.operation_id(),
             if outcome.is_error {
@@ -514,7 +588,7 @@ pub fn reconcile_background(
                 "Состояние задачи старше подтверждённой операции"
             );
             preview(
-                &artifacts.verify_output(&saved.output)?,
+                &verify_saved_output(artifacts, &saved)?,
                 &saved.output,
                 saved.is_error,
             )
