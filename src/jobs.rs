@@ -415,6 +415,10 @@ fn validate(spec: &mut JobSpec, patterns: &[Vec<u8>]) -> Result<()> {
     spec.cwd = std::fs::canonicalize(&spec.cwd)
         .map_err(|_| anyhow::anyhow!("invalid working directory"))?;
     ensure!(spec.cwd.is_dir(), "invalid working directory");
+    ensure!(
+        !has_secret(spec.cwd.as_os_str().as_encoded_bytes(), patterns),
+        "working directory rejected"
+    );
     Ok(())
 }
 fn authorized<'a>(
@@ -1196,7 +1200,9 @@ mod platform {
         cmd.args(&spec.argv[1..])
             .current_dir(&spec.cwd)
             .env_clear()
-            .envs(spec.env.iter().cloned());
+            .envs(spec.env.iter().cloned())
+            .env("PWD", &spec.cwd)
+            .env("RCODE_MODEL_SHELL", "1");
         cmd.stdin(if spec.stdin {
             std::process::Stdio::piped()
         } else {
@@ -1925,6 +1931,56 @@ mod tests {
         for value in ["abcdef", "%61%62%63%64%65%66"] {
             assert!(JobsSupervisor::new(value, vec!["abcdef".into()]).is_err());
         }
+    }
+    #[tokio::test]
+    async fn native_environment_contains_host_marker_and_canonical_pwd() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = d.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        for kind in [JobKind::Managed, JobKind::Foreground] {
+            let s = JobsSupervisor::new("environment-session", vec![]).unwrap();
+            let mut job = spec(&alias, "unused");
+            job.kind = kind;
+            job.argv = vec!["/usr/bin/env".into()];
+            let started = s.start(job, CancellationToken::new()).await.unwrap();
+            let result = terminal(&s, &started.id).await;
+            assert_eq!(result.status, JobStatus::Exited);
+            let values: std::collections::HashMap<_, _> = result
+                .stdout
+                .lines()
+                .map(|line| line.split_once('=').unwrap())
+                .collect();
+            assert_eq!(values.get("RCODE_MODEL_SHELL"), Some(&"1"));
+            assert_eq!(
+                values.get("PWD"),
+                Some(&real.canonicalize().unwrap().to_str().unwrap())
+            );
+            assert_eq!(values.len(), 2, "Ambient environment must not be inherited");
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_host_environment_cannot_be_spoofed_or_contain_known_key_in_pwd() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("environment-session", vec!["private-cwd-key".into()]).unwrap();
+        for key in ["RCODE_MODEL_SHELL", "PWD"] {
+            let mut job = spec(d.path(), "touch forbidden");
+            job.env.push((key.into(), "override".into()));
+            assert!(s.start(job, CancellationToken::new()).await.is_err());
+        }
+        let secret = d.path().join("private-cwd-key");
+        std::fs::create_dir(&secret).unwrap();
+        assert!(
+            s.start(spec(&secret, "touch forbidden"), CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(!secret.join("forbidden").exists());
+        assert!(!d.path().join("forbidden").exists());
+        s.shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn host_actor_identity_is_rejected_before_spawn() {
