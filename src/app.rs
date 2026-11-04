@@ -2012,15 +2012,30 @@ impl ToolExecutor<'_> {
                         .await
                         .map(Some)
                 }
-                JobRequest::Poll(a) => jobs
-                    .poll_snapshot(
+                JobRequest::Poll(a) => {
+                    // Committed output is authoritative even after native eviction.
+                    // Stop/input never consult this read-only recovery path.
+                    if let Some(value) = crate::operation_receipts::command_output(
+                        journal,
+                        artifacts,
+                        &session.id,
                         owner,
-                        &a.command_id,
-                        a.stdout_offset,
-                        a.stderr_offset,
-                        a.max_bytes,
-                    )
-                    .map(Some),
+                        &a,
+                        &secrets,
+                    )? {
+                        direct = Some(value);
+                        Ok(None)
+                    } else {
+                        jobs.poll_snapshot(
+                            owner,
+                            &a.command_id,
+                            a.stdout_offset,
+                            a.stderr_offset,
+                            a.max_bytes,
+                        )
+                        .map(Some)
+                    }
+                }
                 JobRequest::Stop(a) => jobs.stop(owner, &a.command_id).await.map(Some),
                 JobRequest::Input(a) => {
                     direct = Some(
@@ -2057,7 +2072,7 @@ impl ToolExecutor<'_> {
             }
             other => {
                 let outcome = match other {
-                    Ok(None) => ToolOutcome::success(direct.expect("input receipt").to_string()),
+                    Ok(None) => ToolOutcome::success(direct.expect("direct receipt").to_string()),
                     Err(error) => ToolOutcome::error(
                         json!({"error":"command_failed","message":format!("{error:#}")})
                             .to_string(),

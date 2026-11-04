@@ -79,6 +79,66 @@ struct SavedRequest {
     arguments: ArtifactMeta,
 }
 
+/// Resolve only committed command lifetimes; UUIDs never recreate native ownership.
+pub(crate) fn command_output(
+    journal: &OperationJournal,
+    artifacts: &ArtifactStore,
+    session_id: &str,
+    actor: Option<&str>,
+    request: &crate::job_tools::PollArgs,
+    secrets: &[String],
+) -> Result<Option<Value>> {
+    journal.check_session(session_id)?;
+    // The journal has a hard 2048-operation limit, including after recovery.
+    // Filter by immutable actor/tool before loading command payloads.
+    for record in journal.records(artifacts)? {
+        if record.origin.tool != "command_lifetime"
+            || record.terminal.is_none()
+            || record.origin.actor.as_deref() != actor
+        {
+            continue;
+        }
+        let intent = journal.intent_payload(&record.operation_id, artifacts)?;
+        let saved: SavedRequest = serde_json::from_value(intent)?;
+        ensure!(saved.version == 1, "Неизвестная версия запроса процесса");
+        ensure!(
+            saved.arguments.origin == record.origin,
+            "Чужие аргументы процесса"
+        );
+        let args: Value = serde_json::from_str(&artifacts.verify_required(&saved.arguments)?)?;
+        if args["command_id"] != request.command_id {
+            continue;
+        }
+        ensure!(
+            args["origin"]["actor"] == serde_json::to_value(actor)?
+                && args["origin"]["turn"] == record.origin.turn,
+            "Чужой origin процесса"
+        );
+        let payload = journal
+            .terminal_payload(&record.operation_id, artifacts)?
+            .ok_or_else(|| anyhow::anyhow!("Результат процесса не подтверждён"))?;
+        let saved: SavedResult = serde_json::from_value(payload)?;
+        ensure!(
+            saved.version == 1
+                && matches!(saved.output_format, Some(OutputFormat::CommandManifestV1))
+                && saved.output.origin == record.origin
+                && saved.output.session_id == session_id,
+            "Чужой или неизвестный формат результата процесса"
+        );
+        let text = verify_saved_output(artifacts, &saved)?;
+        return crate::job_manifest::page(
+            artifacts,
+            &text,
+            session_id,
+            &record.origin,
+            request,
+            secrets,
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
 fn unknown(id: &str) -> String {
     json!({"error":"interrupted","outcome":"unknown","operation_id":id,"hint":UNKNOWN}).to_string()
 }
@@ -742,6 +802,132 @@ mod tests {
         }));
         session.save(store).unwrap();
         call
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn durable_lookup_requires_committed_lifetime_and_exact_worker_owner() {
+        use crate::jobs::{JobKind, JobOrigin, JobSpec, JobStatus, JobsSupervisor};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let jobs = JobsSupervisor::new_for_session(&session.id, vec![]).unwrap();
+        jobs.attach_cleanup_guard(journal.cleanup_guard()).unwrap();
+        let reservation = jobs.reserve_start().unwrap();
+        let id = reservation.id().to_owned();
+        let origin = JobOrigin {
+            actor: Some("worker".into()),
+            turn: 1,
+        };
+        let args = json!({"command_id":id,"origin":origin});
+        let pending = begin_background(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &ToolCall::new("command_lifetime", args.clone()),
+            Some("worker"),
+            &args,
+            &[],
+        )
+        .unwrap();
+        let request = crate::job_tools::PollArgs {
+            command_id: id.clone(),
+            stdout_offset: 0,
+            stderr_offset: 0,
+            max_bytes: 64,
+        };
+        assert!(
+            command_output(
+                &journal,
+                &artifacts,
+                &session.id,
+                Some("worker"),
+                &request,
+                &[]
+            )
+            .unwrap()
+            .is_none()
+        );
+        jobs.start_reserved(
+            reservation,
+            JobSpec {
+                kind: JobKind::Managed,
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf failed-output; exit 7".into(),
+                ],
+                cwd: session.root.clone(),
+                env: vec![],
+                origin,
+                lifetime: Duration::from_secs(60),
+                idle_timeout: Duration::from_secs(60),
+                stdin: false,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let view = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let view = jobs.poll(Some("worker"), &id, 0, 0, 64).await.unwrap();
+                if view.status != JobStatus::Running {
+                    break view;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        jobs.publish_snapshot(&view, |view| {
+            let manifest = crate::job_manifest::capture(&jobs, &artifacts, view)?;
+            let mut outcome = ToolOutcome::success(manifest);
+            outcome.is_error = true;
+            finish_command_manifest(
+                &pending,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                outcome,
+                &[],
+            )
+        })
+        .await
+        .unwrap();
+        jobs.acknowledge_payload(Some("worker"), &id).unwrap();
+        let result = command_output(
+            &journal,
+            &artifacts,
+            &session.id,
+            Some("worker"),
+            &request,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["stdout"], "failed-output");
+        assert_eq!(result["exit_code"], 7);
+        for actor in [None, Some("other")] {
+            assert!(
+                command_output(&journal, &artifacts, &session.id, actor, &request, &[])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            command_output(
+                &journal,
+                &artifacts,
+                "other-session",
+                Some("worker"),
+                &request,
+                &[]
+            )
+            .is_err()
+        );
+        jobs.shutdown().await.unwrap();
     }
 
     fn background(

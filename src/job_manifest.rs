@@ -120,6 +120,8 @@ pub(crate) fn verify(artifacts: &ArtifactStore, text: &str, session_id: &str) ->
             && manifest.terminal["session_id"] == session_id
             && manifest.terminal["owner"] == serde_json::to_value(&manifest.origin.actor)?
             && manifest.terminal["origin"]["turn"] == manifest.origin.turn
+            && manifest.terminal["origin"]["actor"]
+                == serde_json::to_value(&manifest.origin.actor)?
             && manifest.terminal["stdout"] == ""
             && manifest.terminal["stderr"] == ""
             && manifest.terminal["payload_unavailable"] == false
@@ -163,4 +165,274 @@ pub(crate) fn verify(artifacts: &ArtifactStore, text: &str, session_id: &str) ->
     }
     ensure!(total <= 32 * 1024 * 1024, "Превышен размер вывода manifest");
     Ok(())
+}
+
+/// Immutable durable view in the original stored byte coordinates.
+pub(crate) fn page(
+    artifacts: &ArtifactStore,
+    text: &str,
+    session_id: &str,
+    lifetime: &ArtifactOrigin,
+    request: &crate::job_tools::PollArgs,
+    secrets: &[String],
+) -> Result<Value> {
+    verify(artifacts, text, session_id)?;
+    let manifest: Manifest = serde_json::from_str(text)?;
+    ensure!(
+        manifest.command_id == request.command_id
+            && manifest.origin.actor == lifetime.actor
+            && manifest.origin.turn == lifetime.turn,
+        "Manifest не принадлежит операции процесса"
+    );
+    ensure!(
+        (4..=65536).contains(&request.max_bytes),
+        "Недопустимый размер страницы"
+    );
+    let credentials = crate::redaction::SecretDictionary::new(secrets)?;
+    let dictionary = crate::retained_redaction::RetainedDictionary::new(&credentials)?;
+    // Metadata must remain parseable; identity fields cannot be silently masked.
+    let clean = crate::redaction::redact_text(&manifest.terminal.to_string(), secrets)?;
+    let mut terminal: Value = serde_json::from_str(&clean)?;
+    ensure!(
+        terminal["id"] == request.command_id
+            && terminal["session_id"] == session_id
+            && terminal["owner"] == serde_json::to_value(&lifetime.actor)?,
+        "Redaction изменила identity процесса"
+    );
+    for (pages, offset, field, next) in [
+        (
+            &manifest.stdout,
+            request.stdout_offset,
+            "stdout",
+            "next_stdout_offset",
+        ),
+        (
+            &manifest.stderr,
+            request.stderr_offset,
+            "stderr",
+            "next_stderr_offset",
+        ),
+    ] {
+        let mut bytes = Vec::new();
+        for page in pages {
+            bytes.extend_from_slice(artifacts.verify_required(&page.artifact)?.as_bytes());
+        }
+        let original = std::str::from_utf8(&bytes)?;
+        ensure!(
+            offset <= bytes.len() && original.is_char_boundary(offset),
+            "Недопустимое смещение вывода"
+        );
+        let mut end = bytes.len().min(offset.saturating_add(request.max_bytes));
+        while !original.is_char_boundary(end) {
+            end -= 1;
+        }
+        ensure!(
+            end > offset || offset == bytes.len(),
+            "Размер страницы не вмещает символ"
+        );
+        let mut retained = StoredText(bytes);
+        let mut cursor = dictionary.cursor(retained.0.len(), &[])?;
+        while !cursor.step(&mut retained, 4096)? {}
+        let output = std::str::from_utf8(&retained.0[offset..end])?;
+        // Downstream event/receipt redaction must not change byte coordinates.
+        ensure!(
+            crate::redaction::redact_text(output, secrets)? == output,
+            "Маска вывода совпала с ключом"
+        );
+        terminal[field] = Value::String(output.to_owned());
+        terminal[next] = Value::from(end);
+    }
+    terminal["command_id"] = Value::String(request.command_id.clone());
+    terminal["persisted"] = Value::Bool(true);
+    Ok(terminal)
+}
+
+struct StoredText(Vec<u8>);
+impl crate::retained_redaction::RetainedText for StoredText {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn byte(&self, index: usize) -> Option<u8> {
+        self.0.get(index).copied()
+    }
+    fn mask(&mut self, range: std::ops::Range<usize>) -> crate::retained_redaction::Result<()> {
+        let bytes = self
+            .0
+            .get_mut(range)
+            .ok_or(crate::retained_redaction::RemaskError::InvalidMaskBounds)?;
+        bytes.fill(b'*');
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    const ID: &str = "12345678-abcd-4abc-8abc-123456789abc";
+    fn fixture(text: &str) -> (tempfile::TempDir, ArtifactStore, Manifest, ArtifactOrigin) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(temp.path(), "session").unwrap();
+        let origin = ArtifactOrigin {
+            actor: Some("worker".into()),
+            turn: 3,
+            tool: "command_output".into(),
+            call_id: ID.into(),
+        };
+        let mut pages = Vec::new();
+        let mut at = 0;
+        while at < text.len() {
+            let mut end = text.len().min(at + 65536);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let artifact = store
+                .capture_required(origin.clone(), &text[at..end], &[])
+                .unwrap();
+            pages.push(Page {
+                offset: at,
+                end,
+                artifact,
+            });
+            at = end;
+        }
+        let manifest = Manifest {
+            version: 1,
+            command_id: ID.into(),
+            origin: origin.clone(),
+            terminal: json!({"id":ID,"session_id":"session","owner":"worker","origin":{"actor":"worker","turn":3},
+                "status":"exited","stdout":"","stderr":"","next_stdout_offset":text.len(),"next_stderr_offset":0,
+                "payload_unavailable":false,"cleanup_complete":true}),
+            stdout: pages,
+            stderr: vec![],
+        };
+        let lifetime = ArtifactOrigin {
+            tool: "command_lifetime".into(),
+            call_id: "start-call".into(),
+            ..origin
+        };
+        (temp, store, manifest, lifetime)
+    }
+    fn request(offset: usize, maximum: usize) -> crate::job_tools::PollArgs {
+        crate::job_tools::PollArgs {
+            command_id: ID.into(),
+            stdout_offset: offset,
+            stderr_offset: 0,
+            max_bytes: maximum,
+        }
+    }
+    #[test]
+    fn persisted_page_masks_cross_page_unicode_secret_without_changing_coordinates_or_artifacts() {
+        let secret = "SECRET-привет";
+        let text = format!("{}{}!", "x".repeat(65530), secret);
+        let (_temp, store, manifest, lifetime) = fixture(&text);
+        let saved = serde_json::to_string(&manifest).unwrap();
+        let keys = vec![secret.to_owned()];
+        let result = page(
+            &store,
+            &saved,
+            "session",
+            &lifetime,
+            &request(65530, secret.len()),
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(result["stdout"], "*".repeat(secret.len()));
+        assert_eq!(result["next_stdout_offset"], 65530 + secret.len());
+        assert_eq!(
+            result,
+            page(
+                &store,
+                &saved,
+                "session",
+                &lifetime,
+                &request(65530, secret.len()),
+                &keys
+            )
+            .unwrap()
+        );
+        let mut cursor = 65530;
+        let mut pieces = String::new();
+        while cursor < 65530 + secret.len() {
+            let part = page(
+                &store,
+                &saved,
+                "session",
+                &lifetime,
+                &request(cursor, 4),
+                &keys,
+            )
+            .unwrap();
+            let next = part["next_stdout_offset"].as_u64().unwrap() as usize;
+            assert!(next > cursor && next - cursor <= 4);
+            pieces.push_str(part["stdout"].as_str().unwrap());
+            cursor = next;
+        }
+        // A page may include the trailing nonsecret byte after the last scalar.
+        assert_eq!(pieces.trim_end_matches('!'), "*".repeat(secret.len()));
+        assert_eq!(
+            store.verify_required(&manifest.stdout[1].artifact).unwrap(),
+            text[65536..]
+        );
+        assert_eq!(
+            store.verify_required(&manifest.stdout[0].artifact).unwrap(),
+            text[..65536]
+        );
+        assert_eq!(
+            page(
+                &store,
+                &saved,
+                "session",
+                &lifetime,
+                &request(text.len(), 4),
+                &keys
+            )
+            .unwrap()["stdout"],
+            ""
+        );
+        assert!(
+            page(
+                &store,
+                &saved,
+                "session",
+                &lifetime,
+                &request(65538, 4),
+                &keys
+            )
+            .is_err()
+        ); // inside Cyrillic scalar
+    }
+    #[test]
+    fn persisted_page_rejects_foreign_origin_and_corrupted_nested_page() {
+        let (temp, store, mut manifest, lifetime) = fixture("content");
+        manifest.terminal["origin"]["actor"] = json!("impostor");
+        assert!(
+            page(
+                &store,
+                &serde_json::to_string(&manifest).unwrap(),
+                "session",
+                &lifetime,
+                &request(0, 4),
+                &[]
+            )
+            .is_err()
+        );
+        manifest.terminal["origin"]["actor"] = json!("worker");
+        let saved = serde_json::to_string(&manifest).unwrap();
+        let mut wrong = lifetime.clone();
+        wrong.actor = None;
+        assert!(page(&store, &saved, "session", &wrong, &request(0, 4), &[]).is_err());
+        wrong = lifetime.clone();
+        wrong.turn += 1;
+        assert!(page(&store, &saved, "session", &wrong, &request(0, 4), &[]).is_err());
+        assert!(page(&store, &saved, "foreign", &lifetime, &request(0, 4), &[]).is_err());
+        std::fs::write(
+            temp.path()
+                .join("artifacts")
+                .join(&manifest.stdout[0].artifact.id),
+            "changed",
+        )
+        .unwrap();
+        assert!(page(&store, &saved, "session", &lifetime, &request(0, 4), &[]).is_err());
+    }
 }

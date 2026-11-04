@@ -91,6 +91,9 @@ async fn native_completion_without_model_poll_saves_paged_output_and_nested_reco
     .await
     .unwrap();
     assert_eq!(receipts.len(), 1);
+    let acknowledged = runtime.jobs().poll(None, &id, 0, 0, 4).await.unwrap();
+    assert!(acknowledged.payload_unavailable);
+    assert!(acknowledged.stdout.is_empty() && acknowledged.stderr.is_empty());
     let manifest: Value = serde_json::from_str(
         &runtime
             .artifacts()
@@ -262,6 +265,10 @@ async fn failed_terminal_save_preserves_foreign_session_and_blocks_new_spawn_but
     .await
     .unwrap();
     assert!(session.task_state.last_operation().is_none());
+    let retained = runtime.jobs().poll(None, &id, 0, 0, 64).await.unwrap();
+    assert!(!retained.payload_unavailable);
+    assert_eq!(retained.stdout, "before-failure");
+
     let job = spec(&session, "touch forbidden");
     let args = json!({"command":"touch forbidden"});
     assert!(

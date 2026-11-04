@@ -369,6 +369,11 @@ impl ManagedJobs {
                 drop(reserved);
                 self.entries.remove(&id);
                 completed.push(receipt);
+                // Receipt and all manifest pages are committed before release.
+                // Entry removal precedes ack: its failure cannot repeat a lifetime.
+                if snapshot.cleanup_complete {
+                    jobs.acknowledge_payload(snapshot.owner.as_deref(), &id)?;
+                }
             }
             if self.entries.is_empty() {
                 self.budget.take();

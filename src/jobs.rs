@@ -1191,6 +1191,7 @@ impl JobsSupervisor {
         require_credentials(&state)?;
         let r = authorized(&mut state, actor, id)?;
         ensure!(r.done, "job still running");
+        ensure!(r.view.cleanup_complete, "job cleanup not confirmed");
         let (out_len, err_len) = (r.out.len, r.err.len);
         let released = r.out.release() + r.err.release();
         // Preserve immutable offsets even though bytes are no longer available.
@@ -3339,6 +3340,36 @@ mod tests {
         s.shutdown().await.unwrap();
     }
     #[tokio::test]
+    async fn acknowledgement_refuses_unconfirmed_cleanup_without_releasing_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("cleanup-ack", vec![]).unwrap();
+        let v = s
+            .start(spec(d.path(), "printf retained"), CancellationToken::new())
+            .await
+            .unwrap();
+        let done = terminal(&s, &v.id).await;
+        assert!(done.cleanup_complete);
+        let allocated = {
+            let mut state = lock(&s.core.state);
+            state.records.get_mut(&v.id).unwrap().view.cleanup_complete = false;
+            state.allocated
+        };
+        assert!(s.acknowledge_payload(None, &v.id).is_err());
+        assert_eq!(lock(&s.core.state).allocated, allocated);
+        assert_eq!(
+            s.poll(None, &v.id, 0, 0, PAGE).await.unwrap().stdout,
+            "retained"
+        );
+        lock(&s.core.state)
+            .records
+            .get_mut(&v.id)
+            .unwrap()
+            .view
+            .cleanup_complete = true;
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn redaction_rejection_ack_and_pages() {
         let d = tempfile::tempdir().unwrap();
         let s = JobsSupervisor::new("s", vec!["abcdef".into()]).unwrap();
@@ -3508,7 +3539,7 @@ mod tests {
         let done = terminal(&s, &v.id).await;
         assert_eq!(done.status, JobStatus::Unknown);
         assert!(!done.cleanup_complete && done.redaction_incomplete);
-        s.acknowledge_payload(None, &v.id).unwrap();
+        assert!(s.acknowledge_payload(None, &v.id).is_err());
         for _ in 0..3 {
             s.start(spec(d.path(), "sleep 20"), CancellationToken::new())
                 .await
