@@ -26,6 +26,8 @@ struct SavedResult {
     version: u32,
     is_error: bool,
     output: ArtifactMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous: Option<crate::task_state::TaskOperation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,6 +39,59 @@ struct SavedRequest {
 
 fn unknown(id: &str) -> String {
     json!({"error":"interrupted","outcome":"unknown","operation_id":id,"hint":UNKNOWN}).to_string()
+}
+
+fn catalog_origin() -> ArtifactOrigin {
+    ArtifactOrigin {
+        actor: None,
+        turn: 0,
+        tool: "operation_catalog".into(),
+        call_id: "history".into(),
+    }
+}
+
+fn restore_catalog(
+    artifacts: &ArtifactStore,
+    session: &mut Session,
+    heads: &[crate::task_state::TaskOperation],
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let existing = session
+        .task_state
+        .operation_catalog()
+        .map(|r| ArtifactMeta {
+            version: 1,
+            id: r.artifact_id.clone(),
+            session_id: r.session_id.clone(),
+            origin: catalog_origin(),
+            bytes: r.bytes,
+            sha256: r.sha256.clone(),
+            truncated: false,
+        });
+    let old_text = existing
+        .as_ref()
+        .map(|meta| artifacts.verify_required(meta))
+        .transpose()?;
+    if heads.is_empty() {
+        return session.task_state.restore_operation_catalog(None);
+    }
+    let text = json!({"version":1,"session_id":session.id,"additional_heads":heads}).to_string();
+    if old_text.as_deref() == Some(&text) {
+        return Ok(());
+    }
+    // Check TaskState capacity before publishing a new required artifact.
+    let mut capacity = session.task_state.clone();
+    capacity.restore_operation_catalog(Some(crate::task_state::TaskReference {
+        artifact_id: "00000000-0000-4000-8000-000000000000".into(),
+        session_id: session.id.clone(),
+        sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+        bytes: text.len(),
+    }))?;
+    // IDs/hashes only: no user text, arguments or output are duplicated here.
+    let meta = artifacts.capture_required(catalog_origin(), &text, &[])?;
+    session.task_state.restore_operation_catalog(Some(
+        crate::task_state::TaskReference::from_artifact(&meta)?,
+    ))
 }
 
 fn tagged(call: &ToolCall, id: &str, content: String) -> Message {
@@ -183,6 +238,7 @@ pub(crate) fn finish(
         version: 1,
         is_error: outcome.is_error,
         output: output.clone(),
+        previous: session.task_state.last_operation().cloned(),
     };
     let payload = serde_json::to_value(payload)?;
     let prepared = journal.prepare_finish(
@@ -228,6 +284,7 @@ pub(crate) fn reconcile(
     let mut candidate = session.clone();
     let mut known = std::collections::HashSet::new();
     let mut unresolved = Vec::new();
+    let mut referenced = std::collections::HashSet::new();
     for record in &records {
         known.insert(record.operation_id.as_str());
         let request: SavedRequest =
@@ -239,39 +296,59 @@ pub(crate) fn reconcile(
             "Аргументы не соответствуют операции"
         );
         artifacts.verify_required(&request.arguments)?;
-        let content =
-            if let Some(payload) = journal.terminal_payload(&record.operation_id, artifacts)? {
-                let saved: SavedResult = serde_json::from_value(payload)?;
+        let content = if let Some(payload) =
+            journal.terminal_payload(&record.operation_id, artifacts)?
+        {
+            let saved: SavedResult = serde_json::from_value(payload)?;
+            if let Some(previous) = &saved.previous {
+                referenced.insert(previous.operation_id.clone());
+                let earlier = records
+                    .iter()
+                    .find(|r| r.operation_id == previous.operation_id)
+                    .ok_or_else(|| anyhow::anyhow!("Потеряна предыдущая операция"))?;
+                let terminal = earlier
+                    .terminal
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Предыдущая операция не подтверждена"))?;
                 ensure!(
-                    saved.version == 1
-                        && saved.output.session_id == session.id
-                        && saved.output.origin == record.origin
-                        && record.outcome
-                            == if saved.is_error {
-                                Outcome::Failed
-                            } else {
-                                Outcome::Succeeded
-                            },
-                    "Результат не соответствует операции"
+                    crate::task_state::TaskReference::from_artifact(terminal)? == previous.terminal
+                        && earlier.task_revision == Some(previous.revision)
+                        && record
+                            .task_revision
+                            .is_some_and(|revision| previous.revision < revision),
+                    "Цепочка результатов не соответствует журналу"
                 );
-                ensure!(
-                    record
-                        .task_revision
-                        .is_some_and(|r| r <= session.task_state.revision()),
-                    "Состояние задачи старше подтверждённой операции"
-                );
-                preview(
-                    &artifacts.verify_output(&saved.output)?,
-                    &saved.output,
-                    saved.is_error,
-                )
-            } else {
-                candidate
-                    .task_state
-                    .invalidate_operation(&record.operation_id);
-                unresolved.push(record);
-                unknown(&record.operation_id)
-            };
+            }
+            ensure!(
+                saved.version == 1
+                    && saved.output.session_id == session.id
+                    && saved.output.origin == record.origin
+                    && record.outcome
+                        == if saved.is_error {
+                            Outcome::Failed
+                        } else {
+                            Outcome::Succeeded
+                        },
+                "Результат не соответствует операции"
+            );
+            ensure!(
+                record
+                    .task_revision
+                    .is_some_and(|r| r <= session.task_state.revision()),
+                "Состояние задачи старше подтверждённой операции"
+            );
+            preview(
+                &artifacts.verify_output(&saved.output)?,
+                &saved.output,
+                saved.is_error,
+            )
+        } else {
+            candidate
+                .task_state
+                .invalidate_operation(&record.operation_id);
+            unresolved.push(record);
+            unknown(&record.operation_id)
+        };
         let mut matching = candidate
             .messages
             .iter_mut()
@@ -312,6 +389,45 @@ pub(crate) fn reconcile(
             );
         }
     }
+    let latest = records
+        .iter()
+        .filter(|r| r.terminal.is_some())
+        .max_by_key(|r| r.task_revision);
+    candidate.task_state.restore_operation(
+        latest
+            .map(|record| {
+                Ok::<_, anyhow::Error>(crate::task_state::TaskOperation {
+                    operation_id: record.operation_id.clone(),
+                    terminal: crate::task_state::TaskReference::from_artifact(
+                        record.terminal.as_ref().expect("filtered"),
+                    )?,
+                    revision: record
+                        .task_revision
+                        .ok_or_else(|| anyhow::anyhow!("Отсутствует ревизия результата"))?,
+                })
+            })
+            .transpose()?,
+    )?;
+    let extra_heads = records
+        .iter()
+        .filter(|record| {
+            record.terminal.is_some()
+                && !referenced.contains(&record.operation_id)
+                && latest.is_none_or(|last| last.operation_id != record.operation_id)
+        })
+        .map(|record| {
+            Ok::<_, anyhow::Error>(crate::task_state::TaskOperation {
+                operation_id: record.operation_id.clone(),
+                terminal: crate::task_state::TaskReference::from_artifact(
+                    record.terminal.as_ref().expect("filtered"),
+                )?,
+                revision: record
+                    .task_revision
+                    .ok_or_else(|| anyhow::anyhow!("Отсутствует ревизия результата"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    restore_catalog(artifacts, &mut candidate, &extra_heads)?;
     // One bounded host warning also covers worker operations and compacted
     // root receipts. Replace it on every reconciliation instead of appending.
     candidate.messages.retain(|m| {
@@ -488,6 +604,257 @@ mod tests {
         reconcile(&journal, &artifacts, &mut session).unwrap();
         assert_eq!(serde_json::to_value(&session).unwrap(), first);
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "one effect");
+    }
+
+    #[test]
+    fn committed_worker_results_remain_discoverable_after_restart_without_delivery() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let call = ToolCall::new("run_command", json!({"command":"true"}));
+        let mut receipts = Vec::new();
+        for text in ["FIRST_RESULT", "SECOND_RESULT"] {
+            let pending = begin(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                Some("worker"),
+                &json!({}),
+                &[],
+            )
+            .unwrap();
+            finish(
+                pending,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                ToolOutcome::success(text),
+                &[],
+            )
+            .unwrap();
+            receipts.push(session.task_state.last_operation().unwrap().clone());
+        }
+        assert!(session.messages.is_empty());
+        drop(journal);
+        session = Session::load(&store, &session.id, &session.root).unwrap();
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        assert!(
+            session
+                .task_state
+                .projection()
+                .unwrap()
+                .contains(&receipts[1].terminal.artifact_id)
+        );
+        let payload = journal
+            .terminal_payload(&receipts[1].operation_id, &artifacts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payload["previous"]["terminal"]["artifact_id"],
+            receipts[0].terminal.artifact_id
+        );
+        assert_eq!(payload["previous"]["revision"], receipts[0].revision);
+        let page = crate::artifact_tool::execute(
+            &artifacts,
+            &json!({"artifact_id": receipts[1].terminal.artifact_id}),
+            None,
+            None,
+        );
+        assert!(!page.is_error);
+        assert!(page.content.contains(&receipts[0].terminal.artifact_id));
+    }
+
+    #[test]
+    fn provisional_operation_does_not_hide_the_previous_committed_worker_result() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let call = ToolCall::new("run_command", json!({"command":"true"}));
+        let first = begin(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &call,
+            Some("worker"),
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        finish(
+            first,
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &call,
+            ToolOutcome::success("confirmed"),
+            &[],
+        )
+        .unwrap();
+        let confirmed = session.task_state.last_operation().unwrap().clone();
+        let second = begin(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &call,
+            Some("worker"),
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        let prepared = journal
+            .prepare_finish(
+                &second.id,
+                Outcome::Succeeded,
+                &Value::Null,
+                second.revision,
+                &artifacts,
+                &[],
+            )
+            .unwrap();
+        session.task_state.host_operation_saved(&prepared).unwrap();
+        session.save(&store).unwrap();
+        drop(journal);
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        assert_eq!(session.task_state.last_operation(), Some(&confirmed));
+        assert_eq!(session.task_state.revision(), 2);
+        assert!(
+            session
+                .task_state
+                .projection()
+                .unwrap()
+                .contains(&confirmed.terminal.artifact_id)
+        );
+        assert!(
+            session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .as_ref()
+                .unwrap()
+                .contains(&second.id)
+        );
+    }
+
+    #[test]
+    fn legacy_worker_receipts_get_a_stable_readable_catalog_without_rewriting_terminals() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let call = ToolCall::new("run_command", json!({"command":"true"}));
+        let mut terminals = Vec::new();
+        for text in ["legacy-first", "legacy-second"] {
+            let pending = begin(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                Some("worker"),
+                &json!({}),
+                &[],
+            )
+            .unwrap();
+            let output = artifacts
+                .capture(pending.origin.clone(), text, &[])
+                .unwrap();
+            let prepared = journal
+                .prepare_finish(
+                    &pending.id,
+                    Outcome::Succeeded,
+                    &json!({"version":1,"is_error":false,"output":output}),
+                    pending.revision,
+                    &artifacts,
+                    &[],
+                )
+                .unwrap();
+            session.task_state.host_operation_saved(&prepared).unwrap();
+            session.save(&store).unwrap();
+            terminals.push(journal.commit_finish(&prepared, &artifacts).unwrap());
+        }
+        let originals: Vec<_> = terminals
+            .iter()
+            .map(|m| artifacts.verify_required(m).unwrap())
+            .collect();
+        drop(journal);
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        let state = serde_json::to_value(&session.task_state).unwrap();
+        let catalog_id = state["operation_catalog"]["artifact_id"]
+            .as_str()
+            .expect("legacy catalog");
+        assert!(
+            session
+                .task_state
+                .projection()
+                .unwrap()
+                .contains(catalog_id)
+        );
+        let page = crate::artifact_tool::execute(
+            &artifacts,
+            &json!({"artifact_id":catalog_id}),
+            None,
+            None,
+        );
+        assert!(!page.is_error);
+        assert!(page.content.contains(&terminals[0].id));
+        let mut assembled = String::new();
+        let mut offset = 0;
+        loop {
+            let result = crate::artifact_tool::execute(
+                &artifacts,
+                &json!({"artifact_id":catalog_id,"offset":offset,"max_bytes":64}),
+                None,
+                None,
+            );
+            assert!(!result.is_error);
+            let page: Value = serde_json::from_str(&result.content).unwrap();
+            assembled.push_str(page["content"].as_str().unwrap());
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        let catalog: Value = serde_json::from_str(&assembled).unwrap();
+        assert_eq!(
+            catalog["additional_heads"][0]["terminal"]["artifact_id"],
+            terminals[0].id
+        );
+        let count = std::fs::read_dir(session.dir(&store).join("artifacts"))
+            .unwrap()
+            .count();
+        session.save(&store).unwrap();
+        session = Session::load(&store, &session.id, &session.root).unwrap();
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        assert_eq!(
+            std::fs::read_dir(session.dir(&store).join("artifacts"))
+                .unwrap()
+                .count(),
+            count
+        );
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|m| artifacts.verify_required(m).unwrap())
+                .collect::<Vec<_>>(),
+            originals
+        );
+        let mut foreign = serde_json::to_value(&session.task_state).unwrap();
+        foreign["operation_catalog"]["session_id"] = json!(uuid::Uuid::new_v4().to_string());
+        assert!(serde_json::from_value::<crate::task_state::TaskState>(foreign).is_err());
+        let before = serde_json::to_value(&session).unwrap();
+        std::fs::remove_file(session.dir(&store).join("artifacts").join(catalog_id)).unwrap();
+        assert!(reconcile(&journal, &artifacts, &mut session).is_err());
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
     }
 
     #[test]

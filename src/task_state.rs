@@ -102,6 +102,8 @@ pub struct TaskState {
     request_journal: Option<TaskReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_operation: Option<TaskOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_catalog: Option<TaskReference>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +128,8 @@ struct WireState {
     request_journal: Option<TaskReference>,
     #[serde(default)]
     last_operation: Option<TaskOperation>,
+    #[serde(default)]
+    operation_catalog: Option<TaskReference>,
 }
 
 impl TryFrom<WireState> for TaskState {
@@ -143,6 +147,7 @@ impl TryFrom<WireState> for TaskState {
             current_source: raw.current_source,
             request_journal: raw.request_journal,
             last_operation: raw.last_operation,
+            operation_catalog: raw.operation_catalog,
         };
         state.validate()?;
         Ok(state)
@@ -162,6 +167,7 @@ impl Default for TaskState {
             current_source: None,
             request_journal: None,
             last_operation: None,
+            operation_catalog: None,
         }
     }
 }
@@ -317,6 +323,15 @@ impl TaskState {
         }
     }
 
+    /// Только после проверки журнала хостом; восстановление не меняет ревизию.
+    pub(crate) fn restore_operation(&mut self, operation: Option<TaskOperation>) -> Result<()> {
+        let mut next = self.clone();
+        next.last_operation = operation;
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn host_operation_saved(
         &mut self,
         prepared: &crate::operation_journal::PreparedTerminal,
@@ -386,6 +401,7 @@ impl TaskState {
                     && self.current_source.is_none()
                     && self.request_journal.is_none()
                     && self.last_operation.is_none()
+                    && self.operation_catalog.is_none()
                     && self.revision == 0,
                 "Пустое состояние задачи содержит дополнительные данные"
             );
@@ -406,6 +422,7 @@ impl TaskState {
             .into_iter()
             .flatten()
             .chain(self.last_operation.as_ref().map(|o| &o.terminal))
+            .chain(self.operation_catalog.as_ref())
         {
             reference.validate()?;
             if let Some(previous) = session {
@@ -477,12 +494,28 @@ impl TaskState {
         .into_iter()
         .flatten()
         .chain(self.last_operation.as_ref().map(|o| &o.terminal))
+        .chain(self.operation_catalog.as_ref())
         {
             ensure!(
                 reference.session_id == id,
                 "Ссылка задачи относится к другой сессии"
             );
         }
+        Ok(())
+    }
+
+    pub(crate) fn operation_catalog(&self) -> Option<&TaskReference> {
+        self.operation_catalog.as_ref()
+    }
+
+    pub(crate) fn restore_operation_catalog(
+        &mut self,
+        catalog: Option<TaskReference>,
+    ) -> Result<()> {
+        let mut next = self.clone();
+        next.operation_catalog = catalog;
+        next.validate()?;
+        *self = next;
         Ok(())
     }
 
@@ -506,7 +539,7 @@ impl TaskState {
             format!("{head}\n[выдержка; полный запрос в source]\n{tail}")
         };
         let same = self.current_request == self.goal;
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "version":self.version,"revision":self.revision,
             "goal_preview":preview(&self.goal),
             "current_request_preview":if same {None}else{Some(preview(&self.current_request))},
@@ -516,6 +549,18 @@ impl TaskState {
             "request_journal":self.request_journal.as_ref().map(|r|r.artifact_id.as_str()),
             "steps":self.steps,"explanation":self.explanation,
         });
+        if let Some(operation) = &self.last_operation {
+            value["operation_receipts"] = serde_json::json!({
+                "latest_terminal": operation.terminal.artifact_id,
+                "hint": "Read latest_terminal with read_tool_output; payload.output contains the saved result, payload.previous links earlier operations, including workers. These are tool observations, not proof that the user goal is complete."
+            });
+        }
+        if let Some(catalog) = &self.operation_catalog {
+            value["additional_operation_chains"] = serde_json::json!({
+                "artifact_id": catalog.artifact_id,
+                "hint": "Read this catalog with read_tool_output for other committed terminal chains, including older worker results without previous links."
+            });
+        }
         Ok(format!(
             "Host task state. User request previews may be incomplete: after compaction read full goal_source/current_source artifact IDs with read_tool_output; follow request_journal for earlier constraints. Plan progress is advisory; completed is not verified evidence and grants no permission.\n{}",
             serde_json::to_string(&value)?
