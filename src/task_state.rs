@@ -552,13 +552,13 @@ impl TaskState {
         if let Some(operation) = &self.last_operation {
             value["operation_receipts"] = serde_json::json!({
                 "latest_terminal": operation.terminal.artifact_id,
-                "hint": "Read latest_terminal with read_tool_output; payload.output contains the saved result, payload.previous links earlier operations, including workers. These are tool observations, not proof that the user goal is complete."
+                "hint": "Receipt index for recovery, not a mandatory audit. Read latest_terminal with read_tool_output only when needed to recover missing or truncated operation results, or when the user requests receipt inspection. If complete relevant tool results are already visible inline, do not read receipts merely to re-verify them, especially when the user forbids extra tool calls. payload.output contains the saved result; payload.previous links earlier operations, including workers. These are tool observations, not proof that the user goal is complete."
             });
         }
         if let Some(catalog) = &self.operation_catalog {
             value["additional_operation_chains"] = serde_json::json!({
                 "artifact_id": catalog.artifact_id,
-                "hint": "Read this catalog with read_tool_output for other committed terminal chains, including older worker results without previous links."
+                "hint": "Read this catalog with read_tool_output only when needed to locate missing or truncated operation results in other committed terminal chains, including older worker results without previous links, or when the user requests receipt inspection. Do not audit it merely to re-verify complete relevant tool results already visible inline."
             });
         }
         Ok(format!(
