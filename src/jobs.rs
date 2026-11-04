@@ -263,8 +263,7 @@ struct Registry {
 }
 struct Core {
     session: String,
-    secrets: Vec<String>,
-    patterns: Vec<Vec<u8>>,
+    credentials: crate::redaction::SecretDictionary,
     require_cleanup_guard: bool,
     state: Mutex<Registry>,
     cancel: CancellationToken,
@@ -308,34 +307,6 @@ fn request(r: &mut Record, status: JobStatus, reason: &str) {
         r.view.reason = Some(reason.into());
     }
     r.stop = true;
-}
-fn patterns(secrets: &[String]) -> Result<Vec<Vec<u8>>> {
-    let mut result = Vec::new();
-    for secret in secrets {
-        let json = serde_json::to_string(secret)?;
-        let escaped = &json[1..json.len() - 1];
-        for form in [
-            secret.clone(),
-            escaped.to_owned(),
-            escaped.replace('/', "\\/"),
-        ] {
-            result.push(form.into_bytes());
-        }
-        for all in [false, true] {
-            for hex in [b"0123456789ABCDEF", b"0123456789abcdef"] {
-                let mut form = Vec::new();
-                for b in secret.bytes() {
-                    if !all && (b.is_ascii_alphanumeric() || b"-._~".contains(&b)) {
-                        form.push(b);
-                    } else {
-                        form.extend([b'%', hex[(b >> 4) as usize], hex[(b & 15) as usize]]);
-                    }
-                }
-                result.push(form);
-            }
-        }
-    }
-    Ok(result)
 }
 fn has_secret(bytes: &[u8], patterns: &[Vec<u8>]) -> bool {
     patterns
@@ -469,15 +440,14 @@ impl JobsSupervisor {
                 && secrets.iter().map(String::len).sum::<usize>() <= INPUT,
             "invalid secret set"
         );
-        let _ = StreamingRedactor::new(&secrets)?;
-        let patterns = patterns(&secrets)?;
-        validate_identity(session_id, &patterns)?;
+        let credentials = crate::redaction::SecretDictionary::new(&secrets)?;
+        let _ = credentials.stream()?;
+        validate_identity(session_id, credentials.patterns())?;
         install_managed_job_panic_adapter();
         Ok(Self {
             core: Arc::new(Core {
                 session: session_id.into(),
-                patterns,
-                secrets,
+                credentials,
                 require_cleanup_guard,
                 state: Mutex::new(Registry {
                     records: HashMap::new(),
@@ -518,14 +488,14 @@ impl JobsSupervisor {
         {
             ensure!(!cancel.is_cancelled(), "scope cancelled");
             ensure!(!self.core.cancel.is_cancelled(), "supervisor closing");
-            validate(&mut spec, &self.core.patterns)?;
+            validate(&mut spec, self.core.credentials.patterns())?;
             ensure!(!cancel.is_cancelled(), "scope cancelled");
             // Includes actual Linux mount/namespace visibility validation before spawn.
             platform::members_gone(0, Instant::now() + CLEANUP)?;
-            let out_redactor = StreamingRedactor::new(&self.core.secrets)?;
-            let err_redactor = StreamingRedactor::new(&self.core.secrets)?;
+            let out_redactor = self.core.credentials.stream()?;
+            let err_redactor = self.core.credentials.stream()?;
             let id = uuid::Uuid::new_v4().to_string();
-            validate_identity(&id, &self.core.patterns)?;
+            validate_identity(&id, self.core.credentials.patterns())?;
             let (tx, rx) = mpsc::channel(1);
             let mut state = lock(&self.core.state);
             ensure!(
@@ -690,7 +660,10 @@ impl JobsSupervisor {
         );
         let mut check = r.input_tail.clone();
         check.extend_from_slice(bytes);
-        ensure!(!has_secret(&check, &self.core.patterns), "input rejected");
+        ensure!(
+            !has_secret(&check, self.core.credentials.patterns()),
+            "input rejected"
+        );
         let permit = if bytes.is_empty() {
             None
         } else {
@@ -710,7 +683,7 @@ impl JobsSupervisor {
                 _permit: permit,
             })
             .map_err(|_| anyhow::anyhow!("input queue unavailable"))?;
-        let tail = self.core.patterns.iter().map(Vec::len).max().unwrap_or(1) - 1;
+        let tail = self.core.credentials.max_pattern_len().saturating_sub(1);
         r.input_tail = check[check.len().saturating_sub(tail)..].to_vec();
         if close {
             r.input = None;
@@ -729,7 +702,7 @@ impl JobsSupervisor {
         parent_cancel: CancellationToken,
     ) -> Result<HandoffReceipt> {
         for value in [actor, operation_id, parent_scope_id] {
-            validate_identity(value, &self.core.patterns)?;
+            validate_identity(value, self.core.credentials.patterns())?;
         }
         let proposed = HandoffReceipt {
             actor: actor.into(),

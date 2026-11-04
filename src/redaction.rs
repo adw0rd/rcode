@@ -47,7 +47,7 @@ struct PrefixTracker {
 type PrefixRecord = (StateID, usize, StateID, bool, bool);
 
 impl PrefixTracker {
-    fn new(patterns: &BTreeSet<Vec<u8>>) -> Result<Self> {
+    fn check_budget(patterns: &[Vec<u8>]) -> Result<usize> {
         let capacity = patterns.iter().try_fold(1usize, |count, pattern| {
             count
                 .checked_add(pattern.len())
@@ -60,6 +60,11 @@ impl PrefixTracker {
                 .is_some_and(|bytes| bytes <= MAX_PREFIX_TABLE_BYTES),
             "Превышен бюджет памяти таблиц redaction"
         );
+        Ok(capacity)
+    }
+
+    fn new(patterns: &[Vec<u8>]) -> Result<Self> {
+        let capacity = Self::check_budget(patterns)?;
         // NFA::new uses Standard semantics. Unlike a leftmost automaton, it
         // preserves suffix transitions after terminal states.
         let nfa = NFA::new(patterns).context("Не удалось построить redaction prefix matcher")?;
@@ -242,10 +247,14 @@ fn percent_encoded(secret: &str, all: bool, lower: bool) -> String {
     encoded
 }
 
-impl StreamingRedactor {
-    /// Recognized forms: exact UTF-8, serde JSON string escaping, JSON slash
-    /// escaping, and canonical/fully percent-encoded forms in upper/lower hex.
-    /// Arbitrary encodings and unknown secrets are outside this contract.
+/// Immutable host snapshot shared by admission, stdin checks and output streams.
+/// Extension builds a candidate; it never removes old secrets or mutates readers.
+/// Installing it into live jobs requires the separate host cutover barrier.
+pub struct SecretDictionary {
+    secrets: Vec<String>,
+    patterns: Vec<Vec<u8>>,
+}
+impl SecretDictionary {
     pub fn new(secrets: &[String]) -> Result<Self> {
         ensure!(
             secrets.len() <= MAX_SECRETS,
@@ -282,16 +291,70 @@ impl StreamingRedactor {
                 }
             }
         }
+        let patterns: Vec<_> = patterns.into_iter().collect();
+        PrefixTracker::check_budget(&patterns)?;
+        Ok(Self {
+            secrets: secrets.to_vec(),
+            patterns,
+        })
+    }
+
+    pub fn extended(&self, additions: &[String]) -> Result<Self> {
+        ensure!(
+            additions.len() <= MAX_SECRETS,
+            "Слишком много секретов для redaction"
+        );
+        // Validate the incoming list before merging it, preserving the old
+        // dictionary on invalid input and bounding temporary allocations.
+        let additions = Self::new(additions)?;
+        let merged: BTreeSet<_> = self
+            .secrets
+            .iter()
+            .chain(&additions.secrets)
+            .cloned()
+            .collect();
+        Self::new(&merged.into_iter().collect::<Vec<_>>())
+    }
+
+    pub fn contains(&self, bytes: &[u8]) -> bool {
+        self.patterns
+            .iter()
+            .any(|p| bytes.windows(p.len()).any(|w| w == p))
+    }
+
+    pub fn patterns(&self) -> &[Vec<u8>] {
+        &self.patterns
+    }
+
+    pub fn max_pattern_len(&self) -> usize {
+        self.patterns.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    pub fn stream(&self) -> Result<StreamingRedactor> {
+        StreamingRedactor::from_dictionary(self)
+    }
+}
+
+impl StreamingRedactor {
+    /// Recognized forms: exact UTF-8, serde JSON string escaping, JSON slash
+    /// escaping, and canonical/fully percent-encoded forms in upper/lower hex.
+    /// Arbitrary encodings and unknown secrets are outside this contract.
+    pub fn new(secrets: &[String]) -> Result<Self> {
+        Self::from_dictionary(&SecretDictionary::new(secrets)?)
+    }
+
+    fn from_dictionary(dictionary: &SecretDictionary) -> Result<Self> {
+        let patterns = &dictionary.patterns;
         let longest = patterns.iter().map(Vec::len).max().unwrap_or(0);
         let (matcher, prefixes) = if patterns.is_empty() {
             (None, None)
         } else {
             // Preflight the metadata budget before building either automaton.
-            let prefixes = PrefixTracker::new(&patterns)?;
+            let prefixes = PrefixTracker::new(patterns)?;
             let matcher = AhoCorasickBuilder::new()
                 .kind(Some(AhoCorasickKind::ContiguousNFA))
                 .match_kind(MatchKind::LeftmostLongest)
-                .build(&patterns)
+                .build(patterns)
                 .context("Не удалось построить redaction matcher")?;
             (Some(matcher), Some(prefixes))
         };
@@ -668,5 +731,35 @@ mod tests {
         let mut output = stream.push(&input).unwrap();
         output.extend(stream.finish().unwrap());
         assert_eq!(output, b"\xff[REDACTED]\xfe");
+    }
+
+    #[test]
+    fn dictionary_extension_keeps_old_secrets_and_all_wire_forms() {
+        let first = SecretDictionary::new(&["old/key\"x".into()]).unwrap();
+        let next = first
+            .extended(&["новый/key".into(), "old/key\"x".into()])
+            .unwrap();
+        assert!(!first.contains("новый/key".as_bytes()));
+        assert!(next.contains("новый/key".as_bytes()));
+        assert!(next.contains(b"old%2Fkey%22x"));
+        assert!(next.contains(b"old\\/key\\\"x"));
+        assert_eq!(next.extended(&[]).unwrap().patterns(), next.patterns());
+        for pattern in next.patterns() {
+            assert!(next.contains(pattern));
+            let mut stream = next.stream().unwrap();
+            let mut out = stream.push(pattern).unwrap();
+            out.extend(stream.finish().unwrap());
+            assert_eq!(out, MASK);
+        }
+        assert!(first.extended(&[String::new()]).is_err());
+        assert!(first.extended(&["x".repeat(MAX_SECRET_BYTES + 1)]).is_err());
+        let full = SecretDictionary::new(&(0..128).map(|n| format!("key-{n}")).collect::<Vec<_>>())
+            .unwrap();
+        assert!(full.extended(&["extra-key".into()]).is_err());
+        let oversized: Vec<_> = (0..64)
+            .map(|n| format!("{n:02}{}", "z".repeat(2000)))
+            .collect();
+        assert!(first.extended(&oversized).is_err());
+        assert!(first.contains(b"old/key\"x"));
     }
 }
