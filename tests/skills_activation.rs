@@ -1131,6 +1131,29 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
     assert_eq!(tool_names(&generations[1]), with_skill);
 }
 
+fn assert_foreign_workflow_guidance_matches_advertised_tools(request: &Request) {
+    let prompt = system(request);
+    let names = tool_names(request);
+    for (foreign, native) in [
+        ("TodoWrite", "update_plan"),
+        ("WebSearch", "web_search"),
+        ("WebFetch", "web_fetch"),
+    ] {
+        assert!(names.iter().any(|name| name == native), "{names:?}");
+        assert!(
+            prompt.contains(&format!("{foreign} = {native}")),
+            "Missing {foreign} mapping"
+        );
+    }
+    assert!(prompt.contains("Use the declared schemas"));
+    assert!(prompt.contains("AskUserQuestion has no dedicated tool"));
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "AskUserQuestion" || name == "ask_user")
+    );
+}
+
 /// Настоящие неизменённые Superpowers, закреплённые по upstream commit и MIT.
 /// Проверяет transport/tools, а не качество решения Qwen (для этого live lane).
 fn real_superpowers() -> PathBuf {
@@ -1197,6 +1220,7 @@ fn real_superpowers_main_and_supporting_files_reach_model_without_rewriting() {
     assert_eq!(output.status.code(), Some(0), "{}", log(&output));
     let requests = server.generations();
     assert_eq!(requests.len(), files.len() + 1);
+    assert_foreign_workflow_guidance_matches_advertised_tools(&requests[0]);
     let prompt = system(&requests[0]);
     for id in [
         "using-superpowers",
@@ -1265,6 +1289,7 @@ fn real_superpowers_loaded_in_plan_cannot_add_shell_or_write_capabilities() {
     let requests = server.generations();
     assert_eq!(requests.len(), 2);
     for request in &requests {
+        assert_foreign_workflow_guidance_matches_advertised_tools(request);
         let names = tool_names(request);
         assert!(names.iter().any(|n| n == "load_skill"));
         for forbidden in ["run_command", "write_file", "edit_file", "apply_patch"] {
