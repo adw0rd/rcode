@@ -27,6 +27,8 @@ const MAX_INPUT_RECEIPTS: usize = 128;
 struct Entry {
     operation: BackgroundOperation,
     origin: JobOrigin,
+    transferred: bool,
+    handoff: Option<crate::operation_receipts::CommittedHandoff>,
 }
 
 // Ready deliveries remain owned until finish_background commits. In particular,
@@ -109,6 +111,83 @@ impl ManagedJobs {
 
     pub(crate) fn input_receipts(&self, command_id: &str, actor: Option<&str>) -> Value {
         self.input_history.for_command(command_id, actor)
+    }
+
+    pub(crate) fn handoff_context(&self, id: &str, actor: &str) -> Result<String> {
+        let entry = self
+            .entries
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Job lifetime not owned by runtime"))?;
+        ensure!(
+            entry.origin.actor.as_deref() == Some(actor) && !entry.transferred,
+            "Handoff denied: foreign or transferred job"
+        );
+        Ok(entry.operation.operation_id().to_owned())
+    }
+    pub(crate) fn transfer_native(
+        &mut self,
+        jobs: &JobsSupervisor,
+        id: &str,
+        actor: &str,
+        operation_id: &str,
+        parent_scope_id: &str,
+        parent_cancel: CancellationToken,
+    ) -> Result<crate::operation_receipts::HandoffData> {
+        let lifetime_id = self.handoff_context(id, actor)?;
+        jobs.handoff_to_parent(actor, id, operation_id, 0, parent_scope_id, parent_cancel)?;
+        // No await or persistence between the native point and cleanup ownership.
+        self.entries
+            .get_mut(id)
+            .expect("owned lifetime")
+            .transferred = true;
+        let view = jobs.poll_snapshot(None, id, 0, 0, 4)?;
+        let boundary = view
+            .epoch_boundaries
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("Missing handoff boundary"))?;
+        ensure!(
+            view.ownership_epoch == 1 && boundary.epoch == 1 && boundary.owner.is_none(),
+            "Invalid native handoff"
+        );
+        Ok(crate::operation_receipts::HandoffData {
+            version: 1,
+            status: "transferred".into(),
+            command_id: id.into(),
+            lifetime_id,
+            worker: actor.into(),
+            parent_scope_id: parent_scope_id.into(),
+            expected_epoch: 0,
+            ownership_epoch: 1,
+            stdout_offset: boundary.stdout_offset,
+            stderr_offset: boundary.stderr_offset,
+            owner: None,
+            operation_id: operation_id.into(),
+        })
+    }
+    pub(crate) fn transfer_pending(&self, id: &str) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|e| e.transferred && e.handoff.is_none())
+    }
+    pub(crate) fn commit_transfer(
+        &mut self,
+        id: &str,
+        proof: crate::operation_receipts::CommittedHandoff,
+    ) -> Result<()> {
+        let entry = self
+            .entries
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("Missing transferred lifetime"))?;
+        ensure!(
+            entry.transferred
+                && entry.handoff.is_none()
+                && proof.data().lifetime_id == entry.operation.operation_id()
+                && proof.data().command_id == id
+                && Some(proof.data().worker.as_str()) == entry.origin.actor.as_deref(),
+            "Foreign handoff proof"
+        );
+        entry.handoff = Some(proof);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -257,7 +336,15 @@ impl ManagedJobs {
                 return Err(error);
             }
         };
-        self.entries.insert(id.clone(), Entry { operation, origin });
+        self.entries.insert(
+            id.clone(),
+            Entry {
+                operation,
+                origin,
+                transferred: false,
+                handoff: None,
+            },
+        );
         // Ownership exists before the first await. No path reconstructs this
         // capability or retries native spawn from a persisted command UUID.
         // Native admission has no suspension points. Check the call token
@@ -335,9 +422,20 @@ impl ManagedJobs {
             let ids: Vec<_> = self.entries.keys().cloned().collect();
             for id in ids {
                 let entry = &self.entries[&id];
-                let snapshot = jobs.poll_snapshot(entry.origin.actor.as_deref(), &id, 0, 0, 4)?;
                 ensure!(
-                    snapshot.origin == entry.origin && snapshot.ownership_epoch == 0,
+                    !entry.transferred || entry.handoff.is_some(),
+                    "Handoff lacks committed receipt"
+                );
+                let owner = if entry.transferred {
+                    None
+                } else {
+                    entry.origin.actor.as_deref()
+                };
+                let snapshot = jobs.poll_snapshot(owner, &id, 0, 0, 4)?;
+                ensure!(
+                    snapshot.origin == entry.origin
+                        && snapshot.owner.as_deref() == owner
+                        && snapshot.ownership_epoch == u64::from(entry.transferred),
                     "Владение процессом изменилось вне durable runtime"
                 );
                 if snapshot.status == JobStatus::Running {
@@ -350,7 +448,11 @@ impl ManagedJobs {
                 )?;
                 let receipt = jobs
                     .publish_snapshot(&snapshot, |view| {
-                        let manifest = crate::job_manifest::capture(jobs, &reserved, view)?;
+                        let manifest = if let Some(proof) = &entry.handoff {
+                            crate::job_epochs::capture(jobs, &reserved, view, proof)?
+                        } else {
+                            crate::job_manifest::capture(jobs, &reserved, view)?
+                        };
                         let mut outcome = ToolOutcome::success(manifest);
                         outcome.is_error = view.status != JobStatus::Exited
                             || view.exit_code != Some(0)

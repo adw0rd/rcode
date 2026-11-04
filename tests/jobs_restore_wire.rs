@@ -179,7 +179,7 @@ async fn persisted_command_can_be_polled_after_cli_restart() {
         .to_owned();
     let pending_id = "11111111-1111-4111-8111-111111111111";
     {
-        let store = rcode::config::ConfigStore::at(state.path().to_path_buf()).unwrap();
+        let store = rcode::config::ConfigStore::at(state.path()).unwrap();
         let mut session = rcode::state::Session::load(&store, &session_id, project.path()).unwrap();
         let artifacts =
             rcode::artifacts::ArtifactStore::open(&session.dir(&store), &session.id).unwrap();

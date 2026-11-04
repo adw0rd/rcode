@@ -14,6 +14,7 @@ pub enum JobRequest {
     Poll(PollArgs),
     Input(InputArgs),
     Stop(StopArgs),
+    Handoff(StopArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -109,10 +110,14 @@ pub fn parse(name: &str, args: &Value) -> Result<JobRequest> {
             );
             Ok(JobRequest::Input(a))
         }
-        "stop_command" => {
+        "stop_command" | "handoff_command" => {
             let a: StopArgs = serde_json::from_value(args.clone())?;
             validate_id(&a.command_id)?;
-            Ok(JobRequest::Stop(a))
+            Ok(if name == "handoff_command" {
+                JobRequest::Handoff(a)
+            } else {
+                JobRequest::Stop(a)
+            })
         }
         _ => bail!("Неизвестный инструмент управления процессами"),
     }
@@ -172,7 +177,11 @@ fn definition(
 pub(crate) fn is_tool(name: &str) -> bool {
     matches!(
         name,
-        "start_command" | "poll_command" | "send_command_input" | "stop_command"
+        "start_command"
+            | "poll_command"
+            | "send_command_input"
+            | "stop_command"
+            | "handoff_command"
     )
 }
 
@@ -182,6 +191,15 @@ pub(crate) fn offered(writable: bool) -> Vec<ToolDefinition> {
     } else {
         Vec::new()
     }
+}
+
+pub(crate) fn handoff_definition() -> ToolDefinition {
+    definition(
+        "handoff_command",
+        "Передаёт собственную работающую команду родителю по отдельному решению хоста. Доступно только worker. Происхождение, срок действия и прежние артефакты не меняются; после передачи worker не управляет процессом и не получает новый вывод. Ответ status=transferred подтверждает передачу: верните command_id родителю и завершитесь.",
+        &["command_id"],
+        json!({"command_id":id_schema()}),
+    )
 }
 
 pub fn definitions() -> Vec<ToolDefinition> {
@@ -250,6 +268,34 @@ mod tests {
             "send_command_input" => json!({"command_id":ID,"text":"hello"}),
             _ => json!({"command_id":ID}),
         }
+    }
+
+    #[test]
+    fn handoff_accepts_only_command_id_and_is_not_offered_to_main() {
+        assert!(matches!(
+            parse("handoff_command", &json!({"command_id":ID})).unwrap(),
+            JobRequest::Handoff(_)
+        ));
+        for field in [
+            "actor",
+            "epoch",
+            "parent_scope_id",
+            "lifetime_id",
+            "operation_id",
+            "owner",
+            "approved",
+            "cancel",
+        ] {
+            let mut value = json!({"command_id":ID});
+            value[field] = json!("spoofed");
+            assert!(parse("handoff_command", &value).is_err());
+        }
+        assert!(parse("handoff_command", &json!({"command_id":"bad"})).is_err());
+        assert!(!offered(true).iter().any(|d| d.name == "handoff_command"));
+        assert_eq!(
+            handoff_definition().parameters["additionalProperties"],
+            false
+        );
     }
 
     #[test]

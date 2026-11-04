@@ -39,6 +39,9 @@ pub struct TurnScope {
     finished: bool,
 }
 impl TurnScope {
+    pub(crate) fn identity(&self) -> String {
+        format!("{}:{}", self.incarnation, self.turn)
+    }
     pub fn cancellation(&self) -> CancellationToken {
         self.cancel.clone()
     }

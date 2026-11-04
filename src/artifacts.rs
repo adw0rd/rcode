@@ -18,6 +18,17 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+thread_local! { static TEST_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(crate) fn reset_read_bytes() {
+    TEST_READ_BYTES.with(|v| v.set(0));
+}
+#[cfg(test)]
+pub(crate) fn read_bytes_count() -> usize {
+    TEST_READ_BYTES.with(|v| v.get())
+}
+
 const ARTIFACT_MAX: usize = 16 * 1024 * 1024;
 const SESSION_MAX: usize = 128 * 1024 * 1024;
 const PAGE_MAX: usize = 64 * 1024;
@@ -370,6 +381,8 @@ impl ArtifactStore {
                 && 12 + n + meta.bytes == len as usize,
             "Несовместимые метаданные артефакта"
         );
+        #[cfg(test)]
+        TEST_READ_BYTES.with(|v| v.set(v.get().saturating_add(meta.bytes)));
         let mut bytes = vec![0; meta.bytes];
         disk(f.read_exact(&mut bytes))?;
         let mut extra = [0];
@@ -629,6 +642,14 @@ impl ArtifactStore {
         );
         let (meta, text, _) = self.load(id)?;
         ensure!(
+            actor.is_none()
+                || meta.origin.tool != "command_lifetime"
+                || serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .is_none_or(|v| v["version"] != 2 || v.get("handoff").is_none()),
+            "Epoch manifest requires typed poll_command; raw worker access denied"
+        );
+        ensure!(
             actor.is_none() || actor == meta.origin.actor.as_deref(),
             "Доступ к артефакту запрещён"
         );
@@ -670,6 +691,14 @@ impl ArtifactStore {
             "Слишком длинный поисковый запрос"
         );
         let (meta, text, _) = self.load(id)?;
+        ensure!(
+            actor.is_none()
+                || meta.origin.tool != "command_lifetime"
+                || serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .is_none_or(|v| v["version"] != 2 || v.get("handoff").is_none()),
+            "Epoch manifest requires typed poll_command; raw worker access denied"
+        );
         ensure!(
             actor.is_none() || actor == meta.origin.actor.as_deref(),
             "Доступ к артефакту запрещён"

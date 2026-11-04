@@ -59,6 +59,7 @@ mod artifact_tool;
 
 pub mod diagnostics;
 
+mod job_epochs;
 mod job_manifest;
 mod job_output;
 pub mod job_tools;

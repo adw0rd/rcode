@@ -35,6 +35,15 @@ pub enum AgentStatus {
     Interrupted,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TransferredCommand {
+    pub command_id: String,
+    pub handoff_operation_id: String,
+    pub lifetime_operation_id: String,
+    pub ownership_epoch: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRecord {
     pub id: String,
@@ -44,6 +53,43 @@ pub struct AgentRecord {
     pub status: AgentStatus,
     pub result: String,
     pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transferred_commands: Vec<TransferredCommand>,
+}
+
+/// Serializes reply closure with the synchronous native handoff point.
+#[derive(Clone)]
+pub struct ReplyAdmission(Arc<Mutex<bool>>);
+impl Default for ReplyAdmission {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(true)))
+    }
+}
+impl ReplyAdmission {
+    pub(crate) fn with_open<T>(
+        &self,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let open = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(*open, "Worker reply closed before handoff");
+        action()
+    }
+}
+struct ScopedReply {
+    receiver: Option<oneshot::Receiver<ToolOutcome>>,
+    admission: ReplyAdmission,
+}
+impl ScopedReply {
+    async fn receive(mut self) -> Result<ToolOutcome, oneshot::error::RecvError> {
+        self.receiver.as_mut().expect("owned reply").await
+    }
+}
+impl Drop for ScopedReply {
+    fn drop(&mut self) {
+        let mut open = self.admission.0.lock().unwrap_or_else(|e| e.into_inner());
+        *open = false;
+        self.receiver.take(); // close while the native admission gate is held
+    }
 }
 
 pub struct AgentRequest {
@@ -53,6 +99,22 @@ pub struct AgentRequest {
     pub call: ToolCall,
     pub cancel: CancellationToken,
     pub reply: oneshot::Sender<ToolOutcome>,
+    pub admission: ReplyAdmission,
+    pub(crate) transfers: Arc<Mutex<Vec<TransferredCommand>>>,
+}
+impl AgentRequest {
+    pub(crate) fn record_transfer(&self, transfer: TransferredCommand) -> anyhow::Result<()> {
+        let mut transfers = self.transfers.lock().unwrap_or_else(|e| e.into_inner());
+        if transfers.contains(&transfer) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            transfers.len() < MAX_TOOL_REQUESTS,
+            "Transfer reporting limit reached"
+        );
+        transfers.push(transfer);
+        Ok(())
+    }
 }
 
 const MAX_RUNNING: usize = 3;
@@ -70,6 +132,7 @@ struct Worker {
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
     collected: bool,
+    transfers: Arc<Mutex<Vec<TransferredCommand>>>,
 }
 
 #[derive(Default)]
@@ -294,9 +357,11 @@ impl AgentPool {
             status: AgentStatus::Running,
             result: String::new(),
             usage: Usage::default(),
+            transferred_commands: Vec::new(),
         }));
         let stats = Arc::new(Mutex::new(UsageStats::default()));
         let cancel = self.cancel.child_token();
+        let transfers = Arc::new(Mutex::new(Vec::new()));
         let task = WorkerTask {
             id: id.clone(),
             name: name.clone(),
@@ -310,6 +375,7 @@ impl AgentPool {
             read_only: self.read_only || args.role != AgentRole::Worker,
             stats: stats.clone(),
             secrets: self.secrets.clone(),
+            transfers: transfers.clone(),
         };
         let shared = record.clone();
         let handle = tokio::spawn(async move {
@@ -340,6 +406,7 @@ impl AgentPool {
             cancel,
             handle: Some(handle),
             collected: false,
+            transfers,
         });
         ToolOutcome::success(json!({"agent_id":id,"name":name,"role":args.role,"status":"running","message":"Используйте wait_agent, чтобы собрать результат"}).to_string())
     }
@@ -497,6 +564,11 @@ fn snapshot(worker: &Worker) -> AgentRecord {
         .unwrap_or_else(|error| error.into_inner())
         .usage
         .clone();
+    record.transferred_commands = worker
+        .transfers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     record
 }
 
@@ -578,6 +650,7 @@ struct WorkerTask {
     read_only: bool,
     stats: Arc<Mutex<UsageStats>>,
     secrets: Arc<Mutex<Vec<String>>>,
+    transfers: Arc<Mutex<Vec<TransferredCommand>>>,
 }
 
 fn readonly_tool(name: &str) -> bool {
@@ -633,6 +706,10 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
         .into_iter()
         .filter(|definition| !task.read_only || readonly_tool(&definition.name))
         .chain(crate::job_tools::offered(!task.read_only))
+        .chain(
+            (!task.read_only && cfg!(any(target_os = "macos", target_os = "linux")))
+                .then(crate::job_tools::handoff_definition),
+        )
         .chain(std::iter::once(crate::artifact_tool::definition()))
         .collect();
     let mut tool_requests = 0;
@@ -724,6 +801,11 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
                 ToolOutcome::error("Некорректный JSON аргументов; исправьте вызов")
             } else {
                 let (reply, receiver) = oneshot::channel();
+                let admission = ReplyAdmission::default();
+                let receiver = ScopedReply {
+                    receiver: Some(receiver),
+                    admission: admission.clone(),
+                };
                 let request = AgentRequest {
                     agent_id: task.id.clone(),
                     name: redact(&task.name, &secrets),
@@ -731,12 +813,15 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
                     call: call.clone(),
                     cancel: task.cancel.clone(),
                     reply,
+                    admission,
+                    transfers: task.transfers.clone(),
                 };
                 task.requests
                     .send(request)
                     .await
                     .map_err(|_| "Broker основного агента недоступен".to_owned())?;
                 receiver
+                    .receive()
                     .await
                     .map_err(|_| "Broker завершился без результата инструмента".to_owned())?
             };
@@ -780,6 +865,28 @@ mod tests {
         net::TcpListener,
         task::{JoinHandle, JoinSet},
     };
+
+    #[tokio::test]
+    async fn dropping_worker_reply_closes_native_admission_before_dispatch() {
+        let (sender, receiver) = oneshot::channel();
+        let admission = ReplyAdmission::default();
+        let scoped = ScopedReply {
+            receiver: Some(receiver),
+            admission: admission.clone(),
+        };
+        drop(scoped.receive());
+        assert!(sender.is_closed());
+        let mut dispatched = false;
+        assert!(
+            admission
+                .with_open(|| {
+                    dispatched = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!dispatched);
+    }
 
     struct Pending {
         body: Value,

@@ -20,6 +20,120 @@ pub(crate) struct PendingOperation {
     revision: u64,
 }
 
+impl PendingOperation {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HandoffReference {
+    pub operation_id: String,
+    pub terminal: ArtifactMeta,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HandoffData {
+    pub version: u32,
+    #[serde(default = "handoff_status")]
+    pub status: String,
+    pub command_id: String,
+    pub lifetime_id: String,
+    pub worker: String,
+    pub parent_scope_id: String,
+    pub expected_epoch: u64,
+    pub ownership_epoch: u64,
+    pub stdout_offset: usize,
+    pub stderr_offset: usize,
+    pub owner: Option<String>,
+    pub operation_id: String,
+}
+fn handoff_status() -> String {
+    "transferred".into()
+}
+#[derive(Clone)]
+pub(crate) struct CommittedHandoff {
+    reference: HandoffReference,
+    data: HandoffData,
+}
+impl CommittedHandoff {
+    pub(crate) fn reference(&self) -> &HandoffReference {
+        &self.reference
+    }
+    pub(crate) fn data(&self) -> &HandoffData {
+        &self.data
+    }
+}
+
+pub(crate) fn committed_handoff(
+    journal: &OperationJournal,
+    artifacts: &ArtifactStore,
+    session_id: &str,
+    reference: &HandoffReference,
+    command_id: &str,
+    lifetime_id: &str,
+    origin: &ArtifactOrigin,
+) -> Result<CommittedHandoff> {
+    journal.check_session(session_id)?;
+    let record = journal
+        .records(artifacts)?
+        .into_iter()
+        .find(|r| r.operation_id == reference.operation_id)
+        .ok_or_else(|| anyhow::anyhow!("Handoff operation not found"))?;
+    ensure!(
+        record.origin.tool == "handoff_command"
+            && record.outcome == Outcome::Succeeded
+            && record.origin.actor == origin.actor
+            && record.origin.turn == origin.turn
+            && record.origin.actor.is_some()
+            && record.terminal.as_ref() == Some(&reference.terminal),
+        "Uncommitted or foreign handoff reference"
+    );
+    let payload = journal
+        .terminal_payload(&record.operation_id, artifacts)?
+        .ok_or_else(|| anyhow::anyhow!("Handoff not committed"))?;
+    let saved: SavedResult = serde_json::from_value(payload)?;
+    ensure!(
+        saved.version == 1
+            && !saved.is_error
+            && saved.output_format.is_none()
+            && saved.output.origin == record.origin
+            && saved.output.session_id == session_id,
+        "Invalid handoff receipt"
+    );
+    let data: HandoffData = serde_json::from_str(&artifacts.verify_required(&saved.output)?)?;
+    let intent: SavedRequest =
+        serde_json::from_value(journal.intent_payload(&record.operation_id, artifacts)?)?;
+    ensure!(
+        intent.version == 1 && intent.arguments.origin == record.origin,
+        "Invalid handoff intent"
+    );
+    let args: Value = serde_json::from_str(&artifacts.verify_required(&intent.arguments)?)?;
+    ensure!(
+        data.version == 1
+            && data.status == "transferred"
+            && data.command_id == command_id
+            && data.lifetime_id == lifetime_id
+            && data.operation_id == reference.operation_id
+            && data.expected_epoch == 0
+            && data.ownership_epoch == 1
+            && data.owner.is_none()
+            && Some(data.worker.as_str()) == origin.actor.as_deref()
+            && args["command_id"] == command_id
+            && args["lifetime_id"] == lifetime_id
+            && args["worker"] == data.worker
+            && args["parent_scope_id"] == data.parent_scope_id
+            && args["expected_epoch"] == 0
+            && !data.parent_scope_id.is_empty(),
+        "Handoff identity mismatch"
+    );
+    Ok(CommittedHandoff {
+        reference: reference.clone(),
+        data,
+    })
+}
+
 /// Host capability долгого действия. Это не разрешение, не PID и не признак
 /// живого процесса. Не сериализуется, не клонируется и не усыновляется при resume.
 pub struct BackgroundOperation {
@@ -58,6 +172,7 @@ struct SavedResult {
 #[serde(rename_all = "snake_case")]
 enum OutputFormat {
     CommandManifestV1,
+    CommandManifestV2,
 }
 
 fn verify_saved_output(artifacts: &ArtifactStore, saved: &SavedResult) -> Result<String> {
@@ -66,8 +181,14 @@ fn verify_saved_output(artifacts: &ArtifactStore, saved: &SavedResult) -> Result
     } else {
         artifacts.verify_output(&saved.output)?
     };
-    if let Some(OutputFormat::CommandManifestV1) = saved.output_format {
-        crate::job_manifest::verify(artifacts, &text, &saved.output.session_id)?;
+    match saved.output_format {
+        Some(OutputFormat::CommandManifestV1) => {
+            crate::job_manifest::verify(artifacts, &text, &saved.output.session_id)?
+        }
+        Some(OutputFormat::CommandManifestV2) => {
+            crate::job_epochs::verify(artifacts, &text, &saved.output.session_id)?
+        }
+        None => {}
     }
     Ok(text)
 }
@@ -92,10 +213,7 @@ pub(crate) fn command_output(
     // The journal has a hard 2048-operation limit, including after recovery.
     // Filter by immutable actor/tool before loading command payloads.
     for record in journal.records(artifacts)? {
-        if record.origin.tool != "command_lifetime"
-            || record.terminal.is_none()
-            || record.origin.actor.as_deref() != actor
-        {
+        if record.origin.tool != "command_lifetime" || record.terminal.is_none() {
             continue;
         }
         let intent = journal.intent_payload(&record.operation_id, artifacts)?;
@@ -110,7 +228,7 @@ pub(crate) fn command_output(
             continue;
         }
         ensure!(
-            args["origin"]["actor"] == serde_json::to_value(actor)?
+            args["origin"]["actor"] == serde_json::to_value(&record.origin.actor)?
                 && args["origin"]["turn"] == record.origin.turn,
             "Чужой origin процесса"
         );
@@ -120,12 +238,49 @@ pub(crate) fn command_output(
         let saved: SavedResult = serde_json::from_value(payload)?;
         ensure!(
             saved.version == 1
-                && matches!(saved.output_format, Some(OutputFormat::CommandManifestV1))
+                && matches!(
+                    saved.output_format,
+                    Some(OutputFormat::CommandManifestV1 | OutputFormat::CommandManifestV2)
+                )
                 && saved.output.origin == record.origin
                 && saved.output.session_id == session_id,
             "Чужой или неизвестный формат результата процесса"
         );
-        let text = verify_saved_output(artifacts, &saved)?;
+        let original_worker = record.origin.actor.as_deref() == actor;
+        if !(original_worker
+            || actor.is_none()
+                && matches!(saved.output_format, Some(OutputFormat::CommandManifestV2)))
+        {
+            return Ok(None);
+        }
+        let text = if matches!(saved.output_format, Some(OutputFormat::CommandManifestV2)) {
+            artifacts.verify_required(&saved.output)?
+        } else {
+            verify_saved_output(artifacts, &saved)?
+        };
+        if matches!(saved.output_format, Some(OutputFormat::CommandManifestV2)) {
+            let reference = crate::job_epochs::reference(&text)?;
+            let proof = committed_handoff(
+                journal,
+                artifacts,
+                session_id,
+                &reference,
+                &request.command_id,
+                &record.operation_id,
+                &record.origin,
+            )?;
+            return crate::job_epochs::page(
+                artifacts,
+                &text,
+                session_id,
+                &record.origin,
+                request,
+                &proof,
+                original_worker,
+                secrets,
+            )
+            .map(Some);
+        }
         return crate::job_manifest::page(
             artifacts,
             &text,
@@ -451,6 +606,12 @@ pub(crate) fn finish_command_manifest(
     outcome: ToolOutcome,
     secrets: &[String],
 ) -> Result<BackgroundReceipt> {
+    let version = serde_json::from_str::<Value>(&outcome.content)?["version"].as_u64();
+    let format = match version {
+        Some(1) => OutputFormat::CommandManifestV1,
+        Some(2) => OutputFormat::CommandManifestV2,
+        _ => anyhow::bail!("Unknown command manifest version"),
+    };
     finish_background_inner(
         operation,
         journal,
@@ -459,7 +620,7 @@ pub(crate) fn finish_command_manifest(
         store,
         outcome,
         secrets,
-        Some(OutputFormat::CommandManifestV1),
+        Some(format),
     )
 }
 
@@ -519,6 +680,31 @@ fn finish_background_inner(
             output_format,
         };
         verify_saved_output(artifacts, &saved)?;
+        if matches!(saved.output_format, Some(OutputFormat::CommandManifestV2)) {
+            let reference = crate::job_epochs::reference(&outcome.content)?;
+            let args: Value =
+                serde_json::from_str(&artifacts.verify_required(&operation.arguments)?)?;
+            let id = args["command_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing command identity"))?;
+            let proof = committed_handoff(
+                journal,
+                artifacts,
+                &session.id,
+                &reference,
+                id,
+                operation.operation_id(),
+                operation.pending.origin(),
+            )?;
+            crate::job_epochs::bind(
+                artifacts,
+                &outcome.content,
+                &session.id,
+                operation.pending.origin(),
+                id,
+                &proof,
+            )?;
+        }
         let payload = serde_json::to_value(saved)?;
         let prepared = journal.prepare_finish(
             operation.operation_id(),
@@ -647,11 +833,26 @@ pub fn reconcile_background(
                     .is_some_and(|r| r <= session.task_state.revision()),
                 "Состояние задачи старше подтверждённой операции"
             );
-            preview(
-                &verify_saved_output(artifacts, &saved)?,
-                &saved.output,
-                saved.is_error,
-            )
+            let text = verify_saved_output(artifacts, &saved)?;
+            if matches!(saved.output_format, Some(OutputFormat::CommandManifestV2)) {
+                let reference = crate::job_epochs::reference(&text)?;
+                let args: Value =
+                    serde_json::from_str(&artifacts.verify_required(&request.arguments)?)?;
+                let id = args["command_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing command identity"))?;
+                let proof = committed_handoff(
+                    journal,
+                    artifacts,
+                    &session.id,
+                    &reference,
+                    id,
+                    &record.operation_id,
+                    &record.origin,
+                )?;
+                crate::job_epochs::bind(artifacts, &text, &session.id, &record.origin, id, &proof)?;
+            }
+            preview(&text, &saved.output, saved.is_error)
         } else {
             candidate
                 .task_state
@@ -928,6 +1129,356 @@ mod tests {
             .is_err()
         );
         jobs.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn handed_off_lifetime_keeps_epoch_artifact_owners_and_committed_read_grants() {
+        use crate::jobs::{JobKind, JobOrigin, JobSpec, JobStatus, JobsSupervisor};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        for corrupt in [false, true] {
+            let (_temp, store, mut session, artifacts, mut journal) = setup();
+            let jobs = JobsSupervisor::new_for_session(&session.id, vec![]).unwrap();
+            jobs.attach_cleanup_guard(journal.cleanup_guard()).unwrap();
+            let reservation = jobs.reserve_start().unwrap();
+            let id = reservation.id().to_owned();
+            let origin = JobOrigin {
+                actor: Some("epoch-worker".into()),
+                turn: 1,
+            };
+            let args = json!({"command_id":id,"origin":origin});
+            let lifetime = begin_background(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &ToolCall::new("command_lifetime", args.clone()),
+                Some("epoch-worker"),
+                &args,
+                &[],
+            )
+            .unwrap();
+            let worker = CancellationToken::new();
+            let parent = CancellationToken::new();
+            jobs.start_reserved(reservation, JobSpec { kind: JobKind::Managed,
+            argv: vec!["/bin/sh".into(), "-c".into(), "printf before; printf olderr >&2; while [ ! -f release ]; do sleep 0.01; done; printf after; printf newerr >&2; sleep 30".into()],
+            cwd: session.root.clone(), env: vec![], origin, lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60), stdin: false }, worker.clone()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let view = jobs
+                        .poll(Some("epoch-worker"), &id, 0, 0, 64)
+                        .await
+                        .unwrap();
+                    if view.stdout == "before" && view.stderr == "olderr" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let call = ToolCall::new("handoff_command", json!({"command_id":id}));
+            let args = json!({"command_id":id,"lifetime_id":lifetime.operation_id(),"worker":"epoch-worker","parent_scope_id":"parent-native","expected_epoch":0});
+            let pending = begin(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                Some("epoch-worker"),
+                &args,
+                &[],
+            )
+            .unwrap();
+            let operation_id = pending.operation_id().to_owned();
+            jobs.handoff_to_parent(
+                "epoch-worker",
+                &id,
+                &operation_id,
+                0,
+                "parent-native",
+                parent.clone(),
+            )
+            .unwrap();
+            let data = HandoffData {
+                version: 1,
+                status: "transferred".into(),
+                command_id: id.clone(),
+                lifetime_id: lifetime.operation_id().into(),
+                worker: "epoch-worker".into(),
+                parent_scope_id: "parent-native".into(),
+                expected_epoch: 0,
+                ownership_epoch: 1,
+                stdout_offset: 6,
+                stderr_offset: 6,
+                owner: None,
+                operation_id: operation_id.clone(),
+            };
+            finish(
+                pending,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                ToolOutcome::success(serde_json::to_string(&data).unwrap()),
+                &[],
+            )
+            .unwrap();
+            let reference = HandoffReference {
+                operation_id: operation_id.clone(),
+                terminal: journal
+                    .committed_reference(&operation_id, &artifacts)
+                    .unwrap()
+                    .0,
+            };
+            let proof = committed_handoff(
+                &journal,
+                &artifacts,
+                &session.id,
+                &reference,
+                &id,
+                lifetime.operation_id(),
+                lifetime.pending.origin(),
+            )
+            .unwrap();
+            worker.cancel();
+            assert_eq!(
+                jobs.poll(None, &id, 0, 0, 64).await.unwrap().status,
+                JobStatus::Running
+            );
+            assert!(
+                jobs.poll(Some("epoch-worker"), &id, 0, 0, 64)
+                    .await
+                    .is_err()
+            );
+            std::fs::write(session.root.join("release"), "go").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let view = jobs.poll(None, &id, 0, 0, 64).await.unwrap();
+                    if view.stdout == "beforeafter" && view.stderr == "olderrnewerr" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let stopped = jobs.stop(None, &id).await.unwrap();
+            let result = jobs
+                .publish_snapshot(&stopped, |view| {
+                    let mut text = crate::job_epochs::capture(&jobs, &artifacts, view, &proof)?;
+                    if corrupt {
+                        let mut value: Value = serde_json::from_str(&text)?;
+                        for field in ["stdout", "stderr"] {
+                            for page in value[field].as_array_mut().unwrap() {
+                                let meta: ArtifactMeta =
+                                    serde_json::from_value(page["artifact"].clone())?;
+                                let bytes = artifacts.verify_required(&meta)?;
+                                let mut origin = meta.origin;
+                                origin.actor = Some("epoch-worker".into());
+                                page["artifact"] = serde_json::to_value(
+                                    artifacts.capture_required(origin, &bytes, &[])?,
+                                )?;
+                                page["epoch"] = json!(0);
+                            }
+                        }
+                        value["terminal"]["epoch_boundaries"][1]["stdout_offset"] =
+                            value["terminal"]["next_stdout_offset"].clone();
+                        value["terminal"]["epoch_boundaries"][1]["stderr_offset"] =
+                            value["terminal"]["next_stderr_offset"].clone();
+                        text = value.to_string();
+                        crate::job_epochs::verify(&artifacts, &text, &session.id)?; // self-consistent, but contradicts committed cuts
+                    }
+                    let mut outcome = ToolOutcome::success(text);
+                    outcome.is_error = true;
+                    finish_command_manifest(
+                        &lifetime,
+                        &mut journal,
+                        &artifacts,
+                        &mut session,
+                        &store,
+                        outcome,
+                        &[],
+                    )
+                })
+                .await;
+            if corrupt {
+                assert!(
+                    result.is_err(),
+                    "Manifest cuts must bind to committed handoff before lifetime commit"
+                );
+                jobs.shutdown().await.unwrap();
+                continue;
+            }
+            let receipt = result.unwrap();
+            let text = artifacts.verify_required(&receipt.output).unwrap();
+            let manifest: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(manifest["version"], 2);
+            for field in ["stdout", "stderr"] {
+                let pages = manifest[field].as_array().unwrap();
+                assert_eq!(pages.len(), 2);
+                let old: ArtifactMeta =
+                    serde_json::from_value(pages[0]["artifact"].clone()).unwrap();
+                let new: ArtifactMeta =
+                    serde_json::from_value(pages[1]["artifact"].clone()).unwrap();
+                assert_eq!(old.origin.actor.as_deref(), Some("epoch-worker"));
+                assert_eq!(new.origin.actor, None);
+                assert!(
+                    artifacts
+                        .read(Some("epoch-worker"), &old.id, 1, 10, None)
+                        .is_ok()
+                );
+                assert!(
+                    artifacts
+                        .read(Some("epoch-worker"), &new.id, 1, 10, None)
+                        .is_err()
+                );
+            }
+            assert!(
+                artifacts
+                    .read(Some("epoch-worker"), &receipt.output.id, 1, 10, None)
+                    .is_err()
+            );
+            assert!(
+                artifacts
+                    .read_bytes(Some("epoch-worker"), &receipt.output.id, 0, 64)
+                    .is_err()
+            );
+            let request = crate::job_tools::PollArgs {
+                command_id: id.clone(),
+                stdout_offset: 0,
+                stderr_offset: 0,
+                max_bytes: 64,
+            };
+            let old = command_output(
+                &journal,
+                &artifacts,
+                &session.id,
+                Some("epoch-worker"),
+                &request,
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(old["stdout"], "before");
+            assert_eq!(old["stderr"], "olderr");
+            let full = command_output(&journal, &artifacts, &session.id, None, &request, &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(full["stdout"], "beforeafter");
+            assert_eq!(full["stderr"], "olderrnewerr");
+            assert!(
+                command_output(
+                    &journal,
+                    &artifacts,
+                    &session.id,
+                    Some("other"),
+                    &request,
+                    &[]
+                )
+                .unwrap()
+                .is_none()
+            );
+            reconcile_background(&journal, &artifacts, &mut session, &[]).unwrap();
+            let mut large = manifest.clone();
+            large["stdout"] = json!([large["stdout"][0].clone()]);
+            for index in 0..32 {
+                let origin = ArtifactOrigin {
+                    actor: None,
+                    turn: 1,
+                    tool: "command_output".into(),
+                    call_id: id.clone(),
+                };
+                let text = match index {
+                    0 => format!("{}KEY-", "Z".repeat(65532)),
+                    1 => format!("привет{}", "Z".repeat(65524)),
+                    _ => "Z".repeat(65536),
+                };
+                let artifact = artifacts.capture_required(origin, &text, &[]).unwrap();
+                large["stdout"].as_array_mut().unwrap().push(json!({"offset":6+index*65536,"end":6+(index+1)*65536,"epoch":1,"artifact":artifact}));
+            }
+            large["terminal"]["next_stdout_offset"] = json!(6 + 32 * 65536);
+            let text = large.to_string();
+            crate::job_epochs::verify(&artifacts, &text, &session.id).unwrap();
+            crate::artifacts::reset_read_bytes();
+            let request = crate::job_tools::PollArgs {
+                command_id: id.clone(),
+                stdout_offset: 6 + 16 * 65536,
+                stderr_offset: 0,
+                max_bytes: 4,
+            };
+            assert_eq!(
+                crate::job_epochs::page(
+                    &artifacts,
+                    &text,
+                    &session.id,
+                    lifetime.pending.origin(),
+                    &request,
+                    &proof,
+                    false,
+                    &[]
+                )
+                .unwrap()["stdout"],
+                "ZZZZ"
+            );
+            assert!(
+                crate::artifacts::read_bytes_count() <= 512 * 1024,
+                "A four-byte poll must not reload full multi-MiB output: {}",
+                crate::artifacts::read_bytes_count()
+            );
+            let keys = vec!["KEY-привет".to_owned()];
+            let mut offset = 6 + 65532;
+            for _ in 0..4 {
+                let request = crate::job_tools::PollArgs {
+                    command_id: id.clone(),
+                    stdout_offset: offset,
+                    stderr_offset: 0,
+                    max_bytes: 4,
+                };
+                let result = crate::job_epochs::page(
+                    &artifacts,
+                    &text,
+                    &session.id,
+                    lifetime.pending.origin(),
+                    &request,
+                    &proof,
+                    false,
+                    &keys,
+                )
+                .unwrap();
+                assert_eq!(result["stdout"], "****");
+                assert_eq!(result["next_stdout_offset"], offset + 4);
+                offset = result["next_stdout_offset"].as_u64().unwrap() as usize;
+            }
+            let request = crate::job_tools::PollArgs {
+                command_id: id.clone(),
+                stdout_offset: 6 + 65536,
+                stderr_offset: 0,
+                max_bytes: 5,
+            };
+            let result = crate::job_epochs::page(
+                &artifacts,
+                &text,
+                &session.id,
+                lifetime.pending.origin(),
+                &request,
+                &proof,
+                false,
+                &keys,
+            )
+            .unwrap();
+            assert_eq!(result["stdout"], "****");
+            assert_eq!(result["next_stdout_offset"], 6 + 65540); // requested end lies inside a Cyrillic scalar
+            let mut tampered = manifest;
+            tampered["terminal"]["epoch_boundaries"][1]["stdout_offset"] = json!(0);
+            assert!(
+                crate::job_epochs::verify(&artifacts, &tampered.to_string(), &session.id).is_err()
+            );
+            jobs.shutdown().await.unwrap();
+        }
     }
 
     fn background(

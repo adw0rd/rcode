@@ -25,6 +25,12 @@ use std::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+thread_local! { static HANDOFF_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "handoff_tests.rs"]
+mod handoff_tests;
+
 pub struct Events {
     pub json: bool,
     secrets: std::sync::Mutex<Vec<String>>,
@@ -706,6 +712,7 @@ struct ToolExecutor<'a> {
     jobs: Option<&'a crate::jobs::JobsSupervisor>,
     managed: Option<&'a mut crate::managed_jobs::ManagedJobs>,
     job_cancel: CancellationToken,
+    parent_scope_id: String,
 }
 
 #[derive(Default)]
@@ -1625,6 +1632,13 @@ impl ToolExecutor<'_> {
         } else {
             None
         };
+        let handoff = matches!(managed, Some(crate::job_tools::JobRequest::Handoff(_)));
+        if handoff && actor.is_none_or(|a| a.role != AgentRole::Worker) {
+            self.denied = true;
+            return Ok(ToolOutcome::error(
+                json!({"error":"denied","message":"Handoff is worker-only"}).to_string(),
+            ));
+        }
         let input = matches!(managed, Some(crate::job_tools::JobRequest::Input(_)));
         let shell_args = match &managed {
             Some(crate::job_tools::JobRequest::Start(a)) => Some(json!({"command":a.command})),
@@ -1745,13 +1759,19 @@ impl ToolExecutor<'_> {
                 && matches!(risk, Some(ShellRisk::Deletion { .. }))
                 && !input
                 && self.deletion_scope_permits(args))
-            || (!write && !shell)
+            || (handoff && self.cli.shell_allowed())
+            || (!write && !shell && !handoff)
         {
             true
         } else if !ui::terminal() || self.cli.json {
             false
         } else {
-            let mut preview = if input {
+            let mut preview = if handoff {
+                format!(
+                    "Передача работающего процесса родителю: {}. Родитель получает историю и дальнейший вывод; worker теряет управление. Срок действия не продлевается.",
+                    original_args
+                )
+            } else if input {
                 format!(
                     "Ввод в работающий процесс (отдельное разрешение): {}",
                     original_args
@@ -1949,6 +1969,12 @@ impl ToolExecutor<'_> {
             cfg!(any(target_os = "macos", target_os = "linux")),
             "Управление процессами недоступно на этой платформе"
         );
+        if let JobRequest::Handoff(a) = &request {
+            return self
+                .execute_handoff(call, &a.command_id, actor, session)
+                .await;
+        }
+
         let session = session.ok_or_else(|| anyhow::anyhow!("Состояние задачи недоступно"))?;
         let jobs = self
             .jobs
@@ -2037,6 +2063,7 @@ impl ToolExecutor<'_> {
                     }
                 }
                 JobRequest::Stop(a) => jobs.stop(owner, &a.command_id).await.map(Some),
+                JobRequest::Handoff(_) => unreachable!("handled before ordinary dispatch"),
                 JobRequest::Input(a) => {
                     direct = Some(
                         managed
@@ -2084,6 +2111,139 @@ impl ToolExecutor<'_> {
                 )
             }
         }
+    }
+
+    async fn execute_handoff(
+        &mut self,
+        call: &ToolCall,
+        id: &str,
+        actor: Option<&AgentRequest>,
+        session: Option<&mut Session>,
+    ) -> Result<ToolOutcome> {
+        let actor = actor.ok_or_else(|| anyhow::anyhow!("Handoff requires worker"))?;
+        let session = session.ok_or_else(|| anyhow::anyhow!("Missing session"))?;
+        let jobs = self
+            .jobs
+            .ok_or_else(|| anyhow::anyhow!("Missing process runtime"))?;
+        let managed = self
+            .managed
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::anyhow!("Missing process ownership"))?;
+        let journal = self
+            .journal
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::anyhow!("Missing journal"))?;
+        let artifacts = self
+            .artifacts
+            .ok_or_else(|| anyhow::anyhow!("Missing artifacts"))?;
+        let store = self
+            .store
+            .ok_or_else(|| anyhow::anyhow!("Missing session store"))?;
+        let secrets = self.events.secret_snapshot();
+        jobs.refresh_credentials(&secrets).await?;
+        managed
+            .settle(jobs, journal, artifacts, session, store, &secrets)
+            .await?;
+        let lifetime_id = match managed.handoff_context(id, &actor.agent_id) {
+            Ok(id) => id,
+            Err(error) => {
+                return Ok(ToolOutcome::error(
+                    json!({"error":"handoff_denied","message":format!("{error:#}")}).to_string(),
+                ));
+            }
+        };
+        let args = json!({"command_id":id,"lifetime_id":lifetime_id,"worker":actor.agent_id,
+            "parent_scope_id":self.parent_scope_id,"expected_epoch":0});
+        let pending = crate::operation_receipts::begin(
+            journal,
+            artifacts,
+            session,
+            store,
+            call,
+            Some(&actor.agent_id),
+            &args,
+            &secrets,
+        )?;
+        let operation_id = pending.operation_id().to_owned();
+        #[cfg(test)]
+        if HANDOFF_TEST_FAULT.with(|f| f.get() == 1) {
+            HANDOFF_TEST_FAULT.with(|f| f.set(0));
+            actor.cancel.cancel();
+        }
+        let native = actor.admission.with_open(|| {
+            anyhow::ensure!(
+                !self.cancel.is_cancelled()
+                    && !actor.cancel.is_cancelled()
+                    && !actor.reply.is_closed(),
+                "Worker cancelled before handoff"
+            );
+            managed.transfer_native(
+                jobs,
+                id,
+                &actor.agent_id,
+                &operation_id,
+                &self.parent_scope_id,
+                self.job_cancel.clone(),
+            )
+        });
+        if native.is_err() && managed.transfer_pending(id) {
+            journal.fail_closed();
+            return Err(native
+                .expect_err("handoff failure")
+                .context("Handoff outcome unknown after native point; parent retains cleanup"));
+        }
+        #[cfg(test)]
+        if native.is_ok() && HANDOFF_TEST_FAULT.with(|f| f.get() == 2) {
+            HANDOFF_TEST_FAULT.with(|f| f.set(0));
+            std::fs::write(session.dir(store).join("session.json"), "foreign session")?;
+        }
+        let outcome = match native {
+            Ok(data) => ToolOutcome::success(serde_json::to_string(&data)?),
+            Err(error) => ToolOutcome::error(
+                json!({"error":"handoff_denied","message":format!("{error:#}")}).to_string(),
+            ),
+        };
+        let successful = !outcome.is_error;
+        let result = (|| {
+            let outcome = crate::operation_receipts::finish(
+                pending, journal, artifacts, session, store, call, outcome, &secrets,
+            )?;
+            if successful {
+                let (terminal, _) = journal.committed_reference(&operation_id, artifacts)?;
+                let reference = crate::operation_receipts::HandoffReference {
+                    operation_id,
+                    terminal,
+                };
+                let origin = crate::artifacts::ArtifactOrigin {
+                    actor: Some(actor.agent_id.clone()),
+                    turn: self.turn_index,
+                    tool: "command_lifetime".into(),
+                    call_id: String::new(),
+                };
+                let proof = crate::operation_receipts::committed_handoff(
+                    journal,
+                    artifacts,
+                    &session.id,
+                    &reference,
+                    id,
+                    &lifetime_id,
+                    &origin,
+                )?;
+                let notice = crate::agents::TransferredCommand {
+                    command_id: proof.data().command_id.clone(),
+                    handoff_operation_id: proof.reference().operation_id.clone(),
+                    lifetime_operation_id: proof.data().lifetime_id.clone(),
+                    ownership_epoch: 1,
+                };
+                managed.commit_transfer(id, proof)?;
+                actor.record_transfer(notice)?;
+            }
+            Ok(outcome)
+        })();
+        if result.is_err() {
+            journal.fail_closed();
+        }
+        result
     }
 
     /// Удаления внутри уже выданных скоупов больше не спрашиваются.
@@ -2452,6 +2612,7 @@ pub(crate) async fn turn(
     }
     let job_scope = execution.begin_turn(session.turn_index, &cancel)?;
     let job_cancel = job_scope.cancellation();
+    let parent_scope_id = job_scope.identity();
     let (artifacts, journal, jobs, managed) = execution.receipt_resources()?;
     let mut next_task = session.task_state.clone();
     if next_task.goal().is_empty() && !session.messages.is_empty() {
@@ -2542,6 +2703,7 @@ pub(crate) async fn turn(
         jobs: Some(jobs),
         managed: Some(managed),
         job_cancel,
+        parent_scope_id,
     };
     let mut done = None;
     // All return/? paths from this block run the common worker finalizer below.
@@ -3155,6 +3317,7 @@ mod tests {
             jobs: None,
             managed: None,
             job_cancel: CancellationToken::new(),
+            parent_scope_id: String::new(),
         };
         let read = ToolCall::new("read_file", json!({"path":"a.txt"}));
         assert!(!executor.execute(&read, None, None).await.unwrap().is_error);
@@ -3203,6 +3366,8 @@ mod tests {
                 call: call.clone(),
                 cancel: cancel.child_token(),
                 reply,
+                admission: Default::default(),
+                transfers: Default::default(),
             };
             let out = executor.execute(&call, Some(&request), None).await.unwrap();
             assert_eq!(out.is_error, expected_error, "{id}: {}", out.content);
@@ -3258,6 +3423,7 @@ mod tests {
                 jobs: None,
                 managed: None,
                 job_cancel: CancellationToken::new(),
+                parent_scope_id: String::new(),
             };
             for call in [
                 ToolCall::new(
@@ -3269,6 +3435,10 @@ mod tests {
                     json!({"command":"printf blocked > blocked.txt"}),
                 ),
                 ToolCall::new(crate::balance::TOOL_NAME, json!({})),
+                ToolCall::new(
+                    "handoff_command",
+                    json!({"command_id":"12345678-abcd-4abc-8abc-123456789abc"}),
+                ),
             ] {
                 let (reply, _receiver) = oneshot::channel();
                 let request = AgentRequest {
@@ -3278,6 +3448,8 @@ mod tests {
                     call: call.clone(),
                     cancel: cancel.child_token(),
                     reply,
+                    admission: Default::default(),
+                    transfers: Default::default(),
                 };
                 let outcome = executor.execute(&call, Some(&request), None).await.unwrap();
                 assert!(
@@ -3320,6 +3492,7 @@ mod tests {
             jobs: None,
             managed: None,
             job_cancel: CancellationToken::new(),
+            parent_scope_id: String::new(),
         };
         for closed_reply in [false, true] {
             let child_cancel = cancel.child_token();
@@ -3342,6 +3515,8 @@ mod tests {
                         ),
                         cancel: child_cancel,
                         reply,
+                        admission: Default::default(),
+                        transfers: Default::default(),
                     },
                     &mut Session::new(
                         &root,
@@ -3387,6 +3562,7 @@ mod tests {
             jobs: None,
             managed: None,
             job_cancel: CancellationToken::new(),
+            parent_scope_id: String::new(),
         };
         executor
             .serve(
@@ -3400,6 +3576,8 @@ mod tests {
                     ),
                     cancel: cancel.child_token(),
                     reply,
+                    admission: Default::default(),
+                    transfers: Default::default(),
                 },
                 &mut Session::new(
                     &root,
@@ -3784,6 +3962,7 @@ mod tests {
             jobs: None,
             managed: None,
             job_cancel: CancellationToken::new(),
+            parent_scope_id: String::new(),
         };
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
         let outcome = executor.execute(&call, None, None).await.unwrap();
@@ -3812,6 +3991,8 @@ mod tests {
                 call: call.clone(),
                 cancel: cancel.child_token(),
                 reply,
+                admission: Default::default(),
+                transfers: Default::default(),
             };
             let outcome = executor.execute(&call, Some(&request), None).await.unwrap();
             assert!(outcome.is_error);

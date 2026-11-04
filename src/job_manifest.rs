@@ -247,6 +247,93 @@ pub(crate) fn page(
     Ok(terminal)
 }
 
+/// Verify only immutable pages intersecting the window plus bounded secret context.
+/// Full nested verification remains mandatory at capture and recovery boundaries.
+pub(crate) fn render_pages(
+    artifacts: &ArtifactStore,
+    pages: &[(usize, usize, &ArtifactMeta)],
+    total: usize,
+    offset: usize,
+    maximum: usize,
+    secrets: &[String],
+) -> Result<(String, usize)> {
+    ensure!(
+        (4..=65536).contains(&maximum) && offset <= total,
+        "Invalid output window"
+    );
+    if offset == total {
+        return Ok((String::new(), offset));
+    }
+    let keys = crate::redaction::SecretDictionary::new(secrets)?;
+    let context = keys.max_pattern_len().saturating_sub(1);
+    ensure!(context <= 49152, "Redaction context too large");
+    let low = offset.saturating_sub(context);
+    let high = offset
+        .saturating_add(maximum)
+        .min(total)
+        .saturating_add(context)
+        .min(total);
+    let selected: Vec<_> = pages
+        .iter()
+        .filter(|(start, end, _)| *end > low && *start < high)
+        .collect();
+    let base = selected
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Missing output window pages"))?
+        .0;
+    let mut bytes = Vec::new();
+    let mut at = base;
+    for &&(start, end, meta) in &selected {
+        ensure!(
+            start == at && end > start && end - start <= 65536,
+            "Output window page gap"
+        );
+        let text = artifacts.verify_required(meta)?;
+        ensure!(text.len() == end - start, "Output window length mismatch");
+        bytes.extend_from_slice(text.as_bytes());
+        at = end;
+    }
+    ensure!(
+        base <= low && at >= high && bytes.len() <= maximum + 2 * context + 2 * 65536,
+        "Incomplete output window context"
+    );
+    let (text, next) = render_window(bytes, offset - base, maximum, secrets)?;
+    Ok((text, base + next))
+}
+
+pub(crate) fn render_window(
+    bytes: Vec<u8>,
+    offset: usize,
+    maximum: usize,
+    secrets: &[String],
+) -> Result<(String, usize)> {
+    ensure!((4..=65536).contains(&maximum), "Invalid output page size");
+    let original = std::str::from_utf8(&bytes)?;
+    ensure!(
+        offset <= bytes.len() && original.is_char_boundary(offset),
+        "Invalid UTF-8 offset"
+    );
+    let mut end = bytes.len().min(offset.saturating_add(maximum));
+    while !original.is_char_boundary(end) {
+        end -= 1;
+    }
+    ensure!(
+        end > offset || offset == bytes.len(),
+        "Page cannot contain next scalar"
+    );
+    let keys = crate::redaction::SecretDictionary::new(secrets)?;
+    let dictionary = crate::retained_redaction::RetainedDictionary::new(&keys)?;
+    let mut retained = StoredText(bytes);
+    let mut cursor = dictionary.cursor(retained.0.len(), &[])?;
+    while !cursor.step(&mut retained, 4096)? {}
+    let output = String::from_utf8(retained.0[offset..end].to_vec())?;
+    ensure!(
+        crate::redaction::redact_text(&output, secrets)? == output,
+        "Mask matches known secret"
+    );
+    Ok((output, end))
+}
+
 struct StoredText(Vec<u8>);
 impl crate::retained_redaction::RetainedText for StoredText {
     fn len(&self) -> usize {
