@@ -341,6 +341,7 @@ struct Record {
     stop: bool,
     cause: Option<JobStatus>,
     last_activity: Instant,
+    foreground_raw_bytes: usize,
     input: Option<mpsc::Sender<Input>>,
     input_budget: Arc<Semaphore>,
     input_tail: Vec<u8>,
@@ -530,7 +531,9 @@ fn validate(spec: &mut JobSpec, patterns: &[Vec<u8>]) -> Result<()> {
             .iter()
             .map(|s| s.len().saturating_add(1))
             .sum::<usize>()
-            <= INPUT,
+            // Foreground reserves 16 KiB for the shell command itself; the
+            // host's /bin/sh, -c and NUL separators add twelve bytes.
+            <= INPUT + if spec.kind == JobKind::Foreground { 12 } else { 0 },
         "argv too large"
     );
     ensure!(spec.env.len() <= 128, "environment too large");
@@ -844,6 +847,23 @@ impl JobsSupervisor {
         publish(snapshot)
     }
 
+    /// Snapshot preflight, not a reservation. Native start repeats admission
+    /// under the registry lock immediately before spawn.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn check_start_capacity(&self) -> Result<()> {
+        let state = lock(&self.core.state);
+        require_credentials(&state)?;
+        ensure!(
+            !state.closing && !self.core.cancel.is_cancelled(),
+            "supervisor closing"
+        );
+        ensure!(
+            state.records.values().filter(|r| r.resource).count() < 4,
+            "Все четыре слота процессов заняты; остановите команду через stop_command или дождитесь её завершения"
+        );
+        Ok(())
+    }
+
     pub fn reserve_start(&self) -> Result<StartReservation> {
         let state = lock(&self.core.state);
         require_credentials(&state)?;
@@ -865,6 +885,17 @@ impl JobsSupervisor {
     }
 
     pub async fn start_reserved(
+        &self,
+        reservation: StartReservation,
+        spec: JobSpec,
+        cancel: CancellationToken,
+    ) -> Result<JobSnapshot> {
+        self.start_reserved_now(reservation, spec, cancel)
+    }
+
+    // Synchronous native admission point: the worker reply gate may cover
+    // validation, spawn and ownership installation without an intervening await.
+    pub(crate) fn start_reserved_now(
         &self,
         reservation: StartReservation,
         mut spec: JobSpec,
@@ -984,6 +1015,7 @@ impl JobsSupervisor {
                     stop: false,
                     cause: None,
                     last_activity: Instant::now(),
+                    foreground_raw_bytes: 0,
                     input: spec.stdin.then_some(tx),
                     input_budget: Arc::new(Semaphore::new(INPUT)),
                     input_tail: Vec::new(),
@@ -1361,15 +1393,24 @@ impl<F: Future> Future for Catch<F> {
         }
     }
 }
-fn sink(state: &mut Registry, id: &str, stderr: bool, chunk: OutputChunk) {
+fn sink(state: &mut Registry, id: &str, stderr: bool, mut chunk: OutputChunk) {
     let Registry {
         records, allocated, ..
     } = state;
     let r = records.get_mut(id).expect("record retained");
     r.view.utf8_lossy |= chunk.lossy;
+    let original_len = chunk.text.len();
+    if r.view.kind == JobKind::Foreground {
+        let mut take = PAGE.saturating_sub(r.out.len + r.err.len).min(original_len);
+        while !chunk.text.is_char_boundary(take) {
+            take -= 1;
+        }
+        chunk.text.truncate(take);
+        // append_chunk clips provenance to the admitted bytes.
+    }
     let target = if stderr { &mut r.err } else { &mut r.out };
     let n = target.append_chunk(&chunk, allocated);
-    if n < chunk.text.len() {
+    if n < original_len {
         r.view.output_truncated = true;
         request(r, JobStatus::Cancelled, "retained output quota");
     }
@@ -1474,7 +1515,9 @@ fn finalize_ready(core: &Core, id: &str, outcome: &RunOutcome) -> bool {
         if let [Some(Ok(out)), Some(Ok(err))] = prepared {
             let capacity =
                 tail_capacity(&r.out, out.text.len()).zip(tail_capacity(&r.err, err.text.len()));
-            let fits = capacity.is_some_and(|(a, b)| a + b <= GLOBAL - *allocated);
+            let fits = capacity.is_some_and(|(a, b)| a + b <= GLOBAL - *allocated)
+                && (r.view.kind != JobKind::Foreground
+                    || r.out.len + r.err.len + out.text.len() + err.text.len() <= PAGE);
             // This observation is the cancellation acceptance boundary. stop() uses
             // this same mutex; cancellation after this point sees a terminal record.
             // Both tails and done/status publish under the lock, with no await.
@@ -1538,14 +1581,31 @@ async fn drain<R: AsyncRead + Unpin>(
             if n == 0 {
                 break;
             }
-            lock(&core.state)
-                .records
-                .get_mut(id)
-                .expect("record retained")
-                .last_activity = Instant::now();
+            let (admitted, overflow) = {
+                let mut state = lock(&core.state);
+                let r = state.records.get_mut(id).expect("record retained");
+                r.last_activity = Instant::now();
+                if r.view.kind == JobKind::Foreground {
+                    let admitted = n.min(PAGE.saturating_sub(r.foreground_raw_bytes));
+                    r.foreground_raw_bytes += admitted;
+                    (admitted, admitted < n)
+                } else {
+                    (n, false)
+                }
+            };
             total = total.saturating_add(n);
-            ensure!(total <= STREAM, "raw output quota");
-            ingest(core, id, stderr, &buffer[..n]).await?;
+            // Foreground excess is discarded while the readers keep draining
+            // through cleanup. A quota stop is not a pipe I/O failure.
+            if admitted != 0 {
+                ensure!(total <= STREAM, "raw output quota");
+                ingest(core, id, stderr, &buffer[..admitted]).await?;
+            }
+            if overflow {
+                let mut state = lock(&core.state);
+                let r = state.records.get_mut(id).expect("record retained");
+                r.view.output_truncated = true;
+                request(r, JobStatus::Cancelled, "foreground raw output quota");
+            }
         }
         Ok(())
     }
@@ -3071,6 +3131,111 @@ mod tests {
             assert_eq!(validate(&mut job, &[]).is_ok(), accepted, "{seconds}");
         }
     }
+    #[tokio::test]
+    async fn foreground_combines_raw_and_retained_output_limits() {
+        let d = tempfile::tempdir().unwrap();
+        // Both individual streams fit below 64 KiB; together they must stop.
+        for (name, bytes) in [("dual", vec![b'x'; 40_000]), ("lossy", vec![0xff; 30_000])] {
+            std::fs::write(d.path().join("output"), &bytes).unwrap();
+            let s = JobsSupervisor::new(name, vec![]).unwrap();
+            let mut job = spec(
+                d.path(),
+                if name == "dual" {
+                    "cat output; cat output >&2"
+                } else {
+                    "cat output"
+                },
+            );
+            job.kind = JobKind::Foreground;
+            let started = s.start(job, CancellationToken::new()).await.unwrap();
+            let done = terminal(&s, &started.id).await;
+            assert!(done.cleanup_complete, "{done:?}");
+            assert!(done.output_truncated, "foreground limit was not applied");
+            assert!(done.stdout.len() + done.stderr.len() <= PAGE);
+            assert!(done.next_stdout_offset + done.next_stderr_offset <= PAGE);
+            if name == "lossy" {
+                assert!(done.utf8_lossy);
+            }
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_raw_limit_applies_even_when_redaction_shrinks_output() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("raw-foreground", vec!["a".repeat(128)]).unwrap();
+        std::fs::write(d.path().join("output"), vec![b'a'; PAGE + 1]).unwrap();
+        let mut job = spec(d.path(), "cat output");
+        job.kind = JobKind::Foreground;
+        let started = s.start(job, CancellationToken::new()).await.unwrap();
+        let done = terminal(&s, &started.id).await;
+        assert!(done.cleanup_complete, "{done:?}");
+        assert!(
+            done.output_truncated,
+            "raw cap bypassed by redaction contraction"
+        );
+        assert!(done.stdout.len() + done.stderr.len() <= PAGE);
+        assert!(!done.stdout.contains(&"a".repeat(128)));
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_eof_expansion_is_bounded_and_exact_limit_is_accepted() {
+        let d = tempfile::tempdir().unwrap();
+        for (tail, truncated) in [("secret", true), ("xxxxxx", false)] {
+            let s = JobsSupervisor::new(
+                "foreground-eof-cap",
+                vec!["secret".into(), "secret-ending-long".into()],
+            )
+            .unwrap();
+            std::fs::write(
+                d.path().join("output"),
+                format!("{}{tail}", "x".repeat(PAGE - tail.len())),
+            )
+            .unwrap();
+            let mut job = spec(d.path(), "cat output");
+            job.kind = JobKind::Foreground;
+            let started = s.start(job, CancellationToken::new()).await.unwrap();
+            let done = terminal(&s, &started.id).await;
+            assert!(done.cleanup_complete);
+            assert_eq!(done.output_truncated, truncated);
+            assert!(done.stdout.len() + done.stderr.len() <= PAGE);
+            if !truncated {
+                assert_eq!(done.stdout.len(), PAGE);
+            }
+            assert!(!done.stdout.contains("secret"));
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_limits_do_not_reduce_managed_output() {
+        let d = tempfile::tempdir().unwrap();
+        let s = JobsSupervisor::new("managed-output-bound", vec![]).unwrap();
+        std::fs::write(d.path().join("output"), vec![b'x'; PAGE + 4096]).unwrap();
+        let started = s
+            .start(spec(d.path(), "cat output"), CancellationToken::new())
+            .await
+            .unwrap();
+        let done = terminal(&s, &started.id).await;
+        assert!(done.cleanup_complete && !done.output_truncated);
+        assert_eq!(done.next_stdout_offset, PAGE);
+        let rest = s.poll(None, &started.id, PAGE, 0, PAGE).await.unwrap();
+        assert_eq!(rest.stdout.len(), 4096);
+        s.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn foreground_shell_keeps_full_16k_command_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let mut job = spec(d.path(), &format!(": #{}", "x".repeat(INPUT - 3)));
+        job.kind = JobKind::Foreground;
+        assert_eq!(job.argv[2].len(), INPUT);
+        assert!(validate(&mut job, &[]).is_ok());
+        job.argv[2].push('x');
+        assert!(validate(&mut job, &[]).is_err());
+    }
+
     #[tokio::test]
     async fn foreground_timeout_is_real_and_cannot_handoff() {
         let d = tempfile::tempdir().unwrap();

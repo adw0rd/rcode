@@ -57,6 +57,19 @@ def main(binary):
                 session=json.loads(session_path.read_text())
                 assert session['usage']['input_tokens']==0 and session['usage']['output_tokens']==0
                 assert any((m.get('provider_meta') or {}).get('kind')=='rcode_user_shell' for m in session['messages'])
+                if sys.platform in ('linux', 'darwin'):
+                    receipts = [m for m in session['messages'] if m['role'] == 'tool' and m.get('name') == 'run_command']
+                    assert len(receipts) == 2, 'Manual commands duplicated tool receipts'
+                    task = session['task_state']
+                    assert task['goal'].startswith("!printf 'SHELL_STDOUT"), 'First explicit command was not saved as goal'
+                    assert task['goal_source'] and task['current_source'] != task['goal_source'], 'Follow-up overwrote goal provenance'
+                    assert task['current_request'].startswith('!pwd;') and task['revision'] == 4, 'Manual requests or receipts advanced revision twice'
+
+                    for receipt in receipts:
+                        value = json.loads(receipt['content'])
+                        assert value.get('command_id') and value['cleanup_complete'], 'Manual shell bypassed native supervisor'
+                        assert receipt.get('host_operation'), 'Manual shell result was not durably linked'
+
                 # Plan constrains the model; an explicitly typed local command remains an operator action.
                 terminal.command('/plan on','Режим плана: включён')
                 terminal.send("!printf 'explicit-user-action' > plan-host.txt\r")

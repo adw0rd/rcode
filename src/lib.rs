@@ -59,6 +59,8 @@ mod artifact_tool;
 
 pub mod diagnostics;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod foreground;
 mod job_epochs;
 mod job_manifest;
 mod job_output;

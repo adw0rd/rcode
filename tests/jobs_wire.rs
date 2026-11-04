@@ -355,3 +355,120 @@ fn rejection_assertion_does_not_accept_success_or_null_error() {
         &json!({"input_id":"receipt","delivery":"accepted"})
     ));
 }
+
+#[tokio::test]
+async fn foreground_uses_native_id_and_preserves_nonzero_diagnostics() {
+    let project = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(None::<Value>));
+    let captured = seen.clone();
+    let server = Server::start(move |request, step| {
+        if step == 0 {
+            tool_reply(
+                "foreground",
+                "run_command",
+                &json!({
+                    "command":"printf hello; printf problem >&2; printf x >> once; exit 7"
+                }),
+            )
+        } else {
+            *captured.lock().unwrap() = latest(request);
+            text_reply("Foreground complete.")
+        }
+    });
+    let out = run(project.path(), state.path(), &server, &["--allow-shell"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "nonzero tool keeps CLI error status"
+    );
+    let value = seen.lock().unwrap().clone().unwrap();
+    let id = value["command_id"]
+        .as_str()
+        .expect("shared native foreground identity");
+    assert_eq!(value["exit_code"], 7);
+    assert_eq!(value["stdout"], "hello");
+    assert_eq!(value["stderr"], "problem");
+    assert_eq!(value["cleanup_complete"], true);
+    assert_eq!(
+        fs::read_to_string(project.path().join("once")).unwrap(),
+        "x"
+    );
+    let session_path = files(state.path())
+        .into_iter()
+        .find(|(p, _)| p.file_name().is_some_and(|n| n == "session.json"))
+        .unwrap()
+        .0;
+    let session: Value = serde_json::from_slice(&fs::read(&session_path).unwrap()).unwrap();
+    let artifacts = rcode::artifacts::ArtifactStore::open(
+        session_path.parent().unwrap(),
+        session["id"].as_str().unwrap(),
+    )
+    .unwrap();
+    let journal = rcode::operation_journal::OperationJournal::open(
+        session_path.parent().unwrap(),
+        session["id"].as_str().unwrap(),
+        &artifacts,
+    )
+    .unwrap();
+    let records = journal.records(&artifacts).unwrap();
+    let record = records
+        .iter()
+        .find(|r| r.origin.tool == "run_command")
+        .unwrap();
+    let request = journal
+        .intent_payload(&record.operation_id, &artifacts)
+        .unwrap();
+    let meta = serde_json::from_value(request["arguments"].clone()).unwrap();
+    let args: Value = serde_json::from_str(&artifacts.verify_required(&meta).unwrap()).unwrap();
+    assert_eq!(args["command_id"], id, "native identity saved before spawn");
+    assert_eq!(
+        args["arguments"]["command"],
+        "printf hello; printf problem >&2; printf x >> once; exit 7"
+    );
+    assert!(
+        journal
+            .terminal_payload(&record.operation_id, &artifacts)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn foreground_cannot_bypass_four_managed_slots() {
+    let project = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(None::<Value>));
+    let captured = seen.clone();
+    let server = Server::start(move |request, step| match step {
+        0..=3 => tool_reply(
+            &format!("background-{step}"),
+            "start_command",
+            &json!({"command":"sleep 30"}),
+        ),
+        4 => tool_reply(
+            "foreground",
+            "run_command",
+            &json!({"command":"printf forbidden > fifth-process"}),
+        ),
+        _ => {
+            *captured.lock().unwrap() = latest(request);
+            text_reply("Capacity exercise complete.")
+        }
+    });
+    let out = run(project.path(), state.path(), &server, &["--allow-shell"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "capacity failure keeps CLI error status"
+    );
+    assert!(
+        !project.path().join("fifth-process").exists(),
+        "foreground bypassed shared resource admission"
+    );
+    let encoded = seen.lock().unwrap().clone().unwrap().to_string();
+    assert!(
+        encoded.contains("slot") || encoded.contains("слот"),
+        "capacity failure must be actionable: {encoded}"
+    );
+}

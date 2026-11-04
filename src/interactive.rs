@@ -1210,7 +1210,9 @@ pub(crate) async fn run(
             input_history = None;
         }
         if let Some(command) = input.strip_prefix('!') {
-            if let Err(error) = user_shell(session, store, tools, events, command, &budget).await {
+            if let Err(error) =
+                user_shell(session, store, tools, execution, events, command, &budget).await
+            {
                 events.emit(
                     "error",
                     json!({"message":events.redact(&format!("{error:#}"))}),

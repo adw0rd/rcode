@@ -57,7 +57,7 @@ pub struct AgentRecord {
     pub transferred_commands: Vec<TransferredCommand>,
 }
 
-/// Serializes reply closure with the synchronous native handoff point.
+/// Serializes reply closure with synchronous native admission and publication.
 #[derive(Clone)]
 pub struct ReplyAdmission(Arc<Mutex<bool>>);
 impl Default for ReplyAdmission {
@@ -70,9 +70,16 @@ impl ReplyAdmission {
         &self,
         action: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.with_state(|open| {
+            anyhow::ensure!(open, "Worker reply closed before native action");
+            action()
+        })
+    }
+    // Holds the same gate for synchronous durable publication, including a
+    // failed receipt when its receiver has already gone away. Never await here.
+    pub(crate) fn with_state<T>(&self, action: impl FnOnce(bool) -> T) -> T {
         let open = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        anyhow::ensure!(*open, "Worker reply closed before handoff");
-        action()
+        action(*open)
     }
 }
 struct ScopedReply {

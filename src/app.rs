@@ -789,7 +789,24 @@ impl RepeatedResults {
         // Call IDs differ on every step; arguments are compared as normalized JSON.
         let arguments = serde_json::from_str::<Value>(&call.function.arguments)
             .map_or_else(|_| call.function.arguments.clone(), |args| args.to_string());
-        let digest: [u8; 32] = Sha256::digest(outcome.content.as_bytes()).into();
+        // Native identities and best-effort signal warnings describe this
+        // execution, not new read data. Keep them in the receipt, but compare
+        // every other field (including stdout/stderr/status/cleanup evidence).
+        // Only remove host fields at the top level, never text inside stdout.
+        let comparable = if name == "run_command" {
+            serde_json::from_str::<Value>(&outcome.content)
+                .ok()
+                .and_then(|mut value| {
+                    let object = value.as_object_mut()?;
+                    object.remove("command_id");
+                    object.remove("cleanup_warning");
+                    Some(value.to_string())
+                })
+        } else {
+            None
+        };
+        let digest: [u8; 32] =
+            Sha256::digest(comparable.as_deref().unwrap_or(&outcome.content).as_bytes()).into();
         let entry = self
             .0
             .entry(format!("{name}\n{arguments}"))
@@ -1900,6 +1917,46 @@ impl ToolExecutor<'_> {
                 .execute_managed(call, original_args, request, cancel, actor, session)
                 .await;
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if shell {
+            let session = session.ok_or_else(|| anyhow::anyhow!("Состояние задачи недоступно"))?;
+            let jobs = self
+                .jobs
+                .ok_or_else(|| anyhow::anyhow!("Runtime процессов недоступен"))?;
+            let journal = self
+                .journal
+                .as_deref_mut()
+                .ok_or_else(|| anyhow::anyhow!("Журнал недоступен"))?;
+            let artifacts = self
+                .artifacts
+                .ok_or_else(|| anyhow::anyhow!("Хранилище результатов недоступно"))?;
+            let store = self
+                .store
+                .ok_or_else(|| anyhow::anyhow!("Хранилище сессии недоступно"))?;
+            if let Some(managed) = self.managed.as_deref_mut() {
+                managed
+                    .settle(
+                        jobs,
+                        journal,
+                        artifacts,
+                        session,
+                        store,
+                        &self.events.secret_snapshot(),
+                    )
+                    .await?;
+            }
+            return crate::foreground::Durable {
+                tools: self.tools,
+                events: self.events,
+                jobs,
+                journal,
+                artifacts,
+                session,
+                store,
+            }
+            .run(call, original_args, actor, cancel)
+            .await;
+        }
         let durable = if write || shell {
             if let Some(journal) = self.journal.as_deref_mut() {
                 let session =
@@ -2322,6 +2379,7 @@ pub(crate) async fn user_shell(
     session: &mut Session,
     store: &ConfigStore,
     tools: &mut Tools,
+    execution: &mut crate::session_runtime::SessionRuntime,
     events: &Events,
     command: &str,
     budget: &ContextBudget,
@@ -2333,6 +2391,7 @@ pub(crate) async fn user_shell(
     if command.len() > 16_384 || command.contains('\0') {
         bail!("Shell-команда слишком длинная или содержит нулевой символ");
     }
+    events.refresh_keys(store)?;
     if events.redact(command) != command {
         bail!(
             "Команда содержит известный ключ провайдера и не запущена; не передавайте ключи в аргументах shell"
@@ -2341,6 +2400,10 @@ pub(crate) async fn user_shell(
     if tools.root() != session.root {
         bail!("Рабочий каталог shell не совпадает с текущей сессией");
     }
+    execution
+        .settle_jobs(session, store, &events.secret_snapshot())
+        .await?;
+    execution.reconcile_receipts(session)?;
     session.repair_pending()?;
     tools.begin_turn()?;
     let cancel = CancellationToken::new();
@@ -2362,6 +2425,38 @@ pub(crate) async fn user_shell(
         session.title = format!("! {command}").chars().take(80).collect();
     }
     session.turn_index += 1;
+    let mut task = session.task_state.clone();
+    if task.goal().is_empty()
+        && let Some(original) = session
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == "user"
+                    && m.provider_meta
+                        .as_ref()
+                        .is_none_or(|p| p.kind != "rcode_runtime")
+            })
+            .and_then(|m| m.content.as_deref())
+            .filter(|s| !s.trim().is_empty())
+    {
+        persist_user_request(
+            execution.artifacts(),
+            &mut task,
+            &events.redact(original),
+            0,
+            events,
+        )?;
+    }
+    // ! is explicit operator input. Keep the complete request in its own
+    // artifact and preserve any original goal, including on the first turn.
+    persist_user_request(
+        execution.artifacts(),
+        &mut task,
+        &format!("!{command}"),
+        session.turn_index,
+        events,
+    )?;
+    session.task_state = task;
     session.save(store)?;
     if let Some(screen) = crate::screen::current() {
         screen.bind_cancel(cancel.clone());
@@ -2369,14 +2464,65 @@ pub(crate) async fn user_shell(
     events.emit("shell_start", json!({"command":command}));
     events.busy("Выполняю shell-команду · Esc/Ctrl+C — прервать");
     let since = std::time::Instant::now();
-    let result = tools
-        .execute(
-            "run_command",
-            &serde_json::from_str(&call.function.arguments)?,
-            &cancel,
+    let scope = execution.begin_turn(session.turn_index, &cancel)?;
+    let result: Result<ToolOutcome> = async {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let (artifacts, journal, jobs, managed) = execution.receipt_resources()?;
+            let journal = journal.ok_or_else(|| anyhow::anyhow!("Журнал shell недоступен"))?;
+            managed
+                .settle(
+                    jobs,
+                    journal,
+                    artifacts,
+                    session,
+                    store,
+                    &events.secret_snapshot(),
+                )
+                .await?;
+            crate::foreground::Durable {
+                tools,
+                events,
+                jobs,
+                journal,
+                artifacts,
+                session,
+                store,
+            }
+            .run(
+                &call,
+                &serde_json::from_str(&call.function.arguments)?,
+                None,
+                &cancel,
+            )
+            .await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            tools
+                .execute(
+                    "run_command",
+                    &serde_json::from_str(&call.function.arguments)?,
+                    &cancel,
+                )
+                .await
+        }
+    }
+    .await;
+    let cleanup = execution
+        .finish_turn_saved(
+            scope,
+            result.is_err(),
+            session,
+            store,
+            &events.secret_snapshot(),
         )
         .await;
     cancel.cancel();
+    let result = match (result, cleanup) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    };
     events.pause();
     match result {
         Ok(mut outcome) => {
@@ -2389,7 +2535,7 @@ pub(crate) async fn user_shell(
                 outcome.is_error,
                 events,
             );
-            session.messages.push(Message::tool(&call, receipt));
+            crate::operation_receipts::put_message(session, &call, &outcome, receipt)?;
             session.save(store)?;
             events.emit("shell_result",json!({"content":outcome.content,"is_error":outcome.is_error,"elapsed_secs":since.elapsed().as_secs_f64()}));
             // Manual commands consume no API tokens but their receipts share
@@ -3001,6 +3147,9 @@ mod tests {
         let key = "manual-shell-private-key";
         events.remember(key.into());
         let before = serde_json::to_value(&session).unwrap();
+        let mut execution =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
         for command in [
             String::new(),
             "bad\0command".into(),
@@ -3011,6 +3160,7 @@ mod tests {
                 &mut session,
                 &store,
                 &mut tools,
+                &mut execution,
                 &events,
                 &command,
                 &ContextBudget::cloud(),
@@ -3021,6 +3171,68 @@ mod tests {
             assert_eq!(serde_json::to_value(&session).unwrap(), before);
             assert!(!root.join("should-not-exist").exists());
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn manual_shell_recovers_legacy_user_goal_and_preserves_its_source() {
+        use sha2::{Digest, Sha256};
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+        let original = "Сохранить первоначальную задачу пользователя";
+        let mut session = Session::new(
+            &root,
+            crate::config::ProviderSettings::new(ProviderKind::Custom),
+        )
+        .unwrap();
+        session.messages.push(Message::user(original));
+        session.save(&store).unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        let mut runtime =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
+        let events = Events::new(true);
+        user_shell(
+            &mut session,
+            &store,
+            &mut tools,
+            &mut runtime,
+            &events,
+            "printf first",
+            &ContextBudget::cloud(),
+        )
+        .await
+        .unwrap();
+        let first = serde_json::to_value(&session.task_state).unwrap();
+        assert_eq!(first["goal"], original);
+        assert_eq!(
+            first["goal_source"]["sha256"],
+            format!("{:x}", Sha256::digest(original.as_bytes()))
+        );
+        assert_eq!(first["revision"], 3); // legacy source, explicit !, receipt
+        user_shell(
+            &mut session,
+            &store,
+            &mut tools,
+            &mut runtime,
+            &events,
+            "printf second",
+            &ContextBudget::cloud(),
+        )
+        .await
+        .unwrap();
+        let second = serde_json::to_value(&session.task_state).unwrap();
+        assert_eq!(second["goal"], first["goal"]);
+        assert_eq!(second["goal_source"], first["goal_source"]);
+        assert_eq!(second["current_request"], "!printf second");
+        assert_eq!(second["revision"], 5); // follow-up and receipt, once each
+        assert_ne!(second["current_source"], second["goal_source"]);
+        runtime
+            .shutdown_saved(&mut session, &store, &[])
+            .await
+            .unwrap();
     }
 
     fn default_cli() -> Cli {
@@ -3156,6 +3368,41 @@ mod tests {
             json!({"path":"b.txt","old_text":"missing","new_text":"change"}),
         );
         assert_eq!(failures.observe(&other, &failed), Some(1));
+    }
+
+    #[test]
+    fn repeated_foreground_reads_ignore_native_identity_but_keep_real_output_changes() {
+        let mut repeated = RepeatedResults::default();
+        let call = ToolCall::new("run_command", json!({"command":"cat README.md"}));
+        let receipt = |id: &str, warning: Option<&str>, stdout: &str| {
+            ToolOutcome::success(
+                json!({
+                    "command_id":id,"cleanup_warning":warning,"stdout":stdout,"stderr":"",
+                    "exit_code":0,"signal":null,"cleanup_complete":true,"reason":null
+                })
+                .to_string(),
+            )
+        };
+        assert_eq!(
+            repeated.observe(&call, &receipt("first", None, "stable")),
+            1
+        );
+        assert_eq!(
+            repeated.observe(
+                &call,
+                &receipt("second", Some("signal raced with exit"), "stable")
+            ),
+            2
+        );
+        assert_eq!(
+            repeated.observe(&call, &receipt("third", None, "changed")),
+            1
+        );
+        assert_eq!(
+            repeated.observe(&call, &receipt("fourth", None, "changed")),
+            2
+        );
+        assert_eq!(repeated.total(&call), 4);
     }
 
     #[test]

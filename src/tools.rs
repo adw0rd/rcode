@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::process::{ExitStatus, Stdio};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -18,6 +20,7 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +34,7 @@ const MAX_ENTRIES: usize = 10_000;
 const MAX_RESULTS: usize = 1_000;
 const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const CHECKPOINT_FILE: &str = "checkpoints.json";
-const SHELL_NOTE: &str = "Изменения shell-команд не управляются undo; изменения отслеживаемых файлов после записи вызывают конфликт.";
+pub(crate) const SHELL_NOTE: &str = "Изменения shell-команд не управляются undo; изменения отслеживаемых файлов после записи вызывают конфликт.";
 
 #[derive(Debug, thiserror::Error)]
 #[error("Не удалось сохранить checkpoint: {0}")]
@@ -1116,94 +1119,101 @@ impl Tools {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<ToolOutcome> {
-        let (command, timeout) = command_args(args)?;
-        check_cancel(cancel)?;
-        self.mark_shell_used()?;
-        #[cfg(unix)]
-        let mut process = {
-            let mut c = tokio::process::Command::new("/bin/sh");
-            c.arg("-c");
-            c.process_group(0);
-            c
-        };
-        #[cfg(windows)]
-        let mut process = {
-            let mut c = tokio::process::Command::new("cmd.exe");
-            c.args(["/D", "/S", "/C"]);
-            c
-        };
-        #[cfg(not(any(unix, windows)))]
-        bail!("run_command не поддерживается на этой платформе");
-        process
-            .arg(command)
-            .current_dir(&self.root)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        for (key, value) in std::env::vars_os() {
-            if allowed_env(&key.to_string_lossy()) {
-                process.env(key, value);
-            }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            crate::foreground::standalone(self, args, cancel).await
         }
-        process.env("PWD", &self.root);
-        process.env("RCODE_MODEL_SHELL", "1");
-        let mut child = process.spawn().context("Не удалось запустить shell")?;
-        let mut group = ProcessGroup::new(child.id());
-        let stdout = child.stdout.take().context("stdout pipe отсутствует")?;
-        let stderr = child.stderr.take().context("stderr pipe отсутствует")?;
-        let budget = Arc::new(AtomicUsize::new(0));
-        let limit = CancellationToken::new();
-        let streams = async {
-            tokio::join!(
-                capture(stdout, budget.clone(), limit.clone()),
-                capture(stderr, budget.clone(), limit.clone())
-            )
-        };
-        tokio::pin!(streams);
-        let timer = tokio::time::sleep(Duration::from_secs(timeout as u64));
-        tokio::pin!(timer);
-        let mut output = None;
-        let (mut status, reason) = loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break (None, Some("cancelled")),
-                _ = &mut timer => break (None, Some("timeout")),
-                _ = limit.cancelled() => break (None, Some("output_limit")),
-                result = child.wait() => break (Some(result?), None),
-                result = &mut streams, if output.is_none() => { output = Some(result); }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let (command, timeout) = command_args(args)?;
+            check_cancel(cancel)?;
+            self.mark_shell_used()?;
+            #[cfg(unix)]
+            let mut process = {
+                let mut c = tokio::process::Command::new("/bin/sh");
+                c.arg("-c");
+                c.process_group(0);
+                c
+            };
+            #[cfg(windows)]
+            let mut process = {
+                let mut c = tokio::process::Command::new("cmd.exe");
+                c.args(["/D", "/S", "/C"]);
+                c
+            };
+            #[cfg(not(any(unix, windows)))]
+            bail!("run_command не поддерживается на этой платформе");
+            process
+                .arg(command)
+                .current_dir(&self.root)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            for (key, value) in std::env::vars_os() {
+                if allowed_env(&key.to_string_lossy()) {
+                    process.env(key, value);
+                }
             }
-        };
-        // Also terminate descendants retaining pipes after their shell exits.
-        group.kill();
-        if status.is_none() {
-            let _ = child.start_kill();
-            status = Some(child.wait().await?);
+            process.env("PWD", &self.root);
+            process.env("RCODE_MODEL_SHELL", "1");
+            let mut child = process.spawn().context("Не удалось запустить shell")?;
+            let mut group = ProcessGroup::new(child.id());
+            let stdout = child.stdout.take().context("stdout pipe отсутствует")?;
+            let stderr = child.stderr.take().context("stderr pipe отсутствует")?;
+            let budget = Arc::new(AtomicUsize::new(0));
+            let limit = CancellationToken::new();
+            let streams = async {
+                tokio::join!(
+                    capture(stdout, budget.clone(), limit.clone()),
+                    capture(stderr, budget.clone(), limit.clone())
+                )
+            };
+            tokio::pin!(streams);
+            let timer = tokio::time::sleep(Duration::from_secs(timeout as u64));
+            tokio::pin!(timer);
+            let mut output = None;
+            let (mut status, reason) = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break (None, Some("cancelled")),
+                    _ = &mut timer => break (None, Some("timeout")),
+                    _ = limit.cancelled() => break (None, Some("output_limit")),
+                    result = child.wait() => break (Some(result?), None),
+                    result = &mut streams, if output.is_none() => { output = Some(result); }
+                }
+            };
+            // Also terminate descendants retaining pipes after their shell exits.
+            group.kill();
+            if status.is_none() {
+                let _ = child.start_kill();
+                status = Some(child.wait().await?);
+            }
+            let output = match output {
+                Some(output) => output,
+                None => tokio::time::timeout(Duration::from_secs(1), &mut streams)
+                    .await
+                    .unwrap_or_else(|_| (Ok(Vec::new()), Ok(Vec::new()))),
+            };
+            let (stdout, stderr) = (output.0?, output.1?);
+            let status = status.context("Статус процесса отсутствует")?;
+            let reason = reason.or_else(|| {
+                if budget.load(Ordering::Relaxed) > MAX_OUTPUT_BYTES {
+                    Some("output_limit")
+                } else {
+                    None
+                }
+            });
+            let content = json!({"exit_code":status.code(),"signal":exit_signal(&status),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"reason":reason,"shell_changes_managed":false,"note":SHELL_NOTE,"termination":if cfg!(unix) {"process_group"} else {"best_effort_child_only"}}).to_string();
+            Ok(ToolOutcome {
+                is_error: reason.is_some() || !status.success(),
+                content,
+                changed_paths: vec![],
+                recorded_operation: None,
+                recorded_output: None,
+            })
         }
-        let output = match output {
-            Some(output) => output,
-            None => tokio::time::timeout(Duration::from_secs(1), &mut streams)
-                .await
-                .unwrap_or_else(|_| (Ok(Vec::new()), Ok(Vec::new()))),
-        };
-        let (stdout, stderr) = (output.0?, output.1?);
-        let status = status.context("Статус процесса отсутствует")?;
-        let reason = reason.or_else(|| {
-            if budget.load(Ordering::Relaxed) > MAX_OUTPUT_BYTES {
-                Some("output_limit")
-            } else {
-                None
-            }
-        });
-        let content = json!({"exit_code":status.code(),"signal":exit_signal(&status),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"reason":reason,"shell_changes_managed":false,"note":SHELL_NOTE,"termination":if cfg!(unix) {"process_group"} else {"best_effort_child_only"}}).to_string();
-        Ok(ToolOutcome {
-            is_error: reason.is_some() || !status.success(),
-            content,
-            changed_paths: vec![],
-            recorded_operation: None,
-            recorded_output: None,
-        })
     }
 }
 
@@ -1772,7 +1782,7 @@ fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool> {
             .with_context(|| format!("{key} должен быть boolean"))
     })
 }
-fn validate_args(name: &str, args: &Value) -> Result<()> {
+pub(crate) fn validate_args(name: &str, args: &Value) -> Result<()> {
     let definition = Tools::definitions()
         .into_iter()
         .find(|d| d.name == name)
@@ -1795,7 +1805,7 @@ fn validate_args(name: &str, args: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn command_args(args: &Value) -> Result<(&str, usize)> {
+pub(crate) fn command_args(args: &Value) -> Result<(&str, usize)> {
     let command = string_arg(args, "command")?;
     ensure!(
         !command.trim().is_empty() && command.len() <= 16_384 && !command.contains('\0'),
@@ -1803,6 +1813,7 @@ fn command_args(args: &Value) -> Result<(&str, usize)> {
     );
     Ok((command, usize_arg(args, "timeout_secs", 60, 1, 300)?))
 }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn allowed_env(key: &str) -> bool {
     #[cfg(windows)]
     let normalized_key = key.to_ascii_uppercase();
@@ -1823,6 +1834,7 @@ fn allowed_env(key: &str) -> bool {
             | "PATHEXT"
     ) || key.starts_with("LC_")
 }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn capture(
     mut stream: impl AsyncRead + Unpin,
     budget: Arc<AtomicUsize>,
@@ -1845,9 +1857,11 @@ async fn capture(
     Ok(output)
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct ProcessGroup {
     pid: Option<u32>,
 }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ProcessGroup {
     fn new(pid: Option<u32>) -> Self {
         Self { pid }
@@ -1867,11 +1881,13 @@ impl ProcessGroup {
         }
     }
 }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.kill();
     }
 }
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exit_signal(status: &ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
