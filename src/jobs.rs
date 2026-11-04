@@ -180,6 +180,16 @@ pub struct InputTicket {
     completion: oneshot::Receiver<InputDelivery>,
 }
 impl InputTicket {
+    pub(crate) fn try_delivery(&mut self) -> Result<Option<InputDelivery>> {
+        match self.completion.try_recv() {
+            Ok(delivery) => Ok(Some(delivery)),
+            Err(oneshot::error::TryRecvError::Empty) => Ok(None),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                anyhow::bail!("input delivery unavailable")
+            }
+        }
+    }
+
     pub async fn wait(self) -> Result<InputDelivery> {
         self.completion
             .await
@@ -502,7 +512,7 @@ fn validate_identity(value: &str, patterns: &[Vec<u8>]) -> Result<()> {
     );
     Ok(())
 }
-fn allowed_env(key: &str) -> bool {
+pub(crate) fn allowed_env(key: &str) -> bool {
     matches!(
         key,
         "PATH" | "HOME" | "USER" | "LOGNAME" | "LANG" | "TMPDIR" | "TEMP" | "TMP" | "SYSTEMROOT"

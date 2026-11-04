@@ -169,6 +169,21 @@ fn definition(
     }
 }
 
+pub(crate) fn is_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "start_command" | "poll_command" | "send_command_input" | "stop_command"
+    )
+}
+
+pub(crate) fn offered(writable: bool) -> Vec<ToolDefinition> {
+    if writable && cfg!(any(target_os = "macos", target_os = "linux")) {
+        definitions()
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         definition(

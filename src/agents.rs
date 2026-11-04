@@ -632,6 +632,7 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
     let definitions: Vec<_> = Tools::definitions()
         .into_iter()
         .filter(|definition| !task.read_only || readonly_tool(&definition.name))
+        .chain(crate::job_tools::offered(!task.read_only))
         .chain(std::iter::once(crate::artifact_tool::definition()))
         .collect();
     let mut tool_requests = 0;

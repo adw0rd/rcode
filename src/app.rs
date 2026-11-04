@@ -27,33 +27,46 @@ use tokio_util::sync::CancellationToken;
 
 pub struct Events {
     pub json: bool,
-    pub(crate) secrets: Vec<String>,
+    secrets: std::sync::Mutex<Vec<String>>,
     pub(crate) display: crate::presentation::Human,
 }
 impl Events {
     pub fn new(json: bool) -> Self {
         Self {
             json,
-            secrets: Vec::new(),
+            secrets: std::sync::Mutex::new(Vec::new()),
             display: crate::presentation::Human::new(false),
         }
     }
-    pub(crate) fn remember(&mut self, secret: String) {
+    pub(crate) fn remember(&self, secret: String) {
+        let mut secrets = self.secrets.lock().unwrap_or_else(|e| e.into_inner());
         if secret.is_empty() {
             return;
         }
         let mut variant = secret;
         for _ in 0..3 {
-            if !self.secrets.contains(&variant) {
-                self.secrets.push(variant.clone());
+            if !secrets.contains(&variant) {
+                secrets.push(variant.clone());
             }
             let encoded = serde_json::to_string(&variant).expect("string serialization");
             variant = encoded[1..encoded.len() - 1].to_owned();
         }
-        self.secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    }
+    pub(crate) fn secret_snapshot(&self) -> Vec<String> {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub(crate) fn refresh_keys(&self, store: &ConfigStore) -> Result<()> {
+        for secret in store.redaction_secrets()? {
+            self.remember(secret);
+        }
+        Ok(())
     }
     pub(crate) fn redact(&self, text: &str) -> String {
-        crate::redaction::redact_text(text, &self.secrets)
+        crate::redaction::redact_text(text, &self.secret_snapshot())
             .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
     }
     fn redact_value(&self, value: &mut Value) {
@@ -398,7 +411,7 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     let mut execution = crate::session_runtime::SessionRuntime::new(
         &session.dir(&store),
         &session.id,
-        events.secrets.clone(),
+        events.secret_snapshot(),
     )?;
     execution.activate()?;
     execution.reconcile_receipts(&mut session)?;
@@ -453,7 +466,7 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     };
     // Neither ordinary errors nor an interactive /exit skip asynchronous cleanup.
     let cleanup = execution
-        .shutdown_saved(&mut session, &store, &events.secrets)
+        .shutdown_saved(&mut session, &store, &events.secret_snapshot())
         .await;
     match (result, cleanup) {
         (Ok(code), Ok(())) => Ok(code),
@@ -605,6 +618,7 @@ fn turn_definitions(plan: bool, local: bool, skills: bool) -> Vec<ToolDefinition
     Tools::definitions()
         .into_iter()
         .filter(|tool| !plan || matches!(tool.name.as_str(), "read_file" | "list_files" | "search"))
+        .chain(crate::job_tools::offered(!plan))
         .chain(AgentPool::definitions())
         .chain(std::iter::once(crate::task_state::definition()))
         .chain(std::iter::once(crate::artifact_tool::definition()))
@@ -689,6 +703,9 @@ struct ToolExecutor<'a> {
     artifacts: Option<&'a crate::artifacts::ArtifactStore>,
     turn_index: u64,
     journal: Option<&'a mut crate::operation_journal::OperationJournal>,
+    jobs: Option<&'a crate::jobs::JobsSupervisor>,
+    managed: Option<&'a mut crate::managed_jobs::ManagedJobs>,
+    job_cancel: CancellationToken,
 }
 
 #[derive(Default)]
@@ -1223,7 +1240,7 @@ async fn graceful_finish(
         format!("{FINAL_SUMMARY_PROMPT}\n\nПричина остановки хода: {reason}"),
     ));
     let definitions: Vec<crate::protocol::ToolDefinition> = Vec::new();
-    let mut guard = StreamGuard::new(&events.secrets)?;
+    let mut guard = StreamGuard::new(&events.secret_snapshot())?;
     events.busy("Составляю итог хода без инструментов");
     let mut emit = |chunk: &str| {
         let clean = guard.push(chunk, false);
@@ -1323,12 +1340,12 @@ fn persist_user_request(
         tool: tool.into(),
         call_id: format!("user-{turn}"),
     };
-    let source = store.capture(origin("user_request"), request, &events.secrets)?;
+    let source = store.capture(origin("user_request"), request, &events.secret_snapshot())?;
     let reference = crate::task_state::TaskReference::from_artifact(&source)?;
     let journal = store.capture(
         origin("user_request_journal"),
         &json!({"version":1,"request":reference,"previous":state.request_journal()}).to_string(),
-        &events.secrets,
+        &events.secret_snapshot(),
     )?;
     state.host_followup_saved(request, &source, &journal)
 }
@@ -1340,6 +1357,28 @@ const FINAL_SUMMARY_PROMPT: &str = "КРИТИЧНО: ЛИМИТ ХОДА ДОС
 const REPEATED_RESULT_FEEDBACK: &str = "[rcode runtime feedback, not a new user permission] The same call with the same arguments returned exactly the same result again in this turn; repeating it adds no information and only fills the limited context. Use the result you already received and continue the user's current request. If a part is missing (for example, marked by rcode_truncated), get only that part: read_file with start_line/max_lines, search for a specific term, or a different, narrower argument. If you have enough information, finish the task or report what remains. Further identical repeats stop the turn.";
 
 impl ToolExecutor<'_> {
+    async fn settle_managed(&mut self, session: &mut Session) -> Result<()> {
+        let (Some(jobs), Some(managed), Some(journal), Some(artifacts), Some(store)) = (
+            self.jobs,
+            self.managed.as_deref_mut(),
+            self.journal.as_deref_mut(),
+            self.artifacts,
+            self.store,
+        ) else {
+            return Ok(());
+        };
+        if !managed.pending() {
+            return Ok(());
+        }
+        self.events.refresh_keys(store)?;
+        let secrets = self.events.secret_snapshot();
+        jobs.refresh_credentials(&secrets).await?;
+        managed
+            .settle(jobs, journal, artifacts, session, store, &secrets)
+            .await?;
+        Ok(())
+    }
+
     fn capture_receipt(
         &self,
         call: &ToolCall,
@@ -1366,7 +1405,7 @@ impl ToolExecutor<'_> {
                 call_id: call.id.clone(),
             },
             &outcome.content,
-            &self.events.secrets,
+            &self.events.secret_snapshot(),
         )?;
         let mut value = match serde_json::from_str::<Value>(&outcome.content) {
             Ok(Value::Object(object)) => Value::Object(object),
@@ -1450,6 +1489,9 @@ impl ToolExecutor<'_> {
             ));
         }
         let agent_id = actor.map(|request| request.agent_id.as_str());
+        if let Some(store) = self.store {
+            self.events.refresh_keys(store)?;
+        }
         self.events.emit("tool_start", json!({"id":call.id,"name":name,"arguments":call.function.arguments,"agent_id":agent_id}));
         let args = serde_json::from_str::<Value>(&call.function.arguments).map(|mut args| {
             self.events.redact_value(&mut args);
@@ -1547,6 +1589,9 @@ impl ToolExecutor<'_> {
                 }
             }
         };
+        if let Some(store) = self.store {
+            self.events.refresh_keys(store)?;
+        }
         let mut outcome = outcome;
         outcome.content = self.events.redact(&outcome.content);
         self.last_error = outcome.is_error;
@@ -1566,7 +1611,32 @@ impl ToolExecutor<'_> {
         actor: Option<&AgentRequest>,
         session: Option<&mut Session>,
     ) -> Result<ToolOutcome> {
-        let name = call.function.name.as_str();
+        let original_args = args;
+        let managed = if crate::job_tools::is_tool(&call.function.name) {
+            match crate::job_tools::parse(&call.function.name, args) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    return Ok(ToolOutcome::error(
+                        json!({"error":"invalid_arguments","message":format!("{error:#}")})
+                            .to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let input = matches!(managed, Some(crate::job_tools::JobRequest::Input(_)));
+        let shell_args = match &managed {
+            Some(crate::job_tools::JobRequest::Start(a)) => Some(json!({"command":a.command})),
+            Some(crate::job_tools::JobRequest::Input(a)) => Some(json!({"command":a.text})),
+            _ => None,
+        };
+        let args = shell_args.as_ref().unwrap_or(args);
+        let name = if shell_args.is_some() {
+            "run_command"
+        } else {
+            call.function.name.as_str()
+        };
         let write = matches!(name, "write_file" | "edit_file");
         let shell = name == "run_command";
         let full_access = self.cli.permissions() == ApprovalMode::FullAccess;
@@ -1627,7 +1697,7 @@ impl ToolExecutor<'_> {
                 return Ok(ToolOutcome::error(format!("{error:#}")));
             }
         }
-        if write || shell {
+        if write || (shell && !input) {
             let validation = self
                 .tools
                 .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))
@@ -1669,9 +1739,11 @@ impl ToolExecutor<'_> {
                     risk,
                     Some(ShellRisk::Dangerous { .. }) | Some(ShellRisk::Deletion { .. })
                 )
+                && !input
                 && self.shell_rule_permits(args))
             || (shell
                 && matches!(risk, Some(ShellRisk::Deletion { .. }))
+                && !input
                 && self.deletion_scope_permits(args))
             || (!write && !shell)
         {
@@ -1679,13 +1751,21 @@ impl ToolExecutor<'_> {
         } else if !ui::terminal() || self.cli.json {
             false
         } else {
-            let mut preview = if shell {
+            let mut preview = if input {
+                format!(
+                    "Ввод в работающий процесс (отдельное разрешение): {}",
+                    original_args
+                )
+            } else if shell {
                 ui::shell_preview(self.tools.root(), args)?
             } else {
                 self.tools
                     .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))?
                     .unwrap_or_else(|| args.to_string())
             };
+            if matches!(managed, Some(crate::job_tools::JobRequest::Start(ref a)) if a.stdin) {
+                preview.push_str("\nstdin будет открыт; отправка текста проверяется отдельно.");
+            }
             if let Some(request) = actor {
                 preview = format!(
                     "Субагент {} ({})\n{preview}",
@@ -1705,7 +1785,7 @@ impl ToolExecutor<'_> {
                     "Удаление файлов запрашивает подтверждение всегда, даже в full-access.",
                 );
             }
-            let always: Option<String> = if danger.is_some() {
+            let always: Option<String> = if danger.is_some() || input {
                 None
             } else if let Some(scope) = &deletion_scope {
                 Some(format!("удаления в {}", scope.display()))
@@ -1795,6 +1875,11 @@ impl ToolExecutor<'_> {
             || format!("Выполняю {name}"),
             |request| format!("Субагент {} · {name}", ui::safe(&request.name)),
         ));
+        if let Some(request) = managed {
+            return self
+                .execute_managed(call, original_args, request, cancel, actor, session)
+                .await;
+        }
         let durable = if write || shell {
             if let Some(journal) = self.journal.as_deref_mut() {
                 let session =
@@ -1813,7 +1898,7 @@ impl ToolExecutor<'_> {
                     call,
                     actor.map(|r| r.agent_id.as_str()),
                     args,
-                    &self.events.secrets,
+                    &self.events.secret_snapshot(),
                 )?;
                 Some((pending, session, artifacts, store))
             } else {
@@ -1840,10 +1925,149 @@ impl ToolExecutor<'_> {
                 store,
                 call,
                 outcome,
-                &self.events.secrets,
+                &self.events.secret_snapshot(),
             )
         } else {
             Ok(outcome)
+        }
+    }
+
+    async fn execute_managed(
+        &mut self,
+        call: &ToolCall,
+        args: &Value,
+        request: crate::job_tools::JobRequest,
+        cancel: &CancellationToken,
+        actor: Option<&AgentRequest>,
+        session: Option<&mut Session>,
+    ) -> Result<ToolOutcome> {
+        use crate::{
+            job_tools::JobRequest,
+            jobs::{JobKind, JobOrigin, JobSpec},
+        };
+        anyhow::ensure!(
+            cfg!(any(target_os = "macos", target_os = "linux")),
+            "Управление процессами недоступно на этой платформе"
+        );
+        let session = session.ok_or_else(|| anyhow::anyhow!("Состояние задачи недоступно"))?;
+        let jobs = self
+            .jobs
+            .ok_or_else(|| anyhow::anyhow!("Runtime процессов недоступен"))?;
+        let managed = self
+            .managed
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::anyhow!("Runtime процессов недоступен"))?;
+        let journal = self
+            .journal
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::anyhow!("Журнал недоступен"))?;
+        let artifacts = self
+            .artifacts
+            .ok_or_else(|| anyhow::anyhow!("Хранилище результатов недоступно"))?;
+        let store = self
+            .store
+            .ok_or_else(|| anyhow::anyhow!("Хранилище сессии недоступно"))?;
+        let secrets = self.events.secret_snapshot();
+        let owner = actor.map(|a| a.agent_id.as_str());
+        jobs.refresh_credentials(&secrets).await?;
+        // Drain before the short receipt begins; its revision must remain fixed.
+        managed
+            .settle(jobs, journal, artifacts, session, store, &secrets)
+            .await?;
+        if matches!(request, JobRequest::Start(_) | JobRequest::Input(_)) {
+            self.tools.mark_shell_used()?;
+        }
+        let pending = crate::operation_receipts::begin(
+            journal, artifacts, session, store, call, owner, args, &secrets,
+        )?;
+        let mut direct = None;
+        let result: Result<Option<crate::jobs::JobSnapshot>> = async {
+            anyhow::ensure!(
+                !cancel.is_cancelled() && !actor.is_some_and(|a| a.reply.is_closed()),
+                "Задача отменена; действие не исполнялось"
+            );
+            match request {
+                JobRequest::Start(a) => {
+                    let spec = JobSpec {
+                        kind: JobKind::Managed,
+                        argv: vec!["/bin/sh".into(), "-c".into(), a.command],
+                        cwd: self.tools.root().to_path_buf(),
+                        env: std::env::vars()
+                            .filter(|(k, _)| crate::jobs::allowed_env(k))
+                            .collect(),
+                        origin: JobOrigin {
+                            actor: owner.map(str::to_owned),
+                            turn: self.turn_index,
+                        },
+                        lifetime: std::time::Duration::from_secs(a.lifetime_minutes * 60),
+                        idle_timeout: std::time::Duration::from_secs(a.idle_minutes * 60),
+                        stdin: a.stdin,
+                    };
+                    let scope = actor.map_or_else(|| self.job_cancel.clone(), |a| a.cancel.clone());
+                    managed
+                        .start(
+                            jobs, journal, artifacts, session, store, call, args, spec, scope,
+                            cancel, &secrets,
+                        )
+                        .await
+                        .map(Some)
+                }
+                JobRequest::Poll(a) => jobs
+                    .poll_snapshot(
+                        owner,
+                        &a.command_id,
+                        a.stdout_offset,
+                        a.stderr_offset,
+                        a.max_bytes,
+                    )
+                    .map(Some),
+                JobRequest::Stop(a) => jobs.stop(owner, &a.command_id).await.map(Some),
+                JobRequest::Input(a) => {
+                    direct = Some(
+                        managed
+                            .send_input(
+                                jobs, journal, artifacts, session, store, call, &a, owner, cancel,
+                                &secrets,
+                            )
+                            .await?,
+                    );
+                    Ok(None)
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(Some(snapshot)) => {
+                jobs.publish_snapshot(&snapshot, |view| {
+                    let mut value = serde_json::to_value(view)?;
+                    value["command_id"] = json!(view.id);
+                    value["inputs"] = managed.input_receipts(&view.id, owner);
+                    crate::operation_receipts::finish(
+                        pending,
+                        journal,
+                        artifacts,
+                        session,
+                        store,
+                        call,
+                        ToolOutcome::success(value.to_string()),
+                        &secrets,
+                    )
+                })
+                .await
+            }
+            other => {
+                let outcome = match other {
+                    Ok(None) => ToolOutcome::success(direct.expect("input receipt").to_string()),
+                    Err(error) => ToolOutcome::error(
+                        json!({"error":"command_failed","message":format!("{error:#}")})
+                            .to_string(),
+                    ),
+                    Ok(Some(_)) => unreachable!(),
+                };
+                crate::operation_receipts::finish(
+                    pending, journal, artifacts, session, store, call, outcome, &secrets,
+                )
+            }
         }
     }
 
@@ -2017,9 +2241,12 @@ async fn drive_with_agents<T>(
 ) -> Result<T> {
     tokio::pin!(future);
     let mut open = true;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = executor.cancel.cancelled() => return Err(io::Error::new(io::ErrorKind::Interrupted, "Ход прерван; дочерние задачи отменены").into()),
+            _ = tick.tick() => executor.settle_managed(session).await?,
             request = inbox.recv(), if open => match request {
                 Some(request) => executor.serve(request, session).await?,
                 None => open = false,
@@ -2146,8 +2373,9 @@ pub(crate) async fn turn(
     let cancel = CancellationToken::new();
     let _interrupt = TurnInterrupt::bind(cancel.clone())?;
     execution.activate()?;
+    events.refresh_keys(store)?;
     execution
-        .settle_jobs(session, store, &events.secrets)
+        .settle_jobs(session, store, &events.secret_snapshot())
         .await?;
     execution.reconcile_receipts(session)?;
     session.repair_pending()?;
@@ -2208,7 +2436,8 @@ pub(crate) async fn turn(
         }
     }
     let job_scope = execution.begin_turn(session.turn_index, &cancel)?;
-    let (artifacts, journal) = execution.receipt_resources()?;
+    let job_cancel = job_scope.cancellation();
+    let (artifacts, journal, jobs, managed) = execution.receipt_resources()?;
     let mut next_task = session.task_state.clone();
     if next_task.goal().is_empty() && !session.messages.is_empty() {
         // Recover an actual prior user message, never a runtime instruction or
@@ -2247,6 +2476,7 @@ pub(crate) async fn turn(
     candidate.task_state = next_task;
     candidate.messages.push(message);
     let candidate_budget = context_budget(client, &candidate, cli, plan, skills);
+    let before = candidate.context_used(&candidate_budget);
     let saved = match candidate.auto_compact_within(0, &candidate_budget) {
         Ok(saved) => saved,
         Err(error) => {
@@ -2256,7 +2486,13 @@ pub(crate) async fn turn(
     };
     *session = candidate;
     if saved > 0 {
-        events.emit("context_compacted", json!({"automatic":true,"saved_chars":saved,"message":"Полные пользовательские запросы сохранены в артефактах; TaskState сохранён."}));
+        ContextPreparation::Compacted {
+            before,
+            after: session.context_used(&candidate_budget),
+            saved,
+            tokens: candidate_budget.is_tokens(),
+        }
+        .report(events);
     }
     session.save(store)?;
     tools.begin_turn()?;
@@ -2272,7 +2508,7 @@ pub(crate) async fn turn(
         cli.max_steps.min(8),
         plan,
     );
-    agents.set_secrets(events.secrets.clone());
+    agents.set_secrets(events.secret_snapshot());
     let mut executor = ToolExecutor {
         tools,
         events,
@@ -2288,6 +2524,9 @@ pub(crate) async fn turn(
         artifacts: Some(artifacts),
         turn_index: session.turn_index,
         journal,
+        jobs: Some(jobs),
+        managed: Some(managed),
+        job_cancel,
     };
     let mut done = None;
     // All return/? paths from this block run the common worker finalizer below.
@@ -2305,7 +2544,8 @@ pub(crate) async fn turn(
             let definitions = turn_definitions(plan, client.is_local(), offers_load_skill(session, skills));
             let mut messages = vec![Message::text("system", system_prompt(session, cli, plan, skills))];
             messages.extend(session.messages.clone());
-            let mut guard = StreamGuard::new(&events.secrets)?;
+            agents.set_secrets(events.secret_snapshot());
+            let mut guard = StreamGuard::new(&events.secret_snapshot())?;
             events.busy(&format!("Думаю · шаг {} / {}", step + 1, cli.max_steps));
             let mut emit = |chunk: &str| {
                 let clean = guard.push(chunk, false);
@@ -2518,11 +2758,25 @@ pub(crate) async fn turn(
     }.await;
     drop(executor);
     let job_cleanup = execution
-        .finish_turn_saved(job_scope, result.is_err(), session, store, &events.secrets)
+        .finish_turn_saved(
+            job_scope,
+            result.is_err(),
+            session,
+            store,
+            &events.secret_snapshot(),
+        )
         .await;
     cancel.cancel();
     agents.shutdown().await;
+    let session_cleanup = if matches!(cli.command, Some(Command::Exec { .. })) {
+        execution
+            .shutdown_saved(session, store, &events.secret_snapshot())
+            .await
+    } else {
+        Ok(())
+    };
     let cleanup: Result<()> = (|| {
+        session_cleanup?;
         sync_agents(session, &mut agents, events)?;
         session.repair_pending()?;
         session.save(store)
@@ -2566,7 +2820,7 @@ mod tests {
         )
         .unwrap();
         let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
-        let mut events = Events::new(false);
+        let events = Events::new(false);
         let key = "manual-shell-private-key";
         events.remember(key.into());
         let before = serde_json::to_value(&session).unwrap();
@@ -2883,6 +3137,9 @@ mod tests {
             artifacts: None,
             turn_index: 0,
             journal: None,
+            jobs: None,
+            managed: None,
+            job_cancel: CancellationToken::new(),
         };
         let read = ToolCall::new("read_file", json!({"path":"a.txt"}));
         assert!(!executor.execute(&read, None, None).await.unwrap().is_error);
@@ -2983,6 +3240,9 @@ mod tests {
                 artifacts: None,
                 turn_index: 0,
                 journal: None,
+                jobs: None,
+                managed: None,
+                job_cancel: CancellationToken::new(),
             };
             for call in [
                 ToolCall::new(
@@ -3042,6 +3302,9 @@ mod tests {
             artifacts: None,
             turn_index: 0,
             journal: None,
+            jobs: None,
+            managed: None,
+            job_cancel: CancellationToken::new(),
         };
         for closed_reply in [false, true] {
             let child_cancel = cancel.child_token();
@@ -3087,7 +3350,7 @@ mod tests {
         tools.begin_turn().unwrap();
         let mut cli = default_cli();
         cli.approval_mode = Some(ApprovalMode::AutoEdit);
-        let mut events = Events::new(true);
+        let events = Events::new(true);
         events.remember("unit-child-api-secret".into());
         let cancel = CancellationToken::new();
         let (reply, receiver) = oneshot::channel();
@@ -3106,6 +3369,9 @@ mod tests {
             artifacts: None,
             turn_index: 0,
             journal: None,
+            jobs: None,
+            managed: None,
+            job_cancel: CancellationToken::new(),
         };
         executor
             .serve(
@@ -3228,7 +3494,7 @@ mod tests {
     }
     #[test]
     fn all_known_keys_remain_redacted_in_nested_json() {
-        let mut events = Events::new(true);
+        let events = Events::new(true);
         events.remember("first-key".into());
         events.remember("second-\"key".into());
         let encoded = json!({"content":"second-\"key"}).to_string();
@@ -3343,6 +3609,7 @@ mod tests {
         // Without skills the tool list is exactly the previous one.
         let previous: Vec<String> = Tools::definitions()
             .into_iter()
+            .chain(crate::job_tools::offered(true))
             .chain(AgentPool::definitions())
             .chain(std::iter::once(crate::task_state::definition()))
             .chain(std::iter::once(crate::artifact_tool::definition()))
@@ -3499,6 +3766,9 @@ mod tests {
             artifacts: None,
             turn_index: 0,
             journal: None,
+            jobs: None,
+            managed: None,
+            job_cancel: CancellationToken::new(),
         };
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
         let outcome = executor.execute(&call, None, None).await.unwrap();

@@ -553,13 +553,14 @@ fn big_prompt(tag: &str, chars: usize) -> String {
 fn local_history_compacts_in_estimated_tokens_before_network() {
     let home = Home::new();
     let server = local_server("m", "OK");
-    // 16384 context: limit 16384 - 4096 - 1638 = 10650 estimated tokens per request.
+    // Leave room for the managed command schemas and durable goal projection.
+    // 20480 context: limit 20480 - 4096 - 2048 = 14336 estimated tokens per request.
     home.add(
         "small",
         &server.base(),
         "openai",
         "m",
-        &["--activate", "--context-tokens", "16384"],
+        &["--activate", "--context-tokens", "20480"],
     );
     let project = home.project("project");
     let mut compacted = Vec::new();
@@ -587,7 +588,7 @@ fn local_history_compacts_in_estimated_tokens_before_network() {
         let body = String::from_utf8_lossy(&request.body).into_owned();
         // ASCII bytes / 2.5 is the estimate rcode uses; JSON framing adds a little.
         assert!(
-            body.len() * 2 / 5 <= 10650 + 1500,
+            body.len() * 2 / 5 <= 14336 + 1500,
             "request too large: {}",
             body.len()
         );

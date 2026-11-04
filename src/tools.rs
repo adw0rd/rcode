@@ -1105,6 +1105,12 @@ impl Tools {
         })
     }
 
+    pub(crate) fn mark_shell_used(&mut self) -> Result<()> {
+        let turn = self.ensure_turn()?;
+        self.checkpoints.turns[turn].shell_used = true;
+        self.persist()
+    }
+
     async fn run_command(
         &mut self,
         args: &Value,
@@ -1112,9 +1118,7 @@ impl Tools {
     ) -> Result<ToolOutcome> {
         let (command, timeout) = command_args(args)?;
         check_cancel(cancel)?;
-        let turn = self.ensure_turn()?;
-        self.checkpoints.turns[turn].shell_used = true;
-        self.persist()?;
+        self.mark_shell_used()?;
         #[cfg(unix)]
         let mut process = {
             let mut c = tokio::process::Command::new("/bin/sh");

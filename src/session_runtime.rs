@@ -77,11 +77,22 @@ impl SessionRuntime {
     pub fn artifacts(&self) -> &ArtifactStore {
         &self.artifacts
     }
+    #[allow(clippy::type_complexity)]
     pub(crate) fn receipt_resources(
         &mut self,
-    ) -> Result<(&ArtifactStore, Option<&mut OperationJournal>)> {
+    ) -> Result<(
+        &ArtifactStore,
+        Option<&mut OperationJournal>,
+        &JobsSupervisor,
+        &mut crate::managed_jobs::ManagedJobs,
+    )> {
         self.activate()?;
-        Ok((&self.artifacts, self.journal.as_mut()))
+        Ok((
+            &self.artifacts,
+            self.journal.as_mut(),
+            &self.jobs,
+            &mut self.managed,
+        ))
     }
 
     pub fn reconcile_receipts(&mut self, session: &mut crate::state::Session) -> Result<()> {
@@ -145,7 +156,8 @@ impl SessionRuntime {
                 call,
                 args,
                 spec,
-                cancel,
+                cancel.clone(),
+                &cancel,
                 secrets,
             )
             .await

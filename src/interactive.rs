@@ -1122,16 +1122,50 @@ pub(crate) async fn run(
                 screen.line(&format!("\n❯ {}", events.redact(&p)));
             }
             Input::Submit(p)
-        } else if rich {
-            composer.read(&footer(session, &runtime, plan, &budget))?
         } else {
-            composer.read_plain(if plan {
+            // One input owner. Keep the async host available to persist natural
+            // command completion while the user is composing or simply idle.
+            let mut editor = std::mem::take(&mut composer);
+            let current_footer = footer(session, &runtime, plan, &budget);
+            let prompt = if plan {
                 "rcode [план] › "
             } else if runtime.permissions() == ApprovalMode::FullAccess {
                 "rcode [полный доступ] › "
             } else {
                 "rcode › "
-            })?
+            };
+            let mut input = tokio::task::spawn_blocking(move || {
+                let result = if rich {
+                    editor.read(&current_footer)
+                } else {
+                    editor.read_plain(prompt)
+                };
+                (editor, result)
+            });
+            let mut timer = tokio::time::interval(Duration::from_millis(250));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut failed_runtime = false;
+            let (editor, result) = loop {
+                tokio::select! {
+                    result = &mut input => break result?,
+                    _ = timer.tick(), if !failed_runtime => {
+                        let settled = async {
+                            events.refresh_keys(store)?;
+                            execution.settle_jobs(session, store, &events.secret_snapshot()).await
+                        }.await;
+                        if let Err(error) = settled {
+                            let cleanup = execution.shutdown_saved(session, store, &events.secret_snapshot()).await;
+                            let error = match cleanup { Ok(()) => error, Err(cleanup) => error.context(format!("Остановка процессов: {cleanup:#}")) };
+                            events.emit("error", json!({"message":events.redact(&format!("{error:#}. Исполнение закрыто. Введите /exit; после перезапуска можно восстановить сессию через /resume."))}));
+                            // Keep the existing editor as the recovery prompt. A closed
+                            // runtime rejects actions; exit preserves Unknown receipts for recovery.
+                            failed_runtime = true;
+                        }
+                    }
+                }
+            };
+            composer = editor;
+            result?
         };
         let input = match input {
             Input::Submit(s) => {
@@ -1158,7 +1192,7 @@ pub(crate) async fn run(
             "/new" | "/clear" | "/resume" | "/help" | "/status" | "/exit" | "/quit"
         ) && let Err(error) = execution.activate()
         {
-            events.emit("error", json!({"message":events.redact(&format!("{error:#}. Исполнение сессии недоступно; используйте /new или /resume."))}));
+            events.emit("error", json!({"message":events.redact(&format!("{error:#}. Исполнение сессии недоступно. Введите /exit; после перезапуска восстановите сессию через /resume."))}));
             continue;
         }
         if let Some(screen) = crate::screen::current() {
@@ -1267,8 +1301,8 @@ pub(crate) async fn run(
                 "/clear"|"/new"=>{
                     let mut next=Session::new(&session.root,session.provider.clone())?;
                     crate::config::ensure_private_directory(&next.dir(store))?;
-                    let mut next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secrets.clone())?;
-                    execution.shutdown_saved(session,store,&events.secrets).await?;
+                    let mut next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secret_snapshot())?;
+                    execution.shutdown_saved(session,store,&events.secret_snapshot()).await?;
                     next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                     let next_tools=configured_tools(&next.root,&next.dir(store).join("checkpoints"),&runtime)?;
                     next.save(store)?;
@@ -1286,8 +1320,8 @@ pub(crate) async fn run(
                         // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
                         let mut restored=Session::load(store,&id,&session.root)?;
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
-                        let mut next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secrets.clone())?;
-                        execution.shutdown_saved(session,store,&events.secrets).await?;
+                        let mut next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secret_snapshot())?;
+                        execution.shutdown_saved(session,store,&events.secret_snapshot()).await?;
                         next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                         next_execution.reconcile_receipts(&mut restored)?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;

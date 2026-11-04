@@ -786,6 +786,11 @@ impl ConfigStore {
     }
 
     /// Generic key slot for auxiliary integrations (for example websearch).
+    /// Host-only redaction material. Never pass this list to children or tools.
+    pub(crate) fn redaction_secrets(&self) -> Result<Vec<String>> {
+        Ok(self.load_credentials()?.providers.into_values().collect())
+    }
+
     pub fn named_credential(&self, name: &str) -> Result<Option<String>> {
         let credentials = self.load_credentials()?;
         Ok(credentials.providers.get(name).cloned())

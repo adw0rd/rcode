@@ -638,7 +638,7 @@ mod tests {
     fn writes_unique_private_files_redacts_the_entire_document_and_keeps_session_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = session(directory.path());
-        let mut events = Events::new(false);
+        let events = Events::new(false);
         let secrets = ["first-export-secret", "second-\"secret"];
         for key in secrets {
             events.remember(key.into());

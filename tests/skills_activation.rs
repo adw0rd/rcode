@@ -1089,6 +1089,12 @@ fn no_skills_keeps_prompt_and_tools_unchanged() {
     assert_no_catalog(without);
     let expected: Vec<String> = Tools::definitions()
         .into_iter()
+        .chain(
+            cfg!(any(target_os = "macos", target_os = "linux"))
+                .then(rcode::job_tools::definitions)
+                .into_iter()
+                .flatten(),
+        )
         .chain(AgentPool::definitions())
         .map(|tool| tool.name)
         .chain([
