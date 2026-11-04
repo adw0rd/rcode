@@ -60,6 +60,25 @@ pub struct PreparedTerminal {
     artifact: ArtifactMeta,
     task_revision: u64,
 }
+
+/// Свидетельство намерения только текущего открытия. Не восстанавливается из
+/// диска/ID и не удерживает filesystem lease после закрытия владельца.
+pub(crate) struct PendingIntent {
+    incarnation: Arc<()>,
+    position: usize,
+    intent: ArtifactMeta,
+    operation_id: String,
+}
+
+impl PendingIntent {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn origin(&self) -> &ArtifactOrigin {
+        &self.intent.origin
+    }
+}
 impl PreparedTerminal {
     pub fn artifact(&self) -> &ArtifactMeta {
         &self.artifact
@@ -128,7 +147,7 @@ pub struct OperationJournal {
     index_limit: usize,
     operation_limit: usize,
     #[cfg(test)]
-    fault: Option<&'static str>,
+    pub(crate) fault: Option<&'static str>,
 }
 
 struct JournalLease {
@@ -276,6 +295,67 @@ impl OperationJournal {
 
     pub(crate) fn check_active(&self) -> Result<()> {
         self.check()
+    }
+
+    pub(crate) fn check_session(&self, session_id: &str) -> Result<()> {
+        ensure!(
+            self.index.session_id == session_id,
+            "Журнал относится к другой сессии"
+        );
+        self.check()
+    }
+
+    pub(crate) fn fail_closed(&mut self) {
+        self.poisoned = true;
+    }
+
+    // Only receipt admission uses this; no public ID-to-capability conversion.
+    pub(crate) fn pending_intent(&self, id: &str) -> Result<PendingIntent> {
+        self.check()?;
+        let position = self
+            .index
+            .records
+            .iter()
+            .position(|r| r.operation_id == id)
+            .ok_or_else(|| anyhow!("Намерение отсутствует"))?;
+        let record = &self.index.records[position];
+        ensure!(
+            record.terminal.is_none() && self.admitted.get(id) == Some(&None),
+            "Намерение не принадлежит текущему открытию или уже завершается"
+        );
+        Ok(PendingIntent {
+            incarnation: self.incarnation.clone(),
+            position,
+            intent: record.intent.clone(),
+            operation_id: id.into(),
+        })
+    }
+
+    pub(crate) fn check_pending(
+        &self,
+        pending: &PendingIntent,
+        session_id: &str,
+        artifacts: &ArtifactStore,
+    ) -> Result<()> {
+        self.check_session(session_id)?;
+        ensure!(
+            Arc::ptr_eq(&self.incarnation, &pending.incarnation),
+            "Намерение принадлежит другому открытию журнала"
+        );
+        let record = self
+            .index
+            .records
+            .get(pending.position)
+            .ok_or_else(|| anyhow!("Намерение отсутствует"))?;
+        ensure!(
+            record.operation_id == pending.operation_id
+                && record.intent == pending.intent
+                && record.origin == pending.intent.origin
+                && record.terminal.is_none()
+                && self.admitted.get(&pending.operation_id) == Some(&None),
+            "Намерение уже завершается или не соответствует журналу"
+        );
+        self.intent(record, artifacts)
     }
 
     pub fn open(session_dir: &Path, session_id: &str, artifacts: &ArtifactStore) -> Result<Self> {
@@ -926,6 +1006,29 @@ impl OperationJournal {
                     .map(|terminal| terminal.payload)
             })
             .transpose()
+    }
+
+    pub(crate) fn committed_reference(
+        &self,
+        operation_id: &str,
+        artifacts: &ArtifactStore,
+    ) -> Result<(ArtifactMeta, u64)> {
+        self.check()?;
+        let record = self
+            .index
+            .records
+            .iter()
+            .find(|r| r.operation_id == operation_id)
+            .ok_or_else(|| anyhow!("Предыдущая операция отсутствует"))?;
+        self.intent(record, artifacts)?;
+        let meta = record
+            .terminal
+            .as_ref()
+            .ok_or_else(|| anyhow!("Предыдущая операция не подтверждена"))?;
+        Ok((
+            meta.clone(),
+            self.terminal(record, meta, artifacts)?.task_revision,
+        ))
     }
 
     /// Pending means unknown, never a retry instruction or proof of failure.

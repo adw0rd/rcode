@@ -62,5 +62,5 @@ mod job_output;
 pub mod job_tools;
 pub mod jobs;
 pub mod operation_journal;
-mod operation_receipts;
+pub mod operation_receipts;
 pub mod session_runtime;

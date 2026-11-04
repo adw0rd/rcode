@@ -4,7 +4,7 @@ use crate::{
     artifacts::{ArtifactMeta, ArtifactOrigin, ArtifactStore},
     config::ConfigStore,
     context::{ContextBudget, preview_receipt},
-    operation_journal::{OperationJournal, Outcome},
+    operation_journal::{OperationJournal, Outcome, PendingIntent},
     protocol::{Message, ProviderMeta, ToolCall, ToolOutcome},
     state::Session,
 };
@@ -18,6 +18,28 @@ pub(crate) struct PendingOperation {
     id: String,
     origin: ArtifactOrigin,
     revision: u64,
+}
+
+/// Host capability долгого действия. Это не разрешение, не PID и не признак
+/// живого процесса. Не сериализуется, не клонируется и не усыновляется при resume.
+pub struct BackgroundOperation {
+    pending: PendingIntent,
+    arguments: ArtifactMeta,
+}
+
+impl BackgroundOperation {
+    pub fn operation_id(&self) -> &str {
+        self.pending.operation_id()
+    }
+}
+
+/// Подтверждённый результат без provider tool message. Полный текст читается
+/// через output; terminal связывает результат с предыдущей завершённой операцией.
+pub struct BackgroundReceipt {
+    pub operation_id: String,
+    pub output: ArtifactMeta,
+    pub terminal: ArtifactMeta,
+    pub task_revision: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -273,6 +295,135 @@ pub(crate) fn finish(
     Ok(outcome)
 }
 
+/// Caller сначала получает разрешение. Native spawn допускается только после
+/// успеха этого метода; ошибка никогда не означает разрешение повторить действие.
+/// Сохраняет задачу/ход, аргументы и намерение, не добавляя provider-сообщений.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_background(
+    journal: &mut OperationJournal,
+    artifacts: &ArtifactStore,
+    session: &mut Session,
+    store: &ConfigStore,
+    call: &ToolCall,
+    actor: Option<&str>,
+    args: &Value,
+    secrets: &[String],
+) -> Result<BackgroundOperation> {
+    journal.check_session(&session.id)?;
+    let mut reservation = session.clone();
+    reservation.task_state = session.task_state.operation_capacity_state(&session.id)?;
+    ensure!(
+        serde_json::to_vec_pretty(&reservation)?.len() <= 8 * 1024 * 1024 - 4096,
+        "В сессии недостаточно места для результата; сократите историю перед действием"
+    );
+    session.save(store)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let origin = ArtifactOrigin {
+        actor: actor.map(str::to_owned),
+        turn: session.turn_index,
+        tool: call.function.name.clone(),
+        call_id: call.id.clone(),
+    };
+    let arguments =
+        artifacts.capture_required(origin.clone(), &serde_json::to_string(args)?, secrets)?;
+    artifacts.verify_required(&arguments)?;
+    let request = serde_json::to_value(SavedRequest {
+        version: 1,
+        arguments: arguments.clone(),
+    })?;
+    journal.begin(&id, origin, &request, artifacts, secrets)?;
+    ensure!(
+        journal.intent_payload(&id, artifacts)? == request,
+        "Удаление секрета изменило ссылку на аргументы"
+    );
+    Ok(BackgroundOperation {
+        pending: journal.pending_intent(&id)?,
+        arguments,
+    })
+}
+
+/// Завершает действие в текущем либо более позднем ходе. Caller подтверждает
+/// реальный исход процесса до вызова. Публикация только после save + commit;
+/// ошибка persistence закрывает журнал до recovery, без повторного spawn.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_background(
+    operation: &BackgroundOperation,
+    journal: &mut OperationJournal,
+    artifacts: &ArtifactStore,
+    session: &mut Session,
+    store: &ConfigStore,
+    outcome: ToolOutcome,
+    secrets: &[String],
+) -> Result<BackgroundReceipt> {
+    // Validate capabilities before writing artifacts, even if a caller retained
+    // an opaque handle after reopening the same session or passed a wrong one.
+    journal.check_pending(&operation.pending, &session.id, artifacts)?;
+    ensure!(
+        session.turn_index >= operation.pending.origin().turn,
+        "Нельзя завершить действие в ходе старше его запуска"
+    );
+    let result = (|| {
+        artifacts.verify_required(&operation.arguments)?;
+        if let Some(previous) = session.task_state.last_operation() {
+            let (terminal, revision) =
+                journal.committed_reference(&previous.operation_id, artifacts)?;
+            ensure!(
+                crate::task_state::TaskReference::from_artifact(&terminal)? == previous.terminal
+                    && revision == previous.revision,
+                "Предыдущий результат задачи не соответствует журналу"
+            );
+        }
+        let revision = session.task_state.next_operation_revision(&session.id)?;
+        let output = artifacts.capture(
+            operation.pending.origin().clone(),
+            &outcome.content,
+            secrets,
+        )?;
+        artifacts.verify_output(&output)?;
+        let payload = serde_json::to_value(SavedResult {
+            version: 1,
+            is_error: outcome.is_error,
+            output: output.clone(),
+            previous: session.task_state.last_operation().cloned(),
+        })?;
+        let prepared = journal.prepare_finish(
+            operation.operation_id(),
+            if outcome.is_error {
+                Outcome::Failed
+            } else {
+                Outcome::Succeeded
+            },
+            &payload,
+            revision,
+            artifacts,
+            secrets,
+        )?;
+        let envelope: Value =
+            serde_json::from_str(&artifacts.verify_required(prepared.artifact())?)?;
+        ensure!(
+            envelope["payload"] == payload,
+            "Удаление секрета изменило ссылку на результат"
+        );
+        let mut candidate = session.clone();
+        candidate.task_state.host_operation_saved(&prepared)?;
+        candidate.save(store)?;
+        let terminal = journal.commit_finish(&prepared, artifacts)?;
+        *session = candidate;
+        Ok(BackgroundReceipt {
+            operation_id: operation.operation_id().into(),
+            output,
+            terminal,
+            task_revision: revision,
+        })
+    })();
+    if result.is_err() {
+        // The runtime retains the handle and must clean up/recover. Do not form
+        // a later chain from a session whose terminal commit is ambiguous.
+        journal.fail_closed();
+    }
+    result
+}
+
 /// Commit журнала важнее текста истории. Проверяем все сохранённые результаты,
 /// даже если соответствующие сообщения уже свернулись при compaction.
 pub(crate) fn reconcile(
@@ -280,6 +431,31 @@ pub(crate) fn reconcile(
     artifacts: &ArtifactStore,
     session: &mut Session,
 ) -> Result<()> {
+    reconcile_background(journal, artifacts, session, &[])
+}
+
+/// Владелец передаёт только удерживаемые фоновые действия текущего открытия.
+/// Capability означает ответственность host за получение результата, а не
+/// liveness процесса. После restart список пуст; строки/PID не заменяют токен.
+pub fn reconcile_background(
+    journal: &OperationJournal,
+    artifacts: &ArtifactStore,
+    session: &mut Session,
+    owned: &[&BackgroundOperation],
+) -> Result<()> {
+    journal.check_session(&session.id)?;
+    let mut current = std::collections::HashSet::new();
+    for operation in owned {
+        journal.check_pending(&operation.pending, &session.id, artifacts)?;
+        ensure!(
+            session.turn_index >= operation.pending.origin().turn,
+            "Фоновое действие относится к более позднему ходу"
+        );
+        ensure!(
+            current.insert(operation.operation_id()),
+            "Повторная capability фонового действия"
+        );
+    }
     let records = journal.records(artifacts)?;
     let mut candidate = session.clone();
     let mut known = std::collections::HashSet::new();
@@ -346,7 +522,9 @@ pub(crate) fn reconcile(
             candidate
                 .task_state
                 .invalidate_operation(&record.operation_id);
-            unresolved.push(record);
+            if !current.contains(record.operation_id.as_str()) {
+                unresolved.push(record);
+            }
             unknown(&record.operation_id)
         };
         let mut matching = candidate
@@ -490,6 +668,509 @@ mod tests {
         }));
         session.save(store).unwrap();
         call
+    }
+
+    fn background(
+        journal: &mut OperationJournal,
+        artifacts: &ArtifactStore,
+        session: &mut Session,
+        store: &ConfigStore,
+    ) -> BackgroundOperation {
+        begin_background(
+            journal,
+            artifacts,
+            session,
+            store,
+            &ToolCall::new("command_lifetime", json!({"command":"host fixture"})),
+            None,
+            &json!({"command":"host fixture"}),
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn background_finishes_across_turns_in_completion_order_with_other_tools() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let first = background(&mut journal, &artifacts, &mut session, &store);
+        let second = background(&mut journal, &artifacts, &mut session, &store);
+        assert!(session.messages.is_empty());
+        assert_eq!(session.task_state.revision(), 0);
+        assert_eq!(journal.records(&artifacts).unwrap().len(), 2);
+        let call = call(&mut session, &store);
+        let ordinary = begin(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &call,
+            None,
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        finish(
+            ordinary,
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &call,
+            ToolOutcome::success("ordinary"),
+            &[],
+        )
+        .unwrap();
+        let ordinary = session.task_state.last_operation().unwrap().clone();
+        let messages = serde_json::to_value(&session.messages).unwrap();
+        session.turn_index += 1;
+        session
+            .task_state
+            .host_followup("Дождаться двух процессов")
+            .unwrap();
+        session.save(&store).unwrap();
+        let before = session.task_state.revision();
+        let second_receipt = finish_background(
+            &second,
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            ToolOutcome::success("SECOND"),
+            &[],
+        )
+        .unwrap();
+        let first_receipt = finish_background(
+            &first,
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            ToolOutcome::success("FIRST"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(second_receipt.task_revision, before + 1);
+        assert_eq!(first_receipt.task_revision, before + 2);
+        assert_eq!(serde_json::to_value(&session.messages).unwrap(), messages);
+        let second_payload = journal
+            .terminal_payload(second.operation_id(), &artifacts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second_payload["previous"]["operation_id"],
+            ordinary.operation_id
+        );
+        let first_payload = journal
+            .terminal_payload(first.operation_id(), &artifacts)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first_payload["previous"]["operation_id"],
+            second.operation_id()
+        );
+        assert!(
+            finish_background(
+                &first,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                ToolOutcome::success("DUPLICATE"),
+                &[]
+            )
+            .is_err()
+        );
+        drop(journal);
+        session = Session::load(&store, &session.id, &session.root).unwrap();
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        assert_eq!(
+            session.task_state.last_operation().unwrap().operation_id,
+            first.operation_id()
+        );
+        assert!(session.task_state.operation_catalog().is_none());
+        assert_eq!(serde_json::to_value(&session.messages).unwrap(), messages);
+        assert_eq!(
+            artifacts.verify_output(&first_receipt.output).unwrap(),
+            "FIRST"
+        );
+        assert_eq!(
+            first_receipt.terminal,
+            *journal.records(&artifacts).unwrap()[0]
+                .terminal
+                .as_ref()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn background_capability_cannot_adopt_reopened_or_foreign_pending() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let pending = background(&mut journal, &artifacts, &mut session, &store);
+        let (_other, other_store, mut other, other_artifacts, mut other_journal) = setup();
+        let before = serde_json::to_value(&other).unwrap();
+        assert!(
+            finish_background(
+                &pending,
+                &mut other_journal,
+                &other_artifacts,
+                &mut other,
+                &other_store,
+                ToolOutcome::success("FOREIGN"),
+                &[]
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&other).unwrap(), before);
+        assert!(other_journal.records(&other_artifacts).unwrap().is_empty());
+        drop(journal);
+        let mut journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        let count = std::fs::read_dir(session.dir(&store).join("artifacts"))
+            .unwrap()
+            .count();
+        assert!(
+            finish_background(
+                &pending,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                ToolOutcome::success("ADOPTED"),
+                &[]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(session.dir(&store).join("artifacts"))
+                .unwrap()
+                .count(),
+            count
+        );
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        assert!(
+            session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("unknown_operations")
+        );
+        assert!(session.task_state.last_operation().is_none());
+    }
+
+    #[test]
+    fn background_reconciliation_distinguishes_owned_work_from_abandoned_intents() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let owned = background(&mut journal, &artifacts, &mut session, &store);
+        let abandoned = background(&mut journal, &artifacts, &mut session, &store);
+        reconcile_background(&journal, &artifacts, &mut session, &[&owned, &abandoned]).unwrap();
+        assert!(session.messages.is_empty());
+        reconcile_background(&journal, &artifacts, &mut session, &[&owned]).unwrap();
+        let warning: Value =
+            serde_json::from_str(session.messages.last().unwrap().content.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(warning["unknown_operations"], 1);
+        assert_eq!(
+            warning["recent"][0]["operation_id"],
+            abandoned.operation_id()
+        );
+        let before = serde_json::to_value(&session).unwrap();
+        assert!(
+            reconcile_background(&journal, &artifacts, &mut session, &[&owned, &owned]).is_err()
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        drop(journal);
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        assert!(reconcile_background(&journal, &artifacts, &mut session, &[&owned]).is_err());
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        reconcile_background(&journal, &artifacts, &mut session, &[]).unwrap();
+        let warning: Value =
+            serde_json::from_str(session.messages.last().unwrap().content.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(warning["unknown_operations"], 2);
+    }
+
+    #[test]
+    fn background_save_failure_preserves_memory_and_blocks_later_commits() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let first = background(&mut journal, &artifacts, &mut session, &store);
+        let second = background(&mut journal, &artifacts, &mut session, &store);
+        let before = serde_json::to_value(&session).unwrap();
+        let path = session.dir(&store).join("session.json");
+        std::fs::write(&path, "foreign edit").unwrap();
+        assert!(
+            finish_background(
+                &first,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                ToolOutcome::success("NOT COMMITTED"),
+                &[]
+            )
+            .is_err()
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foreign edit");
+        assert!(
+            finish_background(
+                &second,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                ToolOutcome::success("LATER"),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(journal.check_active().is_err());
+        drop(journal);
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        assert!(
+            journal
+                .records(&artifacts)
+                .unwrap()
+                .iter()
+                .all(|r| r.outcome == Outcome::Unknown)
+        );
+    }
+
+    #[test]
+    fn background_commit_failure_publishes_nothing_and_recovery_uses_disk_commit() {
+        for point in ["before_rename", "after_rename", "directory_sync"] {
+            let (_temp, store, mut session, artifacts, mut journal) = setup();
+            let pending = background(&mut journal, &artifacts, &mut session, &store);
+            let before = serde_json::to_value(&session).unwrap();
+            journal.fault = Some(point);
+            assert!(
+                finish_background(
+                    &pending,
+                    &mut journal,
+                    &artifacts,
+                    &mut session,
+                    &store,
+                    ToolOutcome::success("TERMINAL"),
+                    &[]
+                )
+                .is_err(),
+                "{point}"
+            );
+            assert_eq!(serde_json::to_value(&session).unwrap(), before, "{point}");
+            assert!(journal.check_active().is_err());
+            drop(journal);
+            session = Session::load(&store, &session.id, &session.root).unwrap();
+            let journal =
+                OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+            reconcile(&journal, &artifacts, &mut session).unwrap();
+            assert_eq!(session.task_state.revision(), 1);
+            assert_eq!(
+                session.task_state.last_operation().is_some(),
+                point != "before_rename"
+            );
+            assert_eq!(
+                journal.records(&artifacts).unwrap()[0].outcome,
+                if point == "before_rename" {
+                    Outcome::Unknown
+                } else {
+                    Outcome::Succeeded
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn background_rejects_old_turn_missing_arguments_and_uncommitted_previous() {
+        for fault in ["turn", "arguments", "previous"] {
+            let (_temp, store, mut session, artifacts, mut journal) = setup();
+            let pending = background(&mut journal, &artifacts, &mut session, &store);
+            match fault {
+                "turn" => session.turn_index = 0,
+                "arguments" => std::fs::remove_file(
+                    session
+                        .dir(&store)
+                        .join("artifacts")
+                        .join(&pending.arguments.id),
+                )
+                .unwrap(),
+                "previous" => {
+                    let other = background(&mut journal, &artifacts, &mut session, &store);
+                    let prepared = journal
+                        .prepare_finish(
+                            other.operation_id(),
+                            Outcome::Succeeded,
+                            &Value::Null,
+                            1,
+                            &artifacts,
+                            &[],
+                        )
+                        .unwrap();
+                    session.task_state.host_operation_saved(&prepared).unwrap();
+                    session.save(&store).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let count = std::fs::read_dir(session.dir(&store).join("artifacts"))
+                .unwrap()
+                .count();
+            let before = serde_json::to_value(&session).unwrap();
+            assert!(
+                finish_background(
+                    &pending,
+                    &mut journal,
+                    &artifacts,
+                    &mut session,
+                    &store,
+                    ToolOutcome::success("MUST NOT WRITE"),
+                    &[]
+                )
+                .is_err(),
+                "{fault}"
+            );
+            assert_eq!(
+                std::fs::read_dir(session.dir(&store).join("artifacts"))
+                    .unwrap()
+                    .count(),
+                count
+            );
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn background_live_process_finishes_after_another_tool_and_turn() {
+        use crate::jobs::{JobKind, JobOrigin, JobSpec, JobStatus, JobsSupervisor};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let pending = background(&mut journal, &artifacts, &mut session, &store);
+        let supervisor = JobsSupervisor::new_for_session(&session.id, vec![]).unwrap();
+        supervisor
+            .attach_cleanup_guard(journal.cleanup_guard())
+            .unwrap();
+        let spec = JobSpec {
+            kind: JobKind::Managed,
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf READY; while [ ! -f release ]; do sleep 0.01; done; printf DONE".into(),
+            ],
+            cwd: session.root.clone(),
+            env: vec![],
+            origin: JobOrigin {
+                actor: None,
+                turn: session.turn_index,
+            },
+            lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+            stdin: false,
+        };
+        // The native effect is admitted only after its durable intent exists.
+        assert_eq!(
+            journal.records(&artifacts).unwrap()[0].outcome,
+            Outcome::Unknown
+        );
+        let started = supervisor
+            .start(spec, CancellationToken::new())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view = supervisor.poll(None, &started.id, 0, 0, 1024).await?;
+                if view.stdout == "READY" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let call = call(&mut session, &store);
+            let write = begin(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                None,
+                &json!({"path":"proof","content":"saved while process is running"}),
+                &[],
+            )?;
+            std::fs::write(session.root.join("proof"), "saved while process is running")?;
+            finish(
+                write,
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                ToolOutcome::success("written"),
+                &[],
+            )?;
+            let previous = session.task_state.last_operation().unwrap().clone();
+            session.turn_index += 1;
+            session.save(&store)?;
+            std::fs::write(session.root.join("release"), "")?;
+            let done = loop {
+                let view = supervisor.poll(None, &started.id, 0, 0, 1024).await?;
+                if view.status != JobStatus::Running {
+                    break view;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            ensure!(
+                done.status == JobStatus::Exited
+                    && done.exit_code == Some(0)
+                    && done.cleanup_complete,
+                "native process did not finish with confirmed cleanup"
+            );
+            let receipt = supervisor
+                .publish_snapshot(&done, |snapshot| {
+                    finish_background(
+                        &pending,
+                        &mut journal,
+                        &artifacts,
+                        &mut session,
+                        &store,
+                        ToolOutcome::success(serde_json::to_string(snapshot)?),
+                        &[],
+                    )
+                })
+                .await?;
+            let saved: Value = serde_json::from_str(&artifacts.verify_output(&receipt.output)?)?;
+            ensure!(
+                saved["stdout"] == "READYDONE" && saved["id"] == started.id,
+                "output does not belong to the native process"
+            );
+            let terminal = journal
+                .terminal_payload(pending.operation_id(), &artifacts)?
+                .unwrap();
+            ensure!(
+                terminal["previous"]["operation_id"] == previous.operation_id,
+                "background receipt lost the intervening tool"
+            );
+            Ok::<_, anyhow::Error>(receipt)
+        })
+        .await;
+        supervisor.shutdown().await.unwrap();
+        let receipt = result.unwrap().unwrap();
+        drop(journal);
+        session = Session::load(&store, &session.id, &session.root).unwrap();
+        let journal =
+            OperationJournal::open(&session.dir(&store), &session.id, &artifacts).unwrap();
+        reconcile(&journal, &artifacts, &mut session).unwrap();
+        assert_eq!(
+            session.task_state.last_operation().unwrap().operation_id,
+            receipt.operation_id
+        );
+        assert_eq!(
+            std::fs::read_to_string(session.root.join("proof")).unwrap(),
+            "saved while process is running"
+        );
     }
 
     #[test]
