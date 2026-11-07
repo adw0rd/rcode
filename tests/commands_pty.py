@@ -121,6 +121,17 @@ def main(binary):
             skill = home / "skills" / "writer" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("---\nname: writer\ndescription: Пишет тексты\n---\nТело скилла\n")
+            browse = home / "skill-sources" / "rstack" / "browse" / "SKILL.md"
+            browse.parent.mkdir(parents=True)
+            browse.write_text("---\nname: browse\ndescription: Открыть браузер\n---\nТело скилла\n")
+            (home / "skills.json").write_text(json.dumps({
+                "version": 1,
+                "sources": {"rstack": {
+                    "kind": "dir", "url": "/fixture/rstack", "ref": None,
+                    "commit": "fixture", "skills_root": "", "tree_sha256": "fixture",
+                    "package_version": None, "installed_at": 0, "updated_at": 0, "only": [],
+                }},
+            }))
 
             terminal = CommandTerminal(binary, workspace, home, [])
             try:
@@ -143,9 +154,41 @@ def main(binary):
                 assert last_user_prompt(fixture) == (
                     "Подготовь PR для задачи 42. Дополнительно учти: 42 \"две части\""), fixture.requests
 
+                # Mentioning the short alias without Tab is ordinary prose.
+                terminal.send("Что делает /browse?\r")
+                terminal.expect_body("CMD_PTY_OK_2")
+                terminal.until(terminal.editor_ready, "composer after ordinary alias mention")
+                assert last_user_prompt(fixture) == "Что делает /browse?", fixture.requests
+
+                # The short alias is a command only at the beginning of a line.
+                terminal.send("/browse открой сайт\r")
+                terminal.expect_body("CMD_PTY_OK_3")
+                terminal.until(terminal.editor_ready, "composer after start-of-line skill alias")
+                prompt = last_user_prompt(fixture)
+                assert "rstack:browse" in prompt and "открой сайт" in prompt, prompt
+                browse_messages = [r for r in fixture.requests if r.get("model")][-1]["messages"]
+                assert browse_messages[-2]["role"] == "assistant", browse_messages
+                assert browse_messages[-2]["tool_calls"][0]["function"]["name"] == "load_skill", browse_messages
+                assert browse_messages[-1]["role"] == "tool", browse_messages
+                assert "Тело скилла" in browse_messages[-1]["content"], browse_messages
+
+                # Inline skills complete from a unique alias to their canonical ID.
+                terminal.send("Пожалуйста, открой /bro")
+                terminal.send("\t")
+                terminal.until(
+                    lambda: any("Пожалуйста, открой /rstack:browse" in row
+                                 for row in terminal.grid.rows()),
+                    "inline skill alias completed to canonical ID",
+                )
+                terminal.send(" потом продолжи\r")
+                terminal.expect_body("CMD_PTY_OK_4")
+                terminal.until(terminal.editor_ready, "composer after inline skill request")
+                prompt = last_user_prompt(fixture)
+                assert prompt == "Пожалуйста, открой /rstack:browse потом продолжи", prompt
+
                 # 2. Unsupported syntax is passed literally and reported once.
                 terminal.send("/run проверь\r")
-                terminal.expect_body("CMD_PTY_OK_2")
+                terminal.expect_body("CMD_PTY_OK_5")
                 terminal.until(terminal.editor_ready, "composer after /run")
                 assert last_user_prompt(fixture) == "Запусти !`touch MARKER` и все тесты проверь", fixture.requests
                 assert "не исполняется" in terminal.text(), terminal.dump()
@@ -160,11 +203,16 @@ def main(binary):
                 terminal.send("\x1b")
                 terminal.until(terminal.editor_ready, "composer after permissions")
 
-                # 4. /skill names the resolved skill in the request.
+                # 4. /skill names the resolved skill in the request and preloads it.
                 terminal.send("/skill writer проверь текст\r")
-                terminal.expect_body("CMD_PTY_OK_3")
+                terminal.expect_body("CMD_PTY_OK_6")
                 terminal.until(terminal.editor_ready, "composer after /skill")
                 assert "writer" in last_user_prompt(fixture), fixture.requests
+                writer_messages = [r for r in fixture.requests if r.get("model")][-1]["messages"]
+                assert writer_messages[-2]["role"] == "assistant", writer_messages
+                assert writer_messages[-2]["tool_calls"][0]["function"]["name"] == "load_skill", writer_messages
+                assert writer_messages[-1]["role"] == "tool", writer_messages
+                assert "Тело скилла" in writer_messages[-1]["content"], writer_messages
 
                 # 5. /help lists custom commands.
                 mark = terminal.mark()
@@ -182,10 +230,24 @@ def main(binary):
 
                 assert not (workspace / "MARKER").exists()
                 posts = [r for r in fixture.requests if r.get("model")]
-                assert len(posts) == 3, len(posts)
+                assert len(posts) == 6, len(posts)
                 assert all(r["model"] == "cloud-model" for r in posts)
             finally:
                 terminal.close()
+
+            plain = CommandTerminal(binary, workspace, home, ["--plain"])
+            try:
+                plain.expect("rcode ›")
+                mark = plain.mark()
+                plain.send("Пожалуйста, открой /bro\t")
+                plain.expect("Пожалуйста, открой /rstack:browse", mark)
+                plain.send(" потом продолжи\r")
+                plain.expect_body("CMD_PTY_OK_7")
+                assert last_user_prompt(fixture) == "Пожалуйста, открой /rstack:browse потом продолжи"
+                plain.send("/exit\r")
+                plain.finished()
+            finally:
+                plain.close()
             print("PASS commands: menu completion, $1/$ARGUMENTS expansion, "
                   "unsupported !-shell notice, builtin shadowing, /skill, /help")
     finally:

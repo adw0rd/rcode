@@ -470,6 +470,7 @@ fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) 
 fn status(
     session: &Session,
     runtime: &Cli,
+    settings: &Settings,
     plan: bool,
     models: &[ModelInfo],
     budget: &ContextBudget,
@@ -507,6 +508,14 @@ fn status(
         );
     }
     context(session, models, budget, skills);
+    let mode = runtime.final_review_mode();
+    let review = crate::final_review::model_target_summary_for_mode(settings, mode);
+    notice!(
+        "Финальное ревью {} · {} / {}",
+        mode.label_ru(),
+        review["provider"].as_str().unwrap_or("same"),
+        ui::safe(review["model"].as_str().unwrap_or_default())
+    );
 }
 /// `skills`: the catalog line of `catalog_summary`.
 fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget, skills: &str) {
@@ -732,10 +741,17 @@ fn skills_view(
     ));
     output
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillRequest {
+    id: String,
+    prompt: String,
+}
+
 /// `/skill ID [запрос]` (DESIGN §6.5): the user request for a skill the
-/// snapshot can load. The skill text is not inlined: the model loads it with
-/// load_skill. Unknown and ambiguous ids fail here, without a model request.
-fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<String> {
+/// snapshot can load. The host preloads the first page via a synthetic
+/// `load_skill` call before the first model request; unknown and ambiguous ids
+/// fail here, without a model request.
+fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<SkillRequest> {
     let rest = rest.trim();
     let (id, request) = rest
         .split_once(char::is_whitespace)
@@ -760,17 +776,106 @@ fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<String> {
             candidates.join(", ")
         ),
     };
-    let mut text = format!(
-        "Пользователь явно выбрал скилл {}. Загрузи его через load_skill и действуй по нему",
+    let mut prompt = format!(
+        "Пользователь явно выбрал скилл {}; rcode уже загрузил его через load_skill (результат ниже). Если есть next_line — дочитай через load_skill. Действуй по скиллу",
         skill.id
     );
     if request.is_empty() {
-        text.push('.');
+        prompt.push('.');
     } else {
-        text.push_str(": ");
-        text.push_str(request);
+        prompt.push_str(": ");
+        prompt.push_str(request);
     }
-    Ok(text)
+    Ok(SkillRequest {
+        id: skill.id.clone(),
+        prompt,
+    })
+}
+
+fn skill_menu(
+    catalog: &SkillCatalog,
+    registry: &crate::commands::CommandRegistry,
+) -> Vec<terminal::MenuCommand> {
+    let available: Vec<_> = catalog
+        .skills
+        .iter()
+        .filter(|skill| skill.shadowed_by.is_none())
+        .collect();
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for skill in &available {
+        *counts.entry(skill.name.as_str()).or_default() += 1;
+    }
+    let occupied: std::collections::BTreeSet<String> = crate::commands::builtin_names()
+        .into_iter()
+        .chain(registry.menu().into_iter().map(|command| command.name))
+        .collect();
+    let mut menu = Vec::new();
+    for skill in available {
+        let canonical = format!("/{}", skill.id);
+        if occupied.contains(&canonical) {
+            continue;
+        }
+        let status = if skill.disabled {
+            " · выключен, явный выбор"
+        } else if skill.disable_model_invocation {
+            " · только явный выбор"
+        } else {
+            ""
+        };
+        let description = format!("{}{}", skill.description, status);
+        menu.push(terminal::MenuCommand {
+            name: canonical,
+            description: description.clone(),
+            custom: false,
+            skill: Some(skill.id.clone()),
+        });
+        let alias = format!("/{}", skill.name);
+        if skill.name != skill.id
+            && counts.get(skill.name.as_str()) == Some(&1)
+            && !occupied.contains(&alias)
+        {
+            menu.push(terminal::MenuCommand {
+                name: alias,
+                description,
+                custom: false,
+                skill: Some(skill.id.clone()),
+            });
+        }
+    }
+    menu
+}
+
+fn start_skill_request(
+    catalog: &SkillCatalog,
+    menu: &[terminal::MenuCommand],
+    input: &str,
+) -> Result<Option<SkillRequest>> {
+    let mut words = input.splitn(2, char::is_whitespace);
+    let first = words.next().unwrap_or_default();
+    let arguments = words.next().unwrap_or_default().trim();
+    let reserved = menu
+        .iter()
+        .any(|command| command.name == first && command.skill.is_none())
+        || crate::commands::builtin_names()
+            .iter()
+            .any(|name| name == first);
+    let canonical = if reserved {
+        None
+    } else {
+        menu.iter()
+            .find(|command| command.skill.is_some() && command.name == first)
+            .and_then(|command| command.skill.as_deref())
+            .or_else(|| {
+                catalog
+                    .skills
+                    .iter()
+                    .find(|skill| skill.shadowed_by.is_none() && format!("/{}", skill.id) == first)
+                    .map(|skill| skill.id.as_str())
+            })
+    };
+    canonical
+        .map(|id| skill_request(catalog, &format!("{id} {arguments}")))
+        .transpose()
 }
 fn cost(session: &Session) {
     notice!(
@@ -785,6 +890,70 @@ fn cost(session: &Session) {
             notice!("Стоимость: API не сообщил цену последнего вызова; оценку не подставляем.")
         }
     }
+    let mut review_totals: std::collections::BTreeMap<(String, String), (u64, u64)> =
+        Default::default();
+    for review in &session.final_reviews {
+        if let Some(usage) = &review.usage {
+            let totals = review_totals
+                .entry((review.provider.clone(), review.model.clone()))
+                .or_default();
+            totals.0 = totals.0.saturating_add(usage.input_tokens);
+            totals.1 = totals.1.saturating_add(usage.output_tokens);
+        }
+    }
+    if !review_totals.is_empty() {
+        notice!("Отдельное финальное ревью:");
+        for ((provider, model), (input, output)) in review_totals {
+            notice!(
+                "  {} / {} · ↑{} входных · ↓{} выходных",
+                ui::safe(&provider),
+                ui::safe(&model),
+                input,
+                output
+            );
+        }
+    }
+}
+
+fn review_model_command(
+    args: &[&str],
+    store: &ConfigStore,
+    settings: &mut Settings,
+    mode: crate::final_review::FinalReviewMode,
+) -> Result<()> {
+    match args {
+        [] | ["status"] => {
+            let value = crate::final_review::model_target_summary_for_mode(settings, mode);
+            notice!(
+                "Финальное ревью: {} · {} / {}",
+                mode.label_ru(),
+                value["provider"].as_str().unwrap_or("same"),
+                value["model"].as_str().unwrap_or_default()
+            );
+        }
+        ["same"] => {
+            crate::final_review::set_same(store, settings)?;
+            notice!("✓ Цель финального ревью: текущая основная модель");
+        }
+        [provider, model] => {
+            crate::final_review::set_selected(store, settings, provider, None, model)?;
+            notice!(
+                "✓ Цель финального ревью сохранена для {} / {}",
+                ui::safe(provider),
+                ui::safe(model)
+            );
+        }
+        ["local", profile, model] => {
+            crate::final_review::set_selected(store, settings, "local", Some(profile), model)?;
+            notice!(
+                "✓ Цель финального ревью сохранена для local / {} / {}",
+                ui::safe(profile),
+                ui::safe(model)
+            );
+        }
+        _ => bail!("Использование: /review-model [status|same|PROVIDER MODEL|local PROFILE MODEL]"),
+    }
+    Ok(())
 }
 fn agents_view(records: &[Value], selector: Option<&str>) -> Result<String> {
     if let Some(selector) = selector {
@@ -899,7 +1068,7 @@ fn help(registry: &crate::commands::CommandRegistry) {
         notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
     }
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог в Markdown; без пути — новый файл в проекте\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -963,14 +1132,28 @@ fn apply_permissions(
     next.allow_shell = false;
     // Drop directory grants from the prior mode, retaining checkpoints and
     // directories explicitly supplied by the operator with --add-dir.
-    let next_tools = configured_tools(
-        &session.root,
-        &session.dir(store).join("checkpoints"),
-        &next,
-    )?;
-    store.save_permissions(&session.root, mode)?;
-    *runtime = next;
-    *tools = next_tools;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Reconfigure directory capabilities in place: opening a second Tools
+        // for this checkpoint would conflict with its lifetime WAL lease.
+        let next_grants = tools.prepare_directory_grants(&next.add_dir)?;
+        store.save_permissions(&session.root, mode)?;
+        *runtime = next;
+        tools.replace_directory_grants(next_grants);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Other platforms retain their existing best-effort Tools backend,
+        // which has no lifetime WAL lease to transfer.
+        let next_tools = configured_tools(
+            &session.root,
+            &session.dir(store).join("checkpoints"),
+            &next,
+        )?;
+        store.save_permissions(&session.root, mode)?;
+        *runtime = next;
+        *tools = next_tools;
+    }
     notice!(
         "✓ Разрешения: {} · {} · сохранено для этого проекта",
         mode.as_str(),
@@ -1112,7 +1295,9 @@ pub(crate) async fn run(
             command_problems(&registry.problems, events);
             shown_command_problems = command_fingerprints;
         }
-        composer.set_commands(registry.menu());
+        let mut menu = registry.menu();
+        menu.extend(skill_menu(&skills, &registry));
+        composer.set_commands(menu.clone());
         let budget = context_budget(client, session, &runtime, plan, &skills);
         if let Some(screen) = crate::screen::current() {
             screen.set_footer(footer(session, &runtime, plan, &budget));
@@ -1221,6 +1406,40 @@ pub(crate) async fn run(
             events.pause();
             continue;
         }
+        if let Some(skill) = start_skill_request(&skills, &menu, input)? {
+            if rich {
+                notice!(
+                    "\n{} {}",
+                    presentation::tone("❯", "1;38;5;110", true),
+                    ui::safe(&redacted)
+                );
+            }
+            if let Err(error) = crate::app::skill_turn(
+                session,
+                store,
+                tools,
+                client,
+                events,
+                &runtime,
+                &skill.prompt,
+                &skill.id,
+                plan,
+                &skills,
+                execution,
+            )
+            .await
+            {
+                events.emit(
+                    "error",
+                    json!({"message":events.redact(&format!("{error:#}"))}),
+                );
+            }
+            events.pause();
+            if let Some(screen) = crate::screen::current() {
+                pending.extend(screen.take_queue());
+            }
+            continue;
+        }
         // /var/folders/.../screen.png is a user path, not a slash command.
         // /attach is parsed with the user prompt so its images reach the same turn.
         if input.starts_with('/')
@@ -1242,6 +1461,33 @@ pub(crate) async fn run(
                 "/model"|"/models"=>select_model(&args,false,rich,store,settings,session,client,events,&mut models).await,
                 "/provider"=>select_model(&args,true,rich,store,settings,session,client,events,&mut models).await,
                 "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
+                "/review-model"=>review_model_command(&args,store,settings,runtime.final_review_mode()),
+                "/final-review"=>{
+                    match args.as_slice() {
+                        [] | ["status"] => {
+                            let mode=runtime.final_review_mode();
+                            let target=crate::final_review::model_target_summary_for_mode(settings,mode);
+                            notice!("Финальное ревью: {} · {} / {}",mode.label_ru(),target["provider"].as_str().unwrap_or("same"),target["model"].as_str().unwrap_or_default());
+                        }
+                        ["on"] => {
+                            crate::final_review::ensure_user_controlled()?;
+                            let route=crate::final_review::resolve_target(settings,&session.provider,&settings.final_review)?;
+                            crate::final_review::selected_credentials(store,&route)?;
+                            runtime.set_final_review_mode(crate::final_review::FinalReviewMode::OneShot);
+                            notice!("✓ Финальное ревью включено для последующих ходов этого запуска");
+                        }
+                        ["repair"] => {
+                            crate::final_review::ensure_user_controlled()?;
+                            let route=crate::final_review::resolve_target(settings,&session.provider,&settings.final_review)?;
+                            crate::final_review::selected_credentials(store,&route)?;
+                            runtime.set_final_review_mode(crate::final_review::FinalReviewMode::Repair);
+                            notice!("✓ Финальное ревью с исправлением (repair) включено для последующих ходов этого запуска");
+                        }
+                        ["off"] => { runtime.set_final_review_mode(crate::final_review::FinalReviewMode::Off); notice!("✓ Финальное ревью выключено"); }
+                        _ => bail!("Использование: /final-review [on|repair|off|status]"),
+                    }
+                    Ok(())
+                },
                 "/vision"=>crate::vision::choose(rich,store,settings,events).await,
                 "/websearch"=>crate::web_search::choose(rich,store,settings,events).await,
                 "/connect"|"/login"=>{let kind=args.first().map(|s|s.parse::<ProviderKind>()).transpose()?;let next=ui::connect(store,settings,kind,rich,None).await?;commit_provider(store,settings,session,client,events,next)?;models.clear();Ok(())},
@@ -1251,7 +1497,7 @@ pub(crate) async fn run(
                     }Ok(())
                 },
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
-                "/status"=>{let rendered=skill_catalog(session,&skills);status(session,&runtime,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)));Ok(())},
+                "/status"=>{let rendered=skill_catalog(session,&skills);status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)));Ok(())},
                 "/balance"=>{
                     if !args.is_empty(){bail!("/balance — баланс текущего провайдера; сменить провайдера: /provider");}
                     let cancel=tokio_util::sync::CancellationToken::new();
@@ -1287,9 +1533,9 @@ pub(crate) async fn run(
                         return Ok(());
                     }
                     // Checked locally first: an unknown id never reaches the model.
-                    let prompt=skill_request(&skills,rest)?;
+                    let skill=skill_request(&skills,rest)?;
                     if rich{notice!("\n{} {}",presentation::tone("❯","1;38;5;110",true),ui::safe(&redacted));}
-                    turn(session,store,tools,client,events,&runtime,&prompt,plan,&skills,execution).await.map(drop)
+                    crate::app::skill_turn(session,store,tools,client,events,&runtime,&skill.prompt,&skill.id,plan,&skills,execution).await.map(drop)
                 },
                 "/export"=>{
                     let path=crate::export::write(session,input.strip_prefix(command).unwrap_or_default(),|text|events.redact(text))?;
@@ -1318,7 +1564,19 @@ pub(crate) async fn run(
                             let choices=saved.iter().map(|s|Choice{label:if s.title.is_empty(){"Новая сессия".into()}else{s.title.clone()},detail:format!("{} · {}",s.provider,s.id),enabled:true}).collect::<Vec<_>>();choose("Восстановить сессию",&choices,0,rich)?.map(|i|saved[i].id.clone())
                         }
                     };
-                    if let Some(id)=id{
+                    let id=if id.as_deref()==Some("latest"){
+                        Session::list(store)?.into_iter().find(|saved|saved.root==session.root).map(|saved|saved.id)
+                    }else{id};
+                    if id.as_deref()==Some(session.id.as_str()){
+                        // Reload session data without constructing a second
+                        // Tools or SessionRuntime for their already leased
+                        // directories.
+                        let mut restored=Session::load(store,&session.id,&session.root)?;
+                        let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
+                        execution.reconcile_receipts(&mut restored)?;
+                        restored.save(store)?;
+                        *session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                    }else if let Some(id)=id{
                         // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
                         let mut restored=Session::load(store,&id,&session.root)?;
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
@@ -1495,6 +1753,52 @@ mod tests {
         }
     }
 
+    fn no_commands() -> crate::commands::CommandRegistry {
+        crate::commands::CommandRegistry {
+            commands: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn skill_menu_keeps_canonical_ids_and_only_unique_bare_aliases() {
+        let skills = catalog(vec![
+            skill("rstack:browse", SkillScope::Source),
+            skill("other:browse", SkillScope::Source),
+            skill("rstack:review", SkillScope::Source),
+        ]);
+        let menu = skill_menu(&skills, &no_commands());
+        let names: Vec<_> = menu.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"/rstack:browse"));
+        assert!(names.contains(&"/other:browse"));
+        assert!(names.contains(&"/rstack:review"));
+        assert!(names.contains(&"/review"));
+        assert!(
+            !names.contains(&"/browse"),
+            "ambiguous alias must be omitted"
+        );
+    }
+
+    #[test]
+    fn start_skill_alias_and_canonical_id_use_the_explicit_skill_request() {
+        let skills = catalog(vec![skill("rstack:browse", SkillScope::Source)]);
+        let menu = skill_menu(&skills, &no_commands());
+        for input in [
+            "/browse открыть страницу",
+            "/rstack:browse открыть страницу",
+        ] {
+            let request = start_skill_request(&skills, &menu, input).unwrap().unwrap();
+            assert_eq!(request.id, "rstack:browse");
+            assert!(request.prompt.contains("явно выбрал скилл rstack:browse"));
+            assert!(
+                request
+                    .prompt
+                    .contains("rcode уже загрузил его через load_skill (результат ниже)")
+            );
+            assert!(request.prompt.contains("открыть страницу"));
+        }
+    }
+
     #[test]
     fn skills_view_shows_status_size_and_catalog_cost_safely() {
         let mut disabled = skill("superpowers:debugging", SkillScope::Source);
@@ -1612,19 +1916,23 @@ mod tests {
         ]);
         assert_eq!(
             skill_request(&catalog, " brainstorming  новая\nкоманда /export ").unwrap(),
-            "Пользователь явно выбрал скилл brainstorming. Загрузи его через load_skill и действуй по нему: новая\nкоманда /export"
+            SkillRequest {
+                id: "brainstorming".into(),
+                prompt: "Пользователь явно выбрал скилл brainstorming; rcode уже загрузил его через load_skill (результат ниже). Если есть next_line — дочитай через load_skill. Действуй по скиллу: новая\nкоманда /export".into(),
+            }
         );
         // A unique bare name resolves to the full id; no request — no colon.
         assert_eq!(
             skill_request(&catalog, "debugging").unwrap(),
-            "Пользователь явно выбрал скилл superpowers:debugging. Загрузи его через load_skill и действуй по нему."
+            SkillRequest {
+                id: "superpowers:debugging".into(),
+                prompt: "Пользователь явно выбрал скилл superpowers:debugging; rcode уже загрузил его через load_skill (результат ниже). Если есть next_line — дочитай через load_skill. Действуй по скиллу.".into(),
+            }
         );
         // Explicit choice also works for skills outside the catalog.
-        assert!(
-            skill_request(&catalog, "off проверь")
-                .unwrap()
-                .contains("скилл off.")
-        );
+        let explicit_off = skill_request(&catalog, "off проверь").unwrap();
+        assert_eq!(explicit_off.id, "off");
+        assert!(explicit_off.prompt.contains("скилл off;"));
         let ambiguous = skill_request(&catalog, "review").unwrap_err().to_string();
         assert!(
             ambiguous.contains("gstack:review, team:review"),

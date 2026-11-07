@@ -424,6 +424,100 @@ async fn image_api_errors_preserve_context_failures_and_http_status() {
 }
 
 #[tokio::test]
+async fn giga_projects_unsupported_composition_only_at_schema_nodes() {
+    let mut definitions = rcode::job_tools::definitions();
+    definitions.push(ToolDefinition {
+        name: "nested_schema".into(), description: "Fixture schema traversal".into(),
+        parameters: json!({"type":"object","required":["not"],"additionalProperties":false,
+            "properties":{
+                "not":{"type":"string","not":{"pattern":"forbidden"}},
+                "allOf":{"type":"string","enum":["allOf","not"]},
+                "payload":{"type":"object","default":{"allOf":["literal"],"not":true},"enum":[{"allOf":["literal"],"not":true}],"const":{"allOf":"literal","not":"literal"}},
+                "rows":{"type":"array","items":{"type":"object","properties":{"value":{"type":"string","allOf":[{"minLength":1}]}}}},
+                "mapping":{"type":"object","additionalProperties":{"type":"string","not":{"pattern":"forbidden"}}}
+            }})
+    });
+    let original: Vec<_> = definitions.iter().map(|d| d.parameters.clone()).collect();
+    for kind in [ProviderKind::GigaChat, ProviderKind::Custom] {
+        let mut replies = vec![];
+        if kind == ProviderKind::GigaChat {
+            replies.push(Reply::json(
+                json!({"access_token":"schema-token","expires_at":4102444800u64}),
+            ));
+        }
+        replies.push(Reply::json(completion()));
+        let (url, task) = server(replies).await;
+        ProviderClient::new(settings(kind, &url, false), "schema-key".into())
+            .unwrap()
+            .complete(&[Message::user("fixture")], &definitions, &mut |_| {})
+            .await
+            .unwrap();
+        let requests = finish_fixture(task).await;
+        let body = requests.last().unwrap().json();
+        let native = kind == ProviderKind::GigaChat;
+        let wire = if native {
+            &body["functions"]
+        } else {
+            &body["tools"]
+        };
+        for (index, definition) in definitions.iter().enumerate() {
+            let params = if native {
+                &wire[index]["parameters"]
+            } else {
+                &wire[index]["function"]["parameters"]
+            };
+            if !native {
+                assert_eq!(params, &original[index]);
+                continue;
+            }
+            assert_eq!(params["type"], definition.parameters["type"]);
+            assert_eq!(params["required"], definition.parameters["required"]);
+            assert_eq!(
+                params["additionalProperties"],
+                definition.parameters["additionalProperties"]
+            );
+            assert!(params.get("allOf").is_none());
+            if definition.name == "start_command" {
+                assert!(params["properties"]["command"].get("allOf").is_none());
+            }
+            if definition.name == "send_command_input" {
+                assert!(params["properties"]["text"].get("not").is_none());
+            }
+            if definition.name == "nested_schema" {
+                assert_eq!(params["properties"]["not"]["type"], "string");
+                assert!(params["properties"]["not"].get("not").is_none());
+                assert_eq!(
+                    params["properties"]["allOf"]["enum"],
+                    json!(["allOf", "not"])
+                );
+                assert_eq!(
+                    params["properties"]["payload"],
+                    definition.parameters["properties"]["payload"]
+                );
+                assert!(
+                    params["properties"]["rows"]["items"]["properties"]["value"]
+                        .get("allOf")
+                        .is_none()
+                );
+                assert!(
+                    params["properties"]["mapping"]["additionalProperties"]
+                        .get("not")
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|d| d.parameters.clone())
+                .collect::<Vec<_>>(),
+            original,
+            "Нельзя менять общие определения инструментов"
+        );
+    }
+}
+
+#[tokio::test]
 async fn real_agent_tools_use_an_optional_string_hash_for_native_giga_schema() {
     let (url, task) = server(vec![
         Reply::json(json!({"access_token":"schema-token","expires_at":4102444800u64})),
@@ -1534,4 +1628,84 @@ async fn second_giga_401_stops_refreshing_and_does_not_expose_access_token() {
     assert!(!error.to_string().contains("derived-secret"));
     assert!(!error.to_string().contains("auth-key"));
     assert_eq!(finish_fixture(task).await.len(), 4);
+}
+
+#[tokio::test]
+async fn synthetic_skill_preload_serializes_across_compatible_and_giga_adapters() {
+    let call = ToolCall::new("load_skill", json!({"name": "rstack:browse"}));
+    let preload_assistant = Message {
+        role: "assistant".into(),
+        content: Some(String::new()),
+        tool_calls: vec![call.clone()],
+        provider_meta: Some(ProviderMeta {
+            kind: "rcode_skill_preload".into(),
+            data: json!({"skill": "rstack:browse"}),
+        }),
+        ..Message::default()
+    };
+    let receipt =
+        json!({"skill": "rstack:browse", "content": "# Browse\n", "sha256": "abc"}).to_string();
+    let history = [
+        Message::user("Пользователь явно выбрал скилл rstack:browse"),
+        preload_assistant,
+        Message::tool(&call, receipt.clone()),
+    ];
+
+    for kind in [
+        ProviderKind::OpenRouter,
+        ProviderKind::Custom,
+        ProviderKind::Yandex,
+    ] {
+        let (url, task) = server(vec![Reply::json(completion())]).await;
+        let mut client = ProviderClient::new(settings(kind, &url, false), "secret".into()).unwrap();
+        client
+            .complete(&history, &[tool()], &mut |_| {})
+            .await
+            .unwrap();
+        let requests = finish_fixture(task).await;
+        let messages = requests[0].json()["messages"].as_array().unwrap().clone();
+        assert_eq!(messages.len(), 3, "{kind:?}");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "");
+        assert!(messages[1].get("provider_meta").is_none());
+        assert_eq!(messages[1]["tool_calls"][0]["id"], call.id);
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "load_skill"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], call.id);
+        assert_eq!(messages[2]["name"], "load_skill");
+        assert_eq!(messages[2]["content"], receipt);
+    }
+
+    let (url, task) = server(vec![
+        Reply::json(json!({"access_token":"access-secret","expires_at":4102444800000u64})),
+        Reply::json(completion()),
+    ])
+    .await;
+    let mut giga = ProviderClient::new(
+        settings(ProviderKind::GigaChat, &url, false),
+        "base64-key".into(),
+    )
+    .unwrap();
+    giga.complete(&history, &[tool()], &mut |_| {})
+        .await
+        .unwrap();
+    let requests = finish_fixture(task).await;
+    let messages = requests[1].json()["messages"].as_array().unwrap().clone();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["content"], "");
+    assert!(messages[1].get("functions_state_id").is_none());
+    assert_eq!(
+        messages[1]["function_call"],
+        json!({"name": "load_skill", "arguments": {"name": "rstack:browse"}})
+    );
+    assert_eq!(messages[2]["role"], "function");
+    assert_eq!(messages[2]["name"], "load_skill");
+    assert_eq!(
+        serde_json::from_str::<Value>(messages[2]["content"].as_str().unwrap()).unwrap(),
+        serde_json::from_str::<Value>(&receipt).unwrap()
+    );
 }

@@ -342,6 +342,25 @@ pub struct Settings {
     pub websearch: WebSearchSettings,
     #[serde(default, skip_serializing_if = "VisionSettings::is_unset")]
     pub vision: VisionSettings,
+    #[serde(default, skip_serializing_if = "ReviewTarget::is_same")]
+    pub final_review: ReviewTarget,
+}
+
+/// Отдельный маршрут дополнительного host-owned финального ревью.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTarget {
+    #[default]
+    Same,
+    Selected {
+        snapshot: ProviderSettings,
+    },
+}
+
+impl ReviewTarget {
+    pub fn is_same(&self) -> bool {
+        matches!(self, Self::Same)
+    }
 }
 
 /// Вспомогательная модель для чтения изображений, если основная их не
@@ -391,6 +410,7 @@ impl Default for Settings {
             local: crate::local::LocalProfiles::default(),
             websearch: WebSearchSettings::default(),
             vision: VisionSettings::default(),
+            final_review: ReviewTarget::Same,
         }
     }
 }
@@ -1450,6 +1470,34 @@ mod tests {
             settings.provider(ProviderKind::OpenRouter).kind,
             ProviderKind::OpenRouter
         );
+    }
+
+    #[test]
+    fn final_review_settings_are_defaulted_and_round_trip_without_changing_active_provider() {
+        let legacy: Settings = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "active": "custom",
+            "providers": {}
+        }))
+        .unwrap();
+        assert!(matches!(legacy.final_review, ReviewTarget::Same));
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("final_review").is_none());
+
+        let mut selected = legacy.clone();
+        let mut snapshot = ProviderSettings::new(ProviderKind::OpenRouter);
+        snapshot.model = "selected-review-model".into();
+        snapshot.base_url = Some("https://review.example/v1".into());
+        selected.final_review = ReviewTarget::Selected { snapshot };
+        let saved = serde_json::to_value(&selected).unwrap();
+        let loaded: Settings = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.active, ProviderKind::Custom);
+        assert!(matches!(
+            loaded.final_review,
+            ReviewTarget::Selected { snapshot }
+                if snapshot.kind == ProviderKind::OpenRouter && snapshot.model == "selected-review-model"
+        ));
+        assert!(loaded.providers.is_empty());
     }
 
     #[test]

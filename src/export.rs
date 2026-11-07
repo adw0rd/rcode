@@ -263,6 +263,38 @@ fn render(session: &Session, redact: impl Fn(&str) -> String) -> String {
     if count == 0 {
         output.push_str("В сохранённой части диалога пока нет сообщений.\n");
     }
+    if !session.final_reviews.is_empty() {
+        output.push_str("\n## Отдельное финальное ревью\n\n");
+        for review in &session.final_reviews {
+            output.push_str(&format!(
+                "### Ход {} · {} / {} · {}\n\n",
+                review.turn_index,
+                label(&clean(&review.provider)),
+                label(&clean(&review.model)),
+                label(&clean(&review.status)),
+            ));
+            if let Some(result) = &review.result {
+                quoted(&mut output, &clean(result));
+            }
+            if let Some(message) = &review.message {
+                quoted(&mut output, &clean(message));
+            }
+            if let Some(usage) = &review.usage {
+                output.push_str(&format!(
+                    "Токены отдельного ревью: ↑{} входных · ↓{} выходных\n\n",
+                    usage.input_tokens, usage.output_tokens
+                ));
+            }
+            if let Some(repair_status) = &review.repair_status {
+                let verification = review.verification_status.as_deref().unwrap_or("not_run");
+                output.push_str(&format!(
+                    "Доработка основной моделью: {} · проверка: {}\n\n",
+                    label(&clean(repair_status)),
+                    label(&clean(verification))
+                ));
+            }
+        }
+    }
     output.replace(&session.id, "[ID сессии скрыт]")
 }
 
@@ -424,6 +456,52 @@ mod tests {
         assert!(text.contains("## Локальная команда пользователя"));
         assert!(!text.contains("## Ассистент"));
         assert!(text.contains("pwd") && text.contains("/project"));
+    }
+
+    #[test]
+    fn exports_final_review_separately_with_route_result_and_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = session(directory.path());
+        session.messages = vec![Message::user("Исходная задача")];
+        session
+            .final_reviews
+            .push(crate::final_review::FinalReviewRecord {
+                status: "completed".into(),
+                provider: "openrouter".into(),
+                model: "review-model".into(),
+                turn_index: 7,
+                draft_sha256: "PRIVATE_DRAFT_HASH".into(),
+                route_fingerprint: "PRIVATE_ROUTE_HASH".into(),
+                local_profile: None,
+                packet_sha256: Some("PRIVATE_PACKET_HASH".into()),
+                result: Some("Подтверждённая рекомендация".into()),
+                refusal: false,
+                usage: Some(crate::protocol::Usage {
+                    input_tokens: 31,
+                    output_tokens: 9,
+                    ..Default::default()
+                }),
+                message: None,
+                ..Default::default()
+            });
+
+        let text = render(&session);
+        for expected in [
+            "## Отдельное финальное ревью",
+            "Ход 7",
+            "openrouter / review\\-model",
+            "Подтверждённая рекомендация",
+            "↑31 входных · ↓9 выходных",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+        for hidden in [
+            "PRIVATE_DRAFT_HASH",
+            "PRIVATE_ROUTE_HASH",
+            "PRIVATE_PACKET_HASH",
+        ] {
+            assert!(!text.contains(hidden), "export leaked {hidden}");
+        }
     }
 
     #[test]

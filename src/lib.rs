@@ -4,6 +4,9 @@ mod certificates;
 pub(crate) mod commands;
 pub mod config;
 pub mod context;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod file_wal;
+pub mod final_review;
 pub(crate) mod frontmatter;
 pub mod local;
 mod local_app;
@@ -18,10 +21,16 @@ pub(crate) mod skills;
 pub(crate) mod skills_cli;
 pub mod state;
 mod think;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod tools;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[path = "tools_legacy.rs"]
 pub mod tools;
 pub mod vision;
 pub mod web_fetch;
 pub mod web_search;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod workspace_stage;
 
 pub mod app;
 pub mod cli;
@@ -70,3 +79,5 @@ mod managed_jobs;
 pub mod operation_journal;
 pub mod operation_receipts;
 pub mod session_runtime;
+
+pub(crate) mod eval;

@@ -56,6 +56,67 @@ fn output_excerpt(text: &str, max: usize) -> Vec<String> {
     }
     lines
 }
+fn command_receipt(content: &str, is_error: bool) -> Option<(String, String)> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    value.as_object()?;
+    let exit_code = value["exit_code"].as_i64();
+    let signal = value["signal"].as_i64();
+    let reason = value["reason"].as_str().or_else(|| value["error"].as_str());
+    let flag = |key: &str| value.get(key).and_then(Value::as_bool) == Some(true);
+    let truncated = value.get("rcode_truncated").is_some_and(Value::is_object)
+        || flag("truncated")
+        || flag("artifact_truncated")
+        || flag("output_truncated")
+        || flag("payload_unavailable")
+        || flag("redaction_incomplete");
+    let failure =
+        is_error || reason.is_some() || exit_code.is_some_and(|code| code != 0) || signal.is_some();
+    let status = match reason {
+        Some("cancelled") => "прервано".to_owned(),
+        Some("timeout") => "время истекло".to_owned(),
+        Some("output_limit") => "лимит вывода".to_owned(),
+        Some("interrupted") => "результат неизвестен после прерывания".to_owned(),
+        Some(reason) => clip(reason, 100),
+        None => match (exit_code, signal) {
+            (Some(code), _) => format!("exit {code}"),
+            (_, Some(signal)) => format!("сигнал {signal}"),
+            _ if failure => "ошибка · статус неизвестен".to_owned(),
+            _ => "статус неизвестен".to_owned(),
+        },
+    };
+    let state = if failure {
+        "ошибка"
+    } else if exit_code == Some(0) && reason.is_none() && signal.is_none() {
+        "успешно"
+    } else {
+        "не подтверждено"
+    };
+    let mut compact = format!("↳ run_command · {status} · {state}");
+    if truncated {
+        compact.push_str(" · квитанция сокращена");
+    }
+    let mut expanded = vec![compact.clone()];
+    for key in ["stdout", "stderr"] {
+        let output = value[key].as_str().unwrap_or_default();
+        if output.is_empty() {
+            continue;
+        }
+        let label = if key == "stdout" { "stdout" } else { "stderr" };
+        for line in &output_excerpt(output, 2) {
+            compact.push_str(&format!("\n  {label}: {line}"));
+        }
+        expanded.push(format!("  {label}:"));
+        expanded.extend(output.split('\n').map(|line| format!("    {line}")));
+    }
+    if truncated {
+        expanded.push(
+            "  ⚠ В истории сохранена сокращённая квитанция; полный вывод здесь недоступен".into(),
+        );
+    }
+    // `note` intentionally stays in the full serialized receipt, never in
+    // the repeating human view. The user can expand output without seeing it.
+    Some((compact, expanded.join("\n")))
+}
 pub fn tone(text: &str, code: &str, rich: bool) -> String {
     if rich && crate::screen::current().is_none() && std::env::var_os("NO_COLOR").is_none() {
         format!("\x1b[{code}m{text}\x1b[0m")
@@ -383,19 +444,28 @@ impl Human {
                 let error = data["is_error"] == true;
                 let content = data["content"].as_str().unwrap_or_default();
                 let name = data["name"].as_str().unwrap_or_default();
-                if error {
+                if name == "run_command" {
+                    if let Some((compact, expanded)) = command_receipt(content, error) {
+                        if let Some(screen) = screen {
+                            screen.detailed_line(&compact, &expanded);
+                        } else {
+                            for line in expanded.lines() {
+                                line!("{}", ui::safe(line));
+                            }
+                        }
+                    } else if error {
+                        line!(
+                            "{} {}",
+                            tone("    ↳ ошибка", "31", rich),
+                            clip(content, 200)
+                        );
+                    } else {
+                        line!("    ↳ run_command · статус неизвестен");
+                    }
+                } else if error {
                     line!("{}", tone("    ↳ ошибка", "31", rich));
                     for line in output_excerpt(content, 5) {
                         line!("      {line}");
-                    }
-                } else if name == "run_command" {
-                    if let Ok(v) = serde_json::from_str::<Value>(content) {
-                        line!("    ↳ exit {}", v["exit_code"]);
-                        for key in ["stdout", "stderr"] {
-                            for line in output_excerpt(v[key].as_str().unwrap_or_default(), 6) {
-                                line!("      {line}");
-                            }
-                        }
                     }
                 } else if let Some(paths) =
                     data["changed_paths"].as_array().filter(|p| !p.is_empty())
@@ -505,6 +575,63 @@ impl Human {
                     );
                 }
             }
+            "review_started" => line!(
+                "{} Финальное ревью · {} / {} · ход {}",
+                tone("◇", "38;5;110", rich),
+                ui::safe(data["provider"].as_str().unwrap_or("?")),
+                ui::safe(data["model"].as_str().unwrap_or("?")),
+                data["turn_index"].as_u64().unwrap_or_default()
+            ),
+            "review_result" => {
+                line!(
+                    "{} Ответ финального ревью · {} / {}",
+                    tone("◇", "32", rich),
+                    ui::safe(data["provider"].as_str().unwrap_or("?")),
+                    ui::safe(data["model"].as_str().unwrap_or("?"))
+                );
+                for result in data["result"].as_str().unwrap_or_default().lines() {
+                    line!("  {}", ui::safe(result));
+                }
+                if data["usage"].is_null() {
+                    line!(
+                        "  Отдельное ревью · {} / {} · расход токенов неизвестен",
+                        ui::safe(data["provider"].as_str().unwrap_or("?")),
+                        ui::safe(data["model"].as_str().unwrap_or("?"))
+                    );
+                }
+            }
+            "review_failed" => line!(
+                "{} Финальное ревью · {} / {} · {}",
+                tone("!", "33", rich),
+                ui::safe(data["provider"].as_str().unwrap_or("?")),
+                ui::safe(data["model"].as_str().unwrap_or("?")),
+                ui::safe(data["message"].as_str().unwrap_or("не выполнено"))
+            ),
+            "review_usage" => line!(
+                "  Отдельное ревью · {} / {} · ↑{} ↓{} токенов",
+                ui::safe(data["provider"].as_str().unwrap_or("?")),
+                ui::safe(data["model"].as_str().unwrap_or("?")),
+                number(data["usage"]["input_tokens"].as_u64().unwrap_or_default()),
+                number(data["usage"]["output_tokens"].as_u64().unwrap_or_default())
+            ),
+            "repair_started" => line!(
+                "{} Доработка по финальному ревью · {} / {} · ход {}",
+                tone("◇", "38;5;110", rich),
+                ui::safe(data["provider"].as_str().unwrap_or("?")),
+                ui::safe(data["model"].as_str().unwrap_or("?")),
+                data["turn_index"].as_u64().unwrap_or_default()
+            ),
+            "repair_result" => line!(
+                "{} Доработка по финальному ревью завершена · {} · проверка: {}",
+                tone("◇", "32", rich),
+                ui::safe(data["status"].as_str().unwrap_or("completed")),
+                ui::safe(data["verification_status"].as_str().unwrap_or("not_run"))
+            ),
+            "repair_failed" => line!(
+                "{} Доработка по финальному ревью · {}",
+                tone("!", "33", rich),
+                ui::safe(data["message"].as_str().unwrap_or("не выполнена"))
+            ),
             "agent_update" => {
                 let color = match data["status"].as_str().unwrap_or_default() {
                     "completed" => "32",
@@ -631,6 +758,89 @@ fn welcome_to(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn failed_command_receipt_is_compact_expands_and_never_repeats_shell_note() {
+        let receipt = json!({
+            "exit_code": 2,
+            "signal": null,
+            "reason": null,
+            "stdout": "generated first\ngenerated second\ngenerated third\n",
+            "stderr": "Подтвердите действие флагом --yes без терминала\n",
+            "note": crate::tools::SHELL_NOTE,
+            "rcode_truncated": {"original_chars": 9000}
+        })
+        .to_string();
+        let (compact, expanded) = command_receipt(&receipt, true).unwrap();
+        assert!(
+            compact.contains("run_command · exit 2 · ошибка"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("Подтвердите действие флагом --yes"),
+            "{compact}"
+        );
+        assert!(compact.contains("квитанция сокращена"), "{compact}");
+        assert!(
+            !compact.contains("SHELL_NOTE") && !compact.contains("undo"),
+            "{compact}"
+        );
+        assert!(expanded.contains("generated third"), "{expanded}");
+        assert!(
+            expanded.contains("полный вывод здесь недоступен"),
+            "{expanded}"
+        );
+        assert!(
+            !expanded.contains("SHELL_NOTE") && !expanded.contains("undo"),
+            "{expanded}"
+        );
+        let unknown = command_receipt(
+            &json!({"exit_code":null,"signal":null,"reason":null,"stdout":""}).to_string(),
+            false,
+        )
+        .unwrap()
+        .0;
+        assert!(
+            unknown.contains("статус неизвестен · не подтверждено"),
+            "{unknown}"
+        );
+        let unavailable = command_receipt(
+            &json!({"exit_code":0,"stdout":"","output_truncated":true}).to_string(),
+            false,
+        )
+        .unwrap()
+        .0;
+        assert!(unavailable.contains("квитанция сокращена"), "{unavailable}");
+
+        let screen = crate::screen::Screen::test_screen();
+        Human::new(true).emit_to(
+            "tool_result",
+            &json!({"name":"run_command", "is_error":true, "content":receipt}),
+            Some(&screen),
+        );
+        assert!(screen.history_text().contains("exit 2"));
+        assert!(!screen.history_text().contains("\"exit_code\""));
+        assert!(!screen.history_text().contains("undo"));
+    }
+    #[test]
+    fn expanded_command_receipt_shows_all_retained_lines_and_long_rows() {
+        let long_line = format!("BEGIN{}END", "x".repeat(500));
+        let many_lines = (0..101)
+            .map(|line| format!("retained-{line:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let receipt = json!({
+            "exit_code": 0,
+            "stdout": format!("{long_line}\n{many_lines}"),
+            "stderr": ""
+        })
+        .to_string();
+        let (_, expanded) = command_receipt(&receipt, false).unwrap();
+        assert!(expanded.contains(&long_line), "expanded row was clipped");
+        assert!(
+            expanded.contains("retained-100"),
+            "retained tail line was omitted"
+        );
+    }
     #[test]
     fn automatic_compaction_notice_reports_actual_char_counts_without_fake_usage() {
         let screen = crate::screen::Screen::test_screen();

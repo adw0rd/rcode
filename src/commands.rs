@@ -123,6 +123,7 @@ impl CommandRegistry {
                 name: format!("/{}", command.name),
                 description: format!("{} · {}", command.description, command.scope.as_str()),
                 custom: true,
+                skill: None,
             })
             .collect()
     }

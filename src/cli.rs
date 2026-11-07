@@ -75,8 +75,29 @@ pub struct Cli {
     pub plan: bool,
     #[arg(long, global = true, help = "Версионированные события JSONL в stdout")]
     pub json: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Включить отдельный финальный обзор текущего ответа выбранной моделью"
+    )]
+    pub final_review: bool,
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "final_review",
+        help = "Включить финальное ревью с одним ограниченным проходом исправления и проверки"
+    )]
+    pub final_review_repair: bool,
     #[arg(long, global=true, default_value_t=32, value_parser=clap::value_parser!(u32).range(1..=256), help="Предел запросов к модели за один ход (1–256); новый запрос начинает новый ход")]
     pub max_steps: u32,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..=3600),
+        help = "Общий срок работы субагента по часам (1–3600 секунд), включая очередь, API и инструменты; отдельный от HTTP timeout и TTL процесса, модель его не задаёт"
+    )]
+    pub agent_timeout_secs: u64,
     #[command(subcommand)]
     pub command: Option<Command>,
     #[arg(help = "Начальный запрос для интерактивной сессии")]
@@ -103,9 +124,29 @@ impl Cli {
         resolved.approval_mode = Some(self.approval_mode.unwrap_or(saved));
         resolved
     }
+
+    pub fn final_review_mode(&self) -> crate::final_review::FinalReviewMode {
+        if self.final_review_repair {
+            crate::final_review::FinalReviewMode::Repair
+        } else if self.final_review {
+            crate::final_review::FinalReviewMode::OneShot
+        } else {
+            crate::final_review::FinalReviewMode::Off
+        }
+    }
+
+    pub fn set_final_review_mode(&mut self, mode: crate::final_review::FinalReviewMode) {
+        self.final_review = mode == crate::final_review::FinalReviewMode::OneShot;
+        self.final_review_repair = mode == crate::final_review::FinalReviewMode::Repair;
+    }
 }
 #[derive(Debug, Subcommand, Clone)]
 pub enum Command {
+    #[command(about = "Изолированная проверка качества агента")]
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
     #[command(about = "Выполнить задачу и завершиться")]
     Exec {
         #[arg(required=true, num_args=1..)]
@@ -119,6 +160,11 @@ pub enum Command {
     Balance,
     #[command(about = "Сохранённые локальные сессии")]
     Sessions,
+    #[command(about = "Настроить модель финального ревью (без сетевого запроса)")]
+    ReviewModel {
+        #[command(subcommand)]
+        command: ReviewModelCommand,
+    },
     #[command(about = "Проверить настройки; --check проверяет доступ к API")]
     Doctor {
         #[arg(long)]
@@ -149,6 +195,19 @@ pub enum Command {
     Websearch {
         #[command(subcommand)]
         command: WebsearchCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum ReviewModelCommand {
+    #[command(about = "Показать выбранный маршрут")]
+    Status,
+    #[command(about = "Использовать текущий маршрут основной модели")]
+    Same,
+    #[command(about = "Сохранить модель настроенного провайдера или профиля local")]
+    Set {
+        #[arg(long)]
+        model: String,
     },
 }
 
@@ -292,4 +351,142 @@ pub enum LocalCommand {
     },
     #[command(about = "Удалить профиль вместе с ключом")]
     Remove { name: String },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum EvalCommand {
+    #[command(about = "Проверить manifest/fixtures/oracles без исполнения и сети")]
+    Validate {
+        #[arg(long)]
+        suite: PathBuf,
+    },
+    #[command(about = "Изолированный Linux-прогон; требует Docker, Python и явного local profile")]
+    Run(Box<EvalRun>),
+    #[command(about = "Сравнить отчёты с одинаковыми корпусом и настройками")]
+    Compare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+    },
+}
+
+#[derive(Debug, clap::Args, Clone)]
+pub struct EvalRun {
+    #[arg(long)]
+    pub suite: PathBuf,
+    #[arg(long)]
+    pub report: PathBuf,
+    #[arg(long)]
+    pub agent_binary: PathBuf,
+    #[arg(
+        long,
+        help = "Локальный immutable image ID sha256:…; автоматической загрузки нет"
+    )]
+    pub image: String,
+    #[arg(long)]
+    pub docker_socket: PathBuf,
+    #[arg(long, default_value = "docker")]
+    pub docker: PathBuf,
+    #[arg(long, default_value = "python3")]
+    pub python: PathBuf,
+    #[arg(long)]
+    pub series: String,
+    #[arg(long)]
+    pub source_sha256: Option<String>,
+    #[arg(
+        long,
+        help = "Явно разрешить JSON transport для streaming-профиля в этом прогоне"
+    )]
+    pub non_streaming: bool,
+    #[arg(
+        long,
+        help = "Разрешить запуск недоверенного проекта в изолированных контейнерах"
+    )]
+    pub yes: bool,
+}
+
+#[cfg(test)]
+mod agent_timeout_cli_tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    fn parsed_timeout(args: &[&str]) -> Result<Option<u64>, clap::Error> {
+        let matches = Cli::command().try_get_matches_from(args)?;
+        Ok(matches
+            .try_get_one::<u64>("agent_timeout_secs")
+            .ok()
+            .flatten()
+            .copied())
+    }
+
+    #[test]
+    fn agent_timeout_defaults_to_120_for_interactive_and_exec() {
+        assert_eq!(parsed_timeout(&["rcode"]).unwrap(), Some(120));
+        assert_eq!(
+            parsed_timeout(&["rcode", "exec", "task"]).unwrap(),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn agent_timeout_flag_parses_before_and_after_exec_and_with_prompt() {
+        assert_eq!(
+            parsed_timeout(&["rcode", "--agent-timeout-secs", "600", "exec", "task"]).unwrap(),
+            Some(600)
+        );
+        Cli::try_parse_from(["rcode", "--agent-timeout-secs", "600", "exec", "task"])
+            .expect("global timeout flag before exec should parse");
+        assert_eq!(
+            parsed_timeout(&["rcode", "exec", "--agent-timeout-secs", "600", "task"]).unwrap(),
+            Some(600)
+        );
+        Cli::try_parse_from(["rcode", "exec", "--agent-timeout-secs", "600", "task"])
+            .expect("global timeout flag after exec should parse");
+        assert_eq!(
+            parsed_timeout(&["rcode", "--agent-timeout-secs", "17", "hello"]).unwrap(),
+            Some(17)
+        );
+        Cli::try_parse_from(["rcode", "--agent-timeout-secs", "17", "hello"])
+            .expect("interactive prompt should retain the timeout flag");
+    }
+
+    #[test]
+    fn agent_timeout_accepts_range_endpoints_and_rejects_out_of_range_values() {
+        for value in ["1", "3600"] {
+            assert_eq!(
+                parsed_timeout(&["rcode", "--agent-timeout-secs", value]).unwrap(),
+                Some(value.parse().unwrap())
+            );
+            Cli::try_parse_from(["rcode", "--agent-timeout-secs", value])
+                .unwrap_or_else(|error| panic!("timeout {value} should parse: {error}"));
+        }
+
+        for value in ["0", "-1", "3601"] {
+            assert!(
+                Cli::try_parse_from(["rcode", "--agent-timeout-secs", value]).is_err(),
+                "timeout {value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn review_model_provider_flag_does_not_collide_with_global_main_provider() {
+        let cli = Cli::try_parse_from([
+            "rcode",
+            "review-model",
+            "set",
+            "--provider",
+            "openrouter",
+            "--model",
+            "review/model",
+        ])
+        .unwrap();
+        assert_eq!(cli.provider, Some(super::ProviderKind::OpenRouter));
+        assert!(matches!(
+            cli.command,
+            Some(super::Command::ReviewModel { command: super::ReviewModelCommand::Set { model } })
+                if model == "review/model"
+        ));
+    }
 }

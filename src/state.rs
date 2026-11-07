@@ -130,6 +130,8 @@ pub struct Session {
     #[serde(default)]
     pub last_usage: Usage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_reviews: Vec<crate::final_review::FinalReviewRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<crate::agents::AgentRecord>,
     #[serde(default)]
     pub task_state: crate::task_state::TaskState,
@@ -168,6 +170,7 @@ impl Session {
             turn_index: 0,
             usage: Usage::default(),
             last_usage: Usage::default(),
+            final_reviews: Vec::new(),
             agents: Vec::new(),
             task_state: crate::task_state::TaskState::default(),
             saved_sha256: None,
@@ -305,6 +308,28 @@ impl Session {
         Ok(result)
     }
     pub fn repair_pending(&mut self) -> Result<usize> {
+        for review in &mut self.final_reviews {
+            if review.status == "pending" {
+                review.status = "interrupted".into();
+                review.message = Some(
+                    "Процесс завершился до сохранения результата; повторного запроса не было"
+                        .into(),
+                );
+                if review.repair_status.as_deref() == Some("pending") {
+                    review.repair_status = Some("not_run".into());
+                    review.verification_status = Some("not_run".into());
+                }
+            } else if review.repair_status.as_deref() == Some("pending") {
+                review.repair_status = Some("interrupted".into());
+                review
+                    .verification_status
+                    .get_or_insert_with(|| "unknown".into());
+                review.message.get_or_insert_with(|| {
+                    "Проход исправления прерван до сохранения результата; повторного запроса не было"
+                        .into()
+                });
+            }
+        }
         let mut repaired = Vec::new();
         let mut pending: Vec<ToolCall> = Vec::new();
         let mut count = 0;
@@ -327,6 +352,11 @@ impl Session {
                 pending.remove(index);
             } else {
                 close(&mut pending, &mut repaired, &mut count);
+                if message.provider_meta.as_ref().is_some_and(|meta| {
+                    meta.kind == "rcode_runtime" && meta.data["final_review_repair"] == true
+                }) {
+                    continue;
+                }
                 let mut ids = HashSet::new();
                 for call in &message.tool_calls {
                     if !ids.insert(&call.id) {
@@ -795,6 +825,78 @@ mod tests {
         assert_eq!(repaired.tool_call_id.as_deref(), Some(second.id.as_str()));
         assert!(repaired.content.as_deref().unwrap().contains("unknown"));
         assert_eq!(session.repair_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn pending_final_review_is_interrupted_and_never_replayed_by_repair() {
+        let project = tempdir().unwrap();
+        let mut session = Session::new(
+            project.path(),
+            ProviderSettings::new(crate::config::ProviderKind::Custom),
+        )
+        .unwrap();
+        let provider = ProviderSettings::new(crate::config::ProviderKind::OpenRouter);
+        session
+            .final_reviews
+            .push(crate::final_review::pending_record(&provider, 3, "draft"));
+
+        assert_eq!(session.repair_pending().unwrap(), 0);
+        assert_eq!(session.final_reviews[0].status, "interrupted");
+        assert!(
+            session.final_reviews[0]
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("повторного запроса не было")
+        );
+        assert_eq!(session.repair_pending().unwrap(), 0);
+        assert_eq!(session.final_reviews[0].status, "interrupted");
+    }
+
+    #[test]
+    fn pending_repair_stage_is_interrupted_and_transient_repair_feedback_is_stripped() {
+        let project = tempdir().unwrap();
+        let mut session = Session::new(
+            project.path(),
+            ProviderSettings::new(crate::config::ProviderKind::Custom),
+        )
+        .unwrap();
+        let provider = ProviderSettings::new(crate::config::ProviderKind::OpenRouter);
+        let mut record = crate::final_review::pending_record_for_mode(
+            &provider,
+            crate::final_review::FinalReviewMode::Repair,
+            4,
+            "draft",
+        );
+        record.status = "completed".into();
+        record.result = Some("review text".into());
+        session.final_reviews.push(record);
+        session.messages.push(Message::user("user task"));
+        session
+            .messages
+            .push(crate::final_review::repair_feedback_message(
+                "review text",
+                "draft-sha",
+                "packet-sha",
+                true,
+            ));
+
+        assert_eq!(session.repair_pending().unwrap(), 0);
+        assert_eq!(session.final_reviews[0].status, "completed");
+        assert_eq!(
+            session.final_reviews[0].repair_status.as_deref(),
+            Some("interrupted")
+        );
+        assert_eq!(
+            session.final_reviews[0].verification_status.as_deref(),
+            Some("unknown")
+        );
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "transient final_review_repair prompt must not remain in history after repair_pending"
+        );
+        assert_eq!(session.messages[0].content.as_deref(), Some("user task"));
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub struct Events {
     pub json: bool,
     secrets: std::sync::Mutex<Vec<String>>,
     pub(crate) display: crate::presentation::Human,
+    #[cfg(test)]
+    recorded: std::sync::Mutex<Vec<Value>>,
 }
 impl Events {
     pub fn new(json: bool) -> Self {
@@ -42,7 +44,16 @@ impl Events {
             json,
             secrets: std::sync::Mutex::new(Vec::new()),
             display: crate::presentation::Human::new(false),
+            #[cfg(test)]
+            recorded: std::sync::Mutex::new(Vec::new()),
         }
+    }
+    #[cfg(test)]
+    fn recorded(&self) -> Vec<Value> {
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     pub(crate) fn remember(&self, secret: String) {
         let mut secrets = self.secrets.lock().unwrap_or_else(|e| e.into_inner());
@@ -74,6 +85,27 @@ impl Events {
     pub(crate) fn redact(&self, text: &str) -> String {
         crate::redaction::redact_text(text, &self.secret_snapshot())
             .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
+    }
+    pub(crate) fn redact_checked(&self, text: &str) -> Result<String> {
+        crate::redaction::redact_text(text, &self.secret_snapshot())
+            .context("Не удалось безопасно обработать текст перед сохранением")
+    }
+    pub(crate) fn redact_value_checked(&self, value: &mut Value) -> Result<()> {
+        match value {
+            Value::String(text) => *text = self.redact_checked(text)?,
+            Value::Array(items) => {
+                for item in items {
+                    self.redact_value_checked(item)?;
+                }
+            }
+            Value::Object(items) => {
+                for item in items.values_mut() {
+                    self.redact_value_checked(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
     fn redact_value(&self, value: &mut Value) {
         match value {
@@ -107,6 +139,11 @@ impl Events {
             object.insert("type".into(), json!(kind));
         }
         self.redact_value(&mut data);
+        #[cfg(test)]
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(data.clone());
         if self.json {
             let _ = writeln!(io::stdout(), "{data}");
         } else {
@@ -206,6 +243,9 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     if cli.json && cli.command.is_none() {
         bail!("Для JSONL используйте rcode exec --json 'запрос'");
     }
+    if let Some(Command::Eval { command }) = &cli.command {
+        return crate::eval::run(command, cli, events).await;
+    }
     let store = ConfigStore::new()?;
     let mut settings = store.load()?;
     for kind in ProviderKind::all() {
@@ -214,6 +254,18 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         }
     }
     local_app::remember_keys(&store, &settings, events);
+    let review_status_only = matches!(
+        cli.command,
+        Some(Command::ReviewModel {
+            command: crate::cli::ReviewModelCommand::Status
+        })
+    );
+    if cli.final_review_mode().is_enabled()
+        && !review_status_only
+        && std::env::var("RCODE_MODEL_SHELL").is_ok_and(|value| value == "1")
+    {
+        bail!("Финальное ревью нельзя включить из shell модели");
+    }
     if let Some(Command::Local { command }) = &cli.command {
         return crate::local_cli::run(command, cli, &store, events).await;
     }
@@ -225,6 +277,17 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     }
     if let Some(Command::Websearch { command }) = &cli.command {
         return crate::web_search::run(command, &store, events).await;
+    }
+    if let Some(Command::ReviewModel { command }) = &cli.command {
+        return crate::final_review::run_model_command_for_mode(
+            command,
+            &store,
+            &mut settings,
+            cli.json,
+            cli.final_review_mode(),
+            cli.provider,
+            cli.profile.as_deref(),
+        );
     }
     if let Some(Command::Connect { provider }) = &cli.command {
         ui::connect(
@@ -355,6 +418,14 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     drop(credential);
     local_app::ensure_profile(&session.provider)?;
     session.provider.validate()?;
+    if cli.final_review_mode().is_enabled() {
+        let target = crate::final_review::resolve_target(
+            &settings,
+            &session.provider,
+            &settings.final_review,
+        )?;
+        crate::final_review::selected_credentials(&store, &target)?;
+    }
     let mut client = local_app::client(&store, &session.provider, events, &missing)?;
     if matches!(cli.command, Some(Command::Balance)) {
         let report = tokio::select! {
@@ -601,6 +672,7 @@ fn system_prompt(session: &Session, cli: &Cli, plan: bool, skills: &SkillCatalog
         "extra_directories": cli.add_dir,
         "approval_mode": cli.permissions().as_str(),
         "mode": if plan { "plan" } else { "agent" },
+        "agent_timeout_secs": cli.agent_timeout_secs,
         "permissions": {
             "file_changes": if plan { "denied" } else if cli.file_edits_allowed() { "allowed" } else { "ask" },
             "shell_commands": if plan { "denied" } else if cli.shell_allowed() { "allowed" } else { "ask" },
@@ -635,6 +707,27 @@ fn turn_definitions(plan: bool, local: bool, skills: bool) -> Vec<ToolDefinition
         .collect()
 }
 
+/// Tools offered during the bounded `primary repair → verification` stage.
+/// Delegation (`spawn_agent`/`wait_agent`) and background handoff (`handoff_command`)
+/// are omitted and also rejected at execution time.
+fn turn_definitions_for_repair(plan: bool, local: bool, skills: bool) -> Vec<ToolDefinition> {
+    Tools::definitions()
+        .into_iter()
+        .filter(|tool| !plan || matches!(tool.name.as_str(), "read_file" | "list_files" | "search"))
+        .chain(
+            crate::job_tools::offered(!plan)
+                .into_iter()
+                .filter(|tool| tool.name != "handoff_command"),
+        )
+        .chain(std::iter::once(crate::task_state::definition()))
+        .chain(std::iter::once(crate::artifact_tool::definition()))
+        .chain((!local).then(crate::balance::BalanceTool::definition))
+        .chain(skills.then(crate::skill_tool::definition))
+        .chain(std::iter::once(crate::web_fetch::definition()))
+        .chain(std::iter::once(crate::web_search::definition()))
+        .collect()
+}
+
 /// `load_skill` is declared while a skill can be loaded, and also while the
 /// history holds its calls: a provider must not receive calls of an
 /// undeclared tool after a skill set was removed (DESIGN §7.3, R13).
@@ -658,7 +751,18 @@ pub(crate) fn context_budget(
     plan: bool,
     skills: &SkillCatalog,
 ) -> ContextBudget {
-    let offered = offers_load_skill(session, skills);
+    context_budget_for_turn(client, session, cli, plan, skills, false)
+}
+
+fn context_budget_for_turn(
+    client: &ProviderClient,
+    session: &Session,
+    cli: &Cli,
+    plan: bool,
+    skills: &SkillCatalog,
+    force_skill_tool: bool,
+) -> ContextBudget {
+    let offered = force_skill_tool || offers_load_skill(session, skills);
     if !client.is_local() {
         let catalog =
             skill_catalog(session, skills).map_or(0, |catalog| catalog.text.chars().count());
@@ -713,6 +817,46 @@ struct ToolExecutor<'a> {
     managed: Option<&'a mut crate::managed_jobs::ManagedJobs>,
     job_cancel: CancellationToken,
     parent_scope_id: String,
+    observations: Option<std::sync::Arc<std::sync::Mutex<crate::final_review::EvidenceCollector>>>,
+}
+
+#[cfg(test)]
+struct ServeReplyTestHook {
+    entered: std::sync::mpsc::SyncSender<Option<String>>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static SERVE_REPLY_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, ServeReplyTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn pause_serve_reply_for_test(call_id: &str, outcome: &ToolOutcome) -> bool {
+    let hook = {
+        let mut hooks = SERVE_REPLY_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hooks.remove(call_id)
+    };
+    if let Some(hook) = hook {
+        let id = serde_json::from_str::<Value>(&outcome.content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("command_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        let _ = hook.entered.send(id);
+        let _ = hook
+            .release
+            .recv_timeout(std::time::Duration::from_secs(15));
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -1211,6 +1355,8 @@ async fn graceful_finish(
     skills: &SkillCatalog,
     events: &Events,
     agents: &mut AgentPool,
+    journal: Option<&crate::operation_journal::OperationJournal>,
+    artifacts: Option<&crate::artifacts::ArtifactStore>,
     cancel: &CancellationToken,
     done: &mut Option<bool>,
     reason: &str,
@@ -1238,7 +1384,22 @@ async fn graceful_finish(
         let receipt_limit = budget.receipt_limit().map(|limit| limit / pending.len());
         for call in pending {
             let args = serde_json::from_str(&call.function.arguments)?;
-            let outcome = agents.execute("wait_agent", &args).await;
+            let mut outcome = agents.execute("wait_agent", &args).await;
+            outcome = if events.refresh_keys(store).is_ok() {
+                crate::operation_receipts::enrich_worker_wait(
+                    outcome,
+                    journal,
+                    artifacts,
+                    &session.id,
+                    session.turn_index,
+                    &events.secret_snapshot(),
+                )
+            } else {
+                crate::operation_receipts::enrich_worker_wait_unavailable(
+                    outcome,
+                    "secret_refresh_unavailable",
+                )
+            };
             let receipt = history_receipt(
                 &budget,
                 receipt_limit,
@@ -1409,7 +1570,44 @@ impl ToolExecutor<'_> {
         actor: Option<&AgentRequest>,
         mut outcome: ToolOutcome,
     ) -> Result<ToolOutcome> {
-        outcome.content = self.events.redact(&outcome.content);
+        let mut redaction_incomplete = false;
+        if self.observations.is_some() {
+            match self.events.redact_checked(&outcome.content) {
+                Ok(content) => outcome.content = content,
+                Err(_) => {
+                    outcome.content = "[rcode: текст скрыт из-за ошибки redaction]".into();
+                    redaction_incomplete = true;
+                }
+            }
+        } else {
+            outcome.content = self.events.redact(&outcome.content);
+        }
+        if let Some(observations) = &self.observations {
+            let mut safe_call = call.clone();
+            if let Ok(mut arguments) = serde_json::from_str::<Value>(&safe_call.function.arguments)
+            {
+                if self.events.redact_value_checked(&mut arguments).is_ok() {
+                    safe_call.function.arguments = arguments.to_string();
+                } else {
+                    safe_call.function.arguments =
+                        "[rcode: текст скрыт из-за ошибки redaction]".into();
+                    redaction_incomplete = true;
+                }
+            } else {
+                match self.events.redact_checked(&safe_call.function.arguments) {
+                    Ok(arguments) => safe_call.function.arguments = arguments,
+                    Err(_) => {
+                        safe_call.function.arguments =
+                            "[rcode: текст скрыт из-за ошибки redaction]".into();
+                        redaction_incomplete = true;
+                    }
+                }
+            }
+            let mut observations = observations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            observations.observe(&safe_call, &outcome, actor.is_some(), redaction_incomplete);
+        }
         let Some(store) = self.artifacts else {
             return Ok(outcome);
         };
@@ -1431,21 +1629,8 @@ impl ToolExecutor<'_> {
             &outcome.content,
             &self.events.secret_snapshot(),
         )?;
-        let mut value = match serde_json::from_str::<Value>(&outcome.content) {
-            Ok(Value::Object(object)) => Value::Object(object),
-            _ => json!({"text":outcome.content}),
-        };
-        value["artifact_id"] = json!(meta.id);
-        value["artifact_bytes"] = json!(meta.bytes);
-        value["artifact_sha256"] = json!(meta.sha256);
-        value["artifact_truncated"] = json!(meta.truncated);
-        outcome.content = crate::context::preview_receipt(
-            &ContextBudget::cloud(),
-            &call.function.name,
-            &value.to_string(),
-            16 * 1024,
-            outcome.is_error,
-        );
+        outcome.content =
+            crate::operation_receipts::preview(&outcome.content, &meta, outcome.is_error);
         Ok(outcome)
     }
 
@@ -1560,7 +1745,6 @@ impl ToolExecutor<'_> {
                         let metadata = json!({
                             "artifact_id": uuid::Uuid::nil().to_string(),
                             "artifact_bytes": u64::MAX,
-                            "artifact_sha256": "f".repeat(64),
                             "artifact_truncated": false,
                         });
                         *limit = limit.saturating_sub(
@@ -1617,7 +1801,9 @@ impl ToolExecutor<'_> {
             self.events.refresh_keys(store)?;
         }
         let mut outcome = outcome;
-        outcome.content = self.events.redact(&outcome.content);
+        if self.observations.is_none() {
+            outcome.content = self.events.redact(&outcome.content);
+        }
         self.last_error = outcome.is_error;
         if actor.is_some() {
             outcome = self.capture_receipt(call, actor, outcome)?;
@@ -1784,31 +1970,33 @@ impl ToolExecutor<'_> {
             false
         } else {
             let mut preview = if handoff {
-                format!(
+                ui::ApprovalPreview::plain(format!(
                     "Передача работающего процесса родителю: {}. Родитель получает историю и дальнейший вывод; worker теряет управление. Срок действия не продлевается.",
                     original_args
-                )
+                ))
             } else if input {
-                format!(
+                ui::ApprovalPreview::plain(format!(
                     "Ввод в работающий процесс (отдельное разрешение): {}",
                     original_args
-                )
+                ))
             } else if shell {
-                ui::shell_preview(self.tools.root(), args)?
+                ui::shell_preview_content(self.tools.root(), args)?
             } else {
-                self.tools
-                    .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))?
-                    .unwrap_or_else(|| args.to_string())
+                ui::ApprovalPreview::plain(
+                    self.tools
+                        .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))?
+                        .unwrap_or_else(|| args.to_string()),
+                )
             };
             if matches!(managed, Some(crate::job_tools::JobRequest::Start(ref a)) if a.stdin) {
-                preview.push_str("\nstdin будет открыт; отправка текста проверяется отдельно.");
+                preview.append_after("stdin будет открыт; отправка текста проверяется отдельно.");
             }
             if let Some(request) = actor {
-                preview = format!(
-                    "Субагент {} ({})\n{preview}",
+                preview.prepend_before(&format!(
+                    "Субагент {} ({})",
                     ui::safe(&request.name),
                     request.agent_id
-                );
+                ));
             }
             self.events.pause();
             if let Some(reason) = &danger {
@@ -1831,7 +2019,8 @@ impl ToolExecutor<'_> {
             } else {
                 None
             };
-            match ui::approve(&self.events.redact(&preview), always.as_deref())? {
+            let preview = preview.redact(|text| self.events.redact(text));
+            match ui::approve_preview(preview, always.as_deref())? {
                 ui::Approval::Yes => true,
                 ui::Approval::No => false,
                 ui::Approval::Cancel => {
@@ -2086,11 +2275,22 @@ impl ToolExecutor<'_> {
                         idle_timeout: std::time::Duration::from_secs(a.idle_minutes * 60),
                         stdin: a.stdin,
                     };
-                    let scope = actor.map_or_else(|| self.job_cancel.clone(), |a| a.cancel.clone());
+                    let scope =
+                        actor.map_or_else(|| self.job_cancel.clone(), |a| a.cancel.child_token());
                     managed
                         .start(
-                            jobs, journal, artifacts, session, store, call, args, spec, scope,
-                            cancel, &secrets,
+                            jobs,
+                            journal,
+                            artifacts,
+                            session,
+                            store,
+                            call,
+                            args,
+                            spec,
+                            scope,
+                            cancel,
+                            actor.map(|a| &a.admission),
+                            &secrets,
                         )
                         .await
                         .map(Some)
@@ -2125,7 +2325,16 @@ impl ToolExecutor<'_> {
                     direct = Some(
                         managed
                             .send_input(
-                                jobs, journal, artifacts, session, store, call, &a, owner, cancel,
+                                jobs,
+                                journal,
+                                artifacts,
+                                session,
+                                store,
+                                call,
+                                &a,
+                                owner,
+                                cancel,
+                                actor.map(|a| &a.admission),
                                 &secrets,
                             )
                             .await?,
@@ -2135,22 +2344,45 @@ impl ToolExecutor<'_> {
             }
         }
         .await;
+        let finish = |mut outcome: ToolOutcome| {
+            let publish = |open: bool| {
+                let closed = !open
+                    || actor.is_some_and(|a| {
+                        a.reply.is_closed() || a.cancel.is_cancelled() || cancel.is_cancelled()
+                    });
+                if closed && !outcome.is_error {
+                    // Execution/acceptance is already a fact. Keep its real
+                    // IDs and native state; losing the reply cannot undo stdin
+                    // delivery or turn an accepted command into "never ran".
+                    let mut value = serde_json::from_str::<Value>(&outcome.content)
+                        .unwrap_or_else(|_| json!({"result":&outcome.content}));
+                    value["delivery_cancelled"] = json!(true);
+                    value["error"] = json!("worker_reply_closed");
+                    value["message"] = json!(
+                        "Ответ worker закрыт или задача отменена; фактический результат сохранён"
+                    );
+                    outcome.content = value.to_string();
+                    outcome.is_error = true;
+                }
+                crate::operation_receipts::finish(
+                    pending, journal, artifacts, session, store, call, outcome, &secrets,
+                )
+            };
+            match actor {
+                Some(actor) => actor.admission.with_state(publish),
+                None => publish(true),
+            }
+        };
         match result {
             Ok(Some(snapshot)) => {
                 jobs.publish_snapshot(&snapshot, |view| {
                     let mut value = serde_json::to_value(view)?;
                     value["command_id"] = json!(view.id);
                     value["inputs"] = managed.input_receipts(&view.id, owner);
-                    crate::operation_receipts::finish(
-                        pending,
-                        journal,
-                        artifacts,
-                        session,
-                        store,
-                        call,
-                        ToolOutcome::success(value.to_string()),
-                        &secrets,
-                    )
+                    if let Some(id) = managed.lifetime_id(&view.id) {
+                        value["lifetime_id"] = json!(id);
+                    }
+                    finish(ToolOutcome::success(value.to_string()))
                 })
                 .await
             }
@@ -2163,9 +2395,7 @@ impl ToolExecutor<'_> {
                     ),
                     Ok(Some(_)) => unreachable!(),
                 };
-                crate::operation_receipts::finish(
-                    pending, journal, artifacts, session, store, call, outcome, &secrets,
-                )
+                finish(outcome)
             }
         }
     }
@@ -2336,12 +2566,129 @@ impl ToolExecutor<'_> {
         {
             return Ok(());
         }
+        let cleanup = request.admission.cleanup_guard();
         let outcome = self
             .execute(&request.call, Some(&request), Some(session))
             .await?;
-        let _ = request.reply.send(outcome);
+        let successful = !outcome.is_error;
+        #[cfg(test)]
+        if pause_serve_reply_for_test(&request.call.id, &outcome) {
+            tokio::task::yield_now().await;
+        }
+        if request.reply.send(outcome).is_ok() && successful {
+            cleanup.transfer_to_receiver();
+        }
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_review_failure(
+    session: &mut Session,
+    store: &ConfigStore,
+    events: &Events,
+    provider: &crate::config::ProviderSettings,
+    mode: crate::final_review::FinalReviewMode,
+    repair_status: Option<&str>,
+    status: &str,
+    message: &str,
+    packet_sha256: Option<String>,
+    draft: &str,
+) -> Result<()> {
+    if let Some(record) = session
+        .final_reviews
+        .last_mut()
+        .filter(|record| record.status == "pending")
+    {
+        record.status = status.into();
+        record.mode = mode;
+        if let Some(repair_status) = repair_status {
+            record.repair_status = Some(repair_status.into());
+        }
+        record.message = Some(events.redact(message));
+    } else {
+        let mut record = crate::final_review::failed_record_for_mode(
+            provider,
+            mode,
+            session.turn_index,
+            draft,
+            status,
+            events.redact(message),
+        );
+        if let Some(repair_status) = repair_status {
+            record.repair_status = Some(repair_status.into());
+        }
+        record.packet_sha256 = packet_sha256;
+        session.final_reviews.push(record);
+    }
+    session.save(store)?;
+    events.emit(
+        "text",
+        json!({"text":events.redact(draft),"origin":"primary_draft"}),
+    );
+    let record = session.final_reviews.last();
+    let event_status = if status == "blocked_context" && repair_status == Some("budget_exhausted") {
+        "budget_exhausted"
+    } else {
+        status
+    };
+    let mut failed_event = json!({
+        "status":event_status,
+        "reason":event_status,
+        "provider":record.map(|value| value.provider.as_str()).unwrap_or_else(|| provider.kind.as_str()),
+        "model":record.map(|value| value.model.as_str()).unwrap_or(&provider.model),
+        "turn_index":record.map(|value| value.turn_index),
+        "draft_sha256":record.map(|value| value.draft_sha256.as_str()),
+        "packet_sha256":record.and_then(|value| value.packet_sha256.as_deref()),
+        "route_fingerprint":record.map(|value| value.route_fingerprint.as_str()),
+        "local_profile":record.and_then(|value| value.local_profile.as_deref()),
+        "message":events.redact(message),
+    });
+    if mode.is_repair() {
+        failed_event["mode"] = json!(mode.as_str());
+        failed_event["repair_status"] =
+            json!(record.and_then(|value| value.repair_status.as_deref()));
+    }
+    events.emit("review_failed", failed_event);
+    Ok(())
+}
+
+fn save_repair_failure(
+    session: &mut Session,
+    store: &ConfigStore,
+    events: &Events,
+    repair_status: &str,
+    verification_status: &str,
+    repair_steps: u32,
+    message: &str,
+) -> Result<()> {
+    let redacted = events.redact(message);
+    if let Some(record) = session.final_reviews.last_mut() {
+        record.repair_status = Some(repair_status.into());
+        record.verification_status = Some(verification_status.into());
+        record.repair_steps = Some(repair_steps);
+        record.message = Some(redacted.clone());
+    }
+    session.save(store)?;
+    let record = session.final_reviews.last();
+    events.emit(
+        "repair_failed",
+        json!({
+            "status": repair_status,
+            "reason": repair_status,
+            "verification_status": verification_status,
+            "repair_steps": repair_steps,
+            "provider": record.map(|value| value.provider.as_str()),
+            "model": record.map(|value| value.model.as_str()),
+            "turn_index": record.map(|value| value.turn_index),
+            "draft_sha256": record.map(|value| value.draft_sha256.as_str()),
+            "packet_sha256": record.and_then(|value| value.packet_sha256.as_deref()),
+            "route_fingerprint": record.map(|value| value.route_fingerprint.as_str()),
+            "local_profile": record.and_then(|value| value.local_profile.as_deref()),
+            "message": redacted,
+        }),
+    );
+    Ok(())
 }
 
 struct TurnInterrupt(tokio::task::JoinHandle<()>);
@@ -2675,6 +3022,36 @@ pub(crate) fn prepare_context(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) async fn skill_turn(
+    session: &mut Session,
+    store: &ConfigStore,
+    tools: &mut Tools,
+    client: &mut ProviderClient,
+    events: &Events,
+    cli: &Cli,
+    prompt: &str,
+    skill_id: &str,
+    plan: bool,
+    skills: &SkillCatalog,
+    execution: &mut crate::session_runtime::SessionRuntime,
+) -> Result<i32> {
+    turn_inner(
+        session,
+        store,
+        tools,
+        client,
+        events,
+        cli,
+        prompt,
+        Some(skill_id),
+        plan,
+        skills,
+        execution,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn turn(
     session: &mut Session,
     store: &ConfigStore,
@@ -2687,12 +3064,45 @@ pub(crate) async fn turn(
     skills: &SkillCatalog,
     execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
+    turn_inner(
+        session, store, tools, client, events, cli, prompt, None, plan, skills, execution,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn turn_inner(
+    session: &mut Session,
+    store: &ConfigStore,
+    tools: &mut Tools,
+    client: &mut ProviderClient,
+    events: &Events,
+    cli: &Cli,
+    prompt: &str,
+    preload_skill: Option<&str>,
+    plan: bool,
+    skills: &SkillCatalog,
+    execution: &mut crate::session_runtime::SessionRuntime,
+) -> Result<i32> {
     anyhow::ensure!(
         execution.session_id() == session.id,
         "Runtime относится к другой сессии"
     );
     let cancel = CancellationToken::new();
     let _interrupt = TurnInterrupt::bind(cancel.clone())?;
+    let review_mode = cli.final_review_mode();
+    let prepared_review_snapshot = if review_mode.is_enabled() {
+        let settings = store.load()?;
+        let route = crate::final_review::resolve_target(
+            &settings,
+            &session.provider,
+            &settings.final_review,
+        )?;
+        crate::final_review::selected_credentials(store, &route)?;
+        Some((settings.final_review.clone(), route))
+    } else {
+        None
+    };
     execution.activate()?;
     events.refresh_keys(store)?;
     execution
@@ -2704,7 +3114,8 @@ pub(crate) async fn turn(
     let mut message = crate::images::user_message(&prompt, &session.root)?;
     // Read-only and bounded: lets a smaller server context shrink the budget first.
     local_app::refresh_context(client, events).await;
-    let budget = context_budget(client, session, cli, plan, skills);
+    let budget =
+        context_budget_for_turn(client, session, cli, plan, skills, preload_skill.is_some());
     let incoming = budget.measure(&message);
     if !prepare_context(session, store, incoming, &budget)?.report(events) {
         return Ok(1);
@@ -2797,7 +3208,14 @@ pub(crate) async fn turn(
     let mut candidate = session.clone();
     candidate.task_state = next_task;
     candidate.messages.push(message);
-    let candidate_budget = context_budget(client, &candidate, cli, plan, skills);
+    let candidate_budget = context_budget_for_turn(
+        client,
+        &candidate,
+        cli,
+        plan,
+        skills,
+        preload_skill.is_some(),
+    );
     let before = candidate.context_used(&candidate_budget);
     let saved = match candidate.auto_compact_within(0, &candidate_budget) {
         Ok(saved) => saved,
@@ -2818,7 +3236,7 @@ pub(crate) async fn turn(
     }
     session.save(store)?;
     tools.begin_turn()?;
-    events.emit("start",json!({"session_id":session.id,"provider":session.provider.kind,"model":session.provider.model,"plan":plan}));
+    events.emit("start",json!({"session_id":session.id,"provider":session.provider.kind,"model":session.provider.model,"plan":plan,"agent_timeout_secs":cli.agent_timeout_secs}));
     if let Some(screen) = crate::screen::current() {
         screen.bind_cancel(cancel.clone());
         screen.context(budget.request_used(&session.messages));
@@ -2830,7 +3248,9 @@ pub(crate) async fn turn(
         cli.max_steps.min(8),
         plan,
     );
+    agents = agents.with_timeout(std::time::Duration::from_secs(cli.agent_timeout_secs));
     agents.set_secrets(events.secret_snapshot());
+    let observations = crate::final_review::turn_collector(review_mode.is_enabled());
     let mut executor = ToolExecutor {
         tools,
         events,
@@ -2850,6 +3270,7 @@ pub(crate) async fn turn(
         managed: Some(managed),
         job_cancel,
         parent_scope_id,
+        observations: observations.clone(),
     };
     let mut done = None;
     // All return/? paths from this block run the common worker finalizer below.
@@ -2859,6 +3280,78 @@ pub(crate) async fn turn(
         let mut file_failures = FileFailureLoop::default();
         let mut repeated = RepeatedResults::default();
         let mut repeated_feedback = 0u8;
+        if let Some(skill_id) = preload_skill {
+            let skill_id = events.redact(skill_id);
+            let budget = context_budget_for_turn(client, session, cli, plan, skills, true);
+            let receipt_limit = budget.receipt_limit();
+            executor.skill_page = SkillPage::for_step(&budget, receipt_limit);
+            let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name": skill_id}));
+            let outcome = executor.execute_main(&call, session, client).await?;
+            let _ = repeated.observe(&call, &outcome);
+            let outcome = executor.capture_receipt(&call, None, outcome)?;
+            let receipt = history_receipt(
+                &budget,
+                receipt_limit,
+                crate::skill_tool::TOOL_NAME,
+                outcome.content.clone(),
+                outcome.is_error,
+                events,
+            );
+            let event_receipt = receipt.clone();
+            session.messages.push(Message {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: vec![call.clone()],
+                provider_meta: Some(ProviderMeta {
+                    kind: "rcode_skill_preload".into(),
+                    data: json!({"skill": skill_id}),
+                }),
+                ..Message::default()
+            });
+            crate::operation_receipts::put_message(session, &call, &outcome, receipt)?;
+            session.save(store)?;
+            if let Some(screen) = crate::screen::current() {
+                screen.context(
+                    context_budget(client, session, cli, plan, skills)
+                        .request_used(&session.messages),
+                );
+            }
+            events.emit(
+                "tool_result",
+                json!({
+                    "id": call.id,
+                    "name": crate::skill_tool::TOOL_NAME,
+                    "is_error": outcome.is_error,
+                    "content": event_receipt,
+                    "changed_paths": outcome.changed_paths,
+                }),
+            );
+            if outcome.is_error {
+                let reason = serde_json::from_str::<Value>(&outcome.content)
+                    .ok()
+                    .and_then(|v| v["message"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| outcome.content.clone());
+                events.emit(
+                    "error",
+                    json!({
+                        "message": format!(
+                            "Скилл {} не загружен: {}; запрос модели не отправлен",
+                            ui::safe(&skill_id),
+                            ui::safe(&reason)
+                        ),
+                        "exit_code": 1,
+                    }),
+                );
+                return Ok(1);
+            }
+            if cancel.is_cancelled() {
+                events.emit(
+                    "error",
+                    json!({"message": "Ход прерван; перед повтором проверьте файлы", "exit_code": 130}),
+                );
+                return Ok(130);
+            }
+        }
         for step in 0..cli.max_steps {
             let budget = context_budget(client, session, cli, plan, skills);
             if !prepare_context(session, store, 0, &budget)?.report(events) {
@@ -2872,13 +3365,23 @@ pub(crate) async fn turn(
             events.busy(&format!("Думаю · шаг {} / {}", step + 1, cli.max_steps));
             let mut emit = |chunk: &str| {
                 let clean = guard.push(chunk, false);
-                if !clean.is_empty() { events.emit("text", json!({"text":clean})); }
+                if !clean.is_empty() && !review_mode.is_enabled() {
+                    events.emit("text", json!({"text":clean}));
+                }
             };
             let completion = drive_with_agents(
                 client.complete(&messages, &definitions, &mut emit), &mut inbox, &mut executor, session,
             ).await;
+            for secret in client.redaction_secrets() {
+                events.remember(secret);
+            }
+            if review_mode.is_enabled() {
+                // Credentials may rotate while the primary request is active.
+                // Refresh the host redaction union before persisting its answer.
+                events.refresh_keys(store)?;
+            }
             let rest = if completion.is_ok() {guard.push("", true)} else {guard.abort()};
-            if !rest.is_empty() { events.emit("text", json!({"text":rest})); }
+            if !rest.is_empty() && !review_mode.is_enabled() { events.emit("text", json!({"text":rest})); }
             let mut completion = completion?;
             if client.is_local() {
                 client.observe_prompt_tokens(
@@ -2933,6 +3436,814 @@ pub(crate) async fn turn(
                     continue;
                 }
                 let code = if executor.denied || executor.last_error {1} else {0};
+                let review_gate = crate::final_review::stage_gate(
+                    review_mode.is_enabled(),
+                    executor.denied,
+                    cancel.is_cancelled(),
+                );
+                let fallback_target = prepared_review_snapshot
+                    .as_ref()
+                    .map(|(_, route)| route.clone())
+                    .unwrap_or_else(|| session.provider.clone());
+                if review_gate == crate::final_review::StageGate::Cancelled {
+                    save_review_failure(
+                        session,
+                        store,
+                        events,
+                        &fallback_target,
+                        review_mode,
+                        review_mode.is_repair().then_some("cancelled"),
+                        "cancelled",
+                        "Ход отменён до запроса финального ревью",
+                        None,
+                        &completion.content,
+                    )?;
+                    events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                    done = Some(false);
+                    return Ok(130);
+                }
+                if review_gate == crate::final_review::StageGate::Denied {
+                    save_review_failure(
+                        session,
+                        store,
+                        events,
+                        &fallback_target,
+                        review_mode,
+                        review_mode.is_repair().then_some("denied"),
+                        "denied",
+                        "Финальное ревью не выполнено: действие было отклонено",
+                        None,
+                        &completion.content,
+                    )?;
+                    done = Some(false);
+                    return Ok(code.max(1));
+                }
+                if review_gate == crate::final_review::StageGate::Run {
+                    if !agents.uncollected_ids().is_empty() {
+                        save_review_failure(
+                            session,
+                            store,
+                            events,
+                            &fallback_target,
+                            review_mode,
+                            review_mode.is_repair().then_some("blocked_context"),
+                            "blocked_context",
+                            "Остались незавершённые фоновые субагенты; финальное ревью не отправлено",
+                            None,
+                            &completion.content,
+                        )?;
+                        done = Some(false);
+                        return Ok(code.max(1));
+                    }
+                    let remaining_turn_requests = cli.max_steps.saturating_sub(step + 1);
+                    if review_mode.is_repair() && remaining_turn_requests == 0 {
+                        save_review_failure(
+                            session,
+                            store,
+                            events,
+                            &fallback_target,
+                            review_mode,
+                            Some("budget_exhausted"),
+                            "blocked_context",
+                            "Лимит шагов хода исчерпан до этапа исправления по финальному ревью",
+                            None,
+                            &completion.content,
+                        )?;
+                        done = Some(false);
+                        return Ok(1);
+                    }
+                    let target = match (prepared_review_snapshot.clone(), store.load()) {
+                        (Some((initial_selection, prepared)), Ok(settings)) => {
+                            let same_selection = serde_json::to_value(&settings.final_review).ok()
+                                == serde_json::to_value(&initial_selection).ok();
+                            match crate::final_review::resolve_target(
+                                &settings,
+                                &session.provider,
+                                &settings.final_review,
+                            ) {
+                                Ok(current)
+                                    if same_selection
+                                        && serde_json::to_value(&current).ok()
+                                            == serde_json::to_value(&prepared).ok() =>
+                                {
+                                    prepared
+                                }
+                                Ok(_) => {
+                                    save_review_failure(
+                                        session,
+                                        store,
+                                        events,
+                                        &prepared,
+                                        review_mode,
+                                        review_mode.is_repair().then_some("stale_route"),
+                                        "stale_route",
+                                        "Маршрут финального ревью изменился во время хода; запрос не отправлен",
+                                        None,
+                                        &completion.content,
+                                    )?;
+                                    done = Some(false);
+                                    return Ok(code.max(1));
+                                }
+                                Err(error) => {
+                                    save_review_failure(
+                                        session,
+                                        store,
+                                        events,
+                                        &prepared,
+                                        review_mode,
+                                        review_mode.is_repair().then_some("stale_route"),
+                                        "stale_route",
+                                        &format!("Маршрут финального ревью недоступен: {error:#}"),
+                                        None,
+                                        &completion.content,
+                                    )?;
+                                    done = Some(false);
+                                    return Ok(code.max(1));
+                                }
+                            }
+                        }
+                        (Some((_, prepared)), Err(_)) => {
+                            save_review_failure(
+                                session,
+                                store,
+                                events,
+                                &prepared,
+                                review_mode,
+                                review_mode.is_repair().then_some("stale_route"),
+                                "stale_route",
+                                "Не удалось повторно проверить маршрут финального ревью",
+                                None,
+                                &completion.content,
+                            )?;
+                            done = Some(false);
+                            return Ok(code.max(1));
+                        }
+                        (None, _) => {
+                            events.emit("review_failed", json!({"status":"failed","message":"Маршрут финального ревью не был зафиксирован"}));
+                            done = Some(false);
+                            return Ok(code.max(1));
+                        }
+                    };
+                    let evidence = observations.as_ref()
+                        .map(|collector| collector.lock().unwrap_or_else(|error| error.into_inner()).snapshot())
+                        .unwrap_or_default();
+                    if let Err(error) = crate::final_review::ensure_complete(&evidence) {
+                        save_review_failure(
+                            session,
+                            store,
+                            events,
+                            &target,
+                            review_mode,
+                            review_mode.is_repair().then_some("blocked_context"),
+                            "blocked_context",
+                            &format!("{error:#}"),
+                            None,
+                            &completion.content,
+                        )?;
+                        done = Some(false);
+                        return Ok(code.max(1));
+                    }
+                    let prepared = match crate::final_review::prepare_review(store, target.clone(), events) {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            save_review_failure(
+                                session,
+                                store,
+                                events,
+                                &target,
+                                review_mode,
+                                review_mode.is_repair().then_some("skipped_review_failed"),
+                                "failed",
+                                "Не удалось подготовить выбранный маршрут финального ревью",
+                                None,
+                                &completion.content,
+                            )?;
+                            done = Some(false);
+                            return Ok(code.max(1));
+                        }
+                    };
+                    let packet = match crate::final_review::packet(
+                        &prompt,
+                        &completion.content,
+                        &session.provider,
+                        &evidence,
+                        events,
+                    ) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            save_review_failure(
+                                session,
+                                store,
+                                events,
+                                &target,
+                                review_mode,
+                                review_mode.is_repair().then_some("blocked_context"),
+                                "blocked_context",
+                                &format!("{error:#}"),
+                                None,
+                                &completion.content,
+                            )?;
+                            done = Some(false);
+                            return Ok(code.max(1));
+                        }
+                    };
+                    let mut pending = crate::final_review::pending_record_for_mode(
+                        &target,
+                        review_mode,
+                        session.turn_index,
+                        &completion.content,
+                    );
+                    let packet_sha256 = crate::final_review::packet_sha256(&packet);
+                    pending.packet_sha256 = Some(packet_sha256.clone());
+                    let provenance = pending.clone();
+                    session.final_reviews.push(pending);
+                    session.save(store)?;
+                    events.busy("Проверяю итог выбранной моделью · только чтение");
+                    let mut started_event = json!({
+                        "status":"pending",
+                        "provider":provenance.provider,
+                        "model":provenance.model,
+                        "turn_index":provenance.turn_index,
+                        "draft_sha256":provenance.draft_sha256,
+                        "packet_sha256":provenance.packet_sha256,
+                        "route_fingerprint":provenance.route_fingerprint,
+                        "local_profile":provenance.local_profile,
+                        "evidence_count":evidence.entries.len(),
+                        "evidence_omitted":evidence.omitted,
+                    });
+                    if review_mode.is_repair() {
+                        started_event["mode"] = json!(review_mode.as_str());
+                    }
+                    let review = crate::final_review::review(prepared, packet, started_event, &cancel, events).await;
+                    match review {
+                        Ok(_) if cancel.is_cancelled() => {
+                            save_review_failure(
+                                session,
+                                store,
+                                events,
+                                &target,
+                                review_mode,
+                                review_mode.is_repair().then_some("cancelled"),
+                                "cancelled",
+                                "Финальное ревью отменено до публикации",
+                                Some(packet_sha256),
+                                &completion.content,
+                            )?;
+                            events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                            done = Some(false);
+                            return Ok(130);
+                        }
+                        Ok(mut record) => {
+                            record.mode = review_mode;
+                            record.repair_status = provenance.repair_status;
+                            record.packet_sha256 = Some(packet_sha256.clone());
+                            record.turn_index = provenance.turn_index;
+                            record.draft_sha256 = provenance.draft_sha256;
+                            record.route_fingerprint = provenance.route_fingerprint;
+                            record.local_profile = provenance.local_profile;
+                            if let Some(result) = &mut record.result {
+                                match events.redact_checked(result) {
+                                    Ok(redacted) => *result = redacted,
+                                    Err(_) => {
+                                        save_review_failure(
+                                            session,
+                                            store,
+                                            events,
+                                            &target,
+                                            review_mode,
+                                            review_mode.is_repair().then_some("skipped_review_failed"),
+                                            "redaction_failed",
+                                            "Ответ ревью не сохранён: не удалось безопасно отредактировать текст",
+                                            Some(packet_sha256),
+                                            &completion.content,
+                                        )?;
+                                        done = Some(false);
+                                        return Ok(code.max(1));
+                                    }
+                                }
+                            }
+                            if record.status == "refused" && review_mode.is_repair() {
+                                record.repair_status = Some("skipped_review_failed".into());
+                            }
+                            if let Some(saved) = session.final_reviews.last_mut() {
+                                *saved = record.clone();
+                            }
+                            session.save(store)?;
+                            events.emit("text", json!({"text":completion.content,"origin":"primary_draft"}));
+                            if let Some(usage) = &record.usage {
+                                events.emit("review_usage", json!({"provider":record.provider,"model":record.model,"usage":usage,"turn_index":record.turn_index,"draft_sha256":record.draft_sha256,"packet_sha256":record.packet_sha256,"route_fingerprint":record.route_fingerprint,"local_profile":record.local_profile}));
+                            }
+                            if record.status == "refused" {
+                                let mut refused_event = json!({"status":"refused","reason":"refusal","provider":record.provider,"model":record.model,"turn_index":record.turn_index,"draft_sha256":record.draft_sha256,"packet_sha256":record.packet_sha256,"route_fingerprint":record.route_fingerprint,"local_profile":record.local_profile,"message":"Модель отказалась выполнять ревью","refusal":true});
+                                if review_mode.is_repair() {
+                                    refused_event["mode"] = json!(review_mode.as_str());
+                                    refused_event["repair_status"] = json!(record.repair_status);
+                                }
+                                events.emit("review_failed", refused_event);
+                                done = Some(false);
+                                return Ok(code.max(1));
+                            }
+                            let mut result_event = json!({"status":record.status,"provider":record.provider,"model":record.model,"turn_index":record.turn_index,"draft_sha256":record.draft_sha256,"packet_sha256":record.packet_sha256,"route_fingerprint":record.route_fingerprint,"local_profile":record.local_profile,"result":record.result,"refusal":record.refusal,"usage":record.usage});
+                            if review_mode.is_repair() {
+                                result_event["mode"] = json!(review_mode.as_str());
+                            }
+                            events.emit("review_result", result_event);
+                            if review_mode.is_repair() {
+                                let review_text = record.result.clone().unwrap_or_default();
+                                let Some(mut repair_budget) =
+                                    crate::final_review::RepairBudget::new(
+                                        remaining_turn_requests,
+                                        target.request_timeout_secs,
+                                        session.provider.request_timeout_secs,
+                                    )
+                                else {
+                                    save_repair_failure(
+                                        session,
+                                        store,
+                                        events,
+                                        "budget_exhausted",
+                                        "not_run",
+                                        0,
+                                        "Лимит шагов хода исчерпан до этапа исправления по финальному ревью",
+                                    )?;
+                                    done = Some(false);
+                                    return Ok(1);
+                                };
+                                let mut verification = crate::final_review::VerificationTracker::default();
+                                executor.last_error = false;
+                                executor.denied = false;
+                                session.messages.push(crate::final_review::repair_feedback_message(
+                                    &review_text,
+                                    &record.draft_sha256,
+                                    &packet_sha256,
+                                    repair_budget.requests_left > 1,
+                                ));
+                                session.save(store)?;
+                                events.emit(
+                                    "repair_started",
+                                    json!({
+                                        "provider": session.provider.kind.as_str(),
+                                        "model": session.provider.model,
+                                        "turn_index": session.turn_index,
+                                        "draft_sha256": record.draft_sha256,
+                                        "packet_sha256": record.packet_sha256,
+                                        "max_steps": repair_budget.requests_left,
+                                        "max_tool_calls": repair_budget.tool_calls_left,
+                                    }),
+                                );
+                                let total_repair_steps = repair_budget.requests_left;
+                                let mut repair_steps_taken = 0u32;
+                                while repair_budget.requests_left > 0 {
+                                    if cancel.is_cancelled() {
+                                        save_repair_failure(
+                                            session,
+                                            store,
+                                            events,
+                                            "cancelled",
+                                            verification.status(),
+                                            repair_steps_taken,
+                                            "Этап исправления отменён",
+                                        )?;
+                                        events.emit("error", json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                                        done = Some(false);
+                                        return Ok(130);
+                                    }
+                                    if std::time::Instant::now() >= repair_budget.repair_deadline {
+                                        save_repair_failure(
+                                            session,
+                                            store,
+                                            events,
+                                            "incomplete",
+                                            verification.status(),
+                                            repair_steps_taken,
+                                            "Истёк общий тайм-аут этапа исправления по финальному ревью",
+                                        )?;
+                                        done = Some(false);
+                                        return Ok(1);
+                                    }
+                                    if repair_budget.requests_left == 1 && repair_steps_taken > 0 {
+                                        session.messages.push(
+                                            crate::final_review::repair_final_step_message(
+                                                &record.draft_sha256,
+                                                &packet_sha256,
+                                            ),
+                                        );
+                                    }
+                                    let budget = context_budget(client, session, cli, plan, skills);
+                                    if !prepare_context(session, store, 0, &budget)?.report(events) {
+                                        save_repair_failure(
+                                            session,
+                                            store,
+                                            events,
+                                            "blocked_context",
+                                            verification.status(),
+                                            repair_steps_taken,
+                                            "Контекст этапа исправления превысил допустимый бюджет",
+                                        )?;
+                                        done = Some(false);
+                                        return Ok(1);
+                                    }
+                                    let definitions = if repair_budget.requests_left == 1 {
+                                        Vec::new()
+                                    } else {
+                                        turn_definitions_for_repair(
+                                            plan,
+                                            client.is_local(),
+                                            offers_load_skill(session, skills),
+                                        )
+                                    };
+                                    let mut messages = vec![Message::text(
+                                        "system",
+                                        system_prompt(session, cli, plan, skills),
+                                    )];
+                                    messages.extend(session.messages.clone());
+                                    let mut guard = StreamGuard::new(&events.secret_snapshot())?;
+                                    events.busy(&format!(
+                                        "Исправляю по финальному ревью · шаг {} / {}",
+                                        repair_steps_taken + 1,
+                                        total_repair_steps
+                                    ));
+                                    let mut emit = |chunk: &str| {
+                                        let _ = guard.push(chunk, false);
+                                    };
+                                    let deadline = tokio::time::Instant::from_std(
+                                        repair_budget.repair_deadline,
+                                    );
+                                    let repair_call = tokio::select! {
+                                        _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+                                        res = tokio::time::timeout_at(
+                                            deadline,
+                                            drive_with_agents(
+                                                client.complete(&messages, &definitions, &mut emit),
+                                                &mut inbox,
+                                                &mut executor,
+                                                session,
+                                            ),
+                                        ) => match res {
+                                            Ok(inner) => inner,
+                                            Err(_) => Err(anyhow::anyhow!("repair_deadline_exceeded")),
+                                        }
+                                    };
+                                    for secret in client.redaction_secrets() {
+                                        events.remember(secret);
+                                    }
+                                    events.refresh_keys(store)?;
+                                    let mut repair_completion = match repair_call {
+                                        Ok(completion) => {
+                                            let _ = guard.push("", true);
+                                            completion
+                                        }
+                                        Err(err) => {
+                                            guard.abort();
+                                            if cancel.is_cancelled() {
+                                                save_repair_failure(
+                                                    session,
+                                                    store,
+                                                    events,
+                                                    "cancelled",
+                                                    verification.status(),
+                                                    repair_steps_taken,
+                                                    "Этап исправления отменён",
+                                                )?;
+                                                events.emit("error", json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                                                done = Some(false);
+                                                return Ok(130);
+                                            }
+                                            if err.to_string() == "repair_deadline_exceeded" {
+                                                save_repair_failure(
+                                                    session,
+                                                    store,
+                                                    events,
+                                                    "incomplete",
+                                                    verification.status(),
+                                                    repair_steps_taken,
+                                                    "Истёк общий тайм-аут этапа исправления по финальному ревью",
+                                                )?;
+                                                done = Some(false);
+                                                return Ok(1);
+                                            }
+                                            save_repair_failure(
+                                                session,
+                                                store,
+                                                events,
+                                                "failed",
+                                                verification.status(),
+                                                repair_steps_taken,
+                                                "Запрос этапа исправления завершился ошибкой",
+                                            )?;
+                                            done = Some(false);
+                                            return Ok(1);
+                                        }
+                                    };
+                                    if cancel.is_cancelled() {
+                                        save_repair_failure(
+                                            session,
+                                            store,
+                                            events,
+                                            "cancelled",
+                                            verification.status(),
+                                            repair_steps_taken,
+                                            "Этап исправления отменён",
+                                        )?;
+                                        events.emit("error", json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                                        done = Some(false);
+                                        return Ok(130);
+                                    }
+                                    repair_budget.requests_left -= 1;
+                                    repair_steps_taken += 1;
+                                    session.last_usage = repair_completion.usage.clone();
+                                    session.usage.input_tokens += repair_completion.usage.input_tokens;
+                                    session.usage.output_tokens += repair_completion.usage.output_tokens;
+                                    session.usage.cached_input_tokens +=
+                                        repair_completion.usage.cached_input_tokens;
+                                    events.emit(
+                                        "usage",
+                                        serde_json::to_value(&repair_completion.usage)?,
+                                    );
+                                    for call in &mut repair_completion.tool_calls {
+                                        if events.redact(&call.id) != call.id || call.id.len() > 256
+                                        {
+                                            call.id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                                        }
+                                        call.function.name = events.redact(&call.function.name);
+                                        if let Ok(mut args) =
+                                            serde_json::from_str::<Value>(&call.function.arguments)
+                                        {
+                                            events.redact_value(&mut args);
+                                            call.function.arguments = args.to_string();
+                                        } else {
+                                            call.function.arguments =
+                                                events.redact(&call.function.arguments);
+                                        }
+                                    }
+                                    if let Some(meta) = &mut repair_completion.provider_meta {
+                                        meta.kind = events.redact(&meta.kind);
+                                        events.redact_value(&mut meta.data);
+                                    }
+                                    if repair_completion.tool_calls.is_empty() {
+                                        match events.redact_checked(&repair_completion.content) {
+                                            Ok(redacted) => repair_completion.content = redacted,
+                                            Err(_) => {
+                                                save_repair_failure(
+                                                    session,
+                                                    store,
+                                                    events,
+                                                    "redaction_failed",
+                                                    verification.status(),
+                                                    repair_steps_taken,
+                                                    "Исправленный ответ не сохранён: не удалось безопасно отредактировать текст",
+                                                )?;
+                                                done = Some(false);
+                                                return Ok(1);
+                                            }
+                                        }
+                                        if repair_completion.refusal
+                                            || repair_completion.finish_reason != "stop"
+                                            || repair_completion.content.trim().is_empty()
+                                            || repair_completion.content.len()
+                                                > crate::final_review::RESULT_LIMIT
+                                        {
+                                            save_repair_failure(
+                                                session,
+                                                store,
+                                                events,
+                                                "failed",
+                                                verification.status(),
+                                                repair_steps_taken,
+                                                "Основная модель вернула пустой, усечённый или отклонённый ответ на этапе исправления",
+                                            )?;
+                                            done = Some(false);
+                                            return Ok(1);
+                                        }
+                                        let repaired_sha256 = crate::final_review::text_sha256(
+                                            &repair_completion.content,
+                                        );
+                                        session
+                                            .messages
+                                            .push(Message::assistant(&repair_completion));
+                                        if let Some(saved) = session.final_reviews.last_mut() {
+                                            saved.repair_status = Some("completed".into());
+                                            saved.verification_status =
+                                                Some(verification.status().into());
+                                            saved.repaired_sha256 = Some(repaired_sha256.clone());
+                                            saved.repair_steps = Some(repair_steps_taken);
+                                        }
+                                        session.save(store)?;
+                                        events.emit(
+                                            "text",
+                                            json!({
+                                                "text": repair_completion.content,
+                                                "origin": "primary_repaired",
+                                            }),
+                                        );
+                                        events.emit(
+                                            "repair_result",
+                                            json!({
+                                                "status": "completed",
+                                                "verification_status": verification.status(),
+                                                "repair_steps": repair_steps_taken,
+                                                "repaired_sha256": repaired_sha256,
+                                                "turn_index": session.turn_index,
+                                            }),
+                                        );
+                                        let final_code = if code != 0
+                                            || executor.denied
+                                            || executor.last_error
+                                            || verification.status() == "failed"
+                                        {
+                                            1
+                                        } else {
+                                            0
+                                        };
+                                        done = Some(false);
+                                        return Ok(final_code);
+                                    }
+                                    repair_completion.content =
+                                        events.redact(&repair_completion.content);
+                                    if definitions.is_empty()
+                                        || repair_completion.tool_calls.len()
+                                            > repair_budget.tool_calls_left
+                                    {
+                                        save_repair_failure(
+                                            session,
+                                            store,
+                                            events,
+                                            "incomplete",
+                                            verification.status(),
+                                            repair_steps_taken,
+                                            "Исчерпан бюджет шагов или вызовов инструментов этапа исправления по финальному ревью",
+                                        )?;
+                                        done = Some(false);
+                                        return Ok(1);
+                                    }
+                                    repair_budget.tool_calls_left -=
+                                        repair_completion.tool_calls.len();
+                                    session
+                                        .messages
+                                        .push(Message::assistant(&repair_completion));
+                                    session.save(store)?;
+                                    let receipt_limit = budget.receipt_limit().map(|limit| {
+                                        limit / repair_completion.tool_calls.len().max(1)
+                                    });
+                                    executor.skill_page =
+                                        SkillPage::for_step(&budget, receipt_limit);
+                                    for call in &repair_completion.tool_calls {
+                                        let name = call.function.name.as_str();
+                                        let outcome = if AgentPool::is_tool(name)
+                                            || name == "handoff_command"
+                                        {
+                                            events.emit(
+                                                "tool_start",
+                                                json!({
+                                                    "id": call.id,
+                                                    "name": name,
+                                                    "arguments": call.function.arguments,
+                                                }),
+                                            );
+                                            executor.last_error = true;
+                                            ToolOutcome::error(
+                                                json!({
+                                                    "error": "forbidden_in_repair",
+                                                    "message": format!("{name} недоступен на этапе финального исправления; выполните проверку напрямую или завершите ответ"),
+                                                })
+                                                .to_string(),
+                                            )
+                                        } else {
+                                            if name == crate::balance::TOOL_NAME {
+                                                executor.balance =
+                                                    Some(crate::balance::BalanceTool::new(
+                                                        client.clone(),
+                                                        session.provider.model.clone(),
+                                                    ));
+                                            }
+                                            executor.execute_main(call, session, client).await?
+                                        };
+                                        verification.observe_tool(
+                                            name,
+                                            outcome.is_error,
+                                            &outcome.changed_paths,
+                                        );
+                                        let outcome =
+                                            executor.capture_receipt(call, None, outcome)?;
+                                        let receipt = history_receipt(
+                                            &budget,
+                                            receipt_limit,
+                                            name,
+                                            outcome.content.clone(),
+                                            outcome.is_error,
+                                            events,
+                                        );
+                                        let event_receipt = receipt.clone();
+                                        crate::operation_receipts::put_message(
+                                            session,
+                                            call,
+                                            &outcome,
+                                            receipt,
+                                        )?;
+                                        session.save(store)?;
+                                        if name == "update_plan" && !outcome.is_error {
+                                            events.emit(
+                                                "plan_updated",
+                                                json!({
+                                                    "revision": session.task_state.revision(),
+                                                    "steps": session.task_state.steps(),
+                                                    "advisory": true,
+                                                }),
+                                            );
+                                        }
+                                        events.emit(
+                                            "tool_result",
+                                            json!({
+                                                "id": call.id,
+                                                "name": name,
+                                                "is_error": outcome.is_error,
+                                                "content": event_receipt,
+                                                "changed_paths": outcome.changed_paths,
+                                            }),
+                                        );
+                                        if cancel.is_cancelled() {
+                                            save_repair_failure(
+                                                session,
+                                                store,
+                                                events,
+                                                "cancelled",
+                                                verification.status(),
+                                                repair_steps_taken,
+                                                "Этап исправления отменён",
+                                            )?;
+                                            events.emit("error", json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                                            done = Some(false);
+                                            return Ok(130);
+                                        }
+                                        if executor.denied {
+                                            save_repair_failure(
+                                                session,
+                                                store,
+                                                events,
+                                                "denied",
+                                                verification.status(),
+                                                repair_steps_taken,
+                                                "Этап исправления остановлен: действие было отклонено",
+                                            )?;
+                                            done = Some(false);
+                                            return Ok(1);
+                                        }
+                                    }
+                                    if repair_budget.tool_calls_left == 0
+                                        && repair_budget.requests_left > 1
+                                    {
+                                        repair_budget.requests_left = 1;
+                                    }
+                                }
+                                save_repair_failure(
+                                    session,
+                                    store,
+                                    events,
+                                    "incomplete",
+                                    verification.status(),
+                                    repair_steps_taken,
+                                    "Исчерпан бюджет шагов этапа исправления по финальному ревью",
+                                )?;
+                                done = Some(false);
+                                return Ok(1);
+                            }
+                        }
+                        Err(error) => {
+                            let cancelled = cancel.is_cancelled();
+                            let status = if cancelled { "cancelled" } else { "failed" };
+                            let repair_status = if cancelled {
+                                "cancelled"
+                            } else {
+                                "skipped_review_failed"
+                            };
+                            let message = if cancelled {
+                                "Финальное ревью отменено"
+                            } else {
+                                let _ = error;
+                                "Финальное ревью не выполнено"
+                            };
+                            save_review_failure(
+                                session,
+                                store,
+                                events,
+                                &target,
+                                review_mode,
+                                review_mode.is_repair().then_some(repair_status),
+                                status,
+                                message,
+                                Some(packet_sha256),
+                                &completion.content,
+                            )?;
+                            if cancelled {
+                                events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                                done = Some(false);
+                                return Ok(130);
+                            }
+                            done = Some(false);
+                            return Ok(code.max(1));
+                        }
+                    }
+                }
                 done = Some(false);
                 return Ok(code);
             }
@@ -2950,7 +4261,7 @@ pub(crate) async fn turn(
             executor.skill_page = SkillPage::for_step(&budget, receipt_limit);
             for call in &completion.tool_calls {
                 let name = call.function.name.as_str();
-                let outcome = if AgentPool::is_tool(name) {
+                let mut outcome = if AgentPool::is_tool(name) {
                     events.emit("tool_start",json!({"id":call.id,"name":name,"arguments":call.function.arguments}));
                     let outcome = match serde_json::from_str::<Value>(&call.function.arguments) {
                         Ok(args) => drive_with_agents(async { Ok(agents.execute(name,&args).await) }, &mut inbox, &mut executor, session).await?,
@@ -2966,6 +4277,23 @@ pub(crate) async fn turn(
                     }
                     executor.execute_main(call, session, client).await?
                 };
+                if name == "wait_agent" {
+                    outcome = if events.refresh_keys(store).is_ok() {
+                        crate::operation_receipts::enrich_worker_wait(
+                            outcome,
+                            executor.journal.as_deref(),
+                            executor.artifacts,
+                            &session.id,
+                            session.turn_index,
+                            &events.secret_snapshot(),
+                        )
+                    } else {
+                        crate::operation_receipts::enrich_worker_wait_unavailable(
+                            outcome,
+                            "secret_refresh_unavailable",
+                        )
+                    };
+                }
                 outside_path_failed |= outcome.is_error && serde_json::from_str::<Value>(&outcome.content)
                     .is_ok_and(|error| error["error"] == "outside_workspace");
                 made_progress |= !outcome.is_error;
@@ -3043,6 +4371,7 @@ pub(crate) async fn turn(
                 } else {
                     return graceful_finish(
                         client, session, store, cli, plan, skills, events, &mut agents,
+                        executor.journal.as_deref(), executor.artifacts,
                         &cancel, &mut done, &reason, 1,
                     )
                     .await;
@@ -3072,7 +4401,8 @@ pub(crate) async fn turn(
         // Лимит шагов — не обрыв: финальный запрос без инструментов даёт
         // текстовое резюме (что сделано, что осталось), как в opencode.
         graceful_finish(
-            client, session, store, cli, plan, skills, events, &mut agents, &cancel,
+            client, session, store, cli, plan, skills, events, &mut agents,
+            executor.journal.as_deref(), executor.artifacts, &cancel,
             &mut done,
             &format!("достигнут лимит шагов ({})", cli.max_steps),
             1,
@@ -3238,6 +4568,1299 @@ mod tests {
     fn default_cli() -> Cli {
         use clap::Parser;
         Cli::parse_from(["rcode"])
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct ManagedAdmissionFixture {
+        _base: tempfile::TempDir,
+        root: std::path::PathBuf,
+        store: ConfigStore,
+        session: Session,
+        runtime: crate::session_runtime::SessionRuntime,
+        tools: Tools,
+        cli: Cli,
+        events: Events,
+        root_cancel: CancellationToken,
+        turn: crate::session_runtime::TurnScope,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl ManagedAdmissionFixture {
+        fn new(hook: Option<crate::managed_jobs::ManagedTestHook>) -> anyhow::Result<Self> {
+            let base = tempfile::tempdir()?;
+            let root = base.path().join("project");
+            std::fs::create_dir(&root)?;
+            let store = ConfigStore::at(base.path().join("state"))?;
+            let mut session = Session::new(
+                &root,
+                crate::config::ProviderSettings::new(ProviderKind::Custom),
+            )?;
+            session
+                .task_state
+                .host_followup("Проверить отмену управляемых команд worker")?;
+            session.turn_index = 1;
+            session.save(&store)?;
+            let mut runtime = crate::session_runtime::SessionRuntime::new(
+                &session.dir(&store),
+                &session.id,
+                vec![],
+            )?;
+            let root_cancel = CancellationToken::new();
+            let turn = runtime.begin_turn(1, &root_cancel)?;
+            if let Some(hook) = hook {
+                runtime.receipt_resources()?.3.set_test_hook(hook);
+            }
+            let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints"))?;
+            tools.begin_turn()?;
+            let mut cli = default_cli();
+            cli.approval_mode = Some(ApprovalMode::FullAccess);
+            Ok(Self {
+                _base: base,
+                root,
+                store,
+                session,
+                runtime,
+                tools,
+                cli,
+                events: Events::new(true),
+                root_cancel,
+                turn,
+            })
+        }
+
+        async fn execute(&mut self, request: &AgentRequest) -> anyhow::Result<ToolOutcome> {
+            let Self {
+                root: _,
+                store,
+                session,
+                runtime,
+                tools,
+                cli,
+                events,
+                root_cancel,
+                turn,
+                ..
+            } = self;
+            let (artifacts, journal, jobs, managed) = runtime.receipt_resources()?;
+            let journal = journal.expect("durable journal");
+            let mut executor = ToolExecutor {
+                tools,
+                events,
+                cli,
+                cancel: root_cancel,
+                plan: false,
+                denied: false,
+                last_error: false,
+                balance: None,
+                store: Some(store),
+                skills: &SkillCatalog::empty(),
+                skill_page: SkillPage::default(),
+                artifacts: Some(artifacts),
+                turn_index: 1,
+                journal: Some(journal),
+                jobs: Some(jobs),
+                managed: Some(managed),
+                job_cancel: turn.cancellation(),
+                parent_scope_id: turn.identity(),
+                observations: None,
+            };
+            executor
+                .execute(&request.call, Some(request), Some(session))
+                .await
+        }
+
+        async fn serve(&mut self, request: AgentRequest) -> anyhow::Result<()> {
+            let Self {
+                store,
+                session,
+                runtime,
+                tools,
+                cli,
+                events,
+                root_cancel,
+                turn,
+                ..
+            } = self;
+            let (artifacts, journal, jobs, managed) = runtime.receipt_resources()?;
+            let journal = journal.expect("durable journal");
+            let mut executor = ToolExecutor {
+                tools,
+                events,
+                cli,
+                cancel: root_cancel,
+                plan: false,
+                denied: false,
+                last_error: false,
+                balance: None,
+                store: Some(store),
+                skills: &SkillCatalog::empty(),
+                skill_page: SkillPage::default(),
+                artifacts: Some(artifacts),
+                turn_index: 1,
+                journal: Some(journal),
+                jobs: Some(jobs),
+                managed: Some(managed),
+                job_cancel: turn.cancellation(),
+                parent_scope_id: turn.identity(),
+                observations: None,
+            };
+            executor.serve(request, session).await
+        }
+
+        fn jobs(&mut self) -> anyhow::Result<&crate::jobs::JobsSupervisor> {
+            Ok(self.runtime.receipt_resources()?.2)
+        }
+
+        async fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.runtime
+                .shutdown_saved(&mut self.session, &self.store, &[])
+                .await
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn admission_worker_request(
+        call: ToolCall,
+        cancel: CancellationToken,
+        reply: tokio::sync::oneshot::Sender<ToolOutcome>,
+        admission: crate::agents::ReplyAdmission,
+    ) -> AgentRequest {
+        AgentRequest {
+            agent_id: "worker-q4".into(),
+            name: "worker-q4".into(),
+            role: AgentRole::Worker,
+            call,
+            cancel,
+            reply,
+            admission,
+            transfers: Default::default(),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_hook(
+        point: crate::managed_jobs::ManagedTestHookPoint,
+    ) -> (
+        crate::managed_jobs::ManagedTestHook,
+        std::sync::mpsc::Receiver<Option<String>>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        (
+            crate::managed_jobs::ManagedTestHook::new(point, entered_tx, release_rx),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn install_serve_reply_hook(
+        call_id: String,
+    ) -> (
+        std::sync::mpsc::Receiver<Option<String>>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut hooks = SERVE_REPLY_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = hooks.insert(
+            call_id,
+            ServeReplyTestHook {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+        assert!(previous.is_none(), "serve reply hook call ID already armed");
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn await_hook(
+        entered: std::sync::mpsc::Receiver<Option<String>>,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(tokio::task::spawn_blocking(move || {
+            entered.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await??)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn wait_for_file_bytes(path: &std::path::Path, expected: &[u8]) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::fs::read(path).is_ok_and(|bytes| bytes == expected) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct ReleaseHook(Option<std::sync::mpsc::SyncSender<()>>);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl ReleaseHook {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for ReleaseHook {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn preserve_checks_after_cleanup<T>(
+        checks: anyhow::Result<T>,
+        cleanup: anyhow::Result<()>,
+    ) -> anyhow::Result<T> {
+        match (checks, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_scoped_reply_after_durable_start_intent_denies_native_spawn() {
+        let (hook, entered, release) =
+            test_hook(crate::managed_jobs::ManagedTestHookPoint::StartIntent);
+        let mut release_guard = ReleaseHook(Some(release));
+        let mut fixture = ManagedAdmissionFixture::new(Some(hook)).unwrap();
+        let actor_cancel = CancellationToken::new();
+        let call = ToolCall::new(
+            "start_command",
+            json!({"command":"printf started > native-started; sleep 30"}),
+        );
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let request = admission_worker_request(call, actor_cancel.clone(), reply, admission);
+        let root = fixture.root.clone();
+        let intent_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let intent_id_task = intent_id.clone();
+        let task = tokio::spawn(async move {
+            let checks: anyhow::Result<_> = async {
+                let outcome = fixture.execute(&request).await?;
+                let closed = request.reply.is_closed();
+                let marker = root.join("native-started").exists();
+                let id = intent_id_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing Start reservation ID"))?;
+                let (artifacts, journal, jobs, _) = fixture.runtime.receipt_resources()?;
+                let no_native_record = jobs
+                    .poll_snapshot(Some("worker-q4"), &id, 0, 0, 4096)
+                    .is_err();
+                let journal = journal.ok_or_else(|| anyhow::anyhow!("missing journal"))?;
+                let records = journal.records(artifacts)?;
+                let intent = records
+                    .iter()
+                    .find(|record| {
+                        record.origin.tool == "command_lifetime"
+                            && record.origin.actor.as_deref() == Some("worker-q4")
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("durable Start intent missing"))?;
+                let payload = journal.intent_payload(&intent.operation_id, artifacts)?;
+                let args_meta: crate::artifacts::ArtifactMeta =
+                    serde_json::from_value(payload["arguments"].clone())?;
+                let args: Value = serde_json::from_str(&artifacts.verify_required(&args_meta)?)?;
+                let durable_id_matches = args["command_id"] == id;
+                let unknown_intent = intent.outcome == crate::operation_journal::Outcome::Unknown;
+                let actor_open = !request.cancel.is_cancelled();
+                Ok((
+                    outcome.is_error,
+                    closed,
+                    marker,
+                    actor_open,
+                    durable_id_matches,
+                    unknown_intent,
+                    no_native_record,
+                ))
+            }
+            .await;
+            let cleanup = fixture.shutdown().await;
+            preserve_checks_after_cleanup(checks, cleanup)
+        });
+        let hook_result = await_hook(entered).await;
+        if let Ok(Some(observed_id)) = &hook_result {
+            *intent_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observed_id.clone());
+        }
+        drop(scoped);
+        // Release after reply drop; the hook's own bounded receive prevents hangs
+        // if this test is interrupted before this point.
+        release_guard.release();
+        let result = task.await.unwrap().unwrap();
+        assert!(
+            hook_result.is_ok_and(|id| id.is_some()),
+            "Start intent hook must be reached"
+        );
+        let (
+            failed_tool,
+            reply_closed,
+            marker_written,
+            actor_open,
+            durable_id_matches,
+            unknown_intent,
+            no_native_record,
+        ) = result;
+        assert!(failed_tool, "closed reply must reject the pending Start");
+        assert!(reply_closed);
+        assert!(
+            !marker_written,
+            "no native child should run after reply closure"
+        );
+        assert!(actor_open, "reply closure must not cancel actor scope");
+        assert!(durable_id_matches);
+        assert!(unknown_intent);
+        assert!(
+            no_native_record,
+            "native supervisor must not retain a process for the rejected Start"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_reply_after_native_start_acceptance_returns_id_and_cleans_before_stop() {
+        let (hook, entered, release) =
+            test_hook(crate::managed_jobs::ManagedTestHookPoint::StartAccepted);
+        let mut release_guard = ReleaseHook(Some(release));
+        let fixture = ManagedAdmissionFixture::new(Some(hook)).unwrap();
+        let actor_cancel = CancellationToken::new();
+        let call = ToolCall::new("start_command", json!({"command":"sleep 300"}));
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let request = admission_worker_request(call, actor_cancel, reply, admission);
+        let accepted_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let accepted_id_task = accepted_id.clone();
+        let task = tokio::spawn(async move {
+            let mut fixture = fixture;
+            let mut native_id = None;
+            let checks: anyhow::Result<_> = async {
+                let outcome = fixture.execute(&request).await?;
+                let id = accepted_id_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Start acceptance hook lacked native ID"))?;
+                native_id = Some(id.clone());
+                let reply_closed = request.reply.is_closed();
+                let actor_open = !request.cancel.is_cancelled();
+                let failed_tool = outcome.is_error;
+                let value: Value = serde_json::from_str(&outcome.content)?;
+                let id_preserved = value["command_id"].as_str() == Some(id.as_str());
+                let mut cleaned_before_stop = false;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+                while tokio::time::Instant::now() < deadline {
+                    if let Ok(view) = fixture
+                        .jobs()
+                        .and_then(|jobs| jobs.poll_snapshot(Some("worker-q4"), &id, 0, 0, 4096))
+                        && view.cleanup_complete
+                    {
+                        cleaned_before_stop = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok((
+                    reply_closed,
+                    actor_open,
+                    failed_tool,
+                    id_preserved,
+                    cleaned_before_stop,
+                ))
+            }
+            .await;
+            let stop = match native_id {
+                Some(id) => match fixture.jobs() {
+                    Ok(jobs) => match jobs.stop(Some("worker-q4"), &id).await {
+                        Ok(view) if view.cleanup_complete => Ok(()),
+                        Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                },
+                None => Ok(()),
+            };
+            let shutdown = fixture.shutdown().await;
+            preserve_checks_after_cleanup(preserve_checks_after_cleanup(checks, stop), shutdown)
+        });
+        let hook_result = await_hook(entered).await;
+        if let Ok(Some(id)) = &hook_result {
+            *accepted_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+        }
+        drop(scoped);
+        release_guard.release();
+        let task_result = task.await.unwrap();
+        assert!(
+            hook_result.is_ok_and(|id| id.is_some()),
+            "native Start acceptance hook must provide its real ID"
+        );
+        let (reply_closed, actor_open, failed_tool, id_preserved, cleaned_before_stop) =
+            task_result.unwrap();
+        assert!(reply_closed);
+        assert!(actor_open, "reply closure must not cancel the actor scope");
+        assert!(
+            failed_tool,
+            "unacknowledged native Start must return a failed tool outcome"
+        );
+        assert!(
+            id_preserved,
+            "failed short outcome must preserve the accepted command ID"
+        );
+        assert!(
+            cleaned_before_stop,
+            "accepted process must be reaped before per-command stop or runtime shutdown"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_reply_in_serve_gap_cleans_committed_start_before_stop() {
+        let fixture = ManagedAdmissionFixture::new(None).unwrap();
+        let root = fixture.root.clone();
+        let actor_cancel = CancellationToken::new();
+        let call = ToolCall::new(
+            "start_command",
+            json!({"command":"echo ready > child-ready; sleep 300 & echo $! > child.pid; wait"}),
+        );
+        let (entered, release) = install_serve_reply_hook(call.id.clone());
+        let mut release_guard = ReleaseHook(Some(release));
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let observed_admission = admission.clone();
+        let actor_cancel_task = actor_cancel.clone();
+        let request = admission_worker_request(call, actor_cancel, reply, admission);
+        let id_from_hook = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let id_from_hook_task = id_from_hook.clone();
+        let task = tokio::spawn(async move {
+            let mut fixture = fixture;
+            let mut native_id = None;
+            let checks: anyhow::Result<_> = async {
+                fixture.serve(request).await?;
+                let id = id_from_hook_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("serve reply hook did not capture command ID")
+                    })?;
+                native_id = Some(id.clone());
+                let actor_open = !actor_cancel_task.is_cancelled();
+                let mut pre_stop_cleanup = false;
+                let cleanup_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+                while tokio::time::Instant::now() < cleanup_deadline {
+                    if let Ok(view) = fixture
+                        .jobs()
+                        .and_then(|jobs| jobs.poll_snapshot(Some("worker-q4"), &id, 0, 0, 4096))
+                        && view.cleanup_complete
+                    {
+                        pre_stop_cleanup = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok((actor_open, pre_stop_cleanup))
+            }
+            .await;
+            // Per-command cleanup runs even if reply publication or inspection fails.
+            let stop = match native_id {
+                Some(id) => match fixture.jobs() {
+                    Ok(jobs) => match jobs.stop(Some("worker-q4"), &id).await {
+                        Ok(view) if view.cleanup_complete => Ok(()),
+                        Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                },
+                None => Ok(()),
+            };
+            let shutdown = fixture.shutdown().await;
+            preserve_checks_after_cleanup(preserve_checks_after_cleanup(checks, stop), shutdown)
+        });
+        let hook_result = await_hook(entered).await;
+        if let Ok(Some(id)) = &hook_result {
+            *id_from_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+        }
+        // A real readiness file proves the shell and descendant exist before
+        // closing the reply; the bounded wait is not the ordering mechanism.
+        let readiness: anyhow::Result<()> = async {
+            let id = hook_result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("serve hook failed: {error}"))?
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("accepted Start did not yield a command ID"))?;
+            anyhow::ensure!(id.len() == 36, "invalid native command ID");
+            let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let child_pid = loop {
+                let pid = std::fs::read_to_string(root.join("child.pid"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .filter(|pid| *pid > 1);
+                if root.join("child-ready").exists()
+                    && let Some(pid) = pid
+                {
+                    break pid.to_string();
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < ready_deadline,
+                    "child readiness timed out"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            anyhow::ensure!(
+                // Signal 0 checks liveness without depending on an external
+                // kill executable, which minimal Linux runtimes may omit.
+                unsafe { libc::kill(child_pid.parse::<i32>()?, 0) } == 0,
+                "descendant was not live before reply closure"
+            );
+            Ok(())
+        }
+        .await;
+        drop(scoped);
+        let reply_gate_closed = !observed_admission.with_state(|open| open);
+        release_guard.release();
+        let task_result = task.await.unwrap();
+        assert!(
+            hook_result.is_ok_and(|id| id.is_some()),
+            "serve reply hook must be reached"
+        );
+        assert!(
+            readiness.is_ok(),
+            "child readiness must be established before reply closure: {readiness:?}"
+        );
+        let (actor_open, cleaned_before_stop) = task_result.unwrap();
+        assert!(
+            reply_gate_closed,
+            "the actual scoped reply gate must be closed before publication resumes"
+        );
+        assert!(actor_open);
+        assert!(
+            cleaned_before_stop,
+            "reply closure must clean the accepted child before explicit stop"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_serve_future_cleans_start_while_reply_receiver_lives() {
+        let fixture = ManagedAdmissionFixture::new(None).unwrap();
+        let root = fixture.root.clone();
+        let actor_cancel = CancellationToken::new();
+        let call = ToolCall::new(
+            "start_command",
+            json!({
+                "command":"printf ready > abort-ready; sleep 300 & echo $! > abort-child.pid; wait"
+            }),
+        );
+        let (entered, release) = install_serve_reply_hook(call.id.clone());
+        let mut release_guard = ReleaseHook(Some(release));
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let observed_admission = admission.clone();
+        let request = admission_worker_request(call, actor_cancel.clone(), reply, admission);
+        let command_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let command_id_task = command_id.clone();
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut fixture = fixture;
+            let mut native_id = None;
+            let checks: anyhow::Result<_> = async {
+                let mut serve = Box::pin(fixture.serve(request));
+                let cancelled = tokio::select! {
+                    biased;
+                    _ = abort_rx => true,
+                    result = &mut serve => {
+                        result?;
+                        false
+                    }
+                };
+                drop(serve);
+                let id = command_id_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("serve hook did not capture command ID"))?;
+                native_id = Some(id.clone());
+                let actor_open = !actor_cancel.is_cancelled();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+                let mut cleaned_before_stop = false;
+                while tokio::time::Instant::now() < deadline {
+                    if fixture
+                        .jobs()
+                        .and_then(|jobs| jobs.poll_snapshot(Some("worker-q4"), &id, 0, 0, 4096))
+                        .is_ok_and(|view| view.cleanup_complete)
+                    {
+                        cleaned_before_stop = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok((cancelled, actor_open, cleaned_before_stop))
+            }
+            .await;
+            let stop = match native_id {
+                Some(id) => match fixture.jobs() {
+                    Ok(jobs) => match jobs.stop(Some("worker-q4"), &id).await {
+                        Ok(view) if view.cleanup_complete => Ok(()),
+                        Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                },
+                None => Ok(()),
+            };
+            let shutdown = fixture.shutdown().await;
+            preserve_checks_after_cleanup(preserve_checks_after_cleanup(checks, stop), shutdown)
+        });
+
+        let hook_result = await_hook(entered).await;
+        if let Ok(Some(id)) = &hook_result {
+            *command_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+        }
+        let readiness: anyhow::Result<()> = async {
+            hook_result
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("serve hook failed: {error}"))?
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Start acceptance lacked command ID"))?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            let child_pid = loop {
+                let pid = std::fs::read_to_string(root.join("abort-child.pid"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    .filter(|pid| *pid > 1);
+                if root.join("abort-ready").exists()
+                    && let Some(pid) = pid
+                {
+                    break pid.to_string();
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "native child readiness timed out"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            anyhow::ensure!(
+                // Signal 0 checks liveness without depending on an external
+                // kill executable, which minimal Linux runtimes may omit.
+                unsafe { libc::kill(child_pid.parse::<i32>()?, 0) } == 0,
+                "native descendant must be live before abort"
+            );
+            Ok(())
+        }
+        .await;
+        let _ = abort_tx.send(());
+        release_guard.release();
+        let task_result = task.await.unwrap();
+        let gate_open_before_receiver_drop = observed_admission.with_state(|open| open);
+        assert!(
+            gate_open_before_receiver_drop,
+            "ScopedReply receiver must remain alive and unpolled through cleanup"
+        );
+        drop(scoped);
+        assert!(
+            hook_result.is_ok_and(|id| id.is_some()),
+            "serve pre-publication hook must be reached"
+        );
+        assert!(
+            readiness.is_ok(),
+            "native readiness must precede cancellation: {readiness:?}"
+        );
+        let (cancelled, actor_open, cleaned_before_stop) = task_result.unwrap();
+        assert!(cancelled, "abort must win after serve yields from the hook");
+        assert!(
+            actor_open,
+            "dropping serve must not cancel the worker actor"
+        );
+        assert!(
+            cleaned_before_stop,
+            "dropping the serve future must clean its unacknowledged Start before stop"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_send_without_receive_keeps_start_unacknowledged() {
+        let mut fixture = ManagedAdmissionFixture::new(None).unwrap();
+        let actor_cancel = CancellationToken::new();
+        let call = ToolCall::new(
+            "start_command",
+            json!({"command":"printf started > native-started; exec sleep 300"}),
+        );
+        let call_id = call.id.clone();
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let request = admission_worker_request(call, actor_cancel.clone(), reply, admission);
+        let mut command_id = None;
+        let checks: anyhow::Result<()> = async {
+            fixture.serve(request).await?;
+            let (artifacts, journal, jobs, _) = fixture.runtime.receipt_resources()?;
+            let journal = journal.ok_or_else(|| anyhow::anyhow!("missing journal"))?;
+            let records = journal.records(artifacts)?;
+            let lifetime = records
+                .iter()
+                .find(|record| {
+                    record.origin.tool == "command_lifetime" && record.origin.call_id == call_id
+                })
+                .ok_or_else(|| anyhow::anyhow!("durable command lifetime missing"))?;
+            let payload = journal.intent_payload(&lifetime.operation_id, artifacts)?;
+            let args_meta: crate::artifacts::ArtifactMeta =
+                serde_json::from_value(payload["arguments"].clone())?;
+            let args: Value = serde_json::from_str(&artifacts.verify_required(&args_meta)?)?;
+            let id = args["command_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("durable native command ID missing"))?
+                .to_owned();
+            command_id = Some(id.clone());
+            let short_start = records
+                .iter()
+                .find(|record| {
+                    record.origin.tool == "start_command" && record.origin.call_id == call_id
+                })
+                .ok_or_else(|| anyhow::anyhow!("short Start receipt missing"))?;
+            anyhow::ensure!(
+                short_start.outcome == crate::operation_journal::Outcome::Succeeded
+                    && short_start.terminal.is_some(),
+                "short Start receipt must be durably successful"
+            );
+            anyhow::ensure!(
+                wait_for_file_bytes(&fixture.root.join("native-started"), b"started").await,
+                "native command readiness marker missing"
+            );
+            let snapshot = jobs.poll_snapshot(Some("worker-q4"), &id, 0, 0, 4096)?;
+            anyhow::ensure!(
+                snapshot.status == crate::jobs::JobStatus::Running,
+                "native process must still be running before receiver drop"
+            );
+            Ok(())
+        }
+        .await;
+
+        drop(scoped);
+        let actor_open_after_drop = !actor_cancel.is_cancelled();
+        let mut cleaned_before_stop = false;
+        if let Some(id) = command_id.as_deref() {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+            while tokio::time::Instant::now() < deadline {
+                if fixture
+                    .jobs()
+                    .and_then(|jobs| jobs.poll_snapshot(Some("worker-q4"), id, 0, 0, 4096))
+                    .is_ok_and(|view| view.cleanup_complete)
+                {
+                    cleaned_before_stop = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let stop = match command_id {
+            Some(id) => match fixture.jobs() {
+                Ok(jobs) => match jobs.stop(Some("worker-q4"), &id).await {
+                    Ok(view) if view.cleanup_complete => Ok(()),
+                    Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            },
+            None => Ok(()),
+        };
+        let shutdown = fixture.shutdown().await;
+        let checks =
+            preserve_checks_after_cleanup(preserve_checks_after_cleanup(checks, stop), shutdown);
+        assert!(
+            checks.is_ok(),
+            "Start/send/cleanup checks failed: {checks:?}"
+        );
+        assert!(
+            actor_open_after_drop,
+            "receiver drop must not cancel actor scope"
+        );
+        assert!(
+            cleaned_before_stop,
+            "unreceived successful Start send must remain unacknowledged and clean the process"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_start_reply_drop_preserves_managed_stdin() {
+        let mut fixture = ManagedAdmissionFixture::new(None).unwrap();
+        let call = ToolCall::new(
+            "start_command",
+            json!({"command":"cat > stdin-received","stdin":true}),
+        );
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let request = admission_worker_request(call, CancellationToken::new(), reply, admission);
+        let mut command_id = None;
+        let checks: anyhow::Result<()> = async {
+            fixture.serve(request).await?;
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(5), scoped.receive()).await??;
+            anyhow::ensure!(
+                !outcome.is_error,
+                "real serve must publish successful Start acknowledgement"
+            );
+            let value: Value = serde_json::from_str(&outcome.content)?;
+            let id = value["command_id"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("native command ID missing"))?
+                .to_owned();
+            command_id = Some(id.clone());
+            let ticket = fixture
+                .jobs()?
+                .send_input(Some("worker-q4"), &id, b"acknowledged\n", true)
+                .await?;
+            let delivered =
+                tokio::time::timeout(std::time::Duration::from_secs(5), ticket.wait()).await??;
+            anyhow::ensure!(delivered.status == crate::jobs::InputStatus::Delivered);
+            anyhow::ensure!(delivered.written == b"acknowledged\n".len());
+            anyhow::ensure!(
+                wait_for_file_bytes(&fixture.root.join("stdin-received"), b"acknowledged\n",).await,
+                "cat must consume the acknowledged bytes before cleanup"
+            );
+            anyhow::ensure!(
+                std::fs::read(fixture.root.join("stdin-received"))? == b"acknowledged\n",
+                "stdin bytes must be exact"
+            );
+            Ok(())
+        }
+        .await;
+        let stop = match command_id {
+            Some(id) => match fixture.jobs() {
+                Ok(jobs) => match jobs.stop(Some("worker-q4"), &id).await {
+                    Ok(view) if view.cleanup_complete => Ok(()),
+                    Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            },
+            None => Ok(()),
+        };
+        let shutdown = fixture.shutdown().await;
+        let checks =
+            preserve_checks_after_cleanup(preserve_checks_after_cleanup(checks, stop), shutdown);
+        assert!(
+            checks.is_ok(),
+            "managed Start/Input must complete before cleanup: {checks:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_reply_before_input_admission_does_not_close_stdin() {
+        let (hook, entered, release) =
+            test_hook(crate::managed_jobs::ManagedTestHookPoint::InputIntent);
+        let mut release_guard = ReleaseHook(Some(release));
+        let mut fixture = ManagedAdmissionFixture::new(None).unwrap();
+        let start = ToolCall::new(
+            "start_command",
+            json!({"command":"cat > stdin-received","stdin":true}),
+        );
+        let (start_reply, start_scoped, start_admission) = crate::agents::scoped_reply_for_test();
+        let start_result: anyhow::Result<String> = async {
+            fixture
+                .serve(admission_worker_request(
+                    start,
+                    CancellationToken::new(),
+                    start_reply,
+                    start_admission,
+                ))
+                .await?;
+            let start_outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(5), start_scoped.receive())
+                    .await??;
+            anyhow::ensure!(!start_outcome.is_error, "initial Start failed");
+            let start_value: Value = serde_json::from_str(&start_outcome.content)?;
+            start_value["command_id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("initial Start command ID missing"))
+        }
+        .await;
+        let id = match start_result {
+            Ok(id) => id,
+            Err(error) => {
+                let cleanup = fixture.shutdown().await;
+                assert!(
+                    cleanup.is_ok(),
+                    "failed to clean up initial Start: {cleanup:?}"
+                );
+                panic!("failed to prepare stdin process: {error:#}");
+            }
+        };
+
+        // Arm only after Start; the hook is per ManagedJobs and pauses after the
+        // durable input intent, before its native enqueue.
+        let hook_install = fixture
+            .runtime
+            .receipt_resources()
+            .map(|resources| resources.3.set_test_hook(hook));
+        if let Err(error) = hook_install {
+            let cleanup = fixture.shutdown().await;
+            assert!(
+                cleanup.is_ok(),
+                "failed to clean up before input test: {cleanup:?}"
+            );
+            panic!("could not install input hook: {error:#}");
+        }
+        let actor_cancel = CancellationToken::new();
+        let input = ToolCall::new(
+            "send_command_input",
+            json!({
+                "command_id":id,"text":"forbidden\n","close":true
+            }),
+        );
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let request = admission_worker_request(input, actor_cancel.clone(), reply, admission);
+        let task = tokio::spawn(async move {
+            let mut fixture = fixture;
+            let checks: anyhow::Result<_> = async {
+                let outcome = fixture.execute(&request).await?;
+                let closed = request.reply.is_closed();
+                let actor_open = !actor_cancel.is_cancelled();
+                let allowed = fixture
+                    .jobs()?
+                    .send_input(Some("worker-q4"), &id, b"allowed\n", true)
+                    .await;
+                let delivered = match allowed {
+                    Ok(ticket) => {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), ticket.wait())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                    }
+                    Err(_) => None,
+                };
+                let file_complete = if delivered
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.status == crate::jobs::InputStatus::Delivered)
+                {
+                    wait_for_file_bytes(&fixture.root.join("stdin-received"), b"allowed\n").await
+                } else {
+                    false
+                };
+                Ok((
+                    outcome.is_error,
+                    closed,
+                    actor_open,
+                    delivered,
+                    file_complete,
+                ))
+            }
+            .await;
+            let stop = match fixture.jobs() {
+                Ok(jobs) => match jobs.stop(Some("worker-q4"), &id).await {
+                    Ok(view) if view.cleanup_complete => Ok(()),
+                    Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let shutdown = fixture.shutdown().await;
+            let bytes =
+                std::fs::read(fixture.root.join("stdin-received")).map_err(anyhow::Error::from);
+            let stopped = match (stop, shutdown) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            };
+            let cleanup = stopped.and(bytes);
+            match checks {
+                Ok((tool_error, closed, actor_open, delivered, file_complete)) => {
+                    cleanup.map(|bytes| {
+                        (
+                            tool_error,
+                            closed,
+                            actor_open,
+                            delivered,
+                            file_complete,
+                            bytes,
+                        )
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        });
+        let hook_result = await_hook(entered).await;
+        drop(scoped);
+        release_guard.release();
+        let task_result = task.await.unwrap();
+        assert!(
+            hook_result.is_ok_and(|id| id.is_some()),
+            "Input intent hook must be reached"
+        );
+        let (tool_error, reply_closed, actor_open, delivered, file_complete, bytes) =
+            task_result.unwrap();
+        assert!(reply_closed);
+        assert!(
+            tool_error,
+            "closed reply must produce a failed Input tool receipt"
+        );
+        assert!(actor_open, "reply closure must not cancel the worker actor");
+        let delivered =
+            delivered.expect("independent allowed input must be accepted after denied close");
+        assert_eq!(delivered.status, crate::jobs::InputStatus::Delivered);
+        assert_eq!(delivered.written, b"allowed\n".len());
+        assert!(
+            file_complete,
+            "worker must consume the allowed control bytes"
+        );
+        assert_eq!(bytes, b"allowed\n");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_input_reply_settles_the_accepted_delivery_once() {
+        let (hook, entered, release) =
+            test_hook(crate::managed_jobs::ManagedTestHookPoint::InputAccepted);
+        let mut release_guard = ReleaseHook(Some(release));
+        let mut fixture = ManagedAdmissionFixture::new(None).unwrap();
+        let start = ToolCall::new(
+            "start_command",
+            json!({"command":"cat > stdin-received","stdin":true}),
+        );
+        let (start_reply, start_scoped, start_admission) = crate::agents::scoped_reply_for_test();
+        let start_result: anyhow::Result<String> = async {
+            fixture
+                .serve(admission_worker_request(
+                    start,
+                    CancellationToken::new(),
+                    start_reply,
+                    start_admission,
+                ))
+                .await?;
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(5), start_scoped.receive())
+                    .await??;
+            anyhow::ensure!(!outcome.is_error, "initial Start failed");
+            let value: Value = serde_json::from_str(&outcome.content)?;
+            value["command_id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("initial command ID missing"))
+        }
+        .await;
+        let command_id = match start_result {
+            Ok(id) => id,
+            Err(error) => {
+                let cleanup = fixture.shutdown().await;
+                assert!(cleanup.is_ok(), "initial Start cleanup failed: {cleanup:?}");
+                panic!("failed to prepare input process: {error:#}");
+            }
+        };
+        let hook_install = fixture
+            .runtime
+            .receipt_resources()
+            .map(|resources| resources.3.set_test_hook(hook));
+        if let Err(error) = hook_install {
+            let cleanup = fixture.shutdown().await;
+            assert!(cleanup.is_ok(), "input hook cleanup failed: {cleanup:?}");
+            panic!("failed to install input hook: {error:#}");
+        }
+
+        let actor_cancel = CancellationToken::new();
+        let input = ToolCall::new(
+            "send_command_input",
+            json!({"command_id":command_id.clone(),"text":"once\n","close":true}),
+        );
+        let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+        let request = admission_worker_request(input, actor_cancel.clone(), reply, admission);
+        let input_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let input_id_task = input_id.clone();
+        let task = tokio::spawn(async move {
+            let mut fixture = fixture;
+            let checks: anyhow::Result<_> = async {
+                let outcome = fixture.execute(&request).await?;
+                let id = input_id_task
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("accepted Input ID missing"))?;
+                let content: Value = serde_json::from_str(&outcome.content)?;
+                let reply_closed = request.reply.is_closed();
+                let actor_open = !actor_cancel.is_cancelled();
+                let bytes_delivered =
+                    wait_for_file_bytes(&fixture.root.join("stdin-received"), b"once\n").await;
+                let bytes = std::fs::read(fixture.root.join("stdin-received"))?;
+                let settle_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut settled_receipts = Vec::new();
+                let delivered: Value = loop {
+                    let batch = fixture
+                        .runtime
+                        .settle_jobs(&mut fixture.session, &fixture.store, &[])
+                        .await?;
+                    let found_input = batch.iter().any(|receipt| receipt.operation_id == id);
+                    settled_receipts.extend(batch);
+                    if found_input {
+                        let receipt = settled_receipts
+                            .iter()
+                            .find(|receipt| receipt.operation_id == id)
+                            .ok_or_else(|| anyhow::anyhow!("Input delivery receipt missing"))?;
+                        break serde_json::from_str(
+                            &fixture
+                                .runtime
+                                .artifacts()
+                                .verify_required(&receipt.output)?,
+                        )?;
+                    }
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < settle_deadline,
+                        "Input delivery receipt did not settle before deadline"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                };
+                let second = fixture
+                    .runtime
+                    .settle_jobs(&mut fixture.session, &fixture.store, &[])
+                    .await?;
+                let second_has_input = second.iter().any(|receipt| receipt.operation_id == id);
+                let (artifacts, journal, _, _) = fixture.runtime.receipt_resources()?;
+                let journal = journal.ok_or_else(|| anyhow::anyhow!("missing journal"))?;
+                let committed = journal.records(artifacts)?.into_iter().any(|record| {
+                    record.operation_id == id
+                        && record.origin.tool == "command_input_lifetime"
+                        && record.outcome == crate::operation_journal::Outcome::Succeeded
+                        && record.terminal.is_some()
+                });
+                // The worker lost its reply after native input admission. A
+                // failed/cancelled wait must recover the committed delivery
+                // without re-sending any bytes or treating acceptance as delivery.
+                for status in [
+                    crate::agents::AgentStatus::Failed,
+                    crate::agents::AgentStatus::Cancelled,
+                    crate::agents::AgentStatus::Interrupted,
+                ] {
+                    let record = crate::agents::AgentRecord {
+                        id: "worker-q4".into(),
+                        name: "lost-input-reply".into(),
+                        task: "stdin delivery".into(),
+                        role: AgentRole::Worker,
+                        status,
+                        result: "Worker result was not delivered".into(),
+                        usage: Default::default(),
+                        transferred_commands: vec![],
+                    };
+                    let enrich = || {
+                        crate::operation_receipts::enrich_worker_wait(
+                            ToolOutcome::error(serde_json::to_string(&record).unwrap()),
+                            Some(journal),
+                            Some(artifacts),
+                            &fixture.session.id,
+                            fixture.session.turn_index,
+                            &[],
+                        )
+                    };
+                    let wait = enrich();
+                    let repeated_wait = enrich();
+                    anyhow::ensure!(
+                        wait.is_error && wait.content == repeated_wait.content,
+                        "Repeated wait must preserve failure and committed observations"
+                    );
+                    let value: Value = serde_json::from_str(&wait.content)?;
+                    anyhow::ensure!(
+                        value["status"] == serde_json::to_value(status)?
+                            && value["worker_receipts"]["goal_verified"] == false,
+                        "Worker status and unverified goal must remain unchanged"
+                    );
+                    let observations = value["worker_receipts"]["observations"]
+                        .as_array()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing worker observations after lost reply")
+                        })?;
+                    anyhow::ensure!(
+                        observations.iter().any(|observation| {
+                            observation["tool"] == "command_input_lifetime"
+                                && observation["fields"]["input_id"] == id
+                                && observation["fields"]["delivery"] == "delivered"
+                                && observation["fields"]["written"] == b"once\n".len()
+                        }),
+                        "Lost reply must not hide the actual committed input delivery"
+                    );
+                }
+                Ok((
+                    outcome.is_error,
+                    content["input_id"] == id,
+                    content["delivery"] == "accepted",
+                    reply_closed,
+                    actor_open,
+                    bytes_delivered,
+                    bytes,
+                    delivered["delivery"] == "delivered",
+                    delivered["written"] == b"once\n".len(),
+                    !second_has_input,
+                    committed,
+                ))
+            }
+            .await;
+            let stop = match fixture.jobs() {
+                Ok(jobs) => match jobs.stop(Some("worker-q4"), &command_id).await {
+                    Ok(view) if view.cleanup_complete => Ok(()),
+                    Ok(_) => Err(anyhow::anyhow!("per-command cleanup was not confirmed")),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            let shutdown = fixture.shutdown().await;
+            preserve_checks_after_cleanup(preserve_checks_after_cleanup(checks, stop), shutdown)
+        });
+        let hook_result = await_hook(entered).await;
+        if let Ok(Some(id)) = &hook_result {
+            *input_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+        }
+        drop(scoped);
+        release_guard.release();
+        let task_result = task.await.unwrap();
+        assert!(
+            hook_result.is_ok_and(|id| id.is_some()),
+            "Input enqueue was not reached"
+        );
+        let result = task_result.unwrap();
+        let (
+            tool_error,
+            id_retained,
+            accepted,
+            reply_closed,
+            actor_open,
+            bytes_delivered,
+            bytes,
+            receipt_delivered,
+            receipt_written,
+            no_duplicate_settlement,
+            durable_success,
+        ) = result;
+        assert!(tool_error, "lost reply must be reported as a tool error");
+        assert!(
+            id_retained && accepted,
+            "accepted Input ID must remain in the receipt"
+        );
+        assert!(reply_closed && actor_open);
+        assert!(bytes_delivered);
+        assert_eq!(
+            bytes, b"once\n",
+            "accepted bytes must be delivered exactly once"
+        );
+        assert!(receipt_delivered && receipt_written && durable_success);
+        assert!(no_duplicate_settlement);
     }
 
     #[tokio::test]
@@ -3565,6 +6188,7 @@ mod tests {
             managed: None,
             job_cancel: CancellationToken::new(),
             parent_scope_id: String::new(),
+            observations: None,
         };
         let read = ToolCall::new("read_file", json!({"path":"a.txt"}));
         assert!(!executor.execute(&read, None, None).await.unwrap().is_error);
@@ -3671,6 +6295,7 @@ mod tests {
                 managed: None,
                 job_cancel: CancellationToken::new(),
                 parent_scope_id: String::new(),
+                observations: None,
             };
             for call in [
                 ToolCall::new(
@@ -3740,6 +6365,7 @@ mod tests {
             managed: None,
             job_cancel: CancellationToken::new(),
             parent_scope_id: String::new(),
+            observations: None,
         };
         for closed_reply in [false, true] {
             let child_cancel = cancel.child_token();
@@ -3810,6 +6436,7 @@ mod tests {
             managed: None,
             job_cancel: CancellationToken::new(),
             parent_scope_id: String::new(),
+            observations: None,
         };
         executor
             .serve(
@@ -3927,9 +6554,43 @@ mod tests {
     fn shell_confirmation_cannot_hide_lines_or_bidi() {
         let args = json!({"command":"echo bad\n\n\ncargo test\u{202e}"});
         let text = ui::shell_preview(Path::new("/tmp/project"), &args).unwrap();
-        assert_eq!(text.lines().count(), 4);
-        assert!(text.contains("\\n\\n\\ncargo test\\u{202e}"));
+        assert!(text.contains(
+            "Каталог: \"/tmp/project\"\nКоманда:\n```sh\necho bad\n\n\ncargo test\\u{202e}\n```"
+        ));
         assert!(!text.contains('\u{202e}'));
+        let controls =
+            ui::shell_preview(Path::new("/tmp/project"), &json!({"command":"a\rb\u{1b}c"}))
+                .unwrap();
+        assert!(controls.contains("a\\rb\\u{1b}c"));
+        let cwd = ui::shell_preview(
+            Path::new("/tmp/root\ninjected\t\u{1b}"),
+            &json!({"command":"true"}),
+        )
+        .unwrap();
+        assert!(cwd.contains(r#"Каталог: "/tmp/root\ninjected\t\u001b""#));
+        assert!(!cwd.contains("Каталог: /tmp/root\ninjected"));
+        let typed = ui::shell_preview_content(
+            Path::new("/tmp/**`root\ninjected"),
+            &json!({"command":"echo **literal**"}),
+        )
+        .unwrap();
+        assert!(
+            typed
+                .before()
+                .contains(r#"Каталог: "/tmp/**`root\ninjected""#)
+        );
+        assert_eq!(typed.code(), Some("echo **literal**"));
+        assert_eq!(typed.after(), "Изменения shell не управляются /undo.");
+        let fenced =
+            ui::shell_preview(Path::new("/tmp/project"), &json!({"command":"echo ```"})).unwrap();
+        assert!(fenced.contains("````sh\necho ```\n````"));
+        assert!(
+            ui::shell_preview(
+                Path::new("/tmp/project"),
+                &json!({"command":format!("safe{}danger", "\n".repeat(12))})
+            )
+            .is_err()
+        );
         assert!(ui::shell_preview(Path::new("/tmp"), &json!({"command":"x".repeat(600)})).is_err());
     }
     #[test]
@@ -4210,6 +6871,7 @@ mod tests {
             managed: None,
             job_cancel: CancellationToken::new(),
             parent_scope_id: String::new(),
+            observations: None,
         };
         let call = ToolCall::new(crate::skill_tool::TOOL_NAME, json!({"name":"guide"}));
         let outcome = executor.execute(&call, None, None).await.unwrap();
@@ -4286,6 +6948,398 @@ mod tests {
         assert_eq!(
             SkillPage::for_step(&ContextBudget::cloud(), None),
             SkillPage::default()
+        );
+    }
+
+    async fn one_shot_http_server(
+        replies: Vec<Value>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "unexpected EOF reading request headers");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "unexpected EOF reading request body");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body: Value =
+                    serde_json::from_slice(&buf[header_end..header_end + content_length]).unwrap();
+                requests.push(body);
+                let payload = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn skill_turn_preloads_first_page_before_first_model_request_and_keeps_plan_mode() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+        let skill_dir = home.join("skills").join("careful");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(skill_dir.join("references").join("extra.md"), "Extra doc\n").unwrap();
+        let mut long_body = String::from("# Careful skill\nFirst line of skill.\n");
+        for idx in 0..800 {
+            long_body.push_str(&format!(
+                "Line {idx:03}: always verify state before running any command in the repository.\n"
+            ));
+        }
+        assert!(long_body.len() > crate::skill_tool::PAGE_BYTES);
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: careful\ndescription: Careful checks\ndisable-model-invocation: true\nallowed-tools: Bash\n---\n{long_body}"
+            ),
+        )
+        .unwrap();
+        let skills = SkillCatalog::discover(&home, &root, &SkillsConfig::default());
+        assert!(skills.loadable());
+        assert!(
+            skills.skills.iter().all(|s| !s.in_catalog),
+            "only skill has disable-model-invocation"
+        );
+
+        let reply = json!({
+            "choices": [{"message": {"role": "assistant", "content": "План готов"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 10}
+        });
+        let (url, server) = one_shot_http_server(vec![reply]).await;
+        let mut settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
+        settings.base_url = Some(url);
+        let mut session = Session::new(&root, settings.clone()).unwrap();
+        crate::config::ensure_private_directory(&session.dir(&store)).unwrap();
+        let mut execution =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        let mut client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
+        let events = Events::new(false);
+        let prompt = "Пользователь явно выбрал скилл careful; rcode уже загрузил его через load_skill (результат ниже). Если есть next_line — дочитай через load_skill. Действуй по скиллу: проверь миграцию";
+
+        let code = skill_turn(
+            &mut session,
+            &store,
+            &mut tools,
+            &mut client,
+            &events,
+            &default_cli(),
+            prompt,
+            "careful",
+            true,
+            &skills,
+            &mut execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent_messages = requests[0]["messages"].as_array().unwrap();
+        // system, user, synthetic assistant(load_skill), tool(receipt)
+        assert_eq!(sent_messages.len(), 4, "{sent_messages:#?}");
+        assert_eq!(sent_messages[1]["role"], "user");
+        assert_eq!(sent_messages[1]["content"], prompt);
+        assert_eq!(sent_messages[2]["role"], "assistant");
+        assert_eq!(sent_messages[2]["content"], "");
+        assert_eq!(
+            sent_messages[2]["tool_calls"][0]["function"]["name"],
+            "load_skill"
+        );
+        let call_id = sent_messages[2]["tool_calls"][0]["id"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                sent_messages[2]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"name": "careful"})
+        );
+        assert_eq!(sent_messages[3]["role"], "tool");
+        assert_eq!(sent_messages[3]["tool_call_id"], call_id);
+        assert_eq!(sent_messages[3]["name"], "load_skill");
+        let receipt: Value =
+            serde_json::from_str(sent_messages[3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(receipt["skill"], "careful");
+        assert_eq!(receipt["start_line"], 1);
+        assert!(receipt["next_line"].as_u64().unwrap() > 1);
+        assert!(receipt["sha256"].as_str().is_some_and(|s| s.len() == 64));
+        assert!(
+            receipt["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("# Careful skill\nFirst line of skill.\n")
+        );
+        assert_eq!(receipt["resources"], json!(["references/extra.md"]));
+        assert!(receipt["artifact_id"].is_string());
+
+        // Plan mode keeps read-only tools and still declares load_skill because it is in history.
+        let sent_tools: Vec<&str> = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(sent_tools.contains(&"load_skill"), "{sent_tools:?}");
+        assert!(!sent_tools.contains(&"write_file") && !sent_tools.contains(&"run_command"));
+
+        // TaskState stores the short user request, not the skill body.
+        assert_eq!(session.task_state.goal(), prompt);
+        assert!(!session.task_state.goal().contains("First line of skill"));
+        assert_eq!(
+            session.messages[1]
+                .provider_meta
+                .as_ref()
+                .map(|m| m.kind.as_str()),
+            Some("rcode_skill_preload")
+        );
+
+        let recorded = events.recorded();
+        let types: Vec<&str> = recorded.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert!(
+            types.contains(&"tool_start")
+                && types.contains(&"tool_result")
+                && types.contains(&"done"),
+            "{types:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_turn_error_stops_before_model_request_and_persists_consistent_history() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+        let skill_file = home.join("skills").join("broken").join("SKILL.md");
+        std::fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_file,
+            "---\nname: broken\ndescription: Disappears before turn\n---\n# Broken\n",
+        )
+        .unwrap();
+        let skills = SkillCatalog::discover(&home, &root, &SkillsConfig::default());
+        // Remove the file after discovery so preload fails deterministically.
+        std::fs::remove_file(&skill_file).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
+        settings.base_url = Some(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let mut session = Session::new(&root, settings.clone()).unwrap();
+        crate::config::ensure_private_directory(&session.dir(&store)).unwrap();
+        let mut execution =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        let mut client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
+        let events = Events::new(false);
+
+        let code = skill_turn(
+            &mut session,
+            &store,
+            &mut tools,
+            &mut client,
+            &events,
+            &default_cli(),
+            "Пользователь явно выбрал скилл broken; rcode уже загрузил его через load_skill (результат ниже). Если есть next_line — дочитай через load_skill. Действуй по скиллу.",
+            "broken",
+            false,
+            &skills,
+            &mut execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        // History is consistent on disk: user -> assistant(load_skill) -> tool(error receipt).
+        let mut reloaded = Session::load(&store, &session.id, &root).unwrap();
+        assert_eq!(reloaded.repair_pending().unwrap(), 0);
+        assert_eq!(reloaded.messages.len(), 3);
+        assert_eq!(reloaded.messages[0].role, "user");
+        assert_eq!(reloaded.messages[1].role, "assistant");
+        assert_eq!(reloaded.messages[2].role, "tool");
+        let error_receipt: Value =
+            serde_json::from_str(reloaded.messages[2].content.as_deref().unwrap()).unwrap();
+        assert_eq!(error_receipt["error"], "not_found");
+
+        let recorded = events.recorded();
+        assert!(
+            recorded
+                .iter()
+                .any(|e| e["type"] == "tool_result" && e["is_error"] == true)
+        );
+        let error_event = recorded
+            .iter()
+            .find(|e| e["type"] == "error")
+            .expect("error event emitted");
+        let msg = error_event["message"].as_str().unwrap();
+        assert!(
+            msg.contains("Скилл broken не загружен:") && msg.contains("запрос модели не отправлен"),
+            "{msg}"
+        );
+        assert!(!recorded.iter().any(|e| e["type"] == "done"));
+    }
+
+    #[tokio::test]
+    async fn skill_turn_local_bounds_preload_page_and_resume_does_not_repeat_preload() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        let root = base.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+        let skill_file = home.join("skills").join("writer").join("SKILL.md");
+        std::fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+        let mut body = String::from("# Writer\n");
+        for idx in 1..=600 {
+            body.push_str(&format!(
+                "Paragraph {idx:04}: concise technical prose in Russian without filler words, padded for local page fit.\n"
+            ));
+        }
+        assert!(body.len() > crate::skill_tool::PAGE_BYTES);
+        std::fs::write(
+            &skill_file,
+            format!("---\nname: writer\ndescription: Writer skill\n---\n{body}"),
+        )
+        .unwrap();
+        let skills = SkillCatalog::discover(&home, &root, &SkillsConfig::default());
+
+        let reply1 = json!({
+            "choices": [{"message": {"role": "assistant", "content": "Первый ответ"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5}
+        });
+        let reply2 = json!({
+            "choices": [{"message": {"role": "assistant", "content": "Второй ответ после resume"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 5}
+        });
+        let (url, server) = one_shot_http_server(vec![reply1, reply2]).await;
+        let local = crate::local::profile_settings(
+            "qwen",
+            &url,
+            crate::local::LocalRuntime::Mlx,
+            "qwen-local",
+        );
+        let mut session = Session::new(&root, local.clone()).unwrap();
+        crate::config::ensure_private_directory(&session.dir(&store)).unwrap();
+        let mut execution =
+            crate::session_runtime::SessionRuntime::new(&session.dir(&store), &session.id, vec![])
+                .unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        let mut client = ProviderClient::connect(local.clone(), None).unwrap();
+        let events = Events::new(false);
+        let budget = context_budget(&client, &session, &default_cli(), false, &skills);
+        let receipt_limit = budget.receipt_limit().unwrap();
+
+        let code = skill_turn(
+            &mut session,
+            &store,
+            &mut tools,
+            &mut client,
+            &events,
+            &default_cli(),
+            "Пользователь явно выбрал скилл writer; rcode уже загрузил его через load_skill (результат ниже). Если есть next_line — дочитай через load_skill. Действуй по скиллу: напиши абзац",
+            "writer",
+            false,
+            &skills,
+            &mut execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        execution
+            .shutdown_saved(&mut session, &store, &[])
+            .await
+            .unwrap();
+
+        // Simulate /resume in a fresh runtime and run a normal follow-up turn.
+        let mut restored = Session::load(&store, &session.id, &root).unwrap();
+        let mut next_execution = crate::session_runtime::SessionRuntime::new(
+            &restored.dir(&store),
+            &restored.id,
+            vec![],
+        )
+        .unwrap();
+        next_execution.activate().unwrap();
+        next_execution.reconcile_receipts(&mut restored).unwrap();
+        let code2 = turn(
+            &mut restored,
+            &store,
+            &mut tools,
+            &mut client,
+            &events,
+            &default_cli(),
+            "Уточни второй абзац",
+            false,
+            &skills,
+            &mut next_execution,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code2, 0);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_tool_msg = &requests[0]["messages"][3];
+        assert_eq!(first_tool_msg["role"], "tool");
+        let raw_receipt = first_tool_msg["content"].as_str().unwrap();
+        let measured = budget.measure(&Message::text("tool", raw_receipt));
+        assert!(
+            measured <= receipt_limit,
+            "local preload receipt {measured} exceeded limit {receipt_limit}"
+        );
+        let parsed_receipt: Value = serde_json::from_str(raw_receipt).unwrap();
+        assert!(
+            parsed_receipt["content"].as_str().unwrap().len() < crate::skill_tool::PAGE_BYTES,
+            "local page must be cut below cloud 24 KiB"
+        );
+        assert!(parsed_receipt["next_line"].as_u64().unwrap() > 1);
+        let preload_calls_in_second: usize = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .count();
+        assert_eq!(
+            preload_calls_in_second, 1,
+            "resume and follow-up turn must not repeat skill preload"
         );
     }
 }

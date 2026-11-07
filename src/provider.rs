@@ -211,6 +211,18 @@ impl ProviderClient {
         &self.settings
     }
 
+    /// Host-only redaction values for this client; never serialize or send to tools.
+    pub(crate) fn redaction_secrets(&self) -> Vec<String> {
+        let mut values = Vec::new();
+        if let Some(credential) = &self.credential {
+            values.push(credential.clone());
+        }
+        if let Some(token) = &self.token {
+            values.push(token.value.clone());
+        }
+        values
+    }
+
     /// Does the target model accept image inputs: local profiles declare it
     /// with `--vision`; for OpenRouter the catalog publishes input
     /// modalities, other cloud providers are assumed to accept images (the
@@ -598,7 +610,7 @@ impl ProviderClient {
             // Native v1 never uses OpenAI tools or parallel calls.
             body["function_call"] = json!(if tools.is_empty() { "none" } else { "auto" });
             if !tools.is_empty() {
-                body["functions"] = Value::Array(tools.iter().map(|t| json!({"name":t.name,"description":t.description,"parameters":t.parameters})).collect());
+                body["functions"] = Value::Array(tools.iter().map(|t| json!({"name":t.name,"description":t.description,"parameters":giga_parameters(&t.parameters)})).collect());
             }
         } else {
             if self.settings.stream && self.settings.kind != ProviderKind::Yandex {
@@ -1099,6 +1111,34 @@ fn validate_tool_output(
     Ok(())
 }
 
+/// Native Giga's function dialect rejects composition/negation in our schemas.
+/// This changes only model guidance: the host still parses and validates every
+/// tool argument against the full contract, including NUL and text/close rules.
+fn giga_parameters(parameters: &Value) -> Value {
+    fn project(schema: &mut Value) {
+        let Some(object) = schema.as_object_mut() else {
+            return;
+        };
+        object.remove("allOf");
+        object.remove("not");
+        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+            for child in properties.values_mut() {
+                project(child);
+            }
+        }
+        for keyword in ["items", "additionalProperties"] {
+            if let Some(child) = object.get_mut(keyword) {
+                project(child);
+            }
+        }
+        // Do not traverse enum/default/const/examples or property-name maps as
+        // schemas: their literal objects and keys must survive unchanged.
+    }
+    let mut out = parameters.clone();
+    project(&mut out);
+    out
+}
+
 fn reasoning_metadata(model: &Value, kind: ProviderKind) -> (Option<bool>, Option<Vec<Effort>>) {
     let reasoning = model.get("reasoning");
     let efforts_value = reasoning
@@ -1452,17 +1492,17 @@ impl Accumulator {
             self.completion.model = Some(model.into());
         }
         if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
+            let input_tokens = usage
+                .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
+                .and_then(Value::as_u64);
+            let output_tokens = usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(Value::as_u64);
             self.completion.usage = Usage {
-                input_tokens: usage
-                    .get("prompt_tokens")
-                    .or_else(|| usage.get("input_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                output_tokens: usage
-                    .get("completion_tokens")
-                    .or_else(|| usage.get("output_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                input_tokens: input_tokens.unwrap_or(0),
+                output_tokens: output_tokens.unwrap_or(0),
                 cached_input_tokens: usage
                     .pointer("/prompt_tokens_details/cached_tokens")
                     .or_else(|| usage.get("precached_prompt_tokens"))
@@ -1473,6 +1513,10 @@ impl Accumulator {
                     .and_then(Value::as_f64)
                     .filter(|cost| cost.is_finite() && *cost >= 0.0),
             };
+            // The legacy main-session counters above keep their decoding exactly.
+            // The final-review UI reports usage only when both authoritative
+            // token counts were present and valid; partial objects are unknown.
+            self.completion.usage_reported = input_tokens.is_some() && output_tokens.is_some();
         }
         Ok(())
     }
@@ -1509,6 +1553,13 @@ impl Accumulator {
         streaming: bool,
         emit: &mut (dyn FnMut(&str) + Send),
     ) -> Result<()> {
+        if delta
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+        {
+            self.completion.refusal = true;
+        }
         if let Some(role) = delta.get("role").and_then(Value::as_str)
             && !matches!(role, "assistant" | "")
         {

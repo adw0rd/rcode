@@ -114,7 +114,11 @@ pub struct Completion {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Usage,
+    /// True only when the provider supplied complete, valid input/output usage.
+    /// The legacy main-session aggregate continues to use `usage` as before.
+    pub usage_reported: bool,
     pub finish_reason: String,
+    pub refusal: bool,
     pub model: Option<String>,
     pub provider_meta: Option<ProviderMeta>,
     /// Local-server reasoning; never shown, stored in history or sent back.
