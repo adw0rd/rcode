@@ -13,6 +13,8 @@ class Viewport:
     def __init__(self, width, height):
         self.width, self.height = width, height
         self.cells = self.blank()
+        self.background = None
+        self.backgrounds = self.blank_styles()
         self.row = self.col = 0
         self.saved_cursor = (0, 0)
         self.alternate = False
@@ -34,6 +36,9 @@ class Viewport:
     def blank(self):
         return [[" "] * self.width for _ in range(self.height)]
 
+    def blank_styles(self):
+        return [[None] * self.width for _ in range(self.height)]
+
     def rows(self):
         return ["".join(row).rstrip() for row in self.cells]
 
@@ -48,10 +53,13 @@ class Viewport:
 
     def resize(self, width, height):
         old = self.cells
+        old_backgrounds = self.backgrounds
         self.width, self.height = width, height
         self.cells = self.blank()
+        self.backgrounds = self.blank_styles()
         for index, row in enumerate(old[:height]):
             self.cells[index][:min(width, len(row))] = row[:width]
+            self.backgrounds[index][:min(width, len(row))] = old_backgrounds[index][:width]
         self.row = min(self.row, height - 1)
         self.col = min(self.col, width - 1)
 
@@ -131,8 +139,10 @@ class Viewport:
                 self.cells.append([" "] * self.width)
                 self.row = self.height - 1
         self.cells[self.row][self.col] = char
+        self.backgrounds[self.row][self.col] = self.background
         if size == 2 and self.col + 1 < self.width:
             self.cells[self.row][self.col + 1] = ""
+            self.backgrounds[self.row][self.col + 1] = self.background
         self.col += size
 
     def csi(self, parameters, command):
@@ -151,7 +161,19 @@ class Viewport:
         args = [int(part or "0") for part in raw.split(";") if part.isdigit() or not part]
         first = args[0] if args else 0
         amount = first or 1
-        if command in "hl" and private:
+        if command == "m":
+            index = 0
+            while index < len(args):
+                code = args[index]
+                if code in (0, 49):
+                    self.background = None
+                elif 40 <= code <= 47 or 100 <= code <= 107:
+                    self.background = str(code)
+                elif code == 48 and index + 2 < len(args) and args[index + 1] == 5:
+                    self.background = f"48;5;{args[index + 2]}"
+                    index += 2
+                index += 1
+        elif command in "hl" and private:
             enabled = command == "h"
             for mode in args:
                 if mode == 1049:
@@ -196,15 +218,18 @@ class Viewport:
         elif command == "J":
             if first in (2, 3):
                 self.cells = self.blank()
+                self.backgrounds = self.blank_styles()
             else:
                 for row in range(self.height):
                     for col in range(self.width):
                         if (first == 0 and (row, col) >= (self.row, self.col)) or (first == 1 and (row, col) <= (self.row, self.col)):
                             self.cells[row][col] = " "
+                            self.backgrounds[row][col] = None
         elif command == "K":
             for col in range(self.width):
                 if first == 2 or (first == 0 and col >= self.col) or (first == 1 and col <= self.col):
                     self.cells[self.row][col] = " "
+                    self.backgrounds[self.row][col] = None
         elif command == "s":
             self.saved_cursor = self.row, self.col
         elif command == "u":

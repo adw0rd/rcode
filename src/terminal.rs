@@ -70,6 +70,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Провайдер и ключ веб-поиска",
     },
     CommandSpec {
+        name: "/review-model",
+        description: "Выбрать модель отдельного финального ревью",
+    },
+    CommandSpec {
+        name: "/final-review",
+        description: "Включить или выключить финальное ревью для этого запуска",
+    },
+    CommandSpec {
         name: "/effort",
         description: "Настроить глубину рассуждений",
     },
@@ -156,6 +164,8 @@ pub struct MenuCommand {
     pub name: String,
     pub description: String,
     pub custom: bool,
+    /// Canonical skill id for a skill alias; other menu entries have no skill.
+    pub skill: Option<String>,
 }
 
 fn builtin_menu() -> Vec<MenuCommand> {
@@ -165,8 +175,159 @@ fn builtin_menu() -> Vec<MenuCommand> {
             name: command.name.to_owned(),
             description: command.description.to_owned(),
             custom: false,
+            skill: None,
         })
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct MenuMatch {
+    index: usize,
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn menu_matches(line: &str, cursor: usize, menu: &[MenuCommand]) -> Vec<MenuMatch> {
+    if cursor > line.len() || !line.is_char_boundary(cursor) || line.trim_start().starts_with('!') {
+        return Vec::new();
+    }
+    let prefix = &line[..cursor];
+    if prefix.starts_with('/') && !prefix.chars().any(char::is_whitespace) {
+        if cursor != line.len() {
+            return Vec::new();
+        }
+        return menu
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.name.starts_with(prefix))
+            .map(|(index, command)| MenuMatch {
+                index,
+                start: 0,
+                end: cursor,
+                replacement: command
+                    .skill
+                    .as_ref()
+                    .map_or_else(|| command.name.clone(), |id| format!("/{id}")),
+            })
+            .collect();
+    }
+
+    let Some((start, token_end)) = inline_slash_token(line, cursor) else {
+        return Vec::new();
+    };
+    let token = &line[start..token_end];
+    menu.iter()
+        .enumerate()
+        .filter(|(_, command)| {
+            command.skill.as_deref().is_some_and(|id| id.contains(':'))
+                && command.name.starts_with(token)
+        })
+        .map(|(index, command)| MenuMatch {
+            index,
+            start,
+            end: token_end,
+            replacement: command
+                .skill
+                .as_ref()
+                .map_or_else(|| command.name.clone(), |id| format!("/{id}")),
+        })
+        .collect()
+}
+
+fn inline_slash_token(line: &str, cursor: usize) -> Option<(usize, usize)> {
+    if line.trim_start().starts_with('/') {
+        return None;
+    }
+    let before = &line[..cursor];
+    let slash = before.rfind('/')?;
+    if slash + 1 == cursor || before[..slash].ends_with(['.', '/', ':']) {
+        return None;
+    }
+    let preceding = before[..slash].chars().next_back();
+    if preceding.is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
+    }
+    let token = &line[slash..cursor];
+    if !token[1..]
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
+    {
+        return None;
+    }
+    let suffix = line[cursor..].chars().next();
+    if suffix.is_some_and(|ch| !ch.is_whitespace()) {
+        return None;
+    }
+    (!in_code_at(line, slash)).then_some((slash, cursor))
+}
+
+pub(crate) fn in_code_at(text: &str, byte: usize) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag};
+
+    let mut block_start = None;
+    let mut last_code_end = 0;
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        match event {
+            Event::Code(_) if range.start <= byte && byte < range.end => return true,
+            Event::Code(_) if range.end <= byte => last_code_end = last_code_end.max(range.end),
+            Event::Start(Tag::CodeBlock(_)) => block_start = Some(range.start),
+            Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                if block_start.is_some_and(|start| start <= byte && byte < range.end) {
+                    return true;
+                }
+                if range.end <= byte {
+                    last_code_end = last_code_end.max(range.end);
+                }
+                block_start = None;
+            }
+            _ => {}
+        }
+    }
+    if block_start.is_some_and(|start| start <= byte) {
+        return true;
+    }
+
+    // CommonMark treats an unmatched inline delimiter as text. Be conservative
+    // while the user is still typing one: a run must be closed by a run of the
+    // same width before the slash token.
+    let mut open = std::collections::BTreeSet::new();
+    let mut run = 0;
+    for ch in text[last_code_end.min(byte)..byte]
+        .chars()
+        .chain(std::iter::once(' '))
+    {
+        if ch == '`' {
+            run += 1;
+        } else if run > 0 {
+            if !open.remove(&run) {
+                open.insert(run);
+            }
+            run = 0;
+        }
+    }
+    !open.is_empty()
+}
+
+pub(crate) fn complete_menu(
+    line: &str,
+    cursor: usize,
+    extra: &[MenuCommand],
+) -> (usize, Vec<(String, String)>) {
+    let mut menu = builtin_menu();
+    menu.extend(extra.iter().cloned());
+    let matches = menu_matches(line, cursor, &menu);
+    let start = matches.first().map_or(cursor, |matched| matched.start);
+    (
+        start,
+        matches
+            .into_iter()
+            .map(|matched| {
+                let command = &menu[matched.index];
+                (command.name.clone(), matched.replacement)
+            })
+            .collect(),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -194,12 +355,7 @@ impl Editor {
     pub fn read_plain(&self, prompt: &str) -> Result<Input> {
         // Readline owns Unix signal handlers while alive. Drop it before any
         // API wait so Ctrl+C reaches Tokio; the shared input history lives here.
-        let names: Vec<String> = self
-            .custom
-            .iter()
-            .map(|command| command.name.clone())
-            .collect();
-        let mut editor = crate::ui::editor_with_commands(&names)?;
+        let mut editor = crate::ui::editor_with_menu(&self.custom)?;
         for entry in &self.history {
             let _ = editor.add_history_entry(entry.as_str());
         }
@@ -385,6 +541,21 @@ impl Buffer {
         self.text.insert_str(self.cursor, &text[..bytes]);
         self.cursor += bytes;
         self.normalize_cursor();
+    }
+
+    fn replace(&mut self, range: std::ops::Range<usize>, replacement: &str) -> bool {
+        let new_len = self
+            .text
+            .len()
+            .saturating_sub(range.len())
+            .saturating_add(replacement.len());
+        if new_len > MAX_INPUT || range.end > self.text.len() {
+            return false;
+        }
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.normalize_cursor();
+        true
     }
 
     // Вставка и удаление разделителя могут объединить соседние графемы.
@@ -651,7 +822,7 @@ impl ReadState {
                 self.edited();
             }
             KeyCode::Enter => {
-                if !self.commands().is_empty() {
+                if !self.start_line_commands().is_empty() {
                     self.complete();
                 }
                 return Some(Input::Submit(self.buffer.text.clone()));
@@ -719,6 +890,16 @@ impl ReadState {
         self.menu_dismissed = false;
     }
     fn commands(&self) -> Vec<usize> {
+        if self.menu_dismissed {
+            return vec![];
+        }
+        menu_matches(&self.buffer.text, self.buffer.cursor, &self.menu)
+            .into_iter()
+            .map(|matched| matched.index)
+            .collect()
+    }
+
+    fn start_line_commands(&self) -> Vec<usize> {
         let text = self.buffer.text.as_str();
         if self.menu_dismissed || !text.starts_with('/') || text.chars().any(char::is_whitespace) {
             return vec![];
@@ -731,10 +912,13 @@ impl ReadState {
     }
 
     fn complete(&mut self) {
-        if let Some(index) = self.commands().get(self.command_index).copied() {
-            let name = self.menu[index].name.clone();
-            self.buffer = Buffer::default();
-            self.buffer.insert(&name);
+        if let Some(matched) = menu_matches(&self.buffer.text, self.buffer.cursor, &self.menu)
+            .get(self.command_index)
+            .cloned()
+            && self
+                .buffer
+                .replace(matched.start..matched.end, &matched.replacement)
+        {
             self.menu_dismissed = true;
         }
     }
@@ -1020,8 +1204,15 @@ fn editor_layout(
         );
     }
     if menu_rows > 0 {
+        let inline_completion = menu_matches(&state.buffer.text, state.buffer.cursor, &state.menu)
+            .first()
+            .is_some_and(|matched| matched.start > 0);
         view.push(
-            "Команды · ↑↓ выбор · Tab дополнить · Enter выполнить",
+            if inline_completion {
+                "Скиллы · ↑↓ выбор · Tab вставить · Enter отправить"
+            } else {
+                "Команды · ↑↓ выбор · Tab дополнить · Enter выполнить"
+            },
             RowStyle::Subtle,
             width,
         );
@@ -1691,6 +1882,19 @@ mod tests {
     }
 
     #[test]
+    fn final_review_builtins_are_registered_for_slash_tab_completion() {
+        let mut state = ReadState::default();
+        state.buffer.insert("/review-m");
+        state.complete();
+        assert_eq!(state.buffer.text, "/review-model");
+
+        let mut state = ReadState::default();
+        state.buffer.insert("/final-r");
+        state.complete();
+        assert_eq!(state.buffer.text, "/final-review");
+    }
+
+    #[test]
     fn slash_completion_selects_the_highlighted_command() {
         let mut state = ReadState::default();
         state.buffer.insert("/p");
@@ -1706,6 +1910,151 @@ mod tests {
         state.complete();
         assert_eq!(state.buffer.text, "/permissions");
         assert!(state.menu_dismissed);
+    }
+
+    #[test]
+    fn inline_skill_tab_replaces_only_the_reference_with_its_canonical_id() {
+        let mut state = ReadState::new(vec![MenuCommand {
+            name: "/browse".into(),
+            description: "Открыть браузер".into(),
+            custom: true,
+            skill: Some("rstack:browse".into()),
+        }]);
+        state
+            .buffer
+            .insert("Пожалуйста, открой /bro потом продолжи");
+        state.buffer.cursor = "Пожалуйста, открой /bro".len();
+
+        assert_eq!(
+            state.commands(),
+            [0],
+            "Tab should find the inline skill alias"
+        );
+        state.complete();
+        assert_eq!(
+            state.buffer.text,
+            "Пожалуйста, открой /rstack:browse потом продолжи"
+        );
+        assert_eq!(
+            state.buffer.cursor,
+            "Пожалуйста, открой /rstack:browse".len()
+        );
+    }
+
+    #[test]
+    fn inline_skill_completion_ignores_urls_paths_and_backtick_code() {
+        let menu = vec![MenuCommand {
+            name: "/browse".into(),
+            description: "Открыть браузер".into(),
+            custom: true,
+            skill: Some("rstack:browse".into()),
+        }];
+        for text in [
+            "открой https://example.test/bro",
+            "открой ./docs/bro",
+            "выполни `открой /bro`",
+            "~~~~\nоткрой /bro\n~~~~",
+            "открой ``/bro`` и продолжи",
+            "открой ``/bro и продолжи",
+            "  !cat /bro",
+            "/export /bro",
+            "/deploy /bro",
+        ] {
+            let mut state = ReadState::new(menu.clone());
+            state.buffer.insert(text);
+            if let Some(start) = text.find("/bro") {
+                state.buffer.cursor = start + "/bro".len();
+            }
+            assert!(state.commands().is_empty(), "false match in {text:?}");
+        }
+    }
+
+    #[test]
+    fn completion_is_suppressed_inside_existing_start_command_suffixes() {
+        let menu = vec![MenuCommand {
+            name: "/browse".into(),
+            description: "Открыть браузер".into(),
+            custom: false,
+            skill: Some("rstack:browse".into()),
+        }];
+        for (text, cursor) in [
+            ("/browse", 4),
+            ("/bro/file", 4),
+            ("открой /browse", "открой /bro".len()),
+            ("открой /bro/file", "открой /bro".len()),
+        ] {
+            let mut state = ReadState::new(menu.clone());
+            state.buffer.insert(text);
+            state.buffer.cursor = cursor;
+            assert!(state.commands().is_empty(), "partial token in {text:?}");
+        }
+    }
+
+    #[test]
+    fn completion_after_closed_code_with_inner_backtick_is_allowed() {
+        let mut state = ReadState::new(vec![MenuCommand {
+            name: "/browse".into(),
+            description: "Открыть браузер".into(),
+            custom: false,
+            skill: Some("rstack:browse".into()),
+        }]);
+        state.buffer.insert("``текст ` внутри`` открой /bro");
+        assert_eq!(state.commands(), [0]);
+    }
+
+    #[test]
+    fn inline_completion_excludes_local_bare_skill_names() {
+        let mut state = ReadState::new(vec![MenuCommand {
+            name: "/writer".into(),
+            description: "Пишет тексты".into(),
+            custom: false,
+            skill: Some("writer".into()),
+        }]);
+        state.buffer.insert("cat /wri");
+        assert!(state.commands().is_empty());
+    }
+
+    #[test]
+    fn inline_skill_enter_does_not_complete_or_rewrite_the_draft() {
+        let mut state = ReadState::new(vec![MenuCommand {
+            name: "/browse".into(),
+            description: "Открыть браузер".into(),
+            custom: false,
+            skill: Some("rstack:browse".into()),
+        }]);
+        state.buffer.insert("проверь /bro потом");
+        state.buffer.cursor = "проверь /bro".len();
+
+        let submitted = state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &[]);
+        assert_eq!(submitted, Some(Input::Submit("проверь /bro потом".into())));
+        assert_eq!(state.buffer.text, "проверь /bro потом");
+    }
+
+    #[test]
+    fn enter_still_completes_a_partial_start_command_before_submission() {
+        let mut state = ReadState::default();
+        state.buffer.insert("/mo");
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &[]),
+            Some(Input::Submit("/model".into()))
+        );
+    }
+
+    #[test]
+    fn inline_skill_completion_keeps_input_limit_when_canonical_id_is_longer() {
+        let mut state = ReadState::new(vec![MenuCommand {
+            name: "/b".into(),
+            description: "Открыть браузер".into(),
+            custom: false,
+            skill: Some("rstack:browse".into()),
+        }]);
+        state
+            .buffer
+            .insert(&format!("{} /b", "x".repeat(MAX_INPUT - 3)));
+        let before = state.buffer.text.clone();
+        state.complete();
+        assert_eq!(state.buffer.text, before);
+        assert_eq!(state.buffer.text.len(), MAX_INPUT);
     }
 
     #[test]

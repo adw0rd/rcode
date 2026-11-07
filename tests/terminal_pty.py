@@ -166,7 +166,8 @@ class Terminal:
                                 "cursor": [self.grid.row, self.grid.col],
                                 "cursor_visible": self.grid.cursor_visible,
                                 "completed_frames": self.grid.completed_frames,
-                                "rows": self.grid.rows()}
+                                "rows": self.grid.rows(),
+                                "backgrounds": [row[:] for row in self.grid.backgrounds]}
 
     def send(self, text):
         if time.monotonic() >= DEADLINE:
@@ -255,6 +256,8 @@ class Fixture(LoopbackHTTPServer):
         self.release_agent = threading.Event()
         self.busy_started = threading.Event()
         self.release_busy = threading.Event()
+        self.detail_started = threading.Event()
+        self.release_detail = threading.Event()
         super().__init__(("127.0.0.1", 0), Handler)
 
     def recorded(self):
@@ -383,6 +386,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        "finish_reason": "tool_calls"}]})
             return
         if body["messages"][-1]["role"] == "tool":
+            if loop_prompt == "TOOL_DETAILS_TOGGLE":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def detail_event(value):
+                    self.wfile.write(("data: " + json.dumps(value, ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+
+                try:
+                    detail_event({"choices": [{"delta": {"content": "TOOL_DETAIL_WAITING"}, "finish_reason": None}]})
+                    self.server.detail_started.set()
+                    self.server.release_detail.wait(timeout=6)
+                    detail_event({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             self.reply({"choices": [{"message": {"role": "assistant", "content": "TOOL_FINISHED_" + prompt},
                                      "finish_reason": "stop"}]})
             return
@@ -437,8 +460,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
-        if prompt in ("APPROVAL_DENY", "APPROVAL_YES"):
-            filename = "denied.txt" if prompt == "APPROVAL_DENY" else "approved.txt"
+        if prompt in ("APPROVAL_DENY", "APPROVAL_YES", "APPROVAL_RIGHT"):
+            filename = {"APPROVAL_DENY": "denied.txt", "APPROVAL_YES": "approved.txt",
+                        "APPROVAL_RIGHT": "right.txt"}[prompt]
             self.reply({"choices": [{"message": {"role": "assistant", "content": None,
                        "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
                            "name": "write_file", "arguments": json.dumps({"path": filename, "content": "approved via PTY\n"})}}]},
@@ -456,13 +480,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "name": "run_command", "arguments": json.dumps({"command": "printf 'always via PTY\n' > always.txt"})}}]},
                        "finish_reason": "tool_calls"}]})
             return
+        if prompt == "APPROVAL_LEFT":
+            self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
+                           "name": "run_command", "arguments": json.dumps({"command": "touch arrow-left.txt\n# comment"})}}]},
+                       "finish_reason": "tool_calls"}]})
+            return
+        if prompt == "TOOL_DETAILS_TOGGLE" and body["messages"][-1]["role"] == "user":
+            self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_tool_details", "type": "function", "function": {
+                           "name": "run_command", "arguments": json.dumps({"command": "printf 'first output\\nsecond output\\nthird output\\n'"})}}]},
+                       "finish_reason": "tool_calls"}]})
+            return
         if prompt == "ALWAYS_REPEAT":
             self.reply({"choices": [{"message": {"role": "assistant", "content": None,
                        "tool_calls": [{"id": "call_" + prompt, "type": "function", "function": {
                            "name": "run_command", "arguments": json.dumps({"command": "printf 'repeat\n' > always.txt"})}}]},
                        "finish_reason": "tool_calls"}]})
             return
-        if prompt == "CANCEL_REQUEST":
+        if body["messages"][0]["content"].startswith("Ты выполняешь отдельное финальное ревью"):
+            answer = "FINAL_REVIEW_VISIBLE"
+        elif prompt == "CANCEL_REQUEST":
             self.server.cancel_started.set()
             self.server.release_cancel.wait(timeout=6)
             answer = "CANCELLED_RESPONSE_MUST_NOT_APPEAR"
@@ -557,6 +595,23 @@ def main(binary):
             assert sum(not row for row in terminal.grid.rows()[:20]) >= 10, terminal.dump()
             terminal.capture("initial")
             assert terminal.grid.keyboard_stack[-1] & 1, "Shift+Enter requires keyboard protocol opt-in"
+
+            # Review target selection is local configuration only; the
+            # per-run toggle controls whether a later user turn gets one
+            # separate text-only request to the selected route.
+            before_review_settings = len(fixture.recorded())
+            terminal.command("/review-model openrouter review-fixture-model", "Цель финального ревью сохранена")
+            config = load_json(config_path)
+            assert config["active"] == "custom", "selecting a reviewer must preserve the main provider"
+            assert config["providers"]["openrouter"]["model"] == "alpha-one"
+            assert config["final_review"]["selected"]["snapshot"]["model"] == "review-fixture-model"
+            terminal.command("/review-model same", "Цель финального ревью: текущая основная модель")
+            terminal.command("/review-model status", "выключено")
+            terminal.command("/final-review status", "выключено")
+            terminal.command("/final-review on", "включено для последующих ходов")
+            terminal.command("/review-model status", "включено")
+            terminal.command("/final-review off", "Финальное ревью выключено")
+            assert len(fixture.recorded()) == before_review_settings, "review configuration and toggles must not call a model"
 
             # Slash suggestions and Tab must complete a real command.
             mark = terminal.mark()
@@ -854,7 +909,68 @@ def main(binary):
                     assert (workspace / filename).read_text() == "approved via PTY\n"
                 terminal.assert_footer("alpha-one", "openrouter", "high", "ask")
 
+            mark = terminal.mark()
+            terminal.send("APPROVAL_RIGHT\r")
+            terminal.until(lambda: "› Отклонить" in terminal.grid.rows()[-4]
+                           and "Разрешить один раз" in terminal.grid.rows()[-4],
+                           "two-option approval before Right")
+            terminal.send("\x1b[C")
+            terminal.until(lambda: "  Отклонить" in terminal.grid.rows()[-4]
+                           and "› Разрешить один раз" in terminal.grid.rows()[-4],
+                           "Right selects one-time approval")
+            terminal.send("\r")
+            terminal.editor_after("TOOL_FINISHED_APPROVAL_RIGHT", mark)
+            assert (workspace / "right.txt").read_text() == "approved via PTY\n"
+
             phase("always rule")
+
+            # Left wraps from the default deny choice to the final choice.
+            # Enter must therefore save the "touch" shell rule, not approve once.
+            mark = terminal.mark()
+            terminal.send("APPROVAL_LEFT\r")
+            terminal.until(lambda: "› Отклонить" in terminal.grid.rows()[-4]
+                           and "Разрешить «touch» всегда" in terminal.grid.rows()[-4],
+                           "approval panel before left navigation")
+            terminal.expect_body("╭─ sh")
+            terminal.expect_body("touch arrow-left.txt")
+            terminal.expect_body("# comment")
+            code_row = next(index for index, row in enumerate(terminal.grid.rows())
+                            if "touch arrow-left.txt" in row)
+            code_start = terminal.grid.rows()[code_row].index("touch arrow-left.txt")
+            code_end = code_start + len("touch arrow-left.txt")
+            assert all(color is not None and color.startswith("48;5;236")
+                       for color in terminal.grid.backgrounds[code_row][code_start:code_end]), terminal.dump()
+            terminal.send("\x1b[D")
+            terminal.until(lambda: "  Отклонить" in terminal.grid.rows()[-4]
+                           and "  Разрешить один раз" in terminal.grid.rows()[-4]
+                           and "› Разрешить «touch» всегда" in terminal.grid.rows()[-4],
+                           "Left selects the previous approval option")
+            row = terminal.grid.rows()[-4]
+            selected_start = row.index("› Разрешить «touch» всегда")
+            selected_end = selected_start + len("› Разрешить «touch» всегда")
+            selected_backgrounds = terminal.grid.backgrounds[-4][selected_start:selected_end]
+            assert selected_backgrounds and all(color is not None for color in selected_backgrounds), terminal.dump()
+            denied_start = row.index("Отклонить")
+            denied_end = denied_start + len("Отклонить")
+            assert all(color is None for color in terminal.grid.backgrounds[-4][denied_start:denied_end]), terminal.dump()
+            terminal.send("\x1b[B")
+            terminal.until(lambda: "› Отклонить" in terminal.grid.rows()[-4], "Down wraps to deny")
+            terminal.send("\x1b[C")
+            terminal.until(lambda: "› Разрешить один раз" in terminal.grid.rows()[-4], "Right selects the next option")
+            terminal.send("\t")
+            terminal.until(lambda: "› Разрешить «touch» всегда" in terminal.grid.rows()[-4], "Tab selects the next option")
+            terminal.send("\x1b[Z")
+            terminal.until(lambda: "› Разрешить один раз" in terminal.grid.rows()[-4], "BackTab selects the previous option")
+            terminal.send("\x1b[A")
+            terminal.until(lambda: "› Отклонить" in terminal.grid.rows()[-4], "Up selects the previous option")
+            terminal.send("\x1b[D")
+            terminal.until(lambda: "› Разрешить «touch» всегда" in terminal.grid.rows()[-4], "Left wraps to the final option")
+            terminal.capture("approval_left_selected")
+            terminal.send("\r")
+            terminal.editor_after("TOOL_FINISHED_APPROVAL_LEFT", mark)
+            assert (workspace / "arrow-left.txt").exists(), terminal.dump()
+            assert any("touch" in rules for rules in
+                       json.loads((home / "permissions.json").read_text())["shell_allow"].values())
 
             # «Разрешить похожие»: a сохраняет первый токен команды в
             # permissions.json; повторная команда с тем же токеном идёт без панели.
@@ -866,6 +982,46 @@ def main(binary):
             terminal.send("a")
             terminal.editor_after("TOOL_FINISHED_APPROVAL_ALWAYS", mark)
             assert (workspace / "always.txt").read_text() == "always via PTY\n", terminal.dump()
+
+            # Ctrl+O changes only the visible receipt detail while the next
+            # model response is held; the receipt remains available in history.
+            mark = terminal.mark()
+            terminal.send("TOOL_DETAILS_TOGGLE\r")
+            terminal.until(fixture.detail_started.is_set, "tool receipt before held model response")
+            terminal.until(lambda: "exit 0 · успешно" in "\n".join(terminal.grid.rows())
+                           and "first output" in "\n".join(terminal.grid.rows())
+                           and "Ctrl+O подробности" in terminal.grid.rows()[-1],
+                           "compact receipt and expansion hint")
+            assert "third output" not in "\n".join(terminal.grid.rows()), terminal.dump()
+            terminal.capture("tool_receipt_compact")
+            terminal.send("\x0f")
+            terminal.until(lambda: "third output" in "\n".join(terminal.grid.rows())
+                           and "Ctrl+O свернуть вывод" in terminal.grid.rows()[-1],
+                           "expanded command receipt")
+            terminal.capture("tool_receipt_expanded")
+            terminal.send("\x0f")
+            terminal.until(lambda: "third output" not in "\n".join(terminal.grid.rows())
+                           and "Ctrl+O подробности" in terminal.grid.rows()[-1],
+                           "collapsed command receipt")
+            fixture.release_detail.set()
+            terminal.resize(80, 24)
+            terminal.editor_after("TOOL_DETAIL_WAITING", mark)
+            terminal.until(lambda: "Ctrl+O детали" in terminal.grid.rows()[-1],
+                           "idle toggle hint on an 80-column terminal")
+            terminal.capture("tool_receipt_compact_idle_80")
+            terminal.send("\x0f")
+            terminal.until(lambda: "third output" in "\n".join(terminal.grid.rows())
+                           and "Ctrl+O свернуть" in terminal.grid.rows()[-1],
+                           "idle expansion shortcut")
+            assert terminal.editor_ready(), "Idle Ctrl+O must not alter the editor cursor"
+            terminal.capture("tool_receipt_expanded_idle_80")
+            terminal.send("\x0f")
+            terminal.until(lambda: "third output" not in "\n".join(terminal.grid.rows())
+                           and "Ctrl+O детали" in terminal.grid.rows()[-1],
+                           "idle collapse shortcut")
+            terminal.resize(140, 28)
+            terminal.until(terminal.editor_ready, "wide composer after detail preview")
+
             import json as _json
             rules = _json.loads((home / "permissions.json").read_text())
             saved = [rules_ for rules_ in rules["shell_allow"].values()
@@ -1014,6 +1170,56 @@ def main(binary):
             restored = termios.tcgetattr(terminal.master)
             assert restored == terminal.initial_termios, "termios not restored on exit"
             phase("child exited and terminal restored")
+            # Exercise the enabled/disabled interactive stage in an isolated
+            # PTY home so its requests do not alter earlier token assertions.
+            review_workspace, review_home = root / "review-project", root / "review-config"
+            review_workspace.mkdir(mode=0o700)
+            review_home.mkdir(mode=0o700)
+            review_config_path = review_home / "config.json"
+            review_config_path.write_text(json.dumps({
+                "version": 1, "active": "custom",
+                "providers": {
+                    "custom": {"kind":"custom","model":"review-primary","base_url":endpoint,"stream":False},
+                    "openrouter": {"kind":"openrouter","model":"review-default","base_url":endpoint,"stream":False},
+                },
+            }))
+            review_config_path.chmod(0o600)
+            review_terminal = Terminal(binary, review_workspace, review_home)
+            try:
+                review_terminal.until(review_terminal.editor_ready, "isolated final-review PTY editor")
+                review_terminal.command("/review-model openrouter review-selected", "Цель финального ревью сохранена")
+                assert (load_json(review_config_path) or {})["active"] == "custom"
+                requests_before = len(fixture.recorded())
+                review_terminal.command("/final-review on", "включено для последующих ходов")
+                turn_mark = review_terminal.mark()
+                review_terminal.send("FINAL_REVIEW_PTY_ON\r")
+                review_terminal.until(lambda: len(fixture.recorded()) == requests_before + 2,
+                                      "interactive review adds exactly one selected-provider request")
+                review_terminal.editor_after("READY_CUSTOM", turn_mark)
+                review_terminal.expect_body("Ответ финального ревью · openrouter / review-selected")
+                review_terminal.expect_body("FINAL_REVIEW_VISIBLE")
+                request_pair = fixture.recorded()[requests_before:]
+                selected_request = next(request for request in request_pair
+                                        if request["messages"][0]["content"].startswith("Ты выполняешь отдельное финальное ревью"))
+                assert selected_request["model"] == "review-selected", selected_request
+                assert len(selected_request["messages"]) == 2, selected_request
+                assert not selected_request.get("tools"), selected_request
+                saved_review = list((review_home / "sessions").glob("*/session.json"))
+                assert len(saved_review) == 1
+                assert load_json(saved_review[0])["final_reviews"][-1]["status"] == "completed"
+                review_terminal.command("/final-review off", "Финальное ревью выключено")
+                before_off = len(fixture.recorded())
+                turn_mark = review_terminal.mark()
+                review_terminal.send("FINAL_REVIEW_PTY_OFF\r")
+                review_terminal.until(lambda: len(fixture.recorded()) == before_off + 1,
+                                      "disabled interactive turn makes only its primary request")
+                review_terminal.editor_after("READY_CUSTOM", turn_mark)
+                assert len(load_json(saved_review[0])["final_reviews"]) == 1
+                review_terminal.send("\x04")
+                review_terminal.until(lambda: review_terminal.status is not None, "final-review PTY exits")
+                assert review_terminal.status == 0
+            finally:
+                review_terminal.close()
             # The legacy readline handler must not swallow SIGINT during API I/O.
             plain = Terminal(binary, workspace, home, args=("--plain",))
             try:
@@ -1109,6 +1315,7 @@ def main(binary):
         fixture.release_stream_second.set()
         fixture.release_agent.set()
         fixture.release_balance.set()
+        fixture.release_detail.set()
         if terminal is not None:
             capture_path = os.environ.get("RCODE_PTY_DUMP_GRID")
             if capture_path:

@@ -363,11 +363,115 @@ pub enum Approval {
     Always,
     Cancel,
 }
-pub fn approve(preview: &str, always: Option<&str>) -> Result<Approval> {
-    if let Some(screen) = crate::screen::current() {
-        return screen.approve(&safe(preview), always);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalPreview {
+    before: String,
+    code: Option<String>,
+    after: String,
+}
+impl ApprovalPreview {
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            before: text.into(),
+            code: None,
+            after: String::new(),
+        }
     }
-    eprintln!("\n{}", safe(preview));
+    pub(crate) fn shell(before: String, code: String, after: String) -> Self {
+        Self {
+            before,
+            code: Some(code),
+            after,
+        }
+    }
+    pub(crate) fn prepend_before(&mut self, text: &str) {
+        if self.before.is_empty() {
+            self.before.push_str(text);
+        } else {
+            self.before = format!("{text}\n{}", self.before);
+        }
+    }
+    pub(crate) fn append_after(&mut self, text: &str) {
+        if self.after.is_empty() {
+            self.after.push_str(text);
+        } else {
+            self.after.push('\n');
+            self.after.push_str(text);
+        }
+    }
+    pub(crate) fn redact(mut self, mut redact: impl FnMut(&str) -> String) -> Self {
+        self.before = redact(&self.before);
+        self.code = self.code.map(|code| redact(&code));
+        self.after = redact(&self.after);
+        self
+    }
+    pub(crate) fn before(&self) -> &str {
+        &self.before
+    }
+    pub(crate) fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+    pub(crate) fn after(&self) -> &str {
+        &self.after
+    }
+    pub(crate) fn display(&self) -> String {
+        let Some(code) = &self.code else {
+            return format!("{}{}", self.before, self.after);
+        };
+        let fence = code_fence(code);
+        let command_end = if code.is_empty() || code.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        format!(
+            "{}\n{fence}sh\n{code}{command_end}{fence}{}",
+            self.before,
+            if self.after.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", self.after)
+            }
+        )
+    }
+}
+pub(crate) fn code_block_markdown(language: &str, code: &str) -> String {
+    let fence = code_fence(code);
+    let command_end = if code.is_empty() || code.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!("{fence}{language}\n{code}{command_end}{fence}\n")
+}
+fn code_fence(code: &str) -> String {
+    let longest_backticks = code
+        .split('\n')
+        .map(|line| {
+            let mut longest = 0;
+            let mut run = 0;
+            for character in line.chars() {
+                if character == '`' {
+                    run += 1;
+                    longest = longest.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+            longest
+        })
+        .max()
+        .unwrap_or_default();
+    "`".repeat(3.max(longest_backticks + 1))
+}
+pub fn approve(preview: &str, always: Option<&str>) -> Result<Approval> {
+    approve_preview(ApprovalPreview::plain(safe(preview)), always)
+}
+pub fn approve_preview(preview: ApprovalPreview, always: Option<&str>) -> Result<Approval> {
+    if let Some(screen) = crate::screen::current() {
+        return screen.approve_preview(&preview, always);
+    }
+    eprintln!("\n{}", safe(&preview.display()));
     let hint = match always {
         Some(token) => format!(
             "Разрешить? [y/N/a] (a — разрешить «{}» всегда) ",
@@ -391,7 +495,7 @@ pub fn approve(preview: &str, always: Option<&str>) -> Result<Approval> {
 }
 
 pub struct CommandHelper {
-    extra: Vec<String>,
+    extra: Vec<crate::terminal::MenuCommand>,
 }
 impl rustyline::Helper for CommandHelper {}
 impl rustyline::validate::Validator for CommandHelper {}
@@ -407,28 +511,22 @@ impl rustyline::completion::Completer for CommandHelper {
         pos: usize,
         _: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let prefix = &line[..pos];
-        let mut names: Vec<&str> = crate::terminal::COMMANDS
-            .iter()
-            .map(|command| command.name)
-            .collect();
-        names.extend(self.extra.iter().map(String::as_str));
-        let candidates = names
+        let (start, matches) = crate::terminal::complete_menu(line, pos, &self.extra);
+        let candidates = matches
             .into_iter()
-            .filter(|s| s.starts_with(prefix))
-            .map(|s| rustyline::completion::Pair {
-                display: s.into(),
-                replacement: s.into(),
+            .map(|(display, replacement)| rustyline::completion::Pair {
+                display,
+                replacement,
             })
             .collect();
-        Ok((0, candidates))
+        Ok((start, candidates))
     }
 }
 pub fn editor() -> Result<rustyline::Editor<CommandHelper, rustyline::history::DefaultHistory>> {
-    editor_with_commands(&[])
+    editor_with_menu(&[])
 }
-pub fn editor_with_commands(
-    extra: &[String],
+pub fn editor_with_menu(
+    extra: &[crate::terminal::MenuCommand],
 ) -> Result<rustyline::Editor<CommandHelper, rustyline::history::DefaultHistory>> {
     let config = rustyline::Config::builder()
         .max_history_size(crate::terminal::MAX_HISTORY)?
@@ -536,6 +634,13 @@ mod password_echo {
 }
 
 pub fn shell_preview(root: &std::path::Path, args: &serde_json::Value) -> Result<String> {
+    Ok(shell_preview_content(root, args)?.display())
+}
+
+pub fn shell_preview_content(
+    root: &std::path::Path,
+    args: &serde_json::Value,
+) -> Result<ApprovalPreview> {
     let command = args
         .get("command")
         .and_then(serde_json::Value::as_str)
@@ -546,10 +651,26 @@ pub fn shell_preview(root: &std::path::Path, args: &serde_json::Value) -> Result
             "Команда слишком длинная для ручного подтверждения (512 байт отображения). Разбей её на короткие шаги; для доверенных задач доступен явный --allow-shell."
         );
     }
-    Ok(format!(
-        "Shell с правами пользователя; каталог: {}\nКоманда в JSON-записи (\\n означает перевод строки):\n{}\nИзменения shell не управляются /undo.",
-        safe(&serde_json::to_string(&root.display().to_string())?),
-        quoted
+    if command.split('\n').count() > 12 {
+        bail!(
+            "Команда слишком длинная для ручного подтверждения (более 12 строк). Разбейте её на короткие шаги; для доверенных задач доступен явный --allow-shell."
+        );
+    }
+    let mut visible_command = String::new();
+    for character in command.chars() {
+        if character == '\n' {
+            visible_command.push('\n');
+        } else if character.is_control() {
+            visible_command.extend(character.escape_default());
+        } else {
+            visible_command.push_str(&safe(&character.to_string()));
+        }
+    }
+    let cwd = safe(&serde_json::to_string(&root.display().to_string())?);
+    Ok(ApprovalPreview::shell(
+        format!("Shell с правами пользователя.\nКаталог: {cwd}\nКоманда:"),
+        visible_command,
+        "Изменения shell не управляются /undo.".into(),
     ))
 }
 

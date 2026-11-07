@@ -57,6 +57,10 @@ pub enum Paint {
     Border,
     Muted,
     Selected,
+    SelectedOption {
+        start: usize,
+        end: usize,
+    },
     Error,
     ShellInput(usize),
     Success,
@@ -79,12 +83,20 @@ pub struct Panel {
 enum History {
     Plain(String),
     Markdown(markdown::Markdown),
+    Detailed { compact: String, expanded: String },
 }
 impl History {
     fn source(&self) -> &str {
         match self {
             Self::Plain(text) => text,
             Self::Markdown(doc) => doc.source(),
+            Self::Detailed { compact, .. } => compact,
+        }
+    }
+    fn size(&self) -> usize {
+        match self {
+            Self::Detailed { compact, expanded } => compact.len() + expanded.len(),
+            _ => self.source().len(),
         }
     }
     fn is_empty(&self) -> bool {
@@ -114,6 +126,8 @@ struct State {
     copy_hint: Option<String>,
     draft: String,
     queued: Vec<String>,
+    details_expanded: bool,
+    details_available: bool,
 }
 struct TextSelection {
     value: Selection,
@@ -131,7 +145,7 @@ impl State {
             && self.history.len() > 1
         {
             if let Some(old) = self.history.pop_front() {
-                self.bytes = self.bytes.saturating_sub(old.source().len());
+                self.bytes = self.bytes.saturating_sub(old.size());
                 self.markdown_active = self.markdown_active.and_then(|index| index.checked_sub(1));
             }
         }
@@ -210,6 +224,8 @@ impl Screen {
                 copy_hint: None,
                 draft: String::new(),
                 queued: Vec::new(),
+                details_expanded: false,
+                details_available: false,
             }),
             wake: Condvar::new(),
             io: Mutex::new(()),
@@ -373,6 +389,17 @@ impl Screen {
     pub fn line(&self, text: &str) {
         self.append(&format!("{text}\n"));
     }
+    pub fn detailed_line(&self, compact: &str, expanded: &str) {
+        let compact = ui::safe(compact);
+        let expanded = ui::safe(expanded);
+        self.change(|s| {
+            s.markdown_active = None;
+            s.bytes = s.bytes.saturating_add(compact.len() + expanded.len());
+            s.history.push_back(History::Detailed { compact, expanded });
+            s.details_available = true;
+            s.trim_history();
+        });
+    }
     pub fn busy(&self, label: &str) {
         self.change(|s| {
             s.mode = Mode::Busy;
@@ -404,6 +431,8 @@ impl Screen {
             s.history = VecDeque::from([History::Plain(String::new())]);
             s.markdown_active = None;
             s.bytes = 0;
+            s.details_available = false;
+            s.details_expanded = false;
             s.scroll = 0;
             s.anchor = None;
             s.selection = None;
@@ -426,7 +455,32 @@ impl Screen {
         self.change(|s| s.footer.context_chars = chars);
     }
     pub fn approve(&self, preview: &str, always: Option<&str>) -> Result<crate::ui::Approval> {
-        self.line(&format!("\nПодтверждение действия:\n{}", ui::safe(preview)));
+        let preview = crate::ui::ApprovalPreview::plain(ui::safe(preview));
+        self.approve_preview(&preview, always)
+    }
+    pub(crate) fn append_approval_preview(&self, preview: &crate::ui::ApprovalPreview) {
+        self.line("\nПодтверждение действия:");
+        self.finish_markdown();
+        for line in preview.before().split('\n') {
+            self.line(line);
+        }
+        if let Some(code) = preview.code() {
+            self.finish_markdown();
+            self.append_markdown(&ui::code_block_markdown("sh", code));
+            self.finish_markdown();
+        }
+        if !preview.after().is_empty() {
+            for line in preview.after().split('\n') {
+                self.line(line);
+            }
+        }
+    }
+    pub(crate) fn approve_preview(
+        &self,
+        preview: &crate::ui::ApprovalPreview,
+        always: Option<&str>,
+    ) -> Result<crate::ui::Approval> {
+        self.append_approval_preview(preview);
         self.change(|s| {
             s.scroll = 0;
             s.anchor = None;
@@ -443,18 +497,24 @@ impl Screen {
                         " ".to_owned()
                     }
                 };
-                let mut option_row = format!(
-                    "│ {} Отклонить   {} Разрешить один раз",
-                    marker(0),
-                    marker(1)
-                );
+                let mut option_row = String::from("│ ");
+                let mut selected_span = None;
+                let mut append_option = |index: usize, label: &str| {
+                    if index > 0 {
+                        option_row.push_str("   ");
+                    }
+                    let start = UnicodeWidthStr::width(option_row.as_str());
+                    option_row.push_str(&format!("{} {label}", marker(index)));
+                    if index == selected {
+                        selected_span = Some((start, UnicodeWidthStr::width(option_row.as_str())));
+                    }
+                };
+                append_option(0, "Отклонить");
+                append_option(1, "Разрешить один раз");
                 if let Some(token) = always {
-                    option_row.push_str(&format!(
-                        "   {} Разрешить «{}» всегда",
-                        marker(2),
-                        ui::safe(token)
-                    ));
+                    append_option(2, &format!("Разрешить «{}» всегда", ui::safe(token)));
                 }
+                let selected_span = selected_span.expect("selected approval option exists");
                 let hint = if always.is_some() {
                     "╰ y — один раз · a — всегда · n/Esc — нет · Enter — выбранное".to_owned()
                 } else {
@@ -466,7 +526,14 @@ impl Screen {
                         option_row,
                         hint,
                     ],
-                    styles: vec![Paint::Border, Paint::Selected, Paint::Muted],
+                    styles: vec![
+                        Paint::Border,
+                        Paint::SelectedOption {
+                            start: selected_span.0,
+                            end: selected_span.1,
+                        },
+                        Paint::Muted,
+                    ],
                     cursor: None,
                     mode: Mode::Approval,
                 });
@@ -485,14 +552,12 @@ impl Screen {
                         (KeyCode::Char('n' | 'N' | 'н' | 'Н') | KeyCode::Esc, _) => {
                             return Ok(ui::Approval::No);
                         }
-                        (
-                            KeyCode::Left
-                            | KeyCode::Right
-                            | KeyCode::Up
-                            | KeyCode::Down
-                            | KeyCode::Tab,
-                            _,
-                        ) => selected = (selected + 1) % options,
+                        (KeyCode::Left | KeyCode::Up | KeyCode::BackTab, _) => {
+                            selected = (selected + options - 1) % options;
+                        }
+                        (KeyCode::Right | KeyCode::Down | KeyCode::Tab, _) => {
+                            selected = (selected + 1) % options;
+                        }
                         (KeyCode::Enter, _) => {
                             return Ok(match selected {
                                 1 => ui::Approval::Yes,
@@ -577,14 +642,20 @@ impl Screen {
     }
     #[cfg(test)]
     pub(crate) fn history_text(&self) -> String {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
             .history
             .iter()
             .map(|entry| match entry {
                 History::Plain(text) => text.as_str(),
                 History::Markdown(doc) => doc.source().trim_end_matches('\n'),
+                History::Detailed { compact, expanded } => {
+                    if state.details_expanded {
+                        expanded
+                    } else {
+                        compact
+                    }
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -729,6 +800,16 @@ fn transcript(s: &State, width: usize) -> Vec<(String, Option<markdown::Row>)> {
                     .iter()
                     .map(|row| (row.text(), Some(row.clone()))),
             ),
+            History::Detailed { compact, expanded } => {
+                let text = if s.details_expanded {
+                    expanded
+                } else {
+                    compact
+                };
+                for line in text.split('\n') {
+                    rows.extend(wrap(line, width).into_iter().map(|text| (text, None)));
+                }
+            }
         }
     }
     if rows
@@ -930,6 +1011,37 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
         let padding = width - UnicodeWidthStr::width(left.as_str()) - version_width;
         *row = format!("{left}{}{version}", " ".repeat(padding));
     }
+    if s.details_available && footer_count > 0 && width >= 90 {
+        let hint = if s.details_expanded {
+            "Ctrl+O свернуть вывод"
+        } else {
+            "Ctrl+O подробности"
+        };
+        let row = &mut rows[height - 1].0;
+        *row = clip(&format!("{row} · {hint}"), width);
+    }
+    if s.details_available && footer_count > 0 && (60..90).contains(&width) {
+        let percent = s.footer.context_percent();
+        let unit = if s.footer.context_tokens {
+            "~ток."
+        } else {
+            "лок."
+        };
+        let hint = if s.details_expanded {
+            "Ctrl+O свернуть"
+        } else {
+            "Ctrl+O детали"
+        };
+        let row = &mut rows[height - 1].0;
+        *row = clip(
+            &format!(
+                "Контекст {percent}% {unit} · ↑{} ↓{} ток. · {hint}",
+                num(s.footer.input_tokens),
+                num(s.footer.output_tokens)
+            ),
+            width,
+        );
+    }
     let cursor = panel.cursor.and_then(|(row, col)| {
         if row < panel_offset || row >= panel_offset + panel_count || width == 0 {
             None
@@ -997,6 +1109,37 @@ pub(crate) fn print_shell_input(
     queue!(out, ResetColor)?;
     print_selected(out, command, selection, column)
 }
+fn print_approval_option(
+    out: &mut impl Write,
+    text: &str,
+    span: (usize, usize),
+    selection: Option<&Range<usize>>,
+    column: &mut usize,
+) -> io::Result<()> {
+    let mut highlighted = false;
+    for grapheme in text.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        let selected = *column < span.1 && *column + width > span.0;
+        if selected != highlighted {
+            if selected {
+                queue!(
+                    out,
+                    SetBackgroundColor(Color::DarkCyan),
+                    SetForegroundColor(Color::White),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else {
+                queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+            }
+            highlighted = selected;
+        }
+        print_selected(out, grapheme, selection, column)?;
+    }
+    if highlighted {
+        queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+    }
+    Ok(())
+}
 fn render(frame: &Frame) -> io::Result<()> {
     let mut out = io::stdout();
     queue!(out, BeginSynchronizedUpdate, Hide)?;
@@ -1053,6 +1196,11 @@ fn render(frame: &Frame) -> io::Result<()> {
                 SetBackgroundColor(Color::DarkCyan),
                 SetForegroundColor(Color::White)
             )?,
+            Paint::SelectedOption { start, end } => {
+                print_approval_option(&mut out, text, (*start, *end), selection, &mut column)?;
+                queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+                continue;
+            }
             Paint::Error => queue!(out, SetForegroundColor(Color::Red))?,
             Paint::Success => queue!(out, SetForegroundColor(Color::Green))?,
             Paint::ShellInput(marker) => {
@@ -1082,6 +1230,14 @@ fn maximum_scroll(s: &State, width: u16, height: u16) -> usize {
         .map(|entry| match entry {
             History::Plain(text) => wrap(text, width).len(),
             History::Markdown(doc) => doc.rows(width).len(),
+            History::Detailed { compact, expanded } => {
+                let text = if s.details_expanded {
+                    expanded
+                } else {
+                    compact
+                };
+                text.split('\n').map(|line| wrap(line, width).len()).sum()
+            }
         })
         .sum::<usize>();
     if s.history.back().is_some_and(History::is_empty) && lines > 1 {
@@ -1170,7 +1326,12 @@ fn route_at_size(screen: &Screen, event: Event, (width, height): (u16, u16)) {
                 } else {
                     s.selection = None;
                     s.copy_hint = None;
-                    if s.mode == Mode::Busy
+                    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('o') {
+                        if s.details_available {
+                            s.details_expanded = !s.details_expanded;
+                        }
+                        deliver = false;
+                    } else if s.mode == Mode::Busy
                         && (k.code == KeyCode::Esc
                             || (k.code == KeyCode::Char('c')
                                 && k.modifiers.contains(KeyModifiers::CONTROL)))
@@ -1635,6 +1796,108 @@ mod tests {
         let local = status(&footer, "", 120, 0, 120)[1].0.clone();
         assert!(local.contains("25% ~5.0k/20.0k ток."), "{local}");
         assert!(status(&footer, "", 60, 0, 60)[1].0.contains("~ток."));
+    }
+
+    #[test]
+    fn control_o_toggles_only_the_rendered_tool_details() {
+        let screen = Screen::test_screen();
+        screen.detailed_line(
+            "↳ run_command · exit 2 · ошибка",
+            "↳ run_command · exit 2 · ошибка\n  stderr:\n    Подтвердите действие флагом --yes",
+        );
+        assert!(!screen.history_text().contains("--yes"));
+        {
+            let state = screen.state.lock().unwrap();
+            let frame = compose(&state, 140, 28);
+            assert!(frame.rows.last().unwrap().0.contains("Ctrl+O подробности"));
+        }
+        route(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        );
+        assert!(screen.history_text().contains("--yes"));
+        route(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        );
+        assert!(!screen.history_text().contains("--yes"));
+    }
+
+    #[test]
+    fn approval_preview_styles_only_the_typed_command_block() {
+        let screen = Screen::test_screen();
+        let preview = crate::ui::ApprovalPreview::shell(
+            "Каталог: \"/tmp/**`path**\\nnext\"\nСведения: первая\nвторая\nКоманда:".into(),
+            "echo **literal** `ticks`".into(),
+            "Предупреждение: **plain**\nне сливать с командой".into(),
+        );
+        screen.append_approval_preview(&preview);
+        let state = screen.state.lock().unwrap();
+        let frame = compose(&state, 120, 30);
+        for expected in [
+            "Каталог: \"/tmp/**`path**\\nnext\"",
+            "Сведения: первая",
+            "вторая",
+            "Команда:",
+            "Предупреждение: **plain**",
+            "не сливать с командой",
+        ] {
+            let Some((index, _)) = frame
+                .rows
+                .iter()
+                .enumerate()
+                .find(|(_, (line, _))| line == expected)
+            else {
+                panic!("missing plain metadata row {expected:?}");
+            };
+            assert!(
+                !frame.rich_rows.contains_key(&index),
+                "metadata parsed as Markdown"
+            );
+        }
+        let code_rows = frame
+            .rich_rows
+            .values()
+            .filter(|row| row.code)
+            .collect::<Vec<_>>();
+        assert!(
+            !code_rows.is_empty(),
+            "typed command was not rendered as a code block"
+        );
+        assert!(
+            code_rows
+                .iter()
+                .any(|row| row.text().contains("echo **literal** `ticks`"))
+        );
+    }
+
+    #[test]
+    fn expanded_receipt_wraps_long_rows_without_omitting_retained_lines() {
+        let screen = Screen::test_screen();
+        let long_line = format!("BEGIN{}END", "x".repeat(500));
+        let retained_lines = (0..101)
+            .map(|index| format!("retained-{index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        screen.detailed_line("compact receipt", &format!("{long_line}\n{retained_lines}"));
+        route(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+        );
+        let displayed = screen.history_text();
+        assert!(displayed.contains(&long_line));
+        assert!(displayed.contains("retained-000"));
+        assert!(displayed.contains("retained-100"));
+        let state = screen.state.lock().unwrap();
+        let frame = compose(&state, 80, 140);
+        let lines = frame
+            .rows
+            .iter()
+            .map(|(line, _)| line.as_str())
+            .collect::<Vec<_>>();
+        assert!(lines.iter().any(|line| line.starts_with("BEGIN")));
+        assert!(lines.iter().any(|line| line.ends_with("END")));
+        assert!(lines.iter().any(|line| line.contains("retained-100")));
     }
 
     fn route(screen: &Screen, event: Event) {
