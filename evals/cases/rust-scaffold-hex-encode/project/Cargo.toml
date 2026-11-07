@@ -1,0 +1,4 @@
+[package]
+name = "rust_scaffold_hex_encode"
+version = "0.1.0"
+edition = "2024"

@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "new-api",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import slugify;print(json.dumps(slugify(json.loads(sys.argv[1]))))",
+        "\"  Hello---World  \""
+      ],
+      "expected_exit": 0,
+      "expected_json": "hello-world"
+    },
+    {
+      "id": "alias",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import title_slug;print(json.dumps(title_slug('Two Words')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": "two-words"
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import slugify;print(json.dumps(slugify('')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": ""
+    }
+  ]
+}

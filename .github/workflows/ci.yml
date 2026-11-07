@@ -22,6 +22,30 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets --locked
       - run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Windows'
+        with:
+          python-version: '3.12'
+      - run: python3 tests/eval_security.py
+        if: runner.os != 'Windows'
+  eval-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: docker build --file evals/Dockerfile --tag rcode-eval-runtime evals
+      - name: Configure local protected runtime
+        run: |
+          echo "RCODE_EVAL_IMAGE=$(docker image inspect rcode-eval-runtime --format '{{.Id}}')" >> "$GITHUB_ENV"
+          echo "RCODE_EVAL_DOCKER=$(command -v docker)" >> "$GITHUB_ENV"
+          echo "RCODE_EVAL_SOCKET=/var/run/docker.sock" >> "$GITHUB_ENV"
+      - run: python3 evals/runtime/runtime_http.py
+      - run: python3 tests/eval_runtime.py
+      - run: python3 tests/eval_host.py
+      - run: python3 tests/eval_controls.py
   msrv:
     runs-on: ubuntu-latest
     steps:

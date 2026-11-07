@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--offline",
+        "--quiet",
+        "--target-dir",
+        "/agent-tmp/target"
+      ],
+      "timeout_secs": 60
+    }
+  ],
+  "checks": [
+    {
+      "id": "multibyte",
+      "argv": [
+        "/agent-tmp/target/debug/rust_unicode_scalar_count"
+      ],
+      "stdin": "Привет\n",
+      "expected_exit": 0,
+      "expected_json": 6
+    },
+    {
+      "id": "emoji-and-ascii",
+      "argv": [
+        "/agent-tmp/target/debug/rust_unicode_scalar_count"
+      ],
+      "stdin": "a🙂é\n",
+      "expected_exit": 0,
+      "expected_json": 3
+    },
+    {
+      "id": "preserve-spaces",
+      "argv": [
+        "/agent-tmp/target/debug/rust_unicode_scalar_count"
+      ],
+      "stdin": "  x  \n",
+      "expected_exit": 0,
+      "expected_json": 5
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "/agent-tmp/target/debug/rust_unicode_scalar_count"
+      ],
+      "stdin": "",
+      "expected_exit": 0,
+      "expected_json": 0
+    }
+  ]
+}

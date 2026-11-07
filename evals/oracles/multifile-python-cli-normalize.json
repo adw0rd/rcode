@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "order-and-case",
+      "argv": [
+        "python3",
+        "main.py"
+      ],
+      "stdin": "[\" Beta \",\"alpha\",\"GAMMA\"]",
+      "expected_exit": 0,
+      "expected_json": [
+        "beta",
+        "alpha",
+        "gamma"
+      ]
+    },
+    {
+      "id": "empty-input",
+      "argv": [
+        "python3",
+        "main.py"
+      ],
+      "stdin": "[]",
+      "expected_exit": 0,
+      "expected_json": []
+    },
+    {
+      "id": "preserves-empty",
+      "argv": [
+        "python3",
+        "main.py"
+      ],
+      "stdin": "[\"  \",\" X \"]",
+      "expected_exit": 0,
+      "expected_json": [
+        "",
+        "x"
+      ]
+    }
+  ]
+}

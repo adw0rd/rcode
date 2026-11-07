@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "ordinary",
+      "argv": [
+        "python3",
+        "main.py"
+      ],
+      "stdin": "{\"base\":6,\"multiplier\":4}",
+      "expected_exit": 0,
+      "expected_json": {
+        "result": 24
+      }
+    },
+    {
+      "id": "zero-factor",
+      "argv": [
+        "python3",
+        "main.py"
+      ],
+      "stdin": "{\"base\":9,\"multiplier\":0}",
+      "expected_exit": 0,
+      "expected_json": {
+        "result": 0
+      }
+    },
+    {
+      "id": "default-factor",
+      "argv": [
+        "python3",
+        "main.py"
+      ],
+      "stdin": "{\"base\":7}",
+      "expected_exit": 0,
+      "expected_json": {
+        "result": 7
+      }
+    }
+  ]
+}

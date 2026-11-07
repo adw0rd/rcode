@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "tsc",
+        "--strict",
+        "--target",
+        "ES2020",
+        "--module",
+        "commonjs",
+        "--outDir",
+        "/agent-tmp/js",
+        "src/clamp.ts"
+      ],
+      "timeout_secs": 30
+    }
+  ],
+  "checks": [
+    {
+      "id": "middle",
+      "argv": [
+        "node",
+        "-e",
+        "const {clamp}=require('/agent-tmp/js/clamp.js'); console.log(JSON.stringify([clamp(4,0,10),clamp(-2,0,10)]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        4,
+        0
+      ]
+    },
+    {
+      "id": "upper-and-equal",
+      "argv": [
+        "node",
+        "-e",
+        "const {clamp}=require('/agent-tmp/js/clamp.js'); console.log(JSON.stringify([clamp(11,0,10),clamp(3,3,3)]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        10,
+        3
+      ]
+    },
+    {
+      "id": "reversed-bounds",
+      "argv": [
+        "node",
+        "-e",
+        "const {clamp}=require('/agent-tmp/js/clamp.js'); console.log(JSON.stringify([clamp(4,10,0),clamp(12,10,0)]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        4,
+        10
+      ]
+    }
+  ]
+}

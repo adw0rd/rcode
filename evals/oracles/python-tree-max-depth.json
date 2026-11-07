@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "empty",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import max_depth;print(json.dumps(max_depth(None)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 0
+    },
+    {
+      "id": "leaf",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import max_depth;print(json.dumps(max_depth({})))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 1
+    },
+    {
+      "id": "unbalanced",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import max_depth;print(json.dumps(max_depth({'left':{'left':{}},'right':None})))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 3
+    },
+    {
+      "id": "first-command-executed-once",
+      "argv": [
+        "python3",
+        "-I",
+        "-S",
+        "-c",
+        "from pathlib import Path;print(Path('once.txt').read_text())"
+      ],
+      "expected_exit": 0,
+      "expected_stdout": "x\n"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+[package]
+name = "rust_parse_integer_list"
+version = "0.1.0"
+edition = "2024"

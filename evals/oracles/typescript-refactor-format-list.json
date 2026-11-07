@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "tsc",
+        "--strict",
+        "--target",
+        "ES2020",
+        "--module",
+        "commonjs",
+        "--outDir",
+        "/agent-tmp/js",
+        "src/formatList.ts",
+        "src/client.ts"
+      ],
+      "timeout_secs": 30
+    }
+  ],
+  "checks": [
+    {
+      "id": "multiple",
+      "argv": [
+        "node",
+        "-e",
+        "const {formatItems}=require('/agent-tmp/js/formatList.js'); console.log(JSON.stringify(formatItems(['red','green','blue'])))"
+      ],
+      "expected_exit": 0,
+      "expected_json": "red, green, blue"
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "node",
+        "-e",
+        "const {formatItems}=require('/agent-tmp/js/formatList.js'); console.log(JSON.stringify(formatItems([])))"
+      ],
+      "expected_exit": 0,
+      "expected_json": ""
+    },
+    {
+      "id": "single-and-empty-item",
+      "argv": [
+        "node",
+        "-e",
+        "const {formatItems}=require('/agent-tmp/js/formatList.js'); console.log(JSON.stringify([formatItems(['x']),formatItems(['','y'])]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        "x",
+        ", y"
+      ]
+    },
+    {
+      "id": "migrated-client",
+      "argv": [
+        "node",
+        "-e",
+        "const fs=require('fs');const api=require('/agent-tmp/js/formatList.js');console.log(JSON.stringify([fs.existsSync('src/formatList.ts'),!Object.hasOwn(api,'formatList'),require('/agent-tmp/js/client.js').example]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        true,
+        true,
+        "a, b"
+      ]
+    },
+    {
+      "id": "client-uses-new-api",
+      "argv": [
+        "node",
+        "-e",
+        "const fs=require('fs'),cp=require('child_process');fs.writeFileSync('src/formatList.ts',\"export function formatItems(_: string[]): string { return 'probe'; }\");cp.execFileSync('tsc',['--strict','--target','ES2020','--module','commonjs','--outDir','/agent-tmp/coupling','src/formatList.ts','src/client.ts']);console.log(JSON.stringify(require('/agent-tmp/coupling/client.js').example))"
+      ],
+      "expected_exit": 0,
+      "expected_json": "probe",
+      "timeout_secs": 30
+    }
+  ]
+}

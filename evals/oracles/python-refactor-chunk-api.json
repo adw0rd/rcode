@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "new-api",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import chunked;print(json.dumps(chunked(json.loads(sys.argv[1]),2)))",
+        "[1,2,3,4,5]"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        [
+          1,
+          2
+        ],
+        [
+          3,
+          4
+        ],
+        [
+          5
+        ]
+      ]
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import chunked;print(json.dumps(chunked([],3)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": []
+    },
+    {
+      "id": "invalid-size",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import sys;sys.path.insert(0,'.');from solution import chunked\ntry: chunked([1],0)\nexcept ValueError: print('ValueError')\nelse: print('no error')"
+      ],
+      "expected_exit": 0,
+      "expected_stdout": "ValueError\n"
+    }
+  ]
+}

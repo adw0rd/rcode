@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "normal",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import slice_bounds;print(json.dumps(slice_bounds(*json.loads(sys.argv[1]))))",
+        "[10,2,7]"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        2,
+        7
+      ]
+    },
+    {
+      "id": "negative-start",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import slice_bounds;print(json.dumps(slice_bounds(*json.loads(sys.argv[1]))))",
+        "[8,-3,5]"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        5,
+        5
+      ]
+    },
+    {
+      "id": "overshoot",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import slice_bounds;print(json.dumps(slice_bounds(*json.loads(sys.argv[1]))))",
+        "[4,2,9]"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        2,
+        4
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "below",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import clamp;print(json.dumps(clamp(-3,0,5)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 0
+    },
+    {
+      "id": "above",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import clamp;print(json.dumps(clamp(8,0,5)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 5
+    },
+    {
+      "id": "inside",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import clamp;print(json.dumps(clamp(3,0,5)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 3
+    },
+    {
+      "id": "equal-bounds",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import clamp;print(json.dumps(clamp(7,4,4)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 4
+    }
+  ]
+}

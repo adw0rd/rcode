@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--offline",
+        "--quiet",
+        "--target-dir",
+        "/agent-tmp/target"
+      ],
+      "timeout_secs": 60
+    }
+  ],
+  "checks": [
+    {
+      "id": "separated-words",
+      "argv": [
+        "/agent-tmp/target/debug/rust_refactor_word_count"
+      ],
+      "stdin": "one two three",
+      "expected_exit": 0,
+      "expected_json": 3
+    },
+    {
+      "id": "unicode-whitespace",
+      "argv": [
+        "/agent-tmp/target/debug/rust_refactor_word_count"
+      ],
+      "stdin": "слово ещё",
+      "expected_exit": 0,
+      "expected_json": 2
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "/agent-tmp/target/debug/rust_refactor_word_count"
+      ],
+      "stdin": "",
+      "expected_exit": 0,
+      "expected_json": 0
+    },
+    {
+      "id": "module-api",
+      "argv": [
+        "python3",
+        "-I",
+        "-S",
+        "-c",
+        "import pathlib,subprocess;src=pathlib.Path('/agent-tmp/module.rs');src.write_text('#[path = \"/agent-tmp/work/src/words.rs\"] mod words; fn main() { println!(\"{}\", words::count_words(\"one\\\\u{2003}two\")); }');subprocess.run(['rustc',str(src),'-o','/agent-tmp/module'],check=True);subprocess.run(['/agent-tmp/module'],check=True)"
+      ],
+      "expected_exit": 0,
+      "expected_json": 2
+    },
+    {
+      "id": "cli-uses-public-module",
+      "argv": [
+        "python3",
+        "-I",
+        "-S",
+        "-c",
+        "from pathlib import Path;import subprocess;Path('src/words.rs').write_text('pub fn count_words(_: &str) -> usize { 17 }');subprocess.run(['cargo','build','--offline','--quiet','--target-dir','/agent-tmp/coupling'],check=True);subprocess.run(['/agent-tmp/coupling/debug/rust_refactor_word_count'],input=b'one two',check=True)"
+      ],
+      "expected_exit": 0,
+      "timeout_secs": 60,
+      "expected_json": 17
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "tsc",
+        "--strict",
+        "--target",
+        "ES2020",
+        "--module",
+        "commonjs",
+        "--outDir",
+        "/agent-tmp/js",
+        "src/sumSafe.ts",
+        "src/client.ts"
+      ],
+      "timeout_secs": 30
+    }
+  ],
+  "checks": [
+    {
+      "id": "positive-and-negative",
+      "argv": [
+        "node",
+        "-e",
+        "const {sumNumbers}=require('/agent-tmp/js/sumSafe.js'); console.log(JSON.stringify(sumNumbers([3,-1,5])))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 7
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "node",
+        "-e",
+        "const {sumNumbers}=require('/agent-tmp/js/sumSafe.js'); console.log(JSON.stringify(sumNumbers([])))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 0
+    },
+    {
+      "id": "no-mutation",
+      "argv": [
+        "node",
+        "-e",
+        "const {sumNumbers}=require('/agent-tmp/js/sumSafe.js'); const a=[4,2]; sumNumbers(a); console.log(JSON.stringify(a))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        4,
+        2
+      ]
+    },
+    {
+      "id": "migrated-client",
+      "argv": [
+        "node",
+        "-e",
+        "const fs=require('fs');const api=require('/agent-tmp/js/sumSafe.js');console.log(JSON.stringify([fs.existsSync('src/sumSafe.ts'),!Object.hasOwn(api,'sumSafe'),require('/agent-tmp/js/client.js').example]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        true,
+        true,
+        5
+      ]
+    },
+    {
+      "id": "client-uses-new-api",
+      "argv": [
+        "node",
+        "-e",
+        "const fs=require('fs'),cp=require('child_process');fs.writeFileSync('src/sumSafe.ts',\"export function sumNumbers(_: number[]): number { return 17; }\");cp.execFileSync('tsc',['--strict','--target','ES2020','--module','commonjs','--outDir','/agent-tmp/coupling','src/sumSafe.ts','src/client.ts']);console.log(JSON.stringify(require('/agent-tmp/coupling/client.js').example))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 17,
+      "timeout_secs": 30
+    }
+  ]
+}

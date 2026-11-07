@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "links-target-sections",
+      "argv": [
+        "python3",
+        "-I",
+        "-S",
+        "-c",
+        "from html.parser import HTMLParser\nimport json\nclass P(HTMLParser):\n    def __init__(self):\n        super().__init__()\n        self.links=[]; self.ids=set(); self.labels=[]; self.inputs=[]; self.lang=None\n    def handle_starttag(self,t,a):\n        a=dict(a)\n        if t=='a': self.links.append(a.get('href'))\n        if 'id' in a: self.ids.add(a['id'])\n        if t=='label': self.labels.append(a.get('for'))\n        if t=='input': self.inputs.append(a.get('id'))\n        if t=='html': self.lang=a.get('lang')\np=P();p.feed(open('index.html').read())\nprint(json.dumps(sorted(x for x in p.links if x and x.startswith('#') and x[1:] in p.ids)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        "#about",
+        "#contact"
+      ]
+    },
+    {
+      "id": "associated-label",
+      "argv": [
+        "python3",
+        "-I",
+        "-S",
+        "-c",
+        "from html.parser import HTMLParser\nimport json\nclass P(HTMLParser):\n    def __init__(self):\n        super().__init__()\n        self.links=[]; self.ids=set(); self.labels=[]; self.inputs=[]; self.lang=None\n    def handle_starttag(self,t,a):\n        a=dict(a)\n        if t=='a': self.links.append(a.get('href'))\n        if 'id' in a: self.ids.add(a['id'])\n        if t=='label': self.labels.append(a.get('for'))\n        if t=='input': self.inputs.append(a.get('id'))\n        if t=='html': self.lang=a.get('lang')\np=P();p.feed(open('index.html').read())\nprint(json.dumps(any(x and x in p.inputs for x in p.labels)))"
+      ],
+      "expected_exit": 0,
+      "expected_json": true
+    },
+    {
+      "id": "page-language",
+      "argv": [
+        "python3",
+        "-I",
+        "-S",
+        "-c",
+        "from html.parser import HTMLParser\nimport json\nclass P(HTMLParser):\n    def __init__(self):\n        super().__init__()\n        self.links=[]; self.ids=set(); self.labels=[]; self.inputs=[]; self.lang=None\n    def handle_starttag(self,t,a):\n        a=dict(a)\n        if t=='a': self.links.append(a.get('href'))\n        if 'id' in a: self.ids.add(a['id'])\n        if t=='label': self.labels.append(a.get('for'))\n        if t=='input': self.inputs.append(a.get('id'))\n        if t=='html': self.lang=a.get('lang')\np=P();p.feed(open('index.html').read())\nprint(json.dumps(p.lang))"
+      ],
+      "expected_exit": 0,
+      "expected_json": "ru"
+    }
+  ]
+}

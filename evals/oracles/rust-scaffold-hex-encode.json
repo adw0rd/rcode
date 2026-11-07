@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--offline",
+        "--quiet",
+        "--target-dir",
+        "/agent-tmp/target"
+      ],
+      "timeout_secs": 60
+    }
+  ],
+  "checks": [
+    {
+      "id": "empty",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_hex_encode"
+      ],
+      "stdin": "",
+      "expected_exit": 0,
+      "expected_json": ""
+    },
+    {
+      "id": "ascii",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_hex_encode"
+      ],
+      "stdin": "Rust",
+      "expected_exit": 0,
+      "expected_json": "52757374"
+    },
+    {
+      "id": "zero-and-high-byte",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_hex_encode"
+      ],
+      "stdin": "\u0000ÿ",
+      "expected_exit": 0,
+      "expected_json": "00c3bf"
+    },
+    {
+      "id": "newline",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_hex_encode"
+      ],
+      "stdin": "a\n",
+      "expected_exit": 0,
+      "expected_json": "610a"
+    }
+  ]
+}

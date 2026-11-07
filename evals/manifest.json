@@ -1,0 +1,340 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "python-clamp-slice-bounds",
+      "language": "python",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-clamp-slice-bounds/project",
+      "task": "cases/python-clamp-slice-bounds/task.md",
+      "oracle": "oracles/python-clamp-slice-bounds.json"
+    },
+    {
+      "id": "python-stable-dedup",
+      "language": "python",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-stable-dedup/project",
+      "task": "cases/python-stable-dedup/task.md",
+      "oracle": "oracles/python-stable-dedup.json"
+    },
+    {
+      "id": "python-merge-intervals",
+      "language": "python",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-merge-intervals/project",
+      "task": "cases/python-merge-intervals/task.md",
+      "oracle": "oracles/python-merge-intervals.json"
+    },
+    {
+      "id": "python-parse-positive-int",
+      "language": "python",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-parse-positive-int/project",
+      "task": "cases/python-parse-positive-int/task.md",
+      "oracle": "oracles/python-parse-positive-int.json"
+    },
+    {
+      "id": "python-tree-max-depth",
+      "language": "python",
+      "category": "cancel-resume",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-tree-max-depth/project",
+      "task": "cases/python-tree-max-depth/task.md",
+      "oracle": "oracles/python-tree-max-depth.json",
+      "lifecycle": {
+        "interrupt_after_file": "eval-ready",
+        "resume_prompt": "Продолжи исходную задачу: исправь max_depth и проверь результат. Стартовую команду со sleep не повторяй; она уже выполнялась и была прервана. once.txt должен остаться с единственным x."
+      }
+    },
+    {
+      "id": "python-refactor-chunk-api",
+      "language": "python",
+      "category": "refactor",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-refactor-chunk-api/project",
+      "task": "cases/python-refactor-chunk-api/task.md",
+      "oracle": "oracles/python-refactor-chunk-api.json"
+    },
+    {
+      "id": "python-refactor-slug-api",
+      "language": "python",
+      "category": "refactor",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-refactor-slug-api/project",
+      "task": "cases/python-refactor-slug-api/task.md",
+      "oracle": "oracles/python-refactor-slug-api.json"
+    },
+    {
+      "id": "python-scaffold-running-total",
+      "language": "python",
+      "category": "scaffold",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-scaffold-running-total/project",
+      "task": "cases/python-scaffold-running-total/task.md",
+      "oracle": "oracles/python-scaffold-running-total.json"
+    },
+    {
+      "id": "python-scaffold-safe-label",
+      "language": "python",
+      "category": "scaffold",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-scaffold-safe-label/project",
+      "task": "cases/python-scaffold-safe-label/task.md",
+      "oracle": "oracles/python-scaffold-safe-label.json"
+    },
+    {
+      "id": "python-long-context-readme-ledger",
+      "language": "python",
+      "category": "scaffold",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-long-context-readme-ledger/project",
+      "task": "cases/python-long-context-readme-ledger/task.md",
+      "oracle": "oracles/python-long-context-readme-ledger.json"
+    },
+    {
+      "id": "python-skill-activation-clamp",
+      "language": "python",
+      "category": "skill",
+      "max_steps": 12,
+      "timeout_secs": 600,
+      "max_requests": 24,
+      "project": "cases/python-skill-activation-clamp/project",
+      "task": "cases/python-skill-activation-clamp/task.md",
+      "oracle": "oracles/python-skill-activation-clamp.json",
+      "require_tool_success": "load_skill"
+    },
+    {
+      "id": "python-tool-error-then-fix-square",
+      "language": "python",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/python-tool-error-then-fix-square/project",
+      "task": "cases/python-tool-error-then-fix-square/task.md",
+      "oracle": "oracles/python-tool-error-then-fix-square.json"
+    },
+    {
+      "id": "rust-parse-integer-list",
+      "language": "rust",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-parse-integer-list/project",
+      "task": "cases/rust-parse-integer-list/task.md",
+      "oracle": "oracles/rust-parse-integer-list.json"
+    },
+    {
+      "id": "rust-dedup-order",
+      "language": "rust",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-dedup-order/project",
+      "task": "cases/rust-dedup-order/task.md",
+      "oracle": "oracles/rust-dedup-order.json"
+    },
+    {
+      "id": "rust-unicode-scalar-count",
+      "language": "rust",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-unicode-scalar-count/project",
+      "task": "cases/rust-unicode-scalar-count/task.md",
+      "oracle": "oracles/rust-unicode-scalar-count.json"
+    },
+    {
+      "id": "rust-checked-sum",
+      "language": "rust",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-checked-sum/project",
+      "task": "cases/rust-checked-sum/task.md",
+      "oracle": "oracles/rust-checked-sum.json"
+    },
+    {
+      "id": "rust-duration-format",
+      "language": "rust",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-duration-format/project",
+      "task": "cases/rust-duration-format/task.md",
+      "oracle": "oracles/rust-duration-format.json"
+    },
+    {
+      "id": "rust-refactor-word-count",
+      "language": "rust",
+      "category": "refactor",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-refactor-word-count/project",
+      "task": "cases/rust-refactor-word-count/task.md",
+      "oracle": "oracles/rust-refactor-word-count.json"
+    },
+    {
+      "id": "rust-scaffold-line-stats",
+      "language": "rust",
+      "category": "scaffold",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-scaffold-line-stats/project",
+      "task": "cases/rust-scaffold-line-stats/task.md",
+      "oracle": "oracles/rust-scaffold-line-stats.json"
+    },
+    {
+      "id": "rust-scaffold-hex-encode",
+      "language": "rust",
+      "category": "scaffold",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/rust-scaffold-hex-encode/project",
+      "task": "cases/rust-scaffold-hex-encode/task.md",
+      "oracle": "oracles/rust-scaffold-hex-encode.json"
+    },
+    {
+      "id": "typescript-bugfix-clamp",
+      "language": "typescript",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/typescript-bugfix-clamp/project",
+      "task": "cases/typescript-bugfix-clamp/task.md",
+      "oracle": "oracles/typescript-bugfix-clamp.json"
+    },
+    {
+      "id": "typescript-bugfix-stable-unique",
+      "language": "typescript",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/typescript-bugfix-stable-unique/project",
+      "task": "cases/typescript-bugfix-stable-unique/task.md",
+      "oracle": "oracles/typescript-bugfix-stable-unique.json"
+    },
+    {
+      "id": "typescript-bugfix-word-count",
+      "language": "typescript",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/typescript-bugfix-word-count/project",
+      "task": "cases/typescript-bugfix-word-count/task.md",
+      "oracle": "oracles/typescript-bugfix-word-count.json"
+    },
+    {
+      "id": "typescript-refactor-safe-sum",
+      "language": "typescript",
+      "category": "refactor",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/typescript-refactor-safe-sum/project",
+      "task": "cases/typescript-refactor-safe-sum/task.md",
+      "oracle": "oracles/typescript-refactor-safe-sum.json"
+    },
+    {
+      "id": "typescript-refactor-format-list",
+      "language": "typescript",
+      "category": "refactor",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/typescript-refactor-format-list/project",
+      "task": "cases/typescript-refactor-format-list/task.md",
+      "oracle": "oracles/typescript-refactor-format-list.json"
+    },
+    {
+      "id": "typescript-scaffold-rotate",
+      "language": "typescript",
+      "category": "scaffold",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/typescript-scaffold-rotate/project",
+      "task": "cases/typescript-scaffold-rotate/task.md",
+      "oracle": "oracles/typescript-scaffold-rotate.json"
+    },
+    {
+      "id": "multifile-python-cli-config",
+      "language": "multifile",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/multifile-python-cli-config/project",
+      "task": "cases/multifile-python-cli-config/task.md",
+      "oracle": "oracles/multifile-python-cli-config.json"
+    },
+    {
+      "id": "multifile-python-cli-normalize",
+      "language": "multifile",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/multifile-python-cli-normalize/project",
+      "task": "cases/multifile-python-cli-normalize/task.md",
+      "oracle": "oracles/multifile-python-cli-normalize.json"
+    },
+    {
+      "id": "multifile-html-navigation",
+      "language": "multifile",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/multifile-html-navigation/project",
+      "task": "cases/multifile-html-navigation/task.md",
+      "oracle": "oracles/multifile-html-navigation.json"
+    },
+    {
+      "id": "multifile-python-recovery-state",
+      "language": "multifile",
+      "category": "bugfix",
+      "max_steps": 12,
+      "timeout_secs": 300,
+      "max_requests": 24,
+      "project": "cases/multifile-python-recovery-state/project",
+      "task": "cases/multifile-python-recovery-state/task.md",
+      "oracle": "oracles/multifile-python-recovery-state.json"
+    }
+  ]
+}

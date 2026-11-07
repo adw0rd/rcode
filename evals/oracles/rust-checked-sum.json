@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--offline",
+        "--quiet",
+        "--target-dir",
+        "/agent-tmp/target"
+      ],
+      "timeout_secs": 60
+    }
+  ],
+  "checks": [
+    {
+      "id": "ordinary-sum",
+      "argv": [
+        "/agent-tmp/target/debug/rust_checked_sum"
+      ],
+      "stdin": "10 -3 7",
+      "expected_exit": 0,
+      "expected_json": 14
+    },
+    {
+      "id": "positive-overflow",
+      "argv": [
+        "/agent-tmp/target/debug/rust_checked_sum"
+      ],
+      "stdin": "9223372036854775807 1",
+      "expected_exit": 0,
+      "expected_json": "overflow"
+    },
+    {
+      "id": "negative-overflow",
+      "argv": [
+        "/agent-tmp/target/debug/rust_checked_sum"
+      ],
+      "stdin": "-9223372036854775808 -1",
+      "expected_exit": 0,
+      "expected_json": "overflow"
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "/agent-tmp/target/debug/rust_checked_sum"
+      ],
+      "stdin": "",
+      "expected_exit": 0,
+      "expected_json": 0
+    },
+    {
+      "id": "invalid",
+      "argv": [
+        "/agent-tmp/target/debug/rust_checked_sum"
+      ],
+      "stdin": "2 x",
+      "expected_exit": 0,
+      "expected_json": "error"
+    }
+  ]
+}

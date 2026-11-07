@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "basic",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from labels import safe_label;print(json.dumps(safe_label('Blue Sky 7')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": "blue-sky-7"
+    },
+    {
+      "id": "punctuation",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from labels import safe_label;print(json.dumps(safe_label('A_b!C')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": "abc"
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from labels import safe_label;print(json.dumps(safe_label('')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": ""
+    }
+  ]
+}

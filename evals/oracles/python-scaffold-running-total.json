@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "mixed",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from readings import running_totals;print(json.dumps(running_totals(json.loads(sys.argv[1]))))",
+        "[2,-1,4]"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        2,
+        1,
+        5
+      ]
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from readings import running_totals;print(json.dumps(running_totals([])))"
+      ],
+      "expected_exit": 0,
+      "expected_json": []
+    },
+    {
+      "id": "negative",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from readings import running_totals;print(json.dumps(running_totals([-3,-2])))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        -3,
+        -5
+      ]
+    }
+  ]
+}

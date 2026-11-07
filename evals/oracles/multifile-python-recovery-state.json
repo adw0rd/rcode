@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "saved-value",
+      "argv": [
+        "python3",
+        "-c",
+        "import json; open('/agent-tmp/review-state.json','w').write('{\"count\":12}'); import subprocess; subprocess.run(['python3','main.py','/agent-tmp/review-state.json'],check=True)"
+      ],
+      "expected_exit": 0,
+      "expected_json": {
+        "count": 12
+      }
+    },
+    {
+      "id": "missing-file",
+      "argv": [
+        "python3",
+        "-c",
+        "import subprocess; subprocess.run(['python3','main.py','/agent-tmp/no-such-review-state.json'])"
+      ],
+      "expected_exit": 0,
+      "expected_json": {
+        "count": 0
+      }
+    },
+    {
+      "id": "invalid-json",
+      "argv": [
+        "python3",
+        "-c",
+        "open('/agent-tmp/review-bad-state.json','w').write('{'); import subprocess; subprocess.run(['python3','main.py','/agent-tmp/review-bad-state.json'])"
+      ],
+      "expected_exit": 0,
+      "expected_json": {
+        "count": 0
+      }
+    }
+  ]
+}

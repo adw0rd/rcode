@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "prepare": [],
+  "checks": [
+    {
+      "id": "valid",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import parse_positive_int;print(json.dumps(parse_positive_int(json.loads(sys.argv[1]))))",
+        "\"204\""
+      ],
+      "expected_exit": 0,
+      "expected_json": 204
+    },
+    {
+      "id": "zero",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import parse_positive_int;print(json.dumps(parse_positive_int('0')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 0
+    },
+    {
+      "id": "reject-space",
+      "argv": [
+        "python3",
+        "-I",
+        "-c",
+        "import json,sys;sys.path.insert(0,'.');from solution import parse_positive_int;print(json.dumps(parse_positive_int(' 2')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": null
+    }
+  ]
+}

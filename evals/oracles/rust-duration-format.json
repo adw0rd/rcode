@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--offline",
+        "--quiet",
+        "--target-dir",
+        "/agent-tmp/target"
+      ],
+      "timeout_secs": 60
+    }
+  ],
+  "checks": [
+    {
+      "id": "zero",
+      "argv": [
+        "/agent-tmp/target/debug/rust_duration_format"
+      ],
+      "stdin": "0",
+      "expected_exit": 0,
+      "expected_json": "00:00:00"
+    },
+    {
+      "id": "under-hour",
+      "argv": [
+        "/agent-tmp/target/debug/rust_duration_format"
+      ],
+      "stdin": "3599",
+      "expected_exit": 0,
+      "expected_json": "00:59:59"
+    },
+    {
+      "id": "over-day",
+      "argv": [
+        "/agent-tmp/target/debug/rust_duration_format"
+      ],
+      "stdin": "90061",
+      "expected_exit": 0,
+      "expected_json": "25:01:01"
+    },
+    {
+      "id": "large-hours",
+      "argv": [
+        "/agent-tmp/target/debug/rust_duration_format"
+      ],
+      "stdin": "360000",
+      "expected_exit": 0,
+      "expected_json": "100:00:00"
+    },
+    {
+      "id": "invalid",
+      "argv": [
+        "/agent-tmp/target/debug/rust_duration_format"
+      ],
+      "stdin": "-1",
+      "expected_exit": 0,
+      "expected_json": "error"
+    }
+  ]
+}

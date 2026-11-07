@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "tsc",
+        "--strict",
+        "--target",
+        "ES2020",
+        "--module",
+        "commonjs",
+        "--outDir",
+        "/agent-tmp/js",
+        "src/countWords.ts"
+      ],
+      "timeout_secs": 30
+    }
+  ],
+  "checks": [
+    {
+      "id": "mixed-whitespace",
+      "argv": [
+        "node",
+        "-e",
+        "const {countWords}=require('/agent-tmp/js/countWords.js'); console.log(JSON.stringify(countWords('one\\ttwo\\nthree')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 3
+    },
+    {
+      "id": "empty",
+      "argv": [
+        "node",
+        "-e",
+        "const {countWords}=require('/agent-tmp/js/countWords.js'); console.log(JSON.stringify([countWords(''),countWords('  \\t\\n')]))"
+      ],
+      "expected_exit": 0,
+      "expected_json": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "repeated-spaces",
+      "argv": [
+        "node",
+        "-e",
+        "const {countWords}=require('/agent-tmp/js/countWords.js'); console.log(JSON.stringify(countWords('  a   b  ')))"
+      ],
+      "expected_exit": 0,
+      "expected_json": 2
+    }
+  ]
+}

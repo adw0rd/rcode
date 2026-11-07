@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "prepare": [
+    {
+      "argv": [
+        "cargo",
+        "build",
+        "--offline",
+        "--quiet",
+        "--target-dir",
+        "/agent-tmp/target"
+      ],
+      "timeout_secs": 60
+    }
+  ],
+  "checks": [
+    {
+      "id": "empty",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_line_stats"
+      ],
+      "stdin": "",
+      "expected_exit": 0,
+      "expected_json": [
+        0,
+        0
+      ]
+    },
+    {
+      "id": "one-line-no-lf",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_line_stats"
+      ],
+      "stdin": "abc",
+      "expected_exit": 0,
+      "expected_json": [
+        1,
+        3
+      ]
+    },
+    {
+      "id": "trailing-lf",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_line_stats"
+      ],
+      "stdin": "a\nb\n",
+      "expected_exit": 0,
+      "expected_json": [
+        2,
+        4
+      ]
+    },
+    {
+      "id": "blank-lines",
+      "argv": [
+        "/agent-tmp/target/debug/rust_scaffold_line_stats"
+      ],
+      "stdin": "\n\n",
+      "expected_exit": 0,
+      "expected_json": [
+        2,
+        2
+      ]
+    }
+  ]
+}
