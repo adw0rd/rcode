@@ -16,6 +16,49 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedTestHookPoint {
+    StartIntent,
+    StartAccepted,
+    InputIntent,
+    InputAccepted,
+}
+
+#[cfg(test)]
+pub(crate) struct ManagedTestHook {
+    point: ManagedTestHookPoint,
+    entered: std::sync::mpsc::SyncSender<Option<String>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl ManagedTestHook {
+    pub(crate) fn new(
+        point: ManagedTestHookPoint,
+        entered: std::sync::mpsc::SyncSender<Option<String>>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> Self {
+        Self {
+            point,
+            entered,
+            release: std::sync::Mutex::new(release),
+        }
+    }
+
+    fn pause(&self, point: ManagedTestHookPoint, id: Option<&str>) {
+        if self.point != point {
+            return;
+        }
+        let _ = self.entered.send(id.map(str::to_owned));
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(std::time::Duration::from_secs(15));
+    }
+}
+
 // Native retained output is globally bounded at 32 MiB, with at most 128 records
 // before explicit payload acknowledgement. Includes page frames, manifests and
 // lifetime terminals. Ordinary artifact writers cannot spend this reservation.
@@ -95,9 +138,23 @@ pub(crate) struct ManagedJobs {
     budget: Option<ArtifactReservation>,
     inputs: BTreeMap<String, InputEntry>,
     input_history: InputHistory,
+    #[cfg(test)]
+    test_hook: Option<ManagedTestHook>,
 }
 
 impl ManagedJobs {
+    #[cfg(test)]
+    pub(crate) fn set_test_hook(&mut self, hook: ManagedTestHook) {
+        self.test_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn test_pause(&self, point: ManagedTestHookPoint, id: Option<&str>) {
+        if let Some(hook) = &self.test_hook {
+            hook.pause(point, id);
+        }
+    }
+
     pub(crate) fn pending(&self) -> bool {
         !self.entries.is_empty() || !self.inputs.is_empty()
     }
@@ -111,6 +168,12 @@ impl ManagedJobs {
 
     pub(crate) fn input_receipts(&self, command_id: &str, actor: Option<&str>) -> Value {
         self.input_history.for_command(command_id, actor)
+    }
+
+    pub(crate) fn lifetime_id(&self, command_id: &str) -> Option<&str> {
+        self.entries
+            .get(command_id)
+            .map(|entry| entry.operation.operation_id())
     }
 
     pub(crate) fn handoff_context(&self, id: &str, actor: &str) -> Result<String> {
@@ -202,6 +265,7 @@ impl ManagedJobs {
         args: &crate::job_tools::InputArgs,
         actor: Option<&str>,
         cancel: &CancellationToken,
+        reply: Option<&crate::agents::ReplyAdmission>,
         secrets: &[String],
     ) -> Result<Value> {
         journal.check_session(&session.id)?;
@@ -250,6 +314,8 @@ impl ManagedJobs {
                 completion: InputCompletion::Admitting,
             },
         );
+        #[cfg(test)]
+        self.test_pause(ManagedTestHookPoint::InputIntent, Some(&input_id));
         // The capability and a separate input reservation survive both await
         // cancellation and admission failure. Never retry an Admitting entry.
         if cancel.is_cancelled() {
@@ -263,17 +329,25 @@ impl ManagedJobs {
             });
             anyhow::bail!("Input admission cancelled");
         }
-        // Native admission itself decides acceptance. Do not race this future
-        // against cancellation: dropping an admission future could hide acceptance.
-        match jobs
-            .send_input(actor, &command_id, text.as_bytes(), close)
-            .await
-        {
-            Ok(ticket) => {
-                self.inputs
-                    .get_mut(&input_id)
-                    .expect("retained input")
-                    .completion = InputCompletion::Ticket(ticket);
+        // No suspension between enqueue and retention of its delivery ticket.
+        // The same gate serializes receiver closure with this native point.
+        let mut admit = || {
+            ensure!(!cancel.is_cancelled(), "Input admission cancelled");
+            let ticket = jobs.send_input_now(actor, &command_id, text.as_bytes(), close)?;
+            self.inputs
+                .get_mut(&input_id)
+                .expect("retained input")
+                .completion = InputCompletion::Ticket(ticket);
+            Ok(())
+        };
+        let accepted = match reply {
+            Some(reply) => reply.with_open(admit),
+            None => admit(),
+        };
+        match accepted {
+            Ok(()) => {
+                #[cfg(test)]
+                self.test_pause(ManagedTestHookPoint::InputAccepted, Some(&input_id));
                 Ok(json!({"command_id":command_id,"input_id":input_id,"delivery":"accepted"}))
             }
             Err(error) => {
@@ -303,6 +377,7 @@ impl ManagedJobs {
         spec: JobSpec,
         cancel: CancellationToken,
         admission: &CancellationToken,
+        reply: Option<&crate::agents::ReplyAdmission>,
         secrets: &[String],
     ) -> Result<JobSnapshot> {
         journal.check_session(&session.id)?;
@@ -349,11 +424,24 @@ impl ManagedJobs {
         // capability or retries native spawn from a persisted command UUID.
         // Native admission has no suspension points. Check the call token
         // directly after durable I/O, independently of the lifetime relay.
-        let started = if admission.is_cancelled() {
-            Err(anyhow::anyhow!("Запуск отменён после сохранения намерения"))
-        } else {
-            jobs.start_reserved(reservation, spec, cancel).await
+        #[cfg(test)]
+        self.test_pause(ManagedTestHookPoint::StartIntent, Some(&id));
+        let scope = cancel.clone();
+        let admit = || {
+            ensure!(
+                !admission.is_cancelled(),
+                "Запуск отменён после сохранения намерения"
+            );
+            jobs.start_reserved_now(reservation, spec, cancel)
         };
+        let started = match reply {
+            Some(reply) => reply.admit_start(&scope, admit),
+            None => admit(),
+        };
+        #[cfg(test)]
+        if let Ok(snapshot) = &started {
+            self.test_pause(ManagedTestHookPoint::StartAccepted, Some(&snapshot.id));
+        }
         match started {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {

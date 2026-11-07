@@ -10,6 +10,114 @@ use serde_json::{Value, json};
 use support::{Server, text_reply, tool_reply};
 
 #[tokio::test]
+async fn file_hash_is_unambiguous_and_artifact_integrity_cannot_authorize_a_write() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    let original = "user original\n";
+    let expected = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let target = fixture.project.join("source.txt");
+    std::fs::write(&target, original).unwrap();
+    let watched = target.clone();
+    let file_hash = expected.clone();
+    let server = Server::start(move |request, index| {
+        if index == 0 {
+            return tool_reply("read", "read_file", &json!({"path":"source.txt"}));
+        }
+        let body = request.json();
+        let last = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "tool")
+            .unwrap();
+        let receipt: Value = serde_json::from_str(last["content"].as_str().unwrap()).unwrap();
+        match index {
+            1 => {
+                assert_eq!(receipt["sha256"], file_hash);
+                assert!(
+                    receipt.get("artifact_sha256").is_none(),
+                    "A receipt digest must not compete with the file hash"
+                );
+                assert!(receipt["artifact_bytes"].as_u64().unwrap() > 0);
+                assert_eq!(receipt["artifact_truncated"], false);
+                tool_reply(
+                    "saved-read",
+                    "read_tool_output",
+                    &json!({"artifact_id":receipt["artifact_id"],"offset":0,"max_bytes":4096}),
+                )
+            }
+            2 => {
+                let raw = receipt["content"].as_str().unwrap();
+                let inner: Value = serde_json::from_str(raw).unwrap();
+                assert_eq!(inner["sha256"], file_hash);
+                let digest = format!("{:x}", Sha256::digest(raw.as_bytes()));
+                assert_eq!(receipt["meta"]["sha256"], digest);
+                assert_ne!(digest, file_hash);
+                tool_reply(
+                    "wrong-hash",
+                    "write_file",
+                    &json!({"path":"source.txt","content":"must not be written","expected_sha256":digest}),
+                )
+            }
+            3 => {
+                assert_eq!(std::fs::read_to_string(&watched).unwrap(), original);
+                assert!(
+                    receipt["text"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("expected_sha256"))
+                );
+                tool_reply(
+                    "snapshot-write",
+                    "write_file",
+                    &json!({"path":"source.txt","content":"agent replacement\n"}),
+                )
+            }
+            4 => {
+                assert_eq!(
+                    std::fs::read_to_string(&watched).unwrap(),
+                    "agent replacement\n"
+                );
+                assert!(receipt.get("artifact_sha256").is_none());
+                text_reply("Snapshot write completed; the wrong explicit digest was refused.")
+            }
+            _ => panic!("Unexpected generation after a successful write"),
+        }
+    });
+    let output = fixture
+        .run(
+            &server,
+            &["--approval-mode", "auto-edit"],
+            "Read, retrieve saved output, refuse wrong hash, write with host snapshot",
+        )
+        .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(server.generations().len(), 5);
+    let results = events(&output);
+    assert!(
+        results.iter().any(|e| e["type"] == "tool_result"
+            && e["name"] == "write_file"
+            && e["is_error"] == true)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "agent replacement\n"
+    );
+    let saved = fixture.saved();
+    let store = ConfigStore::at(fixture.home.clone()).unwrap();
+    let session = Session::load(&store, saved["id"].as_str().unwrap(), &fixture.project).unwrap();
+    let mut tools =
+        rcode::tools::Tools::new(&fixture.project, &session.dir(&store).join("checkpoints"))
+            .unwrap();
+    tools.undo().unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+}
+
+#[tokio::test]
 async fn omitted_tool_output_is_retrievable_without_reexecuting_the_action() {
     let fixture = Fixture::new();
     let mut content = String::new();

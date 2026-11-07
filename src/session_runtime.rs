@@ -161,6 +161,7 @@ impl SessionRuntime {
                 spec,
                 cancel.clone(),
                 &cancel,
+                None,
                 secrets,
             )
             .await

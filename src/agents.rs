@@ -59,10 +59,17 @@ pub struct AgentRecord {
 
 /// Serializes reply closure with synchronous native admission and publication.
 #[derive(Clone)]
-pub struct ReplyAdmission(Arc<Mutex<bool>>);
+pub struct ReplyAdmission(Arc<Mutex<ReplyState>>);
+struct ReplyState {
+    open: bool,
+    pending_start: Option<CancellationToken>,
+}
 impl Default for ReplyAdmission {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(true)))
+        Self(Arc::new(Mutex::new(ReplyState {
+            open: true,
+            pending_start: None,
+        })))
     }
 }
 impl ReplyAdmission {
@@ -78,23 +85,108 @@ impl ReplyAdmission {
     // Holds the same gate for synchronous durable publication, including a
     // failed receipt when its receiver has already gone away. Never await here.
     pub(crate) fn with_state<T>(&self, action: impl FnOnce(bool) -> T) -> T {
-        let open = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        action(*open)
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        action(state.open)
+    }
+
+    /// The receiver owns this cleanup obligation until it actually receives
+    /// the committed successful Start response. Enqueuing a reply is not ACK.
+    pub(crate) fn admit_start<T>(
+        &self,
+        scope: &CancellationToken,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(state.open, "Worker reply closed before native Start");
+        anyhow::ensure!(
+            state.pending_start.is_none(),
+            "Start already admitted for this reply"
+        );
+        state.pending_start = Some(scope.clone());
+        action()
+    }
+
+    fn cancel_pending_start(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(scope) = state.pending_start.take() {
+            scope.cancel();
+        }
+    }
+
+    fn acknowledge_start(&self) {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending_start.take();
+    }
+
+    pub(crate) fn cleanup_guard(&self) -> ReplyCleanupGuard {
+        ReplyCleanupGuard(Some(self.clone()))
+    }
+}
+
+/// Covers execute, durable publication, and the send gap without depending on
+/// the worker being polled again after the broker future is dropped.
+pub(crate) struct ReplyCleanupGuard(Option<ReplyAdmission>);
+impl ReplyCleanupGuard {
+    pub(crate) fn transfer_to_receiver(mut self) {
+        self.0.take();
+    }
+}
+impl Drop for ReplyCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(admission) = self.0.take() {
+            admission.cancel_pending_start();
+        }
     }
 }
 struct ScopedReply {
     receiver: Option<oneshot::Receiver<ToolOutcome>>,
     admission: ReplyAdmission,
 }
+
+#[cfg(test)]
+pub(crate) struct TestScopedReply(ScopedReply);
+
+#[cfg(test)]
+impl TestScopedReply {
+    pub(crate) async fn receive(self) -> Result<ToolOutcome, oneshot::error::RecvError> {
+        self.0.receive().await
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scoped_reply_for_test() -> (
+    oneshot::Sender<ToolOutcome>,
+    TestScopedReply,
+    ReplyAdmission,
+) {
+    let (sender, receiver) = oneshot::channel();
+    let admission = ReplyAdmission::default();
+    (
+        sender,
+        TestScopedReply(ScopedReply {
+            receiver: Some(receiver),
+            admission: admission.clone(),
+        }),
+        admission,
+    )
+}
+
 impl ScopedReply {
     async fn receive(mut self) -> Result<ToolOutcome, oneshot::error::RecvError> {
-        self.receiver.as_mut().expect("owned reply").await
+        let result = self.receiver.as_mut().expect("owned reply").await;
+        if result.as_ref().is_ok_and(|outcome| !outcome.is_error) {
+            self.admission.acknowledge_start();
+        }
+        result
     }
 }
 impl Drop for ScopedReply {
     fn drop(&mut self) {
-        let mut open = self.admission.0.lock().unwrap_or_else(|e| e.into_inner());
-        *open = false;
+        let mut state = self.admission.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.open = false;
+        if let Some(scope) = state.pending_start.take() {
+            scope.cancel();
+        }
         self.receiver.take(); // close while the native admission gate is held
     }
 }
@@ -173,6 +265,7 @@ pub struct AgentPool {
     system_prompt: String,
     cancel: CancellationToken,
     max_steps: u32,
+    timeout: Duration,
     read_only: bool,
     requests: mpsc::Sender<AgentRequest>,
     workers: Vec<Worker>,
@@ -218,6 +311,11 @@ impl AgentPool {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = secrets;
     }
+    /// Host-owned wall-clock limit, configured before any worker is spawned.
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
     pub fn new(
         client: ProviderClient,
         system_prompt: String,
@@ -232,6 +330,7 @@ impl AgentPool {
                 system_prompt,
                 cancel: cancel.child_token(),
                 max_steps: max_steps.clamp(1, 8),
+                timeout: DEADLINE,
                 read_only,
                 requests,
                 workers: Vec::new(),
@@ -385,16 +484,17 @@ impl AgentPool {
             transfers: transfers.clone(),
         };
         let shared = record.clone();
+        let worker_timeout = self.timeout;
         let handle = tokio::spawn(async move {
             let cancel = task.cancel.clone();
             let secrets = task.secrets.clone();
             let outcome = tokio::select! {
                 biased;
                 _=cancel.cancelled() => (AgentStatus::Cancelled,"Субагент отменён; незавершённые действия не повторяются автоматически".into()),
-                result=tokio::time::timeout(DEADLINE,run_worker(task)) => match result {
+                result=tokio::time::timeout(worker_timeout,run_worker(task)) => match result {
                     Ok(Ok(result))=>(AgentStatus::Completed,result),
                     Ok(Err(error))=>(AgentStatus::Failed,error),
-                    Err(_)=>(AgentStatus::Failed,"Истёк общий лимит времени субагента (120 секунд)".into()),
+                    Err(_)=>(AgentStatus::Failed,format!("Истёк общий лимит времени субагента ({} секунд)", worker_timeout.as_secs())),
                 },
             };
             cancel.cancel();
@@ -989,6 +1089,276 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_is_one_deadline_across_model_and_broker_steps() {
+        let mut fixture = Fixture::new().await;
+        let (pool, mut broker) = AgentPool::new(
+            fixture.client.clone(),
+            "HOST".into(),
+            CancellationToken::new(),
+            8,
+            false,
+        );
+        let mut pool = pool.with_timeout(Duration::from_secs(1));
+        let id = spawn(
+            &mut pool,
+            json!({"task":"two-step deadline","role":"worker"}),
+        )
+        .await;
+        let first = fixture.next().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        first
+            .reply
+            .send(calls(vec![ToolCall::new("read_file", json!({"path":"a"}))]))
+            .unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), broker.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        queued
+            .reply
+            .send(ToolOutcome::success("read result"))
+            .unwrap_or_else(|_| panic!("reply closed before first step"));
+        let second = fixture.next().await;
+        // This response is within its own new 1s request window, but outside
+        // the single 1s worker budget measured from spawn.
+        let delayed = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let _ = second.reply.send(reply("late final"));
+        });
+        let result = wait(&mut pool, &id).await;
+        delayed.await.unwrap();
+        let records = pool.records();
+        let usage = pool.take_usage();
+        let again = pool.take_usage();
+        pool.shutdown().await;
+        assert!(
+            result.is_error,
+            "configured wall-clock timeout must reject late completion"
+        );
+        assert_eq!(records[0].status, AgentStatus::Failed);
+        assert!(
+            records[0].result.contains("(1 секунд)"),
+            "{}",
+            records[0].result
+        );
+        assert_eq!((usage.input_tokens, usage.output_tokens), (5, 2));
+        assert_eq!(again.input_tokens, 0);
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "no replay after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_timeout_is_120_seconds_for_custom_and_local_clients() {
+        let fixture = Fixture::new().await;
+        let (pool, _) = AgentPool::new(
+            fixture.client.clone(),
+            "HOST".into(),
+            CancellationToken::new(),
+            8,
+            false,
+        );
+        assert_eq!(pool.timeout, Duration::from_secs(120));
+
+        let settings = crate::local::profile_settings(
+            "local-timeout-default",
+            fixture.client.settings().base_url.as_deref().unwrap(),
+            crate::local::LocalRuntime::Mlx,
+            "agent-fixture",
+        );
+        let local = ProviderClient::connect(settings, None).unwrap();
+        let (pool, _) = AgentPool::new(local, "HOST".into(), CancellationToken::new(), 8, false);
+        assert_eq!(pool.timeout, Duration::from_secs(120));
+    }
+
+    #[tokio::test]
+    async fn all_roles_can_complete_quickly_with_a_one_second_timeout() {
+        let mut fixture = Fixture::new().await;
+        let (pool, _) = AgentPool::new(
+            fixture.client.clone(),
+            "HOST".into(),
+            CancellationToken::new(),
+            8,
+            false,
+        );
+        let mut pool = pool.with_timeout(Duration::from_secs(1));
+        for role in ["explorer", "reviewer", "worker"] {
+            let id = spawn(&mut pool, json!({"task":"quick answer","role":role})).await;
+            fixture.next().await.reply.send(reply("done")).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), wait(&mut pool, &id))
+                .await
+                .expect("a quick response must finish within the configured timeout");
+            assert!(!result.is_error, "role {role}: {}", result.content);
+            assert_eq!(
+                pool.records().last().unwrap().status,
+                AgentStatus::Completed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_worker_deadline_includes_waiting_for_shared_generation_slot() {
+        let mut fixture = Fixture::new().await;
+        let settings = crate::local::profile_settings(
+            "local-timeout-slot",
+            fixture.client.settings().base_url.as_deref().unwrap(),
+            crate::local::LocalRuntime::Mlx,
+            "agent-fixture",
+        );
+        let local = ProviderClient::connect(settings, None).unwrap();
+        let mut first_client = local.clone();
+        let first_generation = tokio::spawn(async move {
+            first_client
+                .complete(&[Message::user("hold local generation")], &[], &mut |_| {})
+                .await
+        });
+        let held_request = fixture.next().await;
+
+        let (pool, _) = AgentPool::new(local, "HOST".into(), CancellationToken::new(), 8, false);
+        let mut pool = pool.with_timeout(Duration::from_secs(1));
+        let id = spawn(&mut pool, json!({"task":"wait for local slot"})).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), wait(&mut pool, &id))
+            .await
+            .expect("waiting for the shared local slot is part of the worker deadline");
+        assert!(result.is_error);
+        assert_eq!(pool.records()[0].status, AgentStatus::Failed);
+        assert!(pool.records()[0].result.contains("(1 секунд)"));
+        assert_eq!(pool.take_usage().input_tokens, 0);
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "worker did not reach HTTP while slot was held"
+        );
+
+        held_request.reply.send(reply("released")).unwrap();
+        assert!(first_generation.await.unwrap().is_ok());
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "timed out worker was not resumed"
+        );
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn timeout_while_waiting_for_broker_closes_reply_and_counts_usage_once() {
+        let mut fixture = Fixture::new().await;
+        let (pool, mut broker) = AgentPool::new(
+            fixture.client.clone(),
+            "HOST".into(),
+            CancellationToken::new(),
+            8,
+            false,
+        );
+        let mut pool = pool.with_timeout(Duration::from_secs(1));
+        let id = spawn(&mut pool, json!({"task":"broker deadline","role":"worker"})).await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(calls(vec![ToolCall::new("read_file", json!({"path":"a"}))]))
+            .unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), broker.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), wait(&mut pool, &id))
+            .await
+            .expect("the configured worker deadline must bound broker waiting");
+        let record = &pool.records()[0];
+        let usage = pool.take_usage();
+        let again = pool.take_usage();
+        pool.shutdown().await;
+        assert!(result.is_error);
+        assert_eq!(record.status, AgentStatus::Failed);
+        assert!(record.result.contains("(1 секунд)"), "{}", record.result);
+        assert!(queued.reply.is_closed());
+        assert!(queued.cancel.is_cancelled());
+        assert_eq!((usage.input_tokens, usage.output_tokens), (5, 2));
+        assert_eq!((again.input_tokens, again.output_tokens), (0, 0));
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "no replay after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_during_broker_wait_closes_reply_and_counts_usage_once() {
+        let mut fixture = Fixture::new().await;
+        let cancel = CancellationToken::new();
+        let (mut pool, mut broker) = AgentPool::new(
+            fixture.client.clone(),
+            "HOST".into(),
+            cancel.clone(),
+            8,
+            false,
+        );
+        pool = pool.with_timeout(Duration::from_secs(3600));
+        let id = spawn(
+            &mut pool,
+            json!({"task":"cancel broker wait","role":"worker"}),
+        )
+        .await;
+        fixture
+            .next()
+            .await
+            .reply
+            .send(calls(vec![ToolCall::new("read_file", json!({"path":"a"}))]))
+            .unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), broker.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), wait(&mut pool, &id))
+            .await
+            .expect("parent cancellation must promptly stop broker waiting");
+        let record = &pool.records()[0];
+        let usage = pool.take_usage();
+        let again = pool.take_usage();
+        pool.shutdown().await;
+        assert!(result.is_error);
+        assert_eq!(record.status, AgentStatus::Cancelled);
+        assert!(queued.reply.is_closed());
+        assert!(queued.cancel.is_cancelled());
+        assert_eq!((usage.input_tokens, usage.output_tokens), (5, 2));
+        assert_eq!((again.input_tokens, again.output_tokens), (0, 0));
+        assert!(
+            fixture.requests.try_recv().is_err(),
+            "no replay after cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_timeout_arguments_are_rejected_before_api_and_absent_from_schema() {
+        let mut fixture = Fixture::new().await;
+        let (mut pool, _) = AgentPool::new(
+            fixture.client.clone(),
+            "HOST".into(),
+            CancellationToken::new(),
+            8,
+            false,
+        );
+        for field in ["timeout", "timeout_secs", "agent_timeout_secs"] {
+            assert!(
+                pool.execute("spawn_agent", &json!({"task":"bounded",field:1}))
+                    .await
+                    .is_error,
+                "spawn_agent must reject model supplied {field}"
+            );
+        }
+        let definition = AgentPool::definitions()
+            .into_iter()
+            .find(|definition| definition.name == "spawn_agent")
+            .unwrap();
+        let properties = definition.parameters["properties"].as_object().unwrap();
+        for field in ["timeout", "timeout_secs", "agent_timeout_secs"] {
+            assert!(!properties.contains_key(field));
+        }
+        assert!(pool.records().is_empty());
+        assert!(fixture.requests.try_recv().is_err());
     }
 
     #[tokio::test]

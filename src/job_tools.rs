@@ -45,9 +45,21 @@ pub struct PollArgs {
 #[serde(deny_unknown_fields)]
 pub struct InputArgs {
     pub command_id: String,
+    /// Точные байты после wire-нормализации; downstream не добавляет LF повторно.
     pub text: String,
     #[serde(default)]
     pub close: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireInputArgs {
+    command_id: String,
+    text: String,
+    #[serde(default)]
+    close: bool,
+    #[serde(default)]
+    append_newline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -101,14 +113,22 @@ pub fn parse(name: &str, args: &Value) -> Result<JobRequest> {
             Ok(JobRequest::Poll(a))
         }
         "send_command_input" => {
-            let a: InputArgs = serde_json::from_value(args.clone())?;
+            let mut a: WireInputArgs = serde_json::from_value(args.clone())?;
             validate_id(&a.command_id)?;
             validate_text(&a.text)?;
+            if a.append_newline {
+                a.text.push('\n');
+            }
+            validate_text(&a.text)?;
             ensure!(
-                !a.text.is_empty() || a.close,
-                "Пустой text допустим только при close=true"
+                !a.text.is_empty() || a.close || a.append_newline,
+                "Пустой text допустим только при close=true или append_newline=true"
             );
-            Ok(JobRequest::Input(a))
+            Ok(JobRequest::Input(InputArgs {
+                command_id: a.command_id,
+                text: a.text,
+                close: a.close,
+            }))
         }
         "stop_command" | "handoff_command" => {
             let a: StopArgs = serde_json::from_value(args.clone())?;
@@ -223,20 +243,21 @@ pub fn definitions() -> Vec<ToolDefinition> {
             &["command_id"],
             json!({
                 "command_id":id_schema(),
-                "stdout_offset":{"type":"integer", "minimum":0, "maximum":usize::MAX, "default":0},
-                "stderr_offset":{"type":"integer", "minimum":0, "maximum":usize::MAX, "default":0},
+                "stdout_offset":{"type":"integer", "minimum":0, "maximum":crate::jobs::STREAM, "default":0},
+                "stderr_offset":{"type":"integer", "minimum":0, "maximum":crate::jobs::STREAM, "default":0},
                 "max_bytes":{"type":"integer", "minimum":4, "maximum":65536, "default":16384}
             }),
         ),
         definition(
             "send_command_input",
-            "Передаёт текст в stdin существующей команды только при отдельно одобренном хостом доступе к stdin; close закрывает ввод. Пустой текст допустим лишь с close=true.",
+            "Send text only to separately host-approved command stdin. close closes stdin; append_newline adds exactly one LF. No escape decoding. Empty text needs close or append_newline.",
             &["command_id", "text"],
             json!({
                 "command_id":id_schema(),
                 "text":{"type":"string", "maxLength":16384, "not":{"pattern":"\u{0000}"},
-                    "description":"Не более 16384 байт UTF-8, без NUL; хост дополнительно проверяет размер в байтах."},
-                "close":{"type":"boolean", "default":false}
+                    "description":"Final UTF-8 payload including added LF: at most 16384 bytes, no NUL; checked by host."},
+                "close":{"type":"boolean", "default":false},
+                "append_newline":{"type":"boolean", "default":false}
             }),
         ),
         definition(
@@ -249,7 +270,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
         if d.name == "send_command_input" {
             d.parameters["allOf"] = json!([{
                 "if":{"properties":{"text":{"maxLength":0}}, "required":["text"]},
-                "then":{"properties":{"close":{"const":true}}, "required":["close"]}
+                "then":{"anyOf":[
+                    {"properties":{"close":{"const":true}}, "required":["close"]},
+                    {"properties":{"append_newline":{"const":true}}, "required":["append_newline"]}
+                ]}
             }]);
         }
         d
@@ -485,6 +509,18 @@ mod tests {
     }
 
     #[test]
+    fn poll_schema_offsets_are_bounded_by_the_retained_output_quota() {
+        let defs = definitions();
+        let poll = defs.iter().find(|d| d.name == "poll_command").unwrap();
+        for field in ["stdout_offset", "stderr_offset"] {
+            assert_eq!(
+                poll.parameters["properties"][field]["maximum"],
+                16 * 1024 * 1024
+            );
+        }
+    }
+
+    #[test]
     fn schema_contract() {
         let defs = definitions();
         assert_eq!(defs.len(), 4);
@@ -518,9 +554,99 @@ mod tests {
             json!(["command_id", "text"])
         );
         assert_eq!(
-            defs[2].parameters["allOf"][0]["then"]["required"],
+            defs[2].parameters["properties"]["append_newline"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            defs[2].parameters["properties"]["append_newline"]["default"],
+            false
+        );
+        assert_eq!(
+            defs[2].parameters["allOf"][0]["then"]["anyOf"][0]["required"],
             json!(["close"])
         );
+        assert_eq!(
+            defs[2].parameters["allOf"][0]["then"]["anyOf"][1]["required"],
+            json!(["append_newline"])
+        );
         assert_eq!(defs[3].parameters["required"], json!(["command_id"]));
+    }
+
+    #[test]
+    fn explicit_stdin_newline_contract() {
+        let cases = [
+            (json!({"text":"abc"}), "abc", true),
+            (json!({"text":"abc","append_newline":false}), "abc", true),
+            (json!({"text":"abc","append_newline":true}), "abc\n", true),
+            (json!({"text":"","append_newline":true}), "\n", true),
+            (
+                json!({"text":"abc\n","append_newline":true}),
+                "abc\n\n",
+                true,
+            ),
+            (
+                json!({"text":"abc\\n","append_newline":true}),
+                "abc\\n\n",
+                true,
+            ),
+            (json!({"text":"","close":true}), "", true),
+            (json!({"text":""}), "", false),
+        ];
+        for (fields, expected, ok) in cases {
+            let mut args = json!({"command_id":ID});
+            for (key, value) in fields.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            let parsed = parse("send_command_input", &args);
+            assert_eq!(parsed.is_ok(), ok, "{args}");
+            if let Ok(JobRequest::Input(input)) = parsed {
+                assert_eq!(input.text, expected, "{args}");
+            }
+        }
+        let mut nul = json!({"command_id":ID,"text":"a\0b","append_newline":true});
+        assert!(parse("send_command_input", &nul).is_err());
+        nul["text"] = json!("a\0b");
+        nul["append_newline"] = json!(false);
+        assert!(parse("send_command_input", &nul).is_err());
+
+        for (text, append, ok) in [
+            ("a".repeat(16383), true, true),
+            ("a".repeat(16384), true, false),
+            ("a".repeat(16384), false, true),
+            (format!("{}a", "é".repeat(8191)), true, true),
+            ("é".repeat(8192), true, false),
+        ] {
+            assert_eq!(
+                parse(
+                    "send_command_input",
+                    &json!({"command_id":ID,"text":text,"append_newline":append})
+                )
+                .is_ok(),
+                ok
+            );
+        }
+        for bad in [
+            json!(0),
+            json!(1),
+            json!("true"),
+            Value::Null,
+            json!([]),
+            json!({}),
+        ] {
+            assert!(
+                parse(
+                    "send_command_input",
+                    &json!({"command_id":ID,"text":"x","append_newline":bad})
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            parse(
+                "send_command_input",
+                &json!({"command_id":ID,"text":"x","extra":true})
+            )
+            .is_err()
+        );
     }
 }

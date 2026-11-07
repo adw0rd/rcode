@@ -101,6 +101,7 @@ async fn fault_case(mode: u8) -> Result<()> {
             managed: Some(managed),
             job_cancel: parent_token,
             parent_scope_id: parent_id,
+            observations: None,
         };
         HANDOFF_TEST_FAULT.with(|f| f.set(mode));
         let result = executor

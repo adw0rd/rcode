@@ -103,6 +103,9 @@ fn live_macos_sandbox_allows_workspace_and_denies_outside_reads_writes_and_netwo
         loop {
             match listener.accept() {
                 Ok((mut socket, _)) => {
+                    // macOS inherits O_NONBLOCK from the listener. The HTTP
+                    // peer may connect before it sends its first request bytes.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();

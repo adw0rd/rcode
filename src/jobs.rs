@@ -33,7 +33,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const STREAM: usize = 16 * 1024 * 1024;
+pub(crate) const STREAM: usize = 16 * 1024 * 1024;
 const GLOBAL: usize = 32 * 1024 * 1024;
 const BLOCK: usize = 4096;
 const INPUT: usize = 16 * 1024;
@@ -1101,6 +1101,16 @@ impl JobsSupervisor {
         bytes: &[u8],
         close: bool,
     ) -> Result<InputTicket> {
+        self.send_input_now(actor, id, bytes, close)
+    }
+
+    pub(crate) fn send_input_now(
+        &self,
+        actor: Option<&str>,
+        id: &str,
+        bytes: &[u8],
+        close: bool,
+    ) -> Result<InputTicket> {
         ensure!(bytes.len() <= INPUT, "input too large");
         let mut state = lock(&self.core.state);
         require_credentials(&state)?;
@@ -1829,8 +1839,8 @@ mod platform {
     }
     // Linux visibility is established from the actual mount table, procfs type,
     // and PID-namespace identities, not merely successful reads of our own PID.
-    // This deliberately conservative backend rejects all submounts below /proc,
-    // even benign ones, and unknown procfs superblock options. An unavailable or
+    // This deliberately conservative backend rejects submounts shadowing numeric
+    // PIDs/self aliases and unknown procfs superblock options. An unavailable or
     // restricted backend refuses admission; there is no enumeration fallback.
     #[cfg(target_os = "linux")]
     fn mount_path(field: &str) -> Result<Vec<u8>> {
@@ -1977,6 +1987,53 @@ mod platform {
         Ok(event.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
     #[cfg(target_os = "linux")]
+    const STATUS_BYTES: usize = 64 * 1024;
+    // Kernel NStgid/NSpid list IDs from the procfs namespace through nested
+    // namespaces. Exactly one value establishes the namespace match, including
+    // the otherwise ambiguous ancestor/child pair "42 42". No PID-1 access or
+    // ptrace capability is required. See proc_pid_status(5).
+    #[cfg(target_os = "linux")]
+    fn validate_self_status(bytes: &[u8], expected: u32) -> Result<()> {
+        ensure!(
+            bytes.len() < STATUS_BYTES && expected > 0 && expected <= i32::MAX as u32,
+            "procfs status size or PID limit"
+        );
+        let mut seen = [false; 4];
+        for line in bytes.split(|b| *b == b'\n') {
+            let Some(colon) = line.iter().position(|b| *b == b':') else {
+                continue;
+            };
+            let index = match &line[..colon] {
+                b"Tgid" => 0,
+                b"Pid" => 1,
+                b"NStgid" => 2,
+                b"NSpid" => 3,
+                _ => continue,
+            };
+            ensure!(!seen[index], "duplicate procfs status identity");
+            let mut values = line[colon + 1..]
+                .split(|b| b.is_ascii_whitespace())
+                .filter(|s| !s.is_empty());
+            let value = values
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing procfs status identity"))?;
+            ensure!(
+                values.next().is_none()
+                    && value.len() <= 10
+                    && value.iter().all(u8::is_ascii_digit),
+                "procfs PID namespace hierarchy mismatch"
+            );
+            let pid = std::str::from_utf8(value)?.parse::<u32>()?;
+            ensure!(pid == expected, "procfs PID mapping mismatch");
+            seen[index] = true;
+        }
+        ensure!(
+            seen.into_iter().all(|v| v),
+            "procfs namespace identity unavailable"
+        );
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
     fn proc_visibility(deadline: Instant) -> Result<()> {
         use std::{io::Read, os::unix::fs::MetadataExt};
         ensure!(Instant::now() < deadline, "procfs visibility deadline");
@@ -2001,14 +2058,32 @@ mod platform {
         );
         unrestricted_proc_mount(std::str::from_utf8(&bytes)?, deadline)?;
         let own = std::fs::metadata("/proc/self/ns/pid")?;
-        let init = std::fs::metadata("/proc/1/ns/pid")?;
-        ensure!(
-            own.dev() == init.dev() && own.ino() == init.ino(),
-            "procfs belongs to another PID namespace"
-        );
+        let mut status = std::fs::File::open("/proc/self/status")?;
+        let mut identity = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        loop {
+            ensure!(
+                Instant::now() < deadline && identity.len() < STATUS_BYTES,
+                "procfs status read limit/deadline"
+            );
+            let count = (STATUS_BYTES - identity.len()).min(chunk.len());
+            match status.read(&mut chunk[..count]) {
+                Ok(0) => break,
+                Ok(n) => identity.extend_from_slice(&chunk[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        ensure!(Instant::now() < deadline, "procfs status deadline");
+        validate_self_status(&identity, std::process::id())?;
         ensure!(
             std::fs::read_link("/proc/self")? == PathBuf::from(std::process::id().to_string()),
             "procfs PID mapping mismatch"
+        );
+        let after = std::fs::metadata("/proc/self/ns/pid")?;
+        ensure!(
+            own.dev() == after.dev() && own.ino() == after.ino(),
+            "PID namespace changed during observation"
         );
         // Probe the required kernel API before any managed spawn. There is no
         // fallback to interpreting a zombie thread-group leader as process exit.
@@ -2155,6 +2230,57 @@ mod platform {
     #[cfg(all(test, target_os = "linux"))]
     mod visibility_tests {
         use super::*;
+        #[test]
+        fn self_status_namespace_hierarchy_is_strict_and_not_a_pid_guess() {
+            let good = b"Name:\trcode\nTgid:\t42\nPid:\t42\nNStgid:\t42\nNSpid:\t42\n";
+            assert!(validate_self_status(good, 42).is_ok());
+            assert!(
+                validate_self_status(
+                    b"Name:\t\xff\nNSpid:\t42\nPid: 42\nNStgid: 42\nTgid: 42\n",
+                    42
+                )
+                .is_ok()
+            );
+            for field in ["NStgid", "NSpid", "Pid", "Tgid"] {
+                for value in [
+                    "",
+                    "0",
+                    "-42",
+                    "+42",
+                    "43",
+                    "4294967296",
+                    "42x",
+                    "42 42",
+                    "84 42",
+                ] {
+                    let original = std::str::from_utf8(good).unwrap();
+                    let changed =
+                        original.replace(&format!("{field}:\t42"), &format!("{field}:\t{value}"));
+                    assert!(
+                        validate_self_status(changed.as_bytes(), 42).is_err(),
+                        "{field}={value}"
+                    );
+                }
+                let mut repeated = good.to_vec();
+                repeated.extend_from_slice(format!("{field}:\t42\n").as_bytes());
+                assert!(validate_self_status(&repeated, 42).is_err());
+                let missing = std::str::from_utf8(good)
+                    .unwrap()
+                    .replace(&format!("{field}:\t42\n"), "");
+                assert!(validate_self_status(missing.as_bytes(), 42).is_err());
+            }
+            assert!(validate_self_status(good, 0).is_err());
+            let mut full = good.to_vec();
+            full.resize(65536, b' ');
+            assert!(validate_self_status(&full, 42).is_err());
+        }
+        #[test]
+        fn own_proc_namespace_is_available_from_a_worker_thread_without_pid_one_access() {
+            std::thread::spawn(|| proc_visibility(Instant::now() + CLEANUP))
+                .join()
+                .unwrap()
+                .unwrap();
+        }
         fn check(table: &str) -> Result<()> {
             unrestricted_proc_mount(table, Instant::now() + CLEANUP)
         }
@@ -2480,7 +2606,15 @@ mod tests {
         terminal_for(s, None, id).await
     }
     async fn terminal_for(s: &JobsSupervisor, actor: Option<&str>, id: &str) -> JobSnapshot {
-        tokio::time::timeout(Duration::from_secs(8), async {
+        terminal_for_with_watchdog(s, actor, id, Duration::from_secs(8)).await
+    }
+    async fn terminal_for_with_watchdog(
+        s: &JobsSupervisor,
+        actor: Option<&str>,
+        id: &str,
+        watchdog: Duration,
+    ) -> JobSnapshot {
+        tokio::time::timeout(watchdog, async {
             loop {
                 let v = s.poll(actor, id, 0, 0, PAGE).await.unwrap();
                 if v.status != JobStatus::Running {
@@ -3331,7 +3465,9 @@ mod tests {
                 .start(spec(d.path(), &script), CancellationToken::new())
                 .await
                 .unwrap();
-            let done = terminal(&s, &v.id).await;
+            // This setup must move almost 32 MiB under concurrent test load.
+            // Keep the EOF/cancellation assertion below on its normal 8s watchdog.
+            let done = terminal_for_with_watchdog(&s, None, &v.id, Duration::from_secs(30)).await;
             assert_eq!(done.exit_code, Some(0));
             assert!(!done.output_truncated);
         }

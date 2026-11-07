@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const UNKNOWN: &str = "Исход операции неизвестен: подтверждение завершения не сохранено. Проверьте файлы и процессы перед повтором; автоматически действие не повторялось.";
+const WORKER_SUMMARY_MAX: usize = 8 * 1024;
+const WORKER_PREVIEW_MAX: usize = 512;
+const WORKER_OUTPUT_MAX: usize = 64 * 1024;
 
 pub(crate) struct PendingOperation {
     id: String,
@@ -166,6 +169,459 @@ struct SavedResult {
     previous: Option<crate::task_state::TaskOperation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_format: Option<OutputFormat>,
+}
+
+/// Add bounded host observations to a failed worker wait without changing its
+/// failure status or any other fields from the AgentRecord.
+pub(crate) fn enrich_worker_wait(
+    mut outcome: ToolOutcome,
+    journal: Option<&OperationJournal>,
+    artifacts: Option<&ArtifactStore>,
+    session_id: &str,
+    turn: u64,
+    secrets: &[String],
+) -> ToolOutcome {
+    let Ok(record) = serde_json::from_str::<crate::agents::AgentRecord>(&outcome.content) else {
+        return outcome;
+    };
+    if record.role != crate::agents::AgentRole::Worker
+        || !matches!(
+            record.status,
+            crate::agents::AgentStatus::Failed
+                | crate::agents::AgentStatus::Cancelled
+                | crate::agents::AgentStatus::Interrupted
+        )
+    {
+        return outcome;
+    }
+    let summary = match (journal, artifacts) {
+        (Some(journal), Some(artifacts)) => {
+            match journal.worker_observation_sources(artifacts, session_id, &record.id, turn) {
+                Ok(sources) => worker_summary(sources, artifacts, session_id, secrets),
+                Err(_) => Ok(unavailable_worker_summary("journal_unavailable")),
+            }
+        }
+        _ => Ok(unavailable_worker_summary("journal_unavailable")),
+    };
+    let summary = summary.unwrap_or_else(|_| unavailable_worker_summary("summary_unavailable"));
+    let Ok(mut value) = serde_json::from_str::<Value>(&outcome.content) else {
+        return outcome;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return outcome;
+    };
+    object.insert("worker_receipts".into(), summary);
+    if let Ok(content) = serde_json::to_string(&value) {
+        outcome.content = content;
+    }
+    outcome
+}
+
+pub(crate) fn enrich_worker_wait_unavailable(
+    mut outcome: ToolOutcome,
+    reason: &'static str,
+) -> ToolOutcome {
+    let Ok(record) = serde_json::from_str::<crate::agents::AgentRecord>(&outcome.content) else {
+        return outcome;
+    };
+    if record.role != crate::agents::AgentRole::Worker
+        || !matches!(
+            record.status,
+            crate::agents::AgentStatus::Failed
+                | crate::agents::AgentStatus::Cancelled
+                | crate::agents::AgentStatus::Interrupted
+        )
+    {
+        return outcome;
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(&outcome.content) else {
+        return outcome;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("worker_receipts".into(), unavailable_worker_summary(reason));
+        if let Ok(content) = serde_json::to_string(&value) {
+            outcome.content = content;
+        }
+    }
+    outcome
+}
+
+fn unavailable_worker_summary(reason: &str) -> Value {
+    json!({
+        "version": 1,
+        "available": false,
+        "goal_verified": false,
+        "scope": "worker_turn",
+        "selection": "last_8_committed_by_admission",
+        "observations": [],
+        "omitted_operations": 0,
+        "pending_operations": 0,
+        "unavailable_operations": 0,
+        "truncated": false,
+        "unavailable_reason": reason,
+        "semantics": "Saved observations at their revisions; worker failure unchanged; absence does not prove no action; no current process state is asserted."
+    })
+}
+
+fn worker_summary(
+    sources: crate::operation_journal::WorkerObservationSources,
+    artifacts: &ArtifactStore,
+    session_id: &str,
+    secrets: &[String],
+) -> Result<Value> {
+    let mut unavailable = sources.unavailable;
+    let mut observations = Vec::new();
+    for source in sources.sources {
+        let mut observation = json!({
+            "operation_id": source.operation_id,
+            "tool": source.origin.tool,
+            "revision": source.revision,
+            "operation_outcome": source.outcome,
+            "terminal": source.terminal.id,
+        });
+        if secrets.iter().any(|secret| {
+            !secret.is_empty()
+                && [
+                    source.operation_id.as_str(),
+                    source.terminal.id.as_str(),
+                    source.origin.call_id.as_str(),
+                    source.origin.tool.as_str(),
+                    source.origin.actor.as_deref().unwrap_or_default(),
+                ]
+                .iter()
+                .any(|id| id.contains(secret))
+        }) {
+            unavailable += 1;
+            continue;
+        }
+        let saved: SavedResult = match serde_json::from_value::<SavedResult>(source.payload) {
+            Ok(saved) if saved.version == 1 => saved,
+            _ => {
+                unavailable += 1;
+                continue;
+            }
+        };
+        let valid_tool = matches!(
+            source.origin.tool.as_str(),
+            "start_command"
+                | "poll_command"
+                | "send_command_input"
+                | "stop_command"
+                | "handoff_command"
+                | "command_lifetime"
+                | "command_input_lifetime"
+                | "run_command"
+                | "write_file"
+                | "edit_file"
+                | "delete_file"
+                | "mkdir"
+                | "read_file"
+                | "search"
+                | "web_fetch"
+                | "update_plan"
+                | "load_skill"
+        );
+        if !valid_tool
+            || saved.output.session_id != session_id
+            || saved.output.origin != source.origin
+        {
+            unavailable += 1;
+            continue;
+        }
+        let output_id = saved.output.id.clone();
+        if secrets
+            .iter()
+            .any(|secret| !secret.is_empty() && output_id.contains(secret))
+        {
+            unavailable += 1;
+            continue;
+        }
+        observation["output"] = json!(output_id);
+        if saved.output_format.is_some() {
+            observation["payload_unavailable"] = json!("manifest_not_expanded");
+            observation["stdout_truncated"] = json!(false);
+            observations.push(observation);
+            continue;
+        }
+        if saved.output.truncated || saved.output.bytes > WORKER_OUTPUT_MAX {
+            observation["payload_unavailable"] = json!("output_over_limit_or_truncated");
+            observation["stdout_truncated"] = json!(false);
+            observations.push(observation);
+            continue;
+        }
+        let text = match artifacts.verify_output(&saved.output) {
+            Ok(text) => text,
+            Err(_) => {
+                unavailable += 1;
+                continue;
+            }
+        };
+        let native_job = matches!(
+            source.origin.tool.as_str(),
+            "start_command"
+                | "poll_command"
+                | "send_command_input"
+                | "stop_command"
+                | "handoff_command"
+                | "command_lifetime"
+                | "command_input_lifetime"
+        );
+        let mut parsed = native_job
+            .then(|| serde_json::from_str::<Value>(&text).ok())
+            .flatten();
+        if let Some(value) = parsed.as_mut() {
+            if worker_fields_have_secret_ids(value, secrets) {
+                unavailable += 1;
+                continue;
+            }
+            redact_json_strings(value, secrets)?;
+        }
+        let clean = if parsed.is_none() || source.origin.tool == "run_command" {
+            crate::redaction::redact_text(&text, secrets)?
+        } else {
+            String::new()
+        };
+        let fields = parsed
+            .as_ref()
+            .map(|value| worker_fields(&source.origin.tool, value))
+            .unwrap_or_else(|| json!({}));
+        observation["fields"] = fields;
+        let stdout = if matches!(
+            source.origin.tool.as_str(),
+            "start_command" | "poll_command" | "stop_command"
+        ) {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("stdout"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        } else if source.origin.tool == "run_command" {
+            clean.as_str()
+        } else {
+            ""
+        };
+        let preview = utf8_prefix(stdout, WORKER_PREVIEW_MAX);
+        observation["stdout_preview"] = json!(preview);
+        let native_truncated = native_job
+            && parsed
+                .as_ref()
+                .and_then(|value| value.get("output_truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if native_job
+            && parsed
+                .as_ref()
+                .and_then(|value| value.get("payload_unavailable"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            observation["payload_unavailable"] = json!("native_receipt_unavailable");
+        }
+        observation["stdout_truncated"] = json!(preview.len() < stdout.len() || native_truncated);
+        observations.push(observation);
+    }
+    let had_truncation = observations.iter().any(|observation| {
+        observation["stdout_truncated"] == true
+            || observation["fields"]["inputs_truncated"] == true
+            || observation["fields"]["output_truncated"] == true
+    });
+    let mut summary = json!({
+        "version": 1,
+        "available": true,
+        "goal_verified": false,
+        "scope": "worker_turn",
+        "selection": "last_8_committed_by_admission",
+        "observations": observations,
+        "omitted_operations": sources.omitted,
+        "pending_operations": sources.pending,
+        "unavailable_operations": unavailable,
+        "truncated": sources.omitted > 0 || had_truncation,
+        "semantics": "Saved observations at their revisions; worker failure unchanged; absence does not prove no action; no current process state is asserted."
+    });
+    redact_json_strings(&mut summary, secrets)?;
+    loop {
+        let bytes = serde_json::to_vec(&summary)?;
+        if bytes.len() <= WORKER_SUMMARY_MAX {
+            break;
+        }
+        let observations = summary["observations"]
+            .as_array_mut()
+            .expect("summary observations");
+        let mut preview_shrunk = false;
+        for observation in observations.iter_mut().rev() {
+            if let Some(preview) = observation["stdout_preview"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                let cut = preview.len().saturating_sub(64);
+                observation["stdout_preview"] = json!(utf8_prefix(preview, cut));
+                observation["stdout_truncated"] = json!(true);
+                preview_shrunk = true;
+                break;
+            }
+        }
+        if preview_shrunk {
+            summary["truncated"] = json!(true);
+            continue;
+        }
+        if observations.pop().is_some() {
+            summary["omitted_operations"] =
+                json!(summary["omitted_operations"].as_u64().unwrap_or(0) + 1);
+            summary["truncated"] = json!(true);
+            continue;
+        }
+        summary["unavailable_reason"] = json!("summary_over_limit");
+        summary["available"] = json!(false);
+        break;
+    }
+    Ok(summary)
+}
+
+fn utf8_prefix(value: &str, bytes: usize) -> &str {
+    let mut end = bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn worker_fields(tool: &str, value: &Value) -> Value {
+    let mut fields = serde_json::Map::new();
+    let uuid = |v: &Value| {
+        v.as_str()
+            .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok_and(|id| id.to_string() == s))
+    };
+    if matches!(
+        tool,
+        "start_command"
+            | "poll_command"
+            | "stop_command"
+            | "handoff_command"
+            | "send_command_input"
+            | "command_lifetime"
+            | "command_input_lifetime"
+    ) {
+        for key in ["command_id", "input_id"] {
+            if value.get(key).is_some_and(uuid) {
+                fields.insert(key.into(), value[key].clone());
+            }
+        }
+        if let Some(status) = value.get("status").and_then(Value::as_str).filter(|s| {
+            matches!(
+                *s,
+                "running" | "exited" | "stopped" | "timed_out" | "cancelled" | "failed" | "unknown"
+            )
+        }) {
+            fields.insert("status".into(), json!(status));
+        }
+        for key in ["cleanup_complete", "delivery_cancelled"] {
+            if let Some(flag) = value.get(key).and_then(Value::as_bool) {
+                fields.insert(key.into(), json!(flag));
+            }
+        }
+        for key in [
+            "output_truncated",
+            "payload_unavailable",
+            "redaction_incomplete",
+        ] {
+            if let Some(flag) = value.get(key).and_then(Value::as_bool) {
+                fields.insert(key.into(), json!(flag));
+            }
+        }
+        for key in ["exit_code", "signal"] {
+            if let Some(n) = value
+                .get(key)
+                .filter(|v| v.is_null() || v.as_i64().is_some())
+            {
+                fields.insert(key.into(), n.clone());
+            }
+        }
+        if let Some(delivery) = value.get("delivery").and_then(Value::as_str).filter(|s| {
+            matches!(
+                *s,
+                "accepted" | "delivered" | "rejected" | "cancelled" | "io_error"
+            )
+        }) {
+            fields.insert("delivery".into(), json!(delivery));
+        }
+        for key in ["written", "total"] {
+            if let Some(n) = value.get(key).and_then(Value::as_u64) {
+                fields.insert(key.into(), json!(n));
+            }
+        }
+        let input_values: Vec<&Value> = if tool == "command_input_lifetime" {
+            vec![value]
+        } else {
+            value
+                .get("inputs")
+                .and_then(Value::as_array)
+                .map(|inputs| inputs.iter().collect())
+                .unwrap_or_default()
+        };
+        if !input_values.is_empty()
+            || value.get("inputs").is_some()
+            || tool == "command_input_lifetime"
+        {
+            let inputs_truncated = input_values.len() > 4;
+            let mut accepted = Vec::new();
+            for input in input_values.into_iter().take(4) {
+                let mut item = serde_json::Map::new();
+                if input.get("input_id").is_some_and(uuid) {
+                    item.insert("input_id".into(), input["input_id"].clone());
+                }
+                if let Some(delivery) = input.get("delivery").and_then(Value::as_str).filter(|s| {
+                    matches!(
+                        *s,
+                        "accepted" | "delivered" | "rejected" | "cancelled" | "io_error"
+                    )
+                }) {
+                    item.insert("delivery".into(), json!(delivery));
+                }
+                for key in ["written", "total"] {
+                    if let Some(n) = input.get(key).and_then(Value::as_u64) {
+                        item.insert(key.into(), json!(n));
+                    }
+                }
+                accepted.push(Value::Object(item));
+            }
+            fields.insert("inputs".into(), json!(accepted));
+            fields.insert("inputs_truncated".into(), json!(inputs_truncated));
+        }
+    }
+    Value::Object(fields)
+}
+
+fn worker_fields_have_secret_ids(value: &Value, secrets: &[String]) -> bool {
+    let has_secret = |field: &Value| {
+        field.as_str().is_some_and(|id| {
+            secrets
+                .iter()
+                .any(|secret| !secret.is_empty() && id.contains(secret))
+        })
+    };
+    has_secret(&value["command_id"])
+        || has_secret(&value["input_id"])
+        || value["inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs.iter().any(|input| has_secret(&input["input_id"])))
+}
+
+fn redact_json_strings(value: &mut Value, secrets: &[String]) -> Result<()> {
+    match value {
+        Value::String(text) => *text = crate::redaction::redact_text(text, secrets)?,
+        Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item, secrets)?;
+            }
+        }
+        Value::Object(fields) => {
+            for item in fields.values_mut() {
+                redact_json_strings(item, secrets)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -399,9 +855,12 @@ pub(crate) fn preview(text: &str, meta: &ArtifactMeta, is_error: bool) -> String
         Ok(Value::Object(object)) => Value::Object(object),
         _ => json!({"text":text}),
     };
+    // The artifact checksum verifies the saved receipt, not a file read by the
+    // tool. Keep it in ArtifactMeta; showing two hashes here caused models to
+    // pass the receipt digest as write_file.expected_sha256.
+    value.as_object_mut().unwrap().remove("artifact_sha256");
     value["artifact_id"] = json!(meta.id);
     value["artifact_bytes"] = json!(meta.bytes);
-    value["artifact_sha256"] = json!(meta.sha256);
     value["artifact_truncated"] = json!(meta.truncated);
     preview_receipt(
         &ContextBudget::cloud(),
@@ -1003,6 +1462,715 @@ mod tests {
         }));
         session.save(store).unwrap();
         call
+    }
+
+    fn worker_record(
+        actor: &str,
+        role: crate::agents::AgentRole,
+        status: crate::agents::AgentStatus,
+    ) -> String {
+        serde_json::to_string(&crate::agents::AgentRecord {
+            id: actor.into(),
+            name: "worker".into(),
+            task: "short task".into(),
+            role,
+            status,
+            result: "worker failed after local actions".into(),
+            usage: Default::default(),
+            transferred_commands: vec![],
+        })
+        .unwrap()
+    }
+
+    fn commit_actor_tool(
+        journal: &mut OperationJournal,
+        artifacts: &ArtifactStore,
+        session: &mut Session,
+        store: &ConfigStore,
+        actor: &str,
+        tool: &str,
+        output: &str,
+    ) -> String {
+        let mut call = ToolCall::new(tool, json!({}));
+        call.id = uuid::Uuid::new_v4().to_string();
+        let pending = begin(
+            journal,
+            artifacts,
+            session,
+            store,
+            &call,
+            Some(actor),
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        finish(
+            pending,
+            journal,
+            artifacts,
+            session,
+            store,
+            &call,
+            ToolOutcome::success(output),
+            &[],
+        )
+        .unwrap()
+        .recorded_operation
+        .unwrap()
+    }
+
+    fn failed_worker_outcome(actor: &str) -> ToolOutcome {
+        ToolOutcome {
+            is_error: true,
+            content: worker_record(
+                actor,
+                crate::agents::AgentRole::Worker,
+                crate::agents::AgentStatus::Failed,
+            ),
+            changed_paths: vec![],
+            recorded_operation: None,
+            recorded_output: None,
+        }
+    }
+
+    #[test]
+    fn worker_summary_filters_exact_actor_turn_and_counts_pending() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        let matching = commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            &json!({"command_id":uuid::Uuid::new_v4().to_string(),"stdout":"SAFE"}).to_string(),
+        );
+        let foreign = commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &other,
+            "poll_command",
+            "foreign",
+        );
+        session.turn_index = 2;
+        let wrong_turn = commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            "wrong turn",
+        );
+        session.turn_index = 1;
+        let foreign_payload = journal
+            .terminal_payload(&foreign, &artifacts)
+            .unwrap()
+            .unwrap();
+        let foreign_meta: ArtifactMeta =
+            serde_json::from_value(foreign_payload["output"].clone()).unwrap();
+        let wrong_turn_payload = journal
+            .terminal_payload(&wrong_turn, &artifacts)
+            .unwrap()
+            .unwrap();
+        let wrong_turn_meta: ArtifactMeta =
+            serde_json::from_value(wrong_turn_payload["output"].clone()).unwrap();
+        let mut pending_call = ToolCall::new("stop_command", json!({}));
+        pending_call.id = uuid::Uuid::new_v4().to_string();
+        let pending = begin(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &pending_call,
+            Some(&actor),
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        let prepared_output = artifacts
+            .capture(pending.origin.clone(), "prepared but not committed", &[])
+            .unwrap();
+        let prepared_payload = serde_json::to_value(SavedResult {
+            version: 1,
+            is_error: false,
+            output: prepared_output,
+            previous: None,
+            output_format: None,
+        })
+        .unwrap();
+        let _prepared = journal
+            .prepare_finish(
+                &pending.id,
+                Outcome::Succeeded,
+                &prepared_payload,
+                pending.revision,
+                &artifacts,
+                &[],
+            )
+            .unwrap();
+        // Corrupt an artifact for another actor. Exact filtering must avoid it.
+        std::fs::write(
+            session.dir(&store).join("artifacts").join(&foreign_meta.id),
+            b"corrupt",
+        )
+        .unwrap();
+        std::fs::write(
+            session
+                .dir(&store)
+                .join("artifacts")
+                .join(&wrong_turn_meta.id),
+            b"corrupt wrong turn",
+        )
+        .unwrap();
+
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let result: Value = serde_json::from_str(&outcome.content).unwrap();
+        let receipts = &result["worker_receipts"];
+        assert_eq!(receipts["pending_operations"], 1);
+        assert_eq!(receipts["unavailable_operations"], 0);
+        assert_eq!(receipts["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(receipts["observations"][0]["operation_id"], matching);
+        assert!(outcome.is_error);
+    }
+
+    #[test]
+    fn worker_summary_keeps_eight_admissions_and_sorts_by_commit_revision() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let mut pending = Vec::new();
+        for n in 0..9 {
+            let mut call = ToolCall::new("poll_command", json!({}));
+            call.id = uuid::Uuid::new_v4().to_string();
+            let operation = begin(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &call,
+                Some(&actor),
+                &json!({}),
+                &[],
+            )
+            .unwrap();
+            pending.push((operation, call, n));
+        }
+        let oldest_id = pending[0].0.operation_id().to_owned();
+        for (operation, _call, n) in pending.into_iter().rev() {
+            let output_text = json!({"stdout":format!("receipt-{n}")}).to_string();
+            let output = artifacts
+                .capture(operation.origin.clone(), &output_text, &[])
+                .unwrap();
+            let payload = serde_json::to_value(SavedResult {
+                version: 1,
+                is_error: false,
+                output,
+                previous: None,
+                output_format: None,
+            })
+            .unwrap();
+            journal
+                .finish(
+                    &operation.id,
+                    Outcome::Succeeded,
+                    &payload,
+                    n + 1,
+                    &artifacts,
+                    &[],
+                )
+                .unwrap();
+        }
+        let sources = journal
+            .worker_observation_sources(&artifacts, &session.id, &actor, 1)
+            .unwrap();
+        assert_eq!(sources.omitted, 1);
+        assert_eq!(sources.pending, 0);
+        assert_eq!(sources.sources.len(), 8);
+        assert!(
+            sources
+                .sources
+                .windows(2)
+                .all(|pair| pair[0].revision >= pair[1].revision)
+        );
+        assert!(
+            !sources
+                .sources
+                .iter()
+                .any(|source| source.operation_id == oldest_id)
+        );
+    }
+
+    #[test]
+    fn worker_summary_redacts_full_unicode_output_before_preview_and_preserves_failure() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let secret = "секретный-хвост-0123456789";
+        let stdout = format!("{}{}🙂", "a".repeat(500), secret);
+        commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            &json!({"stdout":stdout}).to_string(),
+        );
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[secret.into()],
+        );
+        let result: Value = serde_json::from_str(&outcome.content).unwrap();
+        let receipts = &result["worker_receipts"];
+        assert_eq!(receipts["available"], true);
+        assert!(
+            receipts["observations"][0]["stdout_preview"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= WORKER_PREVIEW_MAX
+        );
+        assert!(!receipts.to_string().contains(secret));
+        assert!(serde_json::to_vec(receipts).unwrap().len() <= WORKER_SUMMARY_MAX);
+        assert!(outcome.is_error);
+    }
+
+    #[test]
+    fn worker_summary_skips_oversized_outputs_before_reading_body() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "run_command",
+            &"x".repeat(WORKER_OUTPUT_MAX + 1),
+        );
+        crate::artifacts::reset_read_bytes();
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let result: Value = serde_json::from_str(&outcome.content).unwrap();
+        let observation = &result["worker_receipts"]["observations"][0];
+        assert_eq!(
+            observation["payload_unavailable"],
+            "output_over_limit_or_truncated"
+        );
+        assert!(crate::artifacts::read_bytes_count() < WORKER_OUTPUT_MAX);
+        assert!(
+            serde_json::to_vec(&result["worker_receipts"])
+                .unwrap()
+                .len()
+                <= WORKER_SUMMARY_MAX
+        );
+    }
+
+    #[test]
+    fn worker_summary_never_reads_a_manifest_or_its_pages() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let mut call = ToolCall::new("command_lifetime", json!({}));
+        call.id = uuid::Uuid::new_v4().to_string();
+        let operation = begin(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &call,
+            Some(&actor),
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        let manifest = format!(
+            "{{\"version\":1,\"page_id\":\"{}\",\"padding\":\"{}\"}}",
+            uuid::Uuid::new_v4(),
+            "x".repeat(128 * 1024)
+        );
+        let output = artifacts
+            .capture_required(operation.origin.clone(), &manifest, &[])
+            .unwrap();
+        let payload = serde_json::to_value(SavedResult {
+            version: 1,
+            is_error: false,
+            output: output.clone(),
+            previous: None,
+            output_format: Some(OutputFormat::CommandManifestV1),
+        })
+        .unwrap();
+        journal
+            .finish(
+                &operation.id,
+                Outcome::Succeeded,
+                &payload,
+                1,
+                &artifacts,
+                &[],
+            )
+            .unwrap();
+        let output_path = session.dir(&store).join("artifacts").join(&output.id);
+        let mut corrupted = std::fs::read(&output_path).unwrap();
+        *corrupted.last_mut().unwrap() ^= 0x01;
+        std::fs::write(&output_path, corrupted).unwrap();
+        crate::artifacts::reset_read_bytes();
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let result: Value = serde_json::from_str(&outcome.content).unwrap();
+        let observation = &result["worker_receipts"]["observations"][0];
+        assert_eq!(observation["payload_unavailable"], "manifest_not_expanded");
+        assert_eq!(observation["output"], output.id);
+        assert_eq!(result["worker_receipts"]["unavailable_operations"], 0);
+        assert!(crate::artifacts::read_bytes_count() < 64 * 1024);
+    }
+
+    #[test]
+    fn worker_summary_is_bounded_after_json_escaping_and_preserves_native_input_truth() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let command_id = uuid::Uuid::new_v4().to_string();
+        let inputs = (0..5).map(|_| json!({
+            "input_id":uuid::Uuid::new_v4().to_string(), "delivery":"accepted", "written":0, "total":900
+        })).collect::<Vec<_>>();
+        commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            &json!({
+                "command_id":command_id,"status":"running","inputs":inputs,
+                "output_truncated":true,"payload_unavailable":true,"stdout":""
+            })
+            .to_string(),
+        );
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let result: Value = serde_json::from_str(&outcome.content).unwrap();
+        let receipts = &result["worker_receipts"];
+        let observation = &receipts["observations"][0];
+        assert_eq!(observation["fields"]["command_id"], command_id);
+        assert_eq!(observation["fields"]["inputs"].as_array().unwrap().len(), 4);
+        assert_eq!(observation["fields"]["inputs_truncated"], true);
+        assert_eq!(observation["fields"]["inputs"][0]["delivery"], "accepted");
+        assert_eq!(observation["fields"]["inputs"][0]["written"], 0);
+        assert_eq!(observation["fields"]["output_truncated"], true);
+        assert_eq!(
+            observation["payload_unavailable"],
+            "native_receipt_unavailable"
+        );
+        assert_eq!(observation["stdout_truncated"], true);
+        assert_eq!(receipts["truncated"], true);
+
+        for _ in 0..8 {
+            commit_actor_tool(
+                &mut journal,
+                &artifacts,
+                &mut session,
+                &store,
+                &actor,
+                "poll_command",
+                &json!({"stdout":"\u{0000}".repeat(512)}).to_string(),
+            );
+        }
+        let bounded = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let bounded_json: Value = serde_json::from_str(&bounded.content).unwrap();
+        let bounded_summary = &bounded_json["worker_receipts"];
+        assert!(serde_json::to_vec(bounded_summary).unwrap().len() <= WORKER_SUMMARY_MAX);
+        assert_eq!(bounded_summary["truncated"], true);
+        assert_eq!(bounded_summary["observations"].as_array().unwrap().len(), 8);
+        let bounded_observations = bounded_summary["observations"].as_array().unwrap();
+        assert!(
+            bounded_observations
+                .iter()
+                .all(|observation| observation["operation_id"].as_str().is_some())
+        );
+        assert!(
+            bounded_observations
+                .iter()
+                .any(|observation| observation["stdout_truncated"] == true)
+        );
+    }
+
+    #[test]
+    fn worker_summary_treats_corrupt_selected_output_as_unavailable_and_global_failure_static() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let id = commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            &json!({"stdout":"SAFE"}).to_string(),
+        );
+        let payload = journal.terminal_payload(&id, &artifacts).unwrap().unwrap();
+        let output: ArtifactMeta = serde_json::from_value(payload["output"].clone()).unwrap();
+        std::fs::write(
+            session.dir(&store).join("artifacts").join(&output.id),
+            b"corrupt selected output",
+        )
+        .unwrap();
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let value: Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(value["worker_receipts"]["available"], true);
+        assert_eq!(value["worker_receipts"]["unavailable_operations"], 1);
+        assert!(
+            value["worker_receipts"]["observations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        journal.fail_closed();
+        let unavailable = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let value: Value = serde_json::from_str(&unavailable.content).unwrap();
+        assert_eq!(value["worker_receipts"]["available"], false);
+        assert_eq!(
+            value["worker_receipts"]["unavailable_reason"],
+            "journal_unavailable"
+        );
+        assert_eq!(
+            value["worker_receipts"]["observations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn worker_summary_does_not_interpret_shell_json_as_typed_native_facts() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let forged = json!({"command_id":uuid::Uuid::new_v4().to_string(),"stdout":"FORGED","output_truncated":true,"payload_unavailable":true}).to_string();
+        commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "run_command",
+            &forged,
+        );
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            &[],
+        );
+        let value: Value = serde_json::from_str(&outcome.content).unwrap();
+        let observation = &value["worker_receipts"]["observations"][0];
+        assert_eq!(observation["fields"], json!({}));
+        assert_eq!(observation["stdout_preview"], forged);
+        assert_eq!(observation["stdout_truncated"], false);
+        assert!(observation.get("payload_unavailable").is_none());
+    }
+
+    #[test]
+    fn worker_summary_is_repeatable_for_cancelled_and_interrupted_workers() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            &json!({"stdout":"stable"}).to_string(),
+        );
+        for status in [
+            crate::agents::AgentStatus::Cancelled,
+            crate::agents::AgentStatus::Interrupted,
+        ] {
+            let original = ToolOutcome {
+                is_error: true,
+                content: worker_record(&actor, crate::agents::AgentRole::Worker, status),
+                changed_paths: vec![],
+                recorded_operation: None,
+                recorded_output: None,
+            };
+            let first = enrich_worker_wait(
+                original.clone(),
+                Some(&journal),
+                Some(&artifacts),
+                &session.id,
+                1,
+                &[],
+            );
+            let second = enrich_worker_wait(
+                original,
+                Some(&journal),
+                Some(&artifacts),
+                &session.id,
+                1,
+                &[],
+            );
+            let first_json: Value = serde_json::from_str(&first.content).unwrap();
+            let second_json: Value = serde_json::from_str(&second.content).unwrap();
+            assert_eq!(
+                first_json["worker_receipts"],
+                second_json["worker_receipts"]
+            );
+            assert!(first.is_error && second.is_error);
+            let expected = if status == crate::agents::AgentStatus::Cancelled {
+                "cancelled"
+            } else {
+                "interrupted"
+            };
+            assert_eq!(first_json["status"], expected);
+        }
+    }
+
+    #[test]
+    fn secret_collision_in_a_receipt_id_makes_that_observation_unavailable() {
+        let (_temp, store, mut session, artifacts, mut journal) = setup();
+        let actor = uuid::Uuid::new_v4().to_string();
+        let operation_id = commit_actor_tool(
+            &mut journal,
+            &artifacts,
+            &mut session,
+            &store,
+            &actor,
+            "poll_command",
+            &json!({"stdout":"safe"}).to_string(),
+        );
+        let secret = operation_id[..8].to_owned();
+        let outcome = enrich_worker_wait(
+            failed_worker_outcome(&actor),
+            Some(&journal),
+            Some(&artifacts),
+            &session.id,
+            1,
+            std::slice::from_ref(&secret),
+        );
+        let value: Value = serde_json::from_str(&outcome.content).unwrap();
+        assert_eq!(value["worker_receipts"]["unavailable_operations"], 1);
+        assert!(
+            value["worker_receipts"]["observations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!value["worker_receipts"].to_string().contains(&secret));
+    }
+
+    #[test]
+    fn worker_wait_only_enriches_failed_workers_and_never_changes_outcome_flags() {
+        let actor = uuid::Uuid::new_v4().to_string();
+        for (role, status) in [
+            (
+                crate::agents::AgentRole::Worker,
+                crate::agents::AgentStatus::Completed,
+            ),
+            (
+                crate::agents::AgentRole::Explorer,
+                crate::agents::AgentStatus::Failed,
+            ),
+        ] {
+            let original = ToolOutcome {
+                is_error: false,
+                content: worker_record(&actor, role, status),
+                changed_paths: vec!["kept".into()],
+                recorded_operation: Some("op".into()),
+                recorded_output: None,
+            };
+            let before = original.content.clone();
+            let enriched = enrich_worker_wait(original, None, None, "session", 1, &[]);
+            assert_eq!(enriched.content, before);
+            assert!(!enriched.is_error);
+            assert_eq!(enriched.changed_paths, vec!["kept"]);
+            assert_eq!(enriched.recorded_operation.as_deref(), Some("op"));
+        }
+    }
+
+    #[test]
+    fn model_preview_keeps_file_or_skill_hash_without_exposing_the_receipt_digest() {
+        let (_temp, _store, _session, artifacts, _journal) = setup();
+        for tool in ["read_file", "load_skill"] {
+            let text=json!({"path":"fixture.txt","sha256":"f".repeat(64),"content":"original","artifact_sha256":"legacy receipt digest"}).to_string();
+            let meta = artifacts
+                .capture(
+                    ArtifactOrigin {
+                        actor: None,
+                        turn: 1,
+                        tool: tool.into(),
+                        call_id: "read".into(),
+                    },
+                    &text,
+                    &[],
+                )
+                .unwrap();
+            let value: Value = serde_json::from_str(&preview(&text, &meta, false)).unwrap();
+            assert_eq!(value["sha256"], "f".repeat(64));
+            assert!(value.get("artifact_sha256").is_none());
+            assert_eq!(value["artifact_id"], meta.id);
+            assert_eq!(value["artifact_bytes"], meta.bytes);
+            assert_eq!(value["artifact_truncated"], false);
+            assert_eq!(
+                meta.sha256,
+                format!("{:x}", Sha256::digest(text.as_bytes()))
+            );
+            assert_eq!(artifacts.verify_required(&meta).unwrap(), text);
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

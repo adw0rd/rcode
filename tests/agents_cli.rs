@@ -88,6 +88,9 @@ struct Server {
 }
 impl Server {
     async fn new() -> Self {
+        Self::with_worker_delay(Duration::ZERO).await
+    }
+    async fn with_worker_delay(worker_delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -125,8 +128,13 @@ impl Server {
                                     bytes.extend_from_slice(&chunk[..count]);
                                 }
                                 let request: Value = serde_json::from_slice(&bytes[split..split+length]).unwrap();
+                                let task = request["messages"].as_array().unwrap().iter()
+                                    .find(|message| message["role"] == "user").unwrap()["content"]
+                                    .as_str().unwrap();
+                                let is_worker = task.starts_with("WORKER_EDIT") || task.starts_with("EXPLORE_READ");
+                                captured.lock().unwrap().push(request.clone());
+                                if is_worker { tokio::time::sleep(worker_delay).await; }
                                 let response = reply(&request).to_string();
-                                captured.lock().unwrap().push(request);
                                 let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len());
                                 let _ = stream.write_all(headers.as_bytes()).await;
                                 let _ = stream.write_all(response.as_bytes()).await;
@@ -154,6 +162,25 @@ impl Drop for Server {
 }
 
 async fn run(project: &Path, state: &Path, endpoint: &str, allow_edits: bool) -> Vec<Value> {
+    run_with_timeout(
+        project,
+        state,
+        endpoint,
+        allow_edits,
+        None,
+        if allow_edits { 0 } else { 1 },
+    )
+    .await
+}
+
+async fn run_with_timeout(
+    project: &Path,
+    state: &Path,
+    endpoint: &str,
+    allow_edits: bool,
+    timeout_secs: Option<u64>,
+    expected_code: i32,
+) -> Vec<Value> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rcode"));
     command
         .env_clear()
@@ -180,6 +207,9 @@ async fn run(project: &Path, state: &Path, endpoint: &str, allow_edits: bool) ->
     if allow_edits {
         command.args(["--approval-mode", "auto-edit"]);
     }
+    if let Some(seconds) = timeout_secs {
+        command.arg("--agent-timeout-secs").arg(seconds.to_string());
+    }
     command.args(["exec", "PARENT_TASK: delegate editing and reading"]);
     let output = tokio::time::timeout(Duration::from_secs(25), command.output())
         .await
@@ -187,7 +217,7 @@ async fn run(project: &Path, state: &Path, endpoint: &str, allow_edits: bool) ->
         .unwrap();
     assert_eq!(
         output.status.code(),
-        Some(if allow_edits { 0 } else { 1 }),
+        Some(expected_code),
         "stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -221,6 +251,13 @@ async fn subagent_edits_share_parent_undo_usage_and_early_final_is_collected() {
         .filter_map(|event| event["text"].as_str())
         .collect::<String>();
     assert!(text.contains("PARENT_COLLECTED_RESULTS"));
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["type"] == "start")
+            .unwrap()["agent_timeout_secs"],
+        120
+    );
     let id = events
         .iter()
         .find(|event| event["type"] == "start")
@@ -267,4 +304,125 @@ async fn editing_worker_does_not_bypass_parent_ask_permissions() {
                 .unwrap_or_default()
                 .contains("denied")
     }));
+}
+
+fn runtime_timeout(request: &Value) -> u64 {
+    let system = request["messages"][0]["content"].as_str().unwrap();
+    let raw = system
+        .split("<rcode_runtime_context>\n")
+        .nth(1)
+        .unwrap()
+        .split("\n</rcode_runtime_context>")
+        .next()
+        .unwrap();
+    serde_json::from_str::<Value>(raw).unwrap()["agent_timeout_secs"]
+        .as_u64()
+        .unwrap()
+}
+
+async fn configured_cli_case(
+    delay: Duration,
+    timeout_secs: u64,
+    expected_code: i32,
+    expected_status: &str,
+) {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = temporary.path().join("project");
+    let state = temporary.path().join("state");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("target.txt"), "user work\n").unwrap();
+    std::fs::write(project.join("README.md"), "notes\n").unwrap();
+    let server = Server::with_worker_delay(delay).await;
+    let events = run_with_timeout(
+        &project,
+        &state,
+        &server.url,
+        true,
+        Some(timeout_secs),
+        expected_code,
+    )
+    .await;
+    let start = events.iter().find(|e| e["type"] == "start").unwrap();
+    assert_eq!(start["agent_timeout_secs"], timeout_secs);
+    let session_id = start["session_id"].as_str().unwrap();
+    let session: Value = serde_json::from_slice(
+        &std::fs::read(state.join("sessions").join(session_id).join("session.json")).unwrap(),
+    )
+    .unwrap();
+    let records = session["agents"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records.iter().all(|r| r["status"] == expected_status),
+        "{records:?}"
+    );
+    let requests = server.requests.lock().unwrap();
+    assert!(requests.iter().all(|r| runtime_timeout(r) == timeout_secs));
+    let workers: Vec<_> = requests
+        .iter()
+        .filter(|r| {
+            let task = r["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "user")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            task.starts_with("WORKER_EDIT") || task.starts_with("EXPLORE_READ")
+        })
+        .collect();
+    if expected_status == "failed" {
+        for event in events
+            .iter()
+            .filter(|event| event["type"] == "tool_result" && event["name"] == "wait_agent")
+        {
+            let receipt: Value = serde_json::from_str(event["content"].as_str().unwrap()).unwrap();
+            if receipt["role"] == "worker" {
+                assert!(
+                    receipt["worker_receipts"].is_object(),
+                    "failed worker wait must include host receipt availability"
+                );
+                assert_eq!(receipt["worker_receipts"]["goal_verified"], false);
+                assert_eq!(receipt["worker_receipts"]["observations"], json!([]));
+            } else {
+                assert!(receipt.get("worker_receipts").is_none());
+            }
+        }
+        assert_eq!(
+            workers.len(),
+            2,
+            "one API request per timed-out worker; no replay"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|r| r["result"].as_str().unwrap().contains("(1 секунд)"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("target.txt")).unwrap(),
+            "user work\n"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["type"] == "tool_start" && e.get("agent_id").is_some())
+        );
+    } else {
+        assert_eq!(
+            std::fs::read_to_string(project.join("target.txt")).unwrap(),
+            "agent change\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn configured_cli_timeout_reaches_worker_and_runtime_and_blocks_late_actions() {
+    configured_cli_case(Duration::from_millis(1500), 1, 1, "failed").await;
+}
+
+#[tokio::test]
+async fn configured_cli_timeout_preserves_worker_completion_with_durable_io() {
+    // This checks propagation and successful durable edits. Exact one-second
+    // expiration is covered separately; fsync latency is machine-dependent.
+    configured_cli_case(Duration::ZERO, 10, 0, "completed").await;
 }

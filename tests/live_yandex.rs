@@ -88,6 +88,16 @@ impl Fixture {
     }
 
     fn run_with_directories(&self, prompt: &str, directories: &[&Path]) -> Vec<Value> {
+        self.run_expected(prompt, directories, 24, 0)
+    }
+
+    fn run_expected(
+        &self,
+        prompt: &str,
+        directories: &[&Path],
+        max_steps: u32,
+        expected_exit: i32,
+    ) -> Vec<Value> {
         let binary = std::env::var_os("RCODE_LIVE_BINARY")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_rcode").into());
         let mut command = Command::new(binary);
@@ -101,7 +111,7 @@ impl Fixture {
                 self.kind.as_str(),
                 "--json",
                 "--max-steps",
-                "24",
+                &max_steps.to_string(),
                 "--approval-mode",
                 "auto-edit",
                 "--allow-shell",
@@ -162,7 +172,7 @@ impl Fixture {
             .filter_map(|event| event["message"].as_str())
             .collect::<Vec<_>>();
         assert!(
-            output.status.success(),
+            output.status.code() == Some(expected_exit),
             "rcode завершился с {:?}; ошибки={errors:?}; ответ={answers}; stderr={stderr}",
             output.status.code()
         );
@@ -173,10 +183,305 @@ impl Fixture {
         assert!(
             events
                 .iter()
-                .any(|event| event["type"] == "done" && event["exit_code"] == 0)
+                .any(|event| event["type"] == "done" && event["exit_code"] == expected_exit)
         );
         events
     }
+}
+
+#[test]
+#[ignore = "Живой GigaChat API; запускать явно с --ignored"]
+fn gigachat_failed_worker_wait_contains_committed_results_without_readback() {
+    let fixture = Fixture::for_provider(ProviderKind::GigaChat);
+    let events = fixture.run_expected(
+        "Создай ровно одного worker и передай ему этот сценарий полностью, сохранив JSON-аргументы дословно. Основной агент вызывает только spawn_agent и wait_agent, затем сообщает факты из worker_receipts без новых инструментов. У worker ровно четыре шага, по одному инструменту на каждом. Шаг 1: start_command с точными аргументами {\"command\":\"cat; sleep 600\",\"stdin\":true,\"lifetime_minutes\":15,\"idle_minutes\":15}. Точка с запятой и sleep входят внутрь строки command: не сокращай её до cat. Шаг 2: send_command_input для полученного command_id, text=giga-worker-summary, append_newline=true, close=true. Шаг 3: poll_command того же ID, stdout должен быть giga-worker-summary и один LF, inputs delivery=delivered. Шаг 4: stop_command того же ID, cleanup_complete=true. После четвёртого инструмента хост остановит worker по лимиту шагов: ожидается Failed. Сообщи этот сбой честно, успешные инструменты не доказывают выполнение цели. Не повторяй действия, не читай артефакты. Не используй run_command, файлы, сеть, handoff или других workers.",
+        &[],
+        4,
+        1,
+    );
+    let starts = events
+        .iter()
+        .filter(|e| e["type"] == "tool_start")
+        .collect::<Vec<_>>();
+    let parent = starts
+        .iter()
+        .filter(|e| e["agent_id"].is_null())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent.len(),
+        2,
+        "Parent должен только запустить и собрать worker"
+    );
+    assert_eq!(parent[0]["name"], "spawn_agent");
+    assert_eq!(parent[1]["name"], "wait_agent");
+    let worker = starts
+        .iter()
+        .filter(|e| !e["agent_id"].is_null())
+        .collect::<Vec<_>>();
+    assert_eq!(worker.len(), 4);
+    for (event, name) in worker.iter().zip([
+        "start_command",
+        "send_command_input",
+        "poll_command",
+        "stop_command",
+    ]) {
+        assert_eq!(event["name"], name);
+    }
+    let start_args: Value = serde_json::from_str(worker[0]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(start_args["command"], "cat; sleep 600");
+    assert_eq!(start_args["stdin"], true);
+    assert_eq!(start_args["lifetime_minutes"], 15);
+    assert_eq!(start_args["idle_minutes"], 15);
+    let wait = events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "wait_agent")
+        .unwrap();
+    assert_eq!(wait["is_error"], true);
+    let receipt: Value = serde_json::from_str(wait["content"].as_str().unwrap()).unwrap();
+    assert_eq!(receipt["status"], "failed");
+    assert!(receipt["result"].as_str().unwrap().contains("лимит шагов"));
+    let summary = &receipt["worker_receipts"];
+    assert_eq!(summary["available"], true);
+    assert_eq!(summary["goal_verified"], false);
+    assert!(serde_json::to_vec(summary).unwrap().len() <= 8192);
+    let observations = summary["observations"].as_array().unwrap();
+    let stop = observations
+        .iter()
+        .find(|o| o["tool"] == "stop_command")
+        .unwrap();
+    assert_eq!(stop["fields"]["status"], "stopped");
+    assert_eq!(stop["fields"]["cleanup_complete"], true);
+    let poll = observations
+        .iter()
+        .find(|o| o["tool"] == "poll_command")
+        .unwrap();
+    assert_eq!(poll["stdout_preview"], "giga-worker-summary\n");
+    assert_eq!(poll["stdout_truncated"], false);
+    assert_eq!(poll["fields"]["command_id"], stop["fields"]["command_id"]);
+    assert!(
+        poll["fields"]["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|input| {
+                input["delivery"] == "delivered" && input["written"] == 20 && input["total"] == 20
+            })
+    );
+}
+
+#[test]
+#[ignore = "Живой GigaChat API и установленный Python; запускать явно с --ignored"]
+fn gigachat_managed_command_delivers_stdin_and_stops_without_shell_fallback() {
+    let fixture = Fixture::for_provider(ProviderKind::GigaChat);
+    let events = fixture.run("Проверь управление одним процессом через инструменты. Вызови ровно один start_command: command = read line; printf '%s\\n' \"$line\"; sleep 30, stdin = true, lifetime_minutes = 1, idle_minutes = 1. Полученный command_id используй во всех следующих вызовах. Затем ровно один send_command_input: text = giga-stdin-canary с переводом строки в конце, close = true. Через poll_command получи stdout со строкой giga-stdin-canary и подтверждение delivery=delivered для input_id. Затем stop_command останови процесс и заверши ответ. Разрешены только start_command, send_command_input, poll_command, stop_command. Не используй run_command, субагентов, файлы, сеть и другие команды.");
+    let receipts: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "tool_result")
+        .map(|e| {
+            assert_eq!(e["is_error"], false, "Управление процессом вернуло ошибку");
+            (
+                e["name"].as_str().unwrap(),
+                serde_json::from_str::<Value>(e["content"].as_str().unwrap()).unwrap(),
+            )
+        })
+        .collect();
+    assert!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "tool_start")
+            .all(|e| matches!(
+                e["name"].as_str(),
+                Some("start_command" | "send_command_input" | "poll_command" | "stop_command")
+            )),
+        "Недопустимый fallback в сценарии managed tools"
+    );
+    let starts: Vec<_> = receipts
+        .iter()
+        .filter(|(name, _)| *name == "start_command")
+        .collect();
+    let inputs: Vec<_> = receipts
+        .iter()
+        .filter(|(name, _)| *name == "send_command_input")
+        .collect();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(inputs.len(), 1);
+    let command_id = starts[0].1["command_id"]
+        .as_str()
+        .expect("Реальный command_id");
+    assert_eq!(starts[0].1["status"], "running");
+    assert_eq!(inputs[0].1["delivery"], "accepted");
+    let input_id = inputs[0].1["input_id"].as_str().expect("Реальный input_id");
+    assert!(receipts.iter().all(|(_, r)| r["command_id"] == command_id));
+    assert!(
+        receipts.iter().any(|(name, r)| *name == "poll_command"
+            && r["stdout"]
+                .as_str()
+                .is_some_and(|s| s.contains("giga-stdin-canary\n"))
+            && r["inputs"].as_array().is_some_and(|items| items
+                .iter()
+                .any(|v| v["input_id"] == input_id && v["delivery"] == "delivered"))),
+        "Нет фактической доставки stdin и вывода процесса"
+    );
+    assert!(
+        receipts
+            .iter()
+            .any(|(name, r)| *name == "stop_command" && r["status"] == "stopped"),
+        "Нет подтвержденной остановки"
+    );
+    println!(
+        "PASS: native GigaChat started one managed process, sent one input, observed its delivery and output, then stopped it without run_command fallback"
+    );
+}
+
+#[test]
+#[ignore = "Живой GigaChat API и установленный Python; запускать явно с --ignored"]
+fn gigachat_superpowers_tdd_observes_red_before_fix_and_independent_green() {
+    let fixture = Fixture::for_provider(ProviderKind::GigaChat);
+    let skill = fixture
+        .project
+        .join(".rcode/skills/test-driven-development");
+    fs::create_dir_all(&skill).unwrap();
+    for name in ["SKILL.md", "testing-anti-patterns.md"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/superpowers-upstream/skills/test-driven-development")
+                .join(name),
+            skill.join(name),
+        )
+        .unwrap();
+    }
+    let original = "def total(values):\n    return sum(set(values))\n";
+    let production = fixture.project.join("prices.py");
+    let tests = fixture.project.join("test_prices.py");
+    fs::write(&production, original).unwrap();
+    fs::write(&tests, "import unittest\nfrom prices import total\n\nclass PricesTest(unittest.TestCase):\n    def test_empty(self):\n        self.assertEqual(total([]), 0)\n    def test_sum(self):\n        self.assertEqual(total([2, 3]), 5)\n").unwrap();
+    let events = fixture.run("Используй установленный скилл test-driven-development через load_skill. Исправь баг в prices.py: total([2,2,3]) должна давать 7, сейчас даёт 5; total суммирует все значения, включая повторы. Дизайн и план такого исправления согласованы. Сначала прочитай файлы, добавь регрессионный unittest в test_prices.py и реально запусти его, наблюдая ожидаемое падение неправильной суммы. Только после этого минимально исправь prices.py и реально проверь все тесты. Чтение и правки только через файловые инструменты; shell только для точной команды python3 -B -m unittest -v без дополнительных команд. Без субагентов, коммитов, сети, установки зависимостей и правок AGENTS.md. Итог кратко по-русски.");
+    let result = |e: &Value| {
+        serde_json::from_str::<Value>(e["content"].as_str().unwrap_or("")).unwrap_or(Value::Null)
+    };
+    let output = |r: &Value| {
+        format!(
+            "{}\n{}",
+            r["stdout"].as_str().unwrap_or(""),
+            r["stderr"].as_str().unwrap_or("")
+        )
+    };
+    let sum_failure = |s: &str| {
+        s.contains("FAIL: test_")
+            && s.contains("AssertionError:")
+            && (s.contains("5 != 7") || s.contains("7 != 5"))
+            && s.contains("FAILED (failures=")
+            && !s.contains("ERROR:")
+            && !s.contains("ImportError")
+    };
+    let mut test_commands = Vec::new();
+    for e in events.iter().filter(|e| e["type"] == "tool_start") {
+        assert!(
+            matches!(
+                e["name"].as_str(),
+                Some(
+                    "list_files"
+                        | "read_file"
+                        | "search"
+                        | "load_skill"
+                        | "write_file"
+                        | "edit_file"
+                        | "run_command"
+                )
+            ),
+            "Неожиданный инструмент в TDD сценарии"
+        );
+        if e["name"] == "run_command" {
+            let args: Value = serde_json::from_str(e["arguments"].as_str().unwrap_or("")).unwrap();
+            assert_eq!(
+                args["command"].as_str().map(str::trim),
+                Some("python3 -B -m unittest -v"),
+                "Shell используется только для запуска unittest"
+            );
+            test_commands.push(e["id"].clone());
+        }
+    }
+    assert!(
+        events.iter().any(|e| e["type"] == "tool_result"
+            && e["name"] == "load_skill"
+            && e["is_error"] == false
+            && result(e)["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST"))),
+        "Оригинальный Superpowers TDD должен быть реально загружен"
+    );
+    let red = events
+        .iter()
+        .position(|e| {
+            let r = result(e);
+            e["type"] == "tool_result"
+                && e["name"] == "run_command"
+                && test_commands.contains(&e["id"])
+                && r["exit_code"].as_i64().is_some_and(|n| n != 0)
+                && sum_failure(&output(&r))
+        })
+        .expect("Нет реально наблюдавшегося RED регрессии");
+    let fix = events
+        .iter()
+        .position(|e| {
+            e["type"] == "tool_result"
+                && e["is_error"] == false
+                && e["changed_paths"].as_array().is_some_and(|paths| {
+                    paths.iter().any(|p| {
+                        p.as_str().is_some_and(|p| {
+                            Path::new(p) == Path::new("prices.py") || Path::new(p) == production
+                        })
+                    })
+                })
+        })
+        .expect("Нет подтвержденной правки production файла");
+    assert!(red < fix, "Production изменен до наблюдаемого RED");
+    assert!(
+        events.iter().enumerate().any(|(i, e)| i > fix
+            && e["type"] == "tool_result"
+            && e["name"] == "run_command"
+            && test_commands.contains(&e["id"])
+            && result(e)["exit_code"] == 0
+            && output(&result(e)).lines().any(|s| s == "OK")),
+        "Нет реального GREEN после исправления"
+    );
+    let run_tests = || {
+        output_with_deadline(
+            Command::new("python3")
+                .args(["-I", "-B", "-m", "unittest", "discover", "-s", ".", "-v"])
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .current_dir(&fixture.project),
+            Duration::from_secs(15),
+        )
+    };
+    assert!(
+        run_tests().status.success(),
+        "Независимый unittest GREEN не прошел"
+    );
+    let independent = output_with_deadline(
+        Command::new("python3").args(["-I", "-B", "-c", "import sys;sys.path.insert(0,'.');from prices import total;assert total([2,2,3])==7;assert total([])==0;assert total([-2,-2,3])==-1;assert total([1,2])==3"])
+            .current_dir(&fixture.project), Duration::from_secs(15));
+    assert!(
+        independent.status.success(),
+        "Независимая проверка контракта не прошла"
+    );
+    let fixed = fs::read(&production).unwrap();
+    assert_ne!(fixed, original.as_bytes());
+    fs::write(&production, original).unwrap();
+    let mutant = run_tests();
+    fs::write(&production, fixed).unwrap();
+    let mutant_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&mutant.stdout),
+        String::from_utf8_lossy(&mutant.stderr)
+    );
+    assert!(
+        !mutant.status.success() && sum_failure(&mutant_output),
+        "Новая регрессия не обнаружила неправильную сумму исходного бага"
+    );
+    println!(
+        "PASS: native GigaChat loaded original Superpowers TDD, observed RED before production edit, then GREEN; independent checks passed and regression rejected original bug"
+    );
 }
 
 #[test]

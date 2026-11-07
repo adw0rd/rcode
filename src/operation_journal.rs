@@ -49,6 +49,23 @@ pub struct OperationRecord {
     pub task_revision: Option<u64>,
 }
 
+/// A committed receipt selected from the private index for one exact actor turn.
+pub(crate) struct CommittedObservationSource {
+    pub operation_id: String,
+    pub origin: ArtifactOrigin,
+    pub terminal: ArtifactMeta,
+    pub outcome: Outcome,
+    pub revision: u64,
+    pub payload: Value,
+}
+
+pub(crate) struct WorkerObservationSources {
+    pub sources: Vec<CommittedObservationSource>,
+    pub omitted: usize,
+    pub pending: usize,
+    pub unavailable: usize,
+}
+
 /// Подготовленный артефакт ещё не является опубликованным результатом.
 /// Токен действителен только для создавшего его экземпляра журнала.
 pub struct PreparedTerminal {
@@ -303,6 +320,64 @@ impl OperationJournal {
             "Журнал относится к другой сессии"
         );
         self.check()
+    }
+
+    /// Read at most the eight newest committed entries in index/admission order
+    /// for one exact worker turn. Other actors are filtered before artifact IO.
+    pub(crate) fn worker_observation_sources(
+        &self,
+        artifacts: &ArtifactStore,
+        session_id: &str,
+        actor: &str,
+        turn: u64,
+    ) -> Result<WorkerObservationSources> {
+        self.check_session(session_id)?;
+        let matching: Vec<&Record> = self
+            .index
+            .records
+            .iter()
+            .filter(|record| {
+                record.origin.actor.as_deref() == Some(actor) && record.origin.turn == turn
+            })
+            .collect();
+        let pending = matching
+            .iter()
+            .filter(|record| record.terminal.is_none())
+            .count();
+        let committed: Vec<&Record> = matching
+            .into_iter()
+            .filter(|record| record.terminal.is_some())
+            .collect();
+        let omitted = committed.len().saturating_sub(8);
+        let selected = committed.iter().rev().take(8).copied().collect::<Vec<_>>();
+        let mut sources = Vec::with_capacity(selected.len());
+        let mut unavailable = 0;
+        for record in selected {
+            let result: Result<CommittedObservationSource> = (|| {
+                self.intent(record, artifacts)?;
+                let meta = record.terminal.as_ref().expect("selected committed record");
+                let terminal = self.terminal(record, meta, artifacts)?;
+                Ok(CommittedObservationSource {
+                    operation_id: record.operation_id.clone(),
+                    origin: record.origin.clone(),
+                    terminal: meta.clone(),
+                    outcome: terminal.outcome,
+                    revision: terminal.task_revision,
+                    payload: terminal.payload,
+                })
+            })();
+            match result {
+                Ok(source) => sources.push(source),
+                Err(_) => unavailable += 1,
+            }
+        }
+        sources.sort_by_key(|source| std::cmp::Reverse(source.revision));
+        Ok(WorkerObservationSources {
+            sources,
+            omitted,
+            pending,
+            unavailable,
+        })
     }
 
     pub(crate) fn fail_closed(&mut self) {

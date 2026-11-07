@@ -258,6 +258,96 @@ async fn native_stdin_receipts_poll_stop_and_durable_manifest() {
 }
 
 #[tokio::test]
+async fn explicit_newline_reaches_live_child_before_stop() {
+    let project = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let capture = seen.clone();
+    let server = Server::start(move |request, step| {
+        assert!(request.is_generation());
+        assert!(step <= 8, "bounded scripted model");
+        let reply = latest(request);
+        if let Some(v) = &reply {
+            capture.lock().unwrap().push(v.clone());
+        }
+        match step {
+            0 => tool_reply(
+                "start-lf",
+                "start_command",
+                &json!({"command":"/bin/sh -c 'head -n 1; sleep 30'", "stdin":true}),
+            ),
+            1 => tool_reply(
+                "input-lf",
+                "send_command_input",
+                &json!({"command_id":command_id(request), "text":"LINE", "append_newline":true, "close":false}),
+            ),
+            _ => {
+                let v = reply.unwrap();
+                if v["status"] == "stopped" {
+                    text_reply("Explicit newline verified and stopped.")
+                } else if v["stdout"]
+                    .as_str()
+                    .is_some_and(|s| s.as_bytes() == b"LINE\n")
+                    && v["status"] == "running"
+                {
+                    tool_reply(
+                        "stop-lf",
+                        "stop_command",
+                        &json!({"command_id":command_id(request)}),
+                    )
+                } else {
+                    tool_reply(
+                        &format!("poll-lf-{step}"),
+                        "poll_command",
+                        &json!({"command_id":command_id(request)}),
+                    )
+                }
+            }
+        }
+    });
+    let out = run(project.path(), state.path(), &server, &["--allow-shell"]).await;
+    success(&out);
+    let seen = seen.lock().unwrap();
+    let start = seen
+        .iter()
+        .find(|v| v["status"] == "running" && v.get("command_id").is_some())
+        .expect("start receipt");
+    let id = start["command_id"].as_str().unwrap();
+    let inputs: Vec<_> = seen
+        .iter()
+        .filter(|v| v.get("input_id").is_some())
+        .collect();
+    assert_eq!(inputs.len(), 1, "one input delivered");
+    let input = inputs[0];
+    assert_eq!(input["delivery"], "accepted");
+    let input_id = input["input_id"].as_str().unwrap();
+    assert_eq!(input["command_id"], id);
+    let poll = seen
+        .iter()
+        .find(|v| {
+            v["stdout"]
+                .as_str()
+                .is_some_and(|s| s.as_bytes() == b"LINE\n")
+                && v["status"] == "running"
+        })
+        .expect("exact live child bytes before stop");
+    let delivered = poll["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["input_id"] == input_id)
+        .expect("same input id in poll");
+    assert_eq!(delivered["delivery"], "delivered");
+    assert_eq!(delivered["total"], 5);
+    assert_eq!(delivered["written"], 5);
+    assert!(
+        seen.iter()
+            .any(|v| v["status"] == "stopped" && v["cleanup_complete"] == true),
+        "child cleanup completed after live byte check"
+    );
+}
+
+#[tokio::test]
 async fn plan_and_missing_shell_permission_never_start_native_children() {
     for flags in [vec!["--plan", "--allow-shell"], vec![]] {
         let project = tempfile::tempdir().unwrap();

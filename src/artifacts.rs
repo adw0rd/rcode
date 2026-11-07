@@ -381,6 +381,15 @@ impl ArtifactStore {
                 && 12 + n + meta.bytes == len as usize,
             "Несовместимые метаданные артефакта"
         );
+        if let Some(expected) = required {
+            // Compare the immutable reference before allocating or reading the
+            // body. A same-UID replacement with different metadata must not
+            // turn a small expected output into an unbounded read.
+            ensure!(
+                meta == *expected,
+                "Метаданные сохранённого артефакта не совпадают"
+            );
+        }
         #[cfg(test)]
         TEST_READ_BYTES.with(|v| v.set(v.get().saturating_add(meta.bytes)));
         let mut bytes = vec![0; meta.bytes];
@@ -397,10 +406,7 @@ impl ArtifactStore {
         let text = String::from_utf8(bytes)
             .map_err(|_| anyhow!("Артефакт содержит некорректный UTF-8"))?;
         if let Some(expected) = required {
-            ensure!(
-                meta == *expected,
-                "Метаданные сохранённого артефакта не совпадают"
-            );
+            let _ = expected;
             disk(f.sync_all())?;
             #[cfg(unix)]
             {
@@ -894,6 +900,23 @@ mod tests {
         *bytes.last_mut().unwrap() = b'y';
         fs::write(path, bytes).unwrap();
         assert!(s.verify_output(&meta).is_err());
+    }
+
+    #[test]
+    fn required_metadata_mismatch_is_rejected_before_reading_artifact_body() {
+        let (_t, s) = setup();
+        let meta = s
+            .capture(origin(Some("worker")), &"x".repeat(1024 * 1024), &[])
+            .unwrap();
+        let mut forged = meta.clone();
+        forged.bytes -= 1;
+        reset_read_bytes();
+        assert!(s.verify_output(&forged).is_err());
+        assert_eq!(
+            read_bytes_count(),
+            0,
+            "mismatched reference must fail before body allocation/read"
+        );
     }
 
     #[test]
