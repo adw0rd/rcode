@@ -349,6 +349,7 @@ pub struct Settings {
 /// Отдельный маршрут дополнительного host-owned финального ревью.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewTarget {
     #[default]
     Same,

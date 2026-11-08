@@ -33,6 +33,7 @@ pub(crate) struct ManagedTestHook {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 impl ManagedTestHook {
     pub(crate) fn new(
         point: ManagedTestHookPoint,
@@ -144,6 +145,7 @@ pub(crate) struct ManagedJobs {
 
 impl ManagedJobs {
     #[cfg(test)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_test_hook(&mut self, hook: ManagedTestHook) {
         self.test_hook = Some(hook);
     }

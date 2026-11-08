@@ -460,6 +460,7 @@ impl OperationJournal {
             ),
             "Каталог сессии изменился"
         );
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = DirBuilder::new();
         #[cfg(unix)]
         builder.mode(0o700);

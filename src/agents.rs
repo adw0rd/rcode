@@ -144,9 +144,11 @@ struct ScopedReply {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct TestScopedReply(ScopedReply);
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 impl TestScopedReply {
     pub(crate) async fn receive(self) -> Result<ToolOutcome, oneshot::error::RecvError> {
         self.0.receive().await
@@ -154,6 +156,7 @@ impl TestScopedReply {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn scoped_reply_for_test() -> (
     oneshot::Sender<ToolOutcome>,
     TestScopedReply,

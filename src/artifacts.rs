@@ -21,10 +21,12 @@ use uuid::Uuid;
 #[cfg(test)]
 thread_local! { static TEST_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn reset_read_bytes() {
     TEST_READ_BYTES.with(|v| v.set(0));
 }
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn read_bytes_count() -> usize {
     TEST_READ_BYTES.with(|v| v.get())
 }
@@ -206,6 +208,7 @@ impl ArtifactStore {
         );
         // Only bootstrap directory creation is ambient; all artifact I/O is confined.
         let parent = disk(Dir::open_ambient_dir(session_dir, ambient_authority()))?;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = DirBuilder::new();
         #[cfg(unix)]
         builder.mode(0o700);

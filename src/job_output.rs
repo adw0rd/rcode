@@ -18,6 +18,8 @@
 //! not as a sticky decoder-wide mode. State is bounded by matcher lookbehind,
 //! one input chunk, redaction expansion, and constant-size decoding metadata.
 
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use crate::redaction::StreamingRedactor;
 use anyhow::{Result, anyhow, ensure};
 use std::ops::Range;

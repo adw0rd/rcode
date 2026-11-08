@@ -12,6 +12,7 @@
 //! Linux admission requires an unrestricted procfs for the current PID namespace.
 //! The host must not change mounts/namespaces concurrently with admission or cleanup;
 //! descendants must remain in that PID namespace as well as the original group.
+#![cfg_attr(not(unix), allow(dead_code))]
 use crate::job_output::{OutputChunk, OutputStream};
 use anyhow::Context as _;
 use anyhow::{Result, bail, ensure};
@@ -2043,7 +2044,7 @@ mod platform {
         );
         let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
         ensure!(
-            unsafe { libc::statfs(b"/proc\0".as_ptr().cast(), &mut filesystem) } == 0
+            unsafe { libc::statfs(c"/proc".as_ptr().cast(), &mut filesystem) } == 0
                 && filesystem.f_type as u64 == 0x9fa0,
             "procfs unavailable"
         );
@@ -2077,7 +2078,8 @@ mod platform {
         ensure!(Instant::now() < deadline, "procfs status deadline");
         validate_self_status(&identity, std::process::id())?;
         ensure!(
-            std::fs::read_link("/proc/self")? == PathBuf::from(std::process::id().to_string()),
+            std::fs::read_link("/proc/self")?.as_os_str()
+                == std::process::id().to_string().as_str(),
             "procfs PID mapping mismatch"
         );
         let after = std::fs::metadata("/proc/self/ns/pid")?;

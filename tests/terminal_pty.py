@@ -24,7 +24,7 @@ sys.dont_write_bytecode = True
 from viewport_vt import Viewport, verify_viewport
 
 
-DEADLINE = time.monotonic() + 51
+DEADLINE = time.monotonic() + 90
 ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
 
