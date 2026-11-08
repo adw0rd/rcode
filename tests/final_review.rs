@@ -777,11 +777,11 @@ fn oversized_packet_fails_without_sending_a_review_request() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let state = temp.path().join("state");
-    let primary = Server::start(|_, _| text_reply(PRIMARY_DRAFT));
+    let primary = Server::start(|_, _| text_reply(&"y".repeat(52 * 1024)));
     let reviewer = Server::start(|_, _| text_reply(REVIEW_RESULT));
     fixture_state(&project, &state, &primary, &reviewer);
 
-    let output = run_prompt(&project, &state, true, &"x".repeat(66 * 1024));
+    let output = run_prompt(&project, &state, true, &"x".repeat(16 * 1024));
     assert_ne!(
         output.status.code(),
         Some(0),
