@@ -858,6 +858,7 @@ fn primary_and_review_credentials_are_redacted_before_packet_and_session_save() 
     assert!(!String::from_utf8_lossy(&output.stdout).contains(REVIEW_KEY));
 }
 
+#[cfg(unix)]
 #[test]
 fn cancellation_during_reviewer_wait_saves_cancelled_without_late_result() {
     use std::time::{Duration, Instant};

@@ -2154,7 +2154,7 @@ mod platform {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing group"))?
                 .parse()?;
-            if group == pgid && !pidfd_process_gone(name.parse()?, deadline)? {
+            if pgid > 0 && group == pgid && !pidfd_process_gone(name.parse()?, deadline)? {
                 gone = false;
             }
         }

@@ -993,8 +993,10 @@ mod tests {
         let reference = stage.reference();
         let proof = proof(b"payload", 0o600);
         let guard = temp.path().join(&reference.name).join(GUARD);
+        let old_guard = fs::File::open(&guard).unwrap();
         fs::remove_file(&guard).unwrap();
         fs::write(&guard, GUARD_BYTES).unwrap();
+        drop(old_guard);
         fs::set_permissions(&guard, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(StageDirectory::cleanup_known(&root, &reference, Some(&proof)).is_err());
         assert!(guard.exists());
