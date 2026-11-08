@@ -7,16 +7,22 @@ use std::{
 };
 
 fn run(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rcode"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rcode"));
+    command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("RCODE_HOME", home)
         .args(["--json", "eval"])
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap()
+        .stdin(std::process::Stdio::null());
+    for name in ["SYSTEMROOT", "TMPDIR", "TEMP", "TMP"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.output().unwrap()
 }
 fn suite(root: &Path) -> std::path::PathBuf {
     fs::create_dir_all(root.join("cases/py-add/project")).unwrap();

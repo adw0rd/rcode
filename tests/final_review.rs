@@ -100,6 +100,18 @@ fn run_prompt_with(
     )
 }
 
+fn apply_test_env(command: &mut Command, state: &Path) {
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("RCODE_HOME", state);
+    for name in ["SYSTEMROOT", "TMPDIR", "TEMP", "TMP", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
 fn run_provider(
     project: &Path,
     state: &Path,
@@ -110,10 +122,8 @@ fn run_provider(
     prompt: &str,
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rcode"));
+    apply_test_env(&mut command, state);
     command
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("RCODE_HOME", state)
         .arg("-C")
         .arg(project)
         .args(["--provider", provider, "--model", model, "--json"]);
@@ -126,10 +136,8 @@ fn run_provider(
 
 fn run_plain_final_review(project: &Path, state: &Path, prompt: &str) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rcode"));
+    apply_test_env(&mut command, state);
     command
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("RCODE_HOME", state)
         .args(["-C"])
         .arg(project)
         .args([
@@ -152,11 +160,8 @@ fn run(project: &Path, state: &Path, final_review: bool) -> Output {
 
 fn run_settings_command(state: &Path, args: &[&str], model_shell: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rcode"));
-    command
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("RCODE_HOME", state)
-        .args(args);
+    apply_test_env(&mut command, state);
+    command.args(args);
     if model_shell {
         command.env("RCODE_MODEL_SHELL", "1");
     }
@@ -933,6 +938,7 @@ fn cancellation_during_reviewer_wait_saves_cancelled_without_late_result() {
     assert_eq!(review["status"], "cancelled");
 }
 
+#[cfg(unix)]
 #[test]
 fn packet_uses_real_file_and_command_receipts_with_typed_status_metadata() {
     let temp = tempfile::tempdir().unwrap();
@@ -1367,10 +1373,9 @@ fn final_review_repair_cli_conflict_and_model_shell_guard() {
     assert_eq!(status_value["data"]["enabled"], true);
     assert_eq!(status_value["data"]["mode"], "repair");
 
-    let blocked = Command::new(env!("CARGO_BIN_EXE_rcode"))
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("RCODE_HOME", &state)
+    let mut blocked_cmd = Command::new(env!("CARGO_BIN_EXE_rcode"));
+    apply_test_env(&mut blocked_cmd, &state);
+    let blocked = blocked_cmd
         .env("RCODE_MODEL_SHELL", "1")
         .arg("-C")
         .arg(&project)

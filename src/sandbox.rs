@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn invalid_roots_and_versions() {
-        let (_temp, root) = workspace();
+        let (temp, root) = workspace();
         let mut config = SandboxConfig {
             version: 2,
             ..Default::default()
@@ -298,7 +298,7 @@ mod tests {
         config.write_roots = vec![file];
         assert!(config.validate(&root).is_err());
         config.write_roots.clear();
-        assert!(config.validate(&root.join("..")).is_err());
+        assert!(config.validate(&temp.path().join("..")).is_err());
         assert!(config.validate(Path::new("")).is_err());
     }
 

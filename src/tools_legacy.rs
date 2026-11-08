@@ -1426,6 +1426,8 @@ impl Tools {
                     .unwrap_or_else(|_| (Ok(Vec::new()), Ok(Vec::new()))),
             };
             let (stdout, stderr) = (output.0?, output.1?);
+            let stdout_lossy = std::str::from_utf8(&stdout).is_err();
+            let stderr_lossy = std::str::from_utf8(&stderr).is_err();
             let status = status.context("Статус процесса отсутствует")?;
             let reason = reason.or_else(|| {
                 if budget.load(Ordering::Relaxed) > MAX_OUTPUT_BYTES {
@@ -1434,7 +1436,8 @@ impl Tools {
                     None
                 }
             });
-            let content = json!({"exit_code":status.code(),"signal":exit_signal(&status),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"reason":reason,"shell_changes_managed":false,"note":SHELL_NOTE,"termination":if cfg!(unix) {"process_group"} else {"best_effort_child_only"}}).to_string();
+            let output_truncated = reason == Some("output_limit");
+            let content = json!({"exit_code":status.code(),"signal":exit_signal(&status),"stdout":String::from_utf8_lossy(&stdout),"stderr":String::from_utf8_lossy(&stderr),"reason":reason,"output_truncated":output_truncated,"stdout_lossy":stdout_lossy,"stderr_lossy":stderr_lossy,"shell_changes_managed":false,"note":SHELL_NOTE,"termination":if cfg!(unix) {"process_group"} else {"best_effort_child_only"}}).to_string();
             Ok(ToolOutcome {
                 is_error: reason.is_some() || !status.success(),
                 content,
