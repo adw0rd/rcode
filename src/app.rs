@@ -1690,6 +1690,15 @@ impl ToolExecutor<'_> {
         actor: Option<&AgentRequest>,
         session: Option<&mut Session>,
     ) -> Result<ToolOutcome> {
+        Box::pin(self.execute_inner(call, actor, session)).await
+    }
+
+    async fn execute_inner(
+        &mut self,
+        call: &ToolCall,
+        actor: Option<&AgentRequest>,
+        session: Option<&mut Session>,
+    ) -> Result<ToolOutcome> {
         let name = call.function.name.as_str();
         let cancel = actor.map_or(self.cancel, |request| &request.cancel);
         if cancel.is_cancelled() || actor.is_some_and(|request| request.reply.is_closed()) {
@@ -3037,7 +3046,7 @@ pub(crate) async fn skill_turn(
     skills: &SkillCatalog,
     execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
-    turn_inner(
+    Box::pin(turn_inner(
         session,
         store,
         tools,
@@ -3049,7 +3058,7 @@ pub(crate) async fn skill_turn(
         plan,
         skills,
         execution,
-    )
+    ))
     .await
 }
 
@@ -3066,9 +3075,9 @@ pub(crate) async fn turn(
     skills: &SkillCatalog,
     execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
-    turn_inner(
+    Box::pin(turn_inner(
         session, store, tools, client, events, cli, prompt, None, plan, skills, execution,
-    )
+    ))
     .await
 }
 

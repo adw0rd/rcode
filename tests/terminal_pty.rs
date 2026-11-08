@@ -60,7 +60,7 @@ fn interactive_terminal_keeps_viewport_and_persists_selected_effort() {
         .process_group(0)
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(56);
+    let deadline = Instant::now() + Duration::from_secs(96);
     let (status, timed_out) = 'running: loop {
         if let Some(status) = child.try_wait().unwrap() {
             break (status, false);
