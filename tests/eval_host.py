@@ -100,6 +100,104 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(bootstrap['profile_credential'],'eval-placeholder-key')
         self.assertNotIn('synthetic-real-key',json.dumps(bootstrap))
 
+    def receipt_phase(self,events,state,resume_id=None):
+        import host
+        from unittest.mock import patch
+        class Channel:
+            def __init__(self,frames):self.frames=list(frames)
+            def receive(self,timeout=None):return self.frames.pop(0)
+            def send(self,_value):pass
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def create(self,*_args,**_kwargs):return 'agent'
+            def start(self,_name,_bootstrap,_deadline):
+                raw=b''.join(json.dumps(event).encode()+b'\n' for event in events)
+                return Channel([{'type':'agent_log','channel':'stdout','data':base64.b64encode(raw).decode()},
+                    {'type':'agent_done','exit_code':0}])
+            def remove(self,*_args):pass
+        class Pump:
+            def __init__(self,_gateway):pass
+            def deliver(self,_channel):pass
+            def close(self):pass
+        invocation={'binary':'/unused/rcode','effective_profile':{'kind':'local','model':'fixture','local':{}}}
+        item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
+        with patch.object(host,'RequestPump',Pump):
+            return host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5,
+                resume_id=resume_id,resume_prompt='continue' if resume_id else None,policy_state=state)
+
+    def test_agent_phase_observes_start_and_every_result(self):
+        from evals.policy import required_skills_met
+        state={'skills':{},'violations':set()};skill='superpowers:test-driven-development'
+        self.receipt_phase([
+            {'type':'tool_start','id':'shell','name':'run_command','arguments':'{"command":"git status"}'},
+            {'type':'tool_result','id':'shell','name':'run_command','is_error':True},
+            {'type':'tool_start','id':'call-1','name':'load_skill','arguments':json.dumps({'name':skill})},
+            {'type':'tool_result','id':'call-1','name':'load_skill','is_error':False}],state)
+        self.assertEqual(state['violations'],{'git'})
+        self.assertTrue(required_skills_met(state,[skill]))
+
+    def test_agent_phase_preserves_policy_state_across_resume(self):
+        from evals.policy import required_skills_met
+        state={'skills':{},'violations':set()};skill='superpowers:test-driven-development'
+        self.receipt_phase([{'type':'tool_start','id':'call-1','name':'load_skill',
+            'arguments':json.dumps({'name':skill})}],state)
+        self.assertFalse(required_skills_met(state,[skill]))
+        self.receipt_phase([{'type':'tool_result','id':'call-1','name':'load_skill','is_error':False}],
+            state,resume_id='00000000-0000-0000-0000-000000000001')
+        self.assertTrue(required_skills_met(state,[skill]))
+
+    def test_run_case_reports_policy_fields_and_exact_failure_reasons(self):
+        import host
+        from unittest.mock import patch
+        from evals.policy import observe_tool_start,observe_tool_result
+        skill='superpowers:test-driven-development'
+        class Channel:
+            def receive(self,timeout=None):return {'type':'storage_ready'}
+            def close(self):pass
+        class FakeDocker:
+            uid=10001;cleanup_deadline=None
+            def volume(self,_size,_deadline):return 'volume'
+            def create(self,*_args,**_kwargs):return 'container'
+            def start(self,*_args,**_kwargs):return Channel()
+            def archive(self,*_args):return b''
+            def remove(self,*_args):pass
+            def cleanup(self,*_args):pass
+        done={'type':'agent_done','exit_code':0,'signal':None,'leader_reaped':True,'pipes_complete':True,
+            'timed_out':False,'cancelled':False,'truncated':False,'forced':False}
+        def run(policy):
+            def phase(_docker,_invocation,_item,_volumes,gateway,_deadline,**kwargs):
+                gateway.generations=1;gateway.attempts=1
+                gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+                state=kwargs['policy_state']
+                if policy=='violation':
+                    observe_tool_start(state,{'id':'shell','name':'run_command','arguments':'{"command":"git status synthetic-receipt-secret"}'})
+                    observe_tool_result(state,{'id':'shell','name':'run_command','is_error':True})
+                if policy=='skill':
+                    observe_tool_start(state,{'id':'call-1','name':'load_skill','arguments':json.dumps({'name':skill})})
+                    observe_tool_result(state,{'id':'call-1','name':'load_skill','is_error':False})
+                return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+            case={'id':'policy-'+policy,'language':'python','category':'fixture','timeout_secs':30,
+                'max_steps':2,'max_requests':2,'require_skills':[skill]}
+            item={'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture','oracle':{'prepare':[],'checks':[]}}
+            invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}}
+            with tempfile.TemporaryDirectory() as temp,patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64):
+                return host.run_case(FakeDocker(),invocation,item,Path(temp))
+        violation=run('violation')
+        self.assertEqual(violation['status'],'failed')
+        self.assertEqual(violation['reason'],'formal task constraints violated')
+        self.assertEqual(violation['formal_violations'],['git'])
+        self.assertNotIn('synthetic-receipt-secret',json.dumps(violation))
+        missing=run('missing')
+        self.assertEqual(missing['status'],'failed')
+        self.assertEqual(missing['reason'],'required skills were not observed')
+        self.assertFalse(missing['required_skills_observed'])
+        passed=run('skill')
+        self.assertEqual(passed['status'],'passed')
+        self.assertEqual(passed['required_skills'],[skill])
+        self.assertTrue(passed['required_skills_observed'])
+        self.assertEqual(passed['formal_violations'],[])
+
 
 @unittest.skipUnless(all(os.environ.get(name) for name in ('RCODE_EVAL_DOCKER','RCODE_EVAL_SOCKET','RCODE_EVAL_IMAGE')),
     'RCODE_EVAL_DOCKER, RCODE_EVAL_SOCKET and RCODE_EVAL_IMAGE are required for opt-in Docker host tests')

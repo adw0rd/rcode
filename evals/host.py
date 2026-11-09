@@ -22,6 +22,7 @@ from runtime import strict
 from host_docker import Docker,Failure
 from host_provider import GigaChatUpstream,HttpsExchange,giga_request,openai_response
 from host_snapshot import extract_frozen
+from policy import observe_tool_start,observe_tool_result,required_skills_met
 
 PROTOCOL=2
 
@@ -228,9 +229,10 @@ def check_isolation(docker,deadline):
         finally:
             if channel:channel.close()
 
-def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,resume_id=None,resume_prompt=None):
+def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,resume_id=None,resume_prompt=None,policy_state=None):
     import uuid
     case=item['case'];channel=None;pump=None
+    if policy_state is None:policy_state={'skills':{},'violations':set()}
     name=docker.create({'/fixture':Path(item['fixture']),'/agent/rcode':Path(invocation['binary'])},deadline,volumes=volumes)
     gigachat=invocation['effective_profile'].get('kind')=='gigachat'
     selection=['--provider','gigachat'] if gigachat else ['--profile','eval']
@@ -272,11 +274,14 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
                             value=str(uuid.UUID(event['session_id']))
                             if session_id is not None and session_id!=value:raise Failure('multiple session bindings')
                             session_id=value
-                        if isinstance(event,dict) and event.get('type')=='tool_result' and event.get('is_error') is False:
-                            tool=event.get('name')
-                            if isinstance(tool,str) and 0<len(tool)<=64 and tool.isascii() and tool.replace('_','').isalnum():
-                                if tool not in reported_tools and len(reported_tools)>=128:raise Failure('reported tool names limit')
-                                reported_tools[tool]=reported_tools.get(tool,0)+1
+                        if isinstance(event,dict) and event.get('type')=='tool_start':observe_tool_start(policy_state,event)
+                        if isinstance(event,dict) and event.get('type')=='tool_result':
+                            observe_tool_result(policy_state,event)
+                            if event.get('is_error') is False:
+                                tool=event.get('name')
+                                if isinstance(tool,str) and 0<len(tool)<=64 and tool.isascii() and tool.replace('_','').isalnum():
+                                    if tool not in reported_tools and len(reported_tools)>=128:raise Failure('reported tool names limit')
+                                    reported_tools[tool]=reported_tools.get(tool,0)+1
             elif kind=='sentinel' and sentinel:
                 if seen:raise Failure('duplicate sentinel')
                 seen=True;pump.cancel();channel.send({'type':'cancel'});cancel_sent=True
@@ -293,8 +298,10 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
 
 def run_case(docker,invocation,item,temporary):
     case=item['case'];start=time.monotonic();deadline=start+case['timeout_secs'];work_deadline=deadline-12;docker.cleanup_deadline=deadline
+    policy_state={'skills':{},'violations':set()};required_skills=case.get('require_skills',[])
     result={'id':case['id'],'case_sha256':item['sha256'],'language':case['language'],'category':case['category'],
-        'status':'blocked','reason':None,'checks':[],'cleanup':'unknown','agent':None,'requests':[],'snapshot_sha256':None,'seconds':None}
+        'status':'blocked','reason':None,'checks':[],'cleanup':'unknown','agent':None,'requests':[],'snapshot_sha256':None,'seconds':None,
+        'required_skills':required_skills,'required_skills_observed':required_skills_met(policy_state,required_skills),'formal_violations':[]}
     profile=invocation['effective_profile']
     credential=invocation.get('provider_credential') if profile.get('kind')=='gigachat' else None
     storage=None;gateway=Gateway(profile,case,work_deadline-20,credential)
@@ -305,7 +312,7 @@ def run_case(docker,invocation,item,temporary):
         if storage.receive()!={'type':'storage_ready'}:raise Failure('storage readiness')
         lifecycle=case.get('lifecycle')
         first=agent_phase(docker,invocation,item,volumes,gateway,work_deadline,
-            sentinel=lifecycle['interrupt_after_file'] if lifecycle else None)
+            sentinel=lifecycle['interrupt_after_file'] if lifecycle else None,policy_state=policy_state)
         result['agent']=first['done'];result['agent_reported_tool_successes']=first['agent_reported_tool_successes']
         if lifecycle:
             result['lifecycle']={'sentinel_observed':first['sentinel'],'cancel_sent':first['cancel_sent'],
@@ -316,7 +323,7 @@ def run_case(docker,invocation,item,temporary):
                     and first['done'].get('leader_reaped') is True and first['done'].get('pipes_complete') is True
                     and first['session_id']):raise AssessmentFailure('lifecycle interruption not established')
             second=agent_phase(docker,invocation,item,volumes,gateway,work_deadline,
-                resume_id=first['session_id'],resume_prompt=lifecycle['resume_prompt'])
+                resume_id=first['session_id'],resume_prompt=lifecycle['resume_prompt'],policy_state=policy_state)
             result['lifecycle']['explicit_resume_argument']=True
             for name,count in second['agent_reported_tool_successes'].items():result['agent_reported_tool_successes'][name]=result['agent_reported_tool_successes'].get(name,0)+count
             result['agent']=second['done'];result['lifecycle']['agent_reported_same_session']=second['session_id']==first['session_id']
@@ -351,8 +358,13 @@ def run_case(docker,invocation,item,temporary):
         tool=case.get('require_tool_success')
         tool_requirement=not tool or (result['agent_reported_tool_successes'].get(tool,0)>0 and any(r.get('requested_tool_names',{}).get(tool,0)>0 for r in gateway.receipts))
         result['tool_requirement_observed']=tool_requirement
-        result['status']='passed' if tool_requirement and success and all(c['passed'] for c in result['checks']) and gateway.generations>0 and all(r['status']=='received' or (lifecycle and r['status']=='cancelled_by_case') for r in gateway.receipts) else 'failed'
-        if not success:result['reason']='agent did not finish successfully'
+        result['required_skills_observed']=required_skills_met(policy_state,required_skills)
+        result['formal_violations']=sorted(policy_state['violations'])
+        functional=tool_requirement and success and all(c['passed'] for c in result['checks']) and gateway.generations>0 and all(r['status']=='received' or (lifecycle and r['status']=='cancelled_by_case') for r in gateway.receipts)
+        result['status']='passed' if functional and not result['formal_violations'] and result['required_skills_observed'] else 'failed'
+        if result['formal_violations']:result['reason']='formal task constraints violated'
+        elif not result['required_skills_observed']:result['reason']='required skills were not observed'
+        elif not success:result['reason']='agent did not finish successfully'
         elif gateway.generations==0:result['reason']='no model inference observed'
     except AssessmentFailure:
         result['status']='failed';result['reason']='required interruption/resume behavior was not observed'
@@ -374,6 +386,8 @@ def run_case(docker,invocation,item,temporary):
             except (Failure,OSError,ValueError):
                 result['cleanup']='unknown';result['status']='unknown';result['reason']='local attachment cleanup could not be confirmed'
             finally:
+                result['required_skills_observed']=required_skills_met(policy_state,required_skills)
+                result['formal_violations']=sorted(policy_state['violations'])
                 result['requests']=gateway.receipts;result['request_attempts']=gateway.attempts;result['generations']=gateway.generations
                 result['seconds']=round(time.monotonic()-start,3)
                 if result['status']!='unknown' and any(r['status']=='failed_or_incomplete' or (r.get('http_status') is not None and not 200<=r['http_status']<300) for r in gateway.receipts):

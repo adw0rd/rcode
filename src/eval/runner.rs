@@ -20,6 +20,7 @@ const HOST: &str = include_str!("../../evals/host.py");
 const PROVIDER: &str = include_str!("../../evals/host_provider.py");
 const DOCKER: &str = include_str!("../../evals/host_docker.py");
 const SNAPSHOT: &str = include_str!("../../evals/host_snapshot.py");
+const POLICY: &str = include_str!("../../evals/policy.py");
 const RUNTIME: &str = include_str!("../../evals/runtime/runtime.py");
 const HTTP: &str = include_str!("../../evals/runtime/runtime_http.py");
 fn sha(bytes: &[u8]) -> String {
@@ -213,6 +214,7 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         ("host_provider.py", PROVIDER),
         ("host_docker.py", DOCKER),
         ("host_snapshot.py", SNAPSHOT),
+        ("policy.py", POLICY),
         ("runtime.py", RUNTIME),
         ("runtime_http.py", HTTP),
     ];
@@ -383,6 +385,21 @@ fn validate_pass(row: &Value, budget: &Value, isolation: &Value) -> Result<()> {
             .iter()
             .all(|k| isolation[*k] == true),
         "PASS без подтверждённой изоляции"
+    );
+    let required_skills = row["required_skills"]
+        .as_array()
+        .context("Required skills PASS")?;
+    let budget_skills = budget["require_skills"]
+        .as_array()
+        .context("Required skills budget")?;
+    let violations = row["formal_violations"]
+        .as_array()
+        .context("Formal violations PASS")?;
+    ensure!(
+        row["required_skills_observed"].as_bool() == Some(true)
+            && violations.is_empty()
+            && required_skills == budget_skills,
+        "PASS без соблюдения формальных ограничений и required skills"
     );
     let generations = row["generations"].as_u64().context("Generations PASS")?;
     let attempts = row["request_attempts"]
@@ -560,12 +577,13 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
     );
     let helpers = key["helpers"].as_object().context("Helper hashes")?;
     ensure!(
-        helpers.len() == 6
+        helpers.len() == 7
             && [
                 "host.py",
                 "host_provider.py",
                 "host_docker.py",
                 "host_snapshot.py",
+                "policy.py",
                 "runtime.py",
                 "runtime_http.py"
             ]

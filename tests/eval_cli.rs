@@ -405,6 +405,7 @@ fn comparison_key() -> Value {
         "host_provider.py",
         "host_docker.py",
         "host_snapshot.py",
+        "policy.py",
         "runtime.py",
         "runtime_http.py",
     ]
@@ -611,10 +612,89 @@ fn isolation_fixture() -> Value {
 }
 fn passed_fixture() -> Value {
     json!({"id":"a","case_sha256":"b".repeat(64),"status":"passed","cleanup":"confirmed_absent","generations":1,"request_attempts":1,"seconds":1.0,"operator_cancelled":false,"tool_requirement_observed":true,
+        "required_skills":["superpowers:using-superpowers","superpowers:test-driven-development"],"required_skills_observed":true,"formal_violations":[],
         "agent":{"type":"agent_done","exit_code":0,"signal":null,"leader_reaped":true,"pipes_complete":true,"timed_out":false,"cancelled":false,"truncated":false,"forced":false,"log_sha256":"f".repeat(64),"log_bytes":100},
         "checks":[{"id":"check","passed":true,"exit_code":0,"signal":null,"timed_out":false,"truncated":false,"prepare_failed":false,"stdout_sha256":"c".repeat(64)}],
         "requests":[{"generation":1,"status":"received","http_status":200,"usage":null}]})
 }
+
+#[test]
+fn compare_requires_exact_policy_receipts_for_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let report = json!({"version":1,"comparison_key":comparison_key(),"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let valid = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&valid.stdout),
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert_eq!(
+        report["comparison_key"]["helpers"]
+            .as_object()
+            .unwrap()
+            .len(),
+        7
+    );
+    let mut variants = Vec::new();
+    for field in [
+        "required_skills",
+        "required_skills_observed",
+        "formal_violations",
+    ] {
+        let mut changed = report.clone();
+        changed["cases"][0].as_object_mut().unwrap().remove(field);
+        variants.push(changed);
+    }
+    for (field, value) in [
+        ("required_skills", Value::Null),
+        ("required_skills_observed", json!(1)),
+        ("required_skills_observed", json!(false)),
+        ("formal_violations", json!({})),
+        ("formal_violations", json!(["git"])),
+        ("required_skills", json!(["superpowers:using-superpowers"])),
+        (
+            "required_skills",
+            json!([
+                "superpowers:test-driven-development",
+                "superpowers:using-superpowers"
+            ]),
+        ),
+    ] {
+        let mut changed = report.clone();
+        changed["cases"][0][field] = value;
+        variants.push(changed);
+    }
+    for changed in variants {
+        fs::write(&path, changed.to_string()).unwrap();
+        let out = run(
+            root.path(),
+            &[
+                "compare",
+                "--baseline",
+                path.to_str().unwrap(),
+                "--candidate",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "invalid policy PASS was trusted: {changed}"
+        );
+    }
+}
+
 #[test]
 fn compare_rejects_pass_without_isolation_binary_identity_or_positive_evidence() {
     let root = tempfile::tempdir().unwrap();
