@@ -414,6 +414,74 @@ fn comparison_key() -> Value {
 }
 
 #[test]
+fn compare_accepts_official_gigachat_and_rejects_unsafe_profile_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let mut key = comparison_key();
+    let mut selected = rcode::config::ProviderSettings::new(rcode::config::ProviderKind::GigaChat);
+    selected.model = "GigaChat-3-Ultra".into();
+    selected.base_url = None;
+    selected.auth_url = Some("https://ngw.devices.sberbank.ru:9443/api/v2/oauth".into());
+    let mut effective = selected.clone();
+    effective.stream = false;
+    key["selected_profile"] = json!(selected);
+    key["effective_profile"] = json!(effective);
+    let secret = "eval-synthetic-secret-7f4c9a";
+    assert!(!key.to_string().contains(secret));
+    let mut report = json!({"version":1,"comparison_key":key,"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let valid = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stdout)
+    );
+
+    let mut invalid_keys = Vec::new();
+    for (field, value) in [
+        ("base_url", json!("https://example.com/v1")),
+        ("auth_url", json!("https://example.com/oauth")),
+        ("ca_file", json!("custom-ca.pem")),
+        ("credential", json!(secret)),
+        ("token", json!(secret)),
+    ] {
+        let mut invalid = report["comparison_key"].clone();
+        invalid["selected_profile"][field] = value.clone();
+        invalid["effective_profile"][field] = value;
+        invalid_keys.push(invalid);
+    }
+    let mut invalid = report["comparison_key"].clone();
+    invalid["effective_profile"]["stream"] = json!(true);
+    invalid_keys.push(invalid);
+    for key in invalid_keys {
+        report["comparison_key"] = key;
+        fs::write(&path, report.to_string()).unwrap();
+        let out = run(
+            root.path(),
+            &[
+                "compare",
+                "--baseline",
+                path.to_str().unwrap(),
+                "--candidate",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(secret));
+    }
+}
+
+#[test]
 fn validate_rejects_lifecycle_traversal_and_hashes_the_resume_contract() {
     let root = tempfile::tempdir().unwrap();
     let path = suite(root.path());

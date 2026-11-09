@@ -3,7 +3,7 @@ use super::{json as strict_json, manifest};
 use crate::{
     app::Events,
     cli::{Cli, EvalRun},
-    config::{ConfigStore, CredentialState, ProviderKind},
+    config::{ConfigStore, ProviderKind},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -103,10 +103,9 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     let name = cli
         .profile
         .as_deref()
-        .context("Для eval run требуется явный --profile local")?;
+        .context("Для eval run требуется явный --profile local или gigachat")?;
     ensure!(
-        cli.provider.is_none_or(|p| p == ProviderKind::Local)
-            && cli.model.is_none()
+        cli.model.is_none()
             && cli.base_url.is_none()
             && cli.effort.is_none()
             && cli.folder_id.is_none()
@@ -146,44 +145,45 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     let suite = manifest::validate(&args.suite)?;
     let store = ConfigStore::new()?;
     let settings = store.load()?;
-    let selected = settings
-        .local
-        .profiles
-        .get(name)
-        .context("Нет выбранного local profile")?
-        .clone();
-    selected.validate()?;
+    let saved = if let Some(profile) = settings.local.profiles.get(name) {
+        Some(profile)
+    } else if name == "gigachat" {
+        settings.providers.get("gigachat")
+    } else {
+        None
+    }
+    .context("Нет выбранного local или GigaChat profile")?
+    .clone();
+    let credential = store.credential_for(&saved)?;
+    let selected = super::profile::select(&settings, name, credential)?;
     ensure!(
-        selected.kind == ProviderKind::Local
-            && selected.ca_file.is_none()
-            && selected.local.as_ref().is_some_and(|l| !l.key_required),
-        "V1 eval поддерживает credential-free local profile без custom CA"
+        cli.provider
+            .is_none_or(|provider| provider == selected.selected.kind),
+        "Глобальный --provider должен соответствовать явно выбранному eval profile"
     );
     ensure!(
-        matches!(
-            store.credential_for(&selected)?,
-            CredentialState::NotRequired
-        ),
-        "V1 eval не переносит ключи; нужен credential-free local profile"
-    );
-    ensure!(
-        !selected.stream || args.non_streaming,
+        !selected.selected.stream || args.non_streaming,
         "Профиль использует streaming. Для явного JSON transport добавьте --non-streaming; профиль не изменяется"
     );
-    let mut effective = selected.clone();
-    effective.stream = false;
-    let endpoint = effective
-        .base_url
-        .as_deref()
-        .context("Нет endpoint local")?;
-    let url = crate::local::validate_local_endpoint(endpoint)?;
-    ensure!(
-        matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
-        ),
-        "V1 eval требует literal loopback 127.0.0.1/localhost/::1"
-    );
+    let super::profile::Selected {
+        selected,
+        effective,
+        credential,
+    } = selected;
+    if selected.kind == ProviderKind::Local {
+        let endpoint = effective
+            .base_url
+            .as_deref()
+            .context("Нет endpoint local")?;
+        let url = crate::local::validate_local_endpoint(endpoint)?;
+        ensure!(
+            matches!(
+                url.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+            ),
+            "V1 eval требует literal loopback 127.0.0.1/localhost/::1"
+        );
+    }
     let binary = read(&args.agent_binary, 128 * 1024 * 1024)?;
     ensure!(
         binary.starts_with(b"\x7fELF"),
@@ -238,13 +238,14 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         fixture(&path, &c.files)?;
         cases.push(json!({"case":c.case,"sha256":c.sha256,"task":c.task,"fixture":path,"oracle":oracle(&c.oracle)}));
     }
-    let invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
+    let invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"provider_credential":credential,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
     let input = serde_json::to_vec(&invocation)?;
     ensure!(
         input.len() <= 16 * 1024 * 1024,
         "Превышен лимит host invocation 16 МиБ"
     );
-    // Python and Docker receive no provider secrets or ambient Docker context.
+    // Only the trusted Python host receives the provider credential, via stdin.
+    // Docker receives no ambient Docker context or provider environment.
     // Keep stdin/out bounded. SIGINT goes to the same foreground process group;
     // Python owns cleanup and produces the honest interrupted report.
     let path = root.to_owned();
@@ -490,6 +491,28 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
             && key["transport"] == "explicit_non_streaming_json",
         "Некорректный comparison key"
     );
+    for profile in [&key["selected_profile"], &key["effective_profile"]] {
+        let fields = profile.as_object().context("Profile object")?;
+        ensure!(
+            fields.keys().all(|field| matches!(
+                field.as_str(),
+                "kind"
+                    | "model"
+                    | "effort"
+                    | "base_url"
+                    | "folder_id"
+                    | "auth_url"
+                    | "scope"
+                    | "ca_file"
+                    | "stream"
+                    | "max_output_tokens"
+                    | "request_timeout_secs"
+                    | "idle_timeout_secs"
+                    | "local"
+            )),
+            "Неизвестные поля профиля comparison key"
+        );
+    }
     let selected: crate::config::ProviderSettings =
         serde_json::from_value(key["selected_profile"].clone())?;
     let effective: crate::config::ProviderSettings =
@@ -497,12 +520,20 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
     selected.validate()?;
     effective.validate()?;
     ensure!(
-        selected.kind == ProviderKind::Local
-            && !effective.stream
-            && selected.local.as_ref().is_some_and(|l| !l.key_required)
-            && selected.ca_file.is_none(),
+        !effective.stream && selected.ca_file.is_none(),
         "Профиль comparison key не поддерживается"
     );
+    match selected.kind {
+        ProviderKind::Local => ensure!(
+            selected
+                .local
+                .as_ref()
+                .is_some_and(|local| !local.key_required),
+            "Профиль comparison key не поддерживается"
+        ),
+        ProviderKind::GigaChat => super::profile::validate_gigachat_endpoints(&selected)?,
+        _ => anyhow::bail!("Профиль comparison key не поддерживается"),
+    }
     let mut expected = key["selected_profile"].clone();
     expected["stream"] = json!(false);
     ensure!(

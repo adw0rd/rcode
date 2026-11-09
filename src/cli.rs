@@ -360,7 +360,9 @@ pub enum EvalCommand {
         #[arg(long)]
         suite: PathBuf,
     },
-    #[command(about = "Изолированный Linux-прогон; требует Docker, Python и явного local profile")]
+    #[command(
+        about = "Изолированный Linux-прогон; требует Docker, Python и явного local или GigaChat profile"
+    )]
     Run(Box<EvalRun>),
     #[command(about = "Сравнить отчёты с одинаковыми корпусом и настройками")]
     Compare {
