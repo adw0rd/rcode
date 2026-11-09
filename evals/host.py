@@ -72,7 +72,16 @@ class Gateway:
             if self.url.scheme not in ('http','https') or self.url.username or self.url.password or self.url.query or self.url.fragment:raise Failure('endpoint shape')
             if self.url.hostname not in ('127.0.0.1','::1','localhost'):raise Failure('local literal loopback endpoint required')
     def sensitive(self,value):
-        return self.gigachat and any(secret and secret in value for secret in self.upstream.secrets)
+        if not self.gigachat:return False
+        secrets={secret for secret in self.upstream.secrets if secret}
+        substrings={secret for secret in secrets if len(secret)>=8}
+        exact=secrets-substrings
+        def walk(item):
+            if isinstance(item,dict):return any(walk(key) or walk(nested) for key,nested in item.items())
+            if isinstance(item,list):return any(walk(nested) for nested in item)
+            if isinstance(item,str):return item in exact or any(secret in item for secret in substrings)
+            return False
+        return walk(value)
     def relay(self,body,cancelled=None):
         self.attempts+=1
         if self.attempts>self.case['max_requests']:return 429,{'error':{'message':'eval request limit'}}
@@ -87,9 +96,9 @@ class Gateway:
             if self.gigachat:
                 native='function_call' in body or 'functions' in body
                 if native:status,value=self.upstream.chat(body,cancelled)
-                else:
-                    status,value=self.upstream.chat(giga_request(body,self.function_states),cancelled)
-                    value=openai_response(value,self.function_states)
+                else:status,value=self.upstream.chat(giga_request(body,self.function_states),cancelled)
+                if self.sensitive(value):raise Failure('sensitive upstream payload')
+                if not native:value=openai_response(value,self.function_states)
             else:
                 remaining=self.deadline-time.monotonic()
                 if remaining<=0:raise Failure('generation deadline')

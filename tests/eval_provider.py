@@ -377,6 +377,91 @@ class GigaChatToolsTests(unittest.TestCase):
         self.assertEqual(str(caught.exception),'tool choice unsupported')
 
 
+class SensitivePayloadTests(unittest.TestCase):
+    profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS','stream':False,
+        'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5}
+    safe_error={'error':{'message':'eval selected endpoint request failed or incomplete'}}
+
+    def gateway(self,responses,credential='Basic synthetic-credential'):
+        import host
+        calls=[]
+        def exchange(operation,authorization,body,cancelled=None):
+            calls.append((operation,authorization,body))
+            return responses.pop(0)
+        with patch.object(host,'HttpsExchange',return_value=exchange):
+            gateway=host.Gateway(self.profile,{'max_steps':2,'max_requests':2},time.monotonic()+5,credential)
+        return gateway,calls
+
+    def request(self,native=False):
+        body={'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False,'messages':[]}
+        if native:body['function_call']='none'
+        return body
+
+    def assert_safe_rejection(self,gateway,status,value,secrets):
+        serialized=json.dumps({'response':value,'receipts':gateway.receipts},ensure_ascii=True)
+        for secret in secrets:
+            self.assertFalse(secret in serialized,'OAuth material reached an agent-visible payload or receipt')
+        self.assertEqual((status,value),(502,self.safe_error))
+
+    def test_request_pump_frame_rejects_current_token_in_error_message(self):
+        import host
+        secret='current-token-123'
+        gateway,_calls=self.gateway([(200,{'access_token':secret,'expires_at':4_000_000_000}),
+            (400,{'error':{'message':'upstream reflected '+secret}})])
+        frames=[]
+        class Channel:
+            def send(self,value):frames.append(value)
+        pump=host.RequestPump(gateway)
+        try:
+            pump.submit(1,self.request())
+            deadline=time.monotonic()+2
+            while not frames and time.monotonic()<deadline:
+                pump.deliver(Channel())
+                time.sleep(.01)
+            self.assertEqual(len(frames),1)
+            serialized=json.dumps(frames,ensure_ascii=True)
+            for value in [secret,'synthetic-credential']:
+                self.assertFalse(value in serialized,'OAuth material reached an agent-visible response frame')
+            self.assertEqual(frames[0],{'type':'response','id':1,'status':502,'body':self.safe_error})
+            receipts=json.dumps(gateway.receipts,ensure_ascii=True)
+            for value in [secret,'synthetic-credential']:
+                self.assertFalse(value in receipts,'OAuth material reached host report receipts')
+        finally:pump.close()
+
+    def test_openai_success_rejects_token_before_tool_conversion(self):
+        secret='current-token-123'
+        gateway,_calls=self.gateway([(200,{'access_token':secret,'expires_at':4_000_000_000}),
+            (200,{'choices':[{'message':{'role':'assistant','content':'','function_call':{
+                'name':'read_file','arguments':{'path':'nested/'+secret}}},'finish_reason':'function_call'}]})])
+        status,value=gateway.relay(self.request())
+        self.assert_safe_rejection(gateway,status,value,[secret,'synthetic-credential'])
+
+    def test_native_success_rejects_token_in_functions_state(self):
+        secret='current-token-123'
+        gateway,_calls=self.gateway([(200,{'access_token':secret,'expires_at':4_000_000_000}),
+            (200,{'choices':[{'message':{'role':'assistant','content':'','function_call':{
+                'name':'read_file','arguments':{'path':'a.rs'}},'functions_state_id':secret},
+                'finish_reason':'function_call'}]})])
+        status,value=gateway.relay(self.request(native=True))
+        self.assert_safe_rejection(gateway,status,value,[secret,'synthetic-credential'])
+
+    def test_native_error_rejects_previous_token_in_nested_key_after_refresh(self):
+        previous='previous-token-123';current='current-token-456'
+        gateway,calls=self.gateway([(200,{'access_token':previous,'expires_at':4_000_000_000}),
+            (401,{'error':'expired'}),(200,{'access_token':current,'expires_at':4_000_000_000}),
+            (400,{'error':{'details':[{'nested-'+previous:'safe'}]}})])
+        status,value=gateway.relay(self.request(native=True))
+        self.assertEqual([call[0] for call in calls],['oauth','chat','oauth','chat'])
+        self.assert_safe_rejection(gateway,status,value,[previous,current,'synthetic-credential'])
+
+    def test_short_secrets_do_not_reject_unrelated_content(self):
+        gateway,_calls=self.gateway([(200,{'access_token':'x','expires_at':4_000_000_000}),
+            (200,{'choices':[{'message':{'role':'assistant','content':'ordinary content'}}]})],credential='Basic z')
+        status,value=gateway.relay(self.request())
+        self.assertEqual(status,200)
+        self.assertEqual(value['choices'][0]['message']['content'],'ordinary content')
+
+
 class LocalGatewayRegressionTests(unittest.TestCase):
     def test_local_loopback_relay_is_unchanged_and_has_no_authorization(self):
         import http.server
@@ -423,10 +508,10 @@ class HostProviderBoundaryTests(unittest.TestCase):
         self.assertFalse(effective['stream'])
         self.assertNotIn('provider_credential',config)
 
-    def test_receipt_metadata_rejects_reflected_credential_and_current_token(self):
+    def test_reflected_credential_and_current_token_fail_closed_before_receipts(self):
         import host
         for reflected,expected in [('synthetic-key',None),('synthetic-access-token',None),('GigaChat-3-Ultra','GigaChat-3-Ultra')]:
-            with self.subTest(metadata='redacted' if expected is None else 'selected model'):
+            with self.subTest(metadata='rejected' if expected is None else 'selected model'):
                 responses=[(200,{'access_token':'synthetic-access-token','expires_at':4_000_000_000}),
                     (200,{'model':reflected,'choices':[]})]
                 def exchange(_operation,_authorization,_body):return responses.pop(0)
@@ -434,14 +519,18 @@ class HostProviderBoundaryTests(unittest.TestCase):
                     'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5}
                 with patch.object(host,'HttpsExchange',return_value=exchange):
                     gateway=host.Gateway(profile,{'max_steps':1,'max_requests':1},time.monotonic()+5,'Basic synthetic-key')
-                    status,_value=gateway.relay({'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False,'messages':[]})
-                self.assertEqual(status,200)
+                    status,value=gateway.relay({'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False,'messages':[]})
                 receipt=gateway.receipts[0]
-                if expected is None:self.assertTrue(receipt.get('response_model') is None,'Sensitive response model reached a receipt')
-                else:self.assertEqual(receipt.get('response_model'),expected)
-                serialized=json.dumps(gateway.receipts,ensure_ascii=True)
+                if expected is None:
+                    self.assertEqual((status,value),(502,SensitivePayloadTests.safe_error))
+                    self.assertEqual(receipt['status'],'failed_or_incomplete')
+                    self.assertIsNone(receipt.get('response_model'))
+                else:
+                    self.assertEqual(status,200)
+                    self.assertEqual(receipt.get('response_model'),expected)
+                serialized=json.dumps({'response':value,'receipts':gateway.receipts},ensure_ascii=True)
                 for secret in ['synthetic-key','synthetic-access-token']:
-                    self.assertFalse(secret in serialized,'OAuth material leaked into request receipts')
+                    self.assertFalse(secret in serialized,'OAuth material leaked into response or request receipts')
 
     def test_real_host_report_and_comparison_key_exclude_oauth_material(self):
         import host
@@ -449,7 +538,7 @@ class HostProviderBoundaryTests(unittest.TestCase):
             (200,{'access_token':'real-token-1','expires_at':4_000_000_000}),
             (401,{'error':'expired'}),
             (200,{'access_token':'real-token-2','expires_at':4_000_000_000}),
-            (200,{'model':'real-token-1','choices':[]}),
+            (200,{'model':'GigaChat-3-Ultra','choices':[]}),
         ]
         operations=[]
         def exchange(operation,authorization,body):
@@ -471,7 +560,7 @@ class HostProviderBoundaryTests(unittest.TestCase):
             def cleanup(self,_deadline):pass
         def phase(_docker,_invocation,_item,_volumes,gateway,_deadline,**_kwargs):
             status,value=gateway.relay({'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False})
-            if status!=200 or value!={'model':'real-token-1','choices':[]}:raise AssertionError('synthetic relay failed')
+            if status!=200 or value!={'model':'GigaChat-3-Ultra','choices':[]}:raise AssertionError('synthetic relay failed')
             return {'done':{'type':'agent_done','exit_code':0,'signal':None,'leader_reaped':True,'pipes_complete':True,
                 'timed_out':False,'cancelled':False,'truncated':False,'forced':False},
                 'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
