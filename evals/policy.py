@@ -1,4 +1,3 @@
-import re
 import shlex
 
 if __package__:
@@ -23,15 +22,98 @@ def _assignment(token):
         and all(char.isalnum() or char == '_' for char in name))
 
 
-def _fallback_violations(command, state):
-    for match in re.finditer(r'(?<![\w.-])(?:[\w.-]+/)*(git|pip3?|curl|wget|nc|ssh)(?![\w.-])', command):
-        executable = match.group(1)
-        if executable == 'git':
-            state['violations'].add('git')
-        elif executable in ('pip', 'pip3'):
-            state['violations'].add('package_install')
+def _substitutions(token):
+    bodies = []
+    offset = 0
+    while True:
+        begin = token.find('$(', offset)
+        if begin < 0:
+            return bodies
+        depth = 1
+        quote = None
+        escaped = False
+        for index in range(begin + 2, len(token)):
+            char = token[index]
+            if escaped:
+                escaped = False
+                continue
+            if char == '\\':
+                escaped = True
+                continue
+            if quote:
+                if char == quote:
+                    quote = None
+                continue
+            if char in ('\'', '"'):
+                quote = char
+            elif char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                if depth == 0:
+                    bodies.append(token[begin + 2:index])
+                    offset = index + 1
+                    break
         else:
-            state['violations'].add('network')
+            return bodies
+
+
+def _fallback_violations(tokens, state, depth):
+    if depth > 8:
+        state['violations'].update(('git', 'package_install', 'network'))
+        return
+    command_position = True
+    backtick = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        nested = _substitutions(token)
+        quoted_backticks = token.split('`')
+        if nested or len(quoted_backticks) > 2:
+            for body in nested:
+                _classify_shell(body, state, depth + 1)
+            for body in quoted_backticks[1::2]:
+                if body:
+                    _classify_shell(body, state, depth + 1)
+            command_position = False
+            index += 1
+            continue
+        closing_backtick = False
+        if '`' in token:
+            if backtick:
+                closing_backtick = True
+                backtick = False
+            else:
+                backtick = True
+                command_position = True
+            token = token.replace('`', '')
+        if not token:
+            index += 1
+            continue
+        if all(char in ';&|\n' for char in token):
+            command_position = True
+        elif token in ('(', '{'):
+            command_position = True
+        elif token in (')', '}', '()'):
+            command_position = False
+        elif '<' in token or '>' in token:
+            if token in ('<', '>', '<<', '>>', '<<<', '<>', '>|', '>&', '<&'):
+                index += 1
+        elif token == '$':
+            pass
+        elif token in ('then', 'do', 'else', 'elif'):
+            command_position = True
+        elif token in ('fi', 'done'):
+            command_position = False
+        elif command_position and token in ('if', 'while', 'until', 'for', 'case', 'select',
+                'function', 'time', 'coproc', '!'):
+            command_position = True
+        elif command_position and not _assignment(token):
+            _classify_simple([token, *tokens[index + 1:]], state, depth + 1)
+            command_position = False
+        if closing_backtick:
+            command_position = False
+        index += 1
 
 
 def _complex_form(tokens):
@@ -141,7 +223,7 @@ def _classify_shell(command, state, depth=0):
         state['violations'].update(('git', 'package_install', 'network'))
         return
     if _complex_form(tokens):
-        _fallback_violations(command, state)
+        _fallback_violations(tokens, state, depth)
         return
     simple = []
     for token in tokens:

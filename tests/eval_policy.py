@@ -172,6 +172,35 @@ class PolicyTests(unittest.TestCase):
                 self.assertIn(expected, state['violations'])
                 self.assertNotIn(command, repr(state))
 
+    def test_fallback_normalizes_concatenated_words_in_executable_positions(self):
+        cases = [
+            ("(g''it status)", 'git'),
+            ('if true; then g""it status; fi', 'git'),
+            ("echo $(c''url https://example.invalid)", 'network'),
+            ("echo $(python3 -m p''ip install pytest)", 'package_install'),
+            ("(command g''it status)", 'git'),
+            ('if true; then exec c""url https://example.invalid; fi', 'network'),
+            ("echo $(env python3 -m p''ip install pytest)", 'package_install'),
+            ('echo `g""it status`', 'git'),
+            ('echo "$(g\'\'it status)"', 'git'),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                self.assertIn(expected, state['violations'])
+                self.assertNotIn(command, repr(state))
+
+    def test_fallback_ignores_echo_and_printf_arguments(self):
+        for command in ['(echo git)', 'if true; then echo git; fi',
+                '(printf "curl pip")', 'if true; then printf git; fi']:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                self.assertEqual(state['violations'], set())
+
     def test_malformed_quoting_fails_closed_without_retaining_command(self):
         state = {'skills': {}, 'violations': set()}
         observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
