@@ -481,6 +481,62 @@ fn compare_accepts_official_gigachat_and_rejects_unsafe_profile_metadata() {
     }
 }
 
+const VALIDATION_SECRET: &str = "eval-validation-secret-51c8e2";
+
+fn assert_key_rejected_without_secret(key: Value) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let report = json!({"version":1,"comparison_key":key,"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let out = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success(), "malformed comparison key accepted");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(VALIDATION_SECRET));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(VALIDATION_SECRET));
+}
+
+#[test]
+fn compare_rejects_unknown_nested_local_fields_without_publishing_values() {
+    for field in ["credential", "token"] {
+        let mut key = comparison_key();
+        key["selected_profile"]["local"][field] = json!(VALIDATION_SECRET);
+        key["effective_profile"]["local"][field] = json!(VALIDATION_SECRET);
+        assert_key_rejected_without_secret(key);
+    }
+}
+
+#[test]
+fn compare_does_not_publish_malformed_kind() {
+    let mut key = comparison_key();
+    key["selected_profile"]["kind"] = json!(VALIDATION_SECRET);
+    key["effective_profile"]["kind"] = json!(VALIDATION_SECRET);
+    assert_key_rejected_without_secret(key);
+}
+
+#[test]
+fn compare_does_not_publish_malformed_effort() {
+    let mut key = comparison_key();
+    key["selected_profile"]["effort"] = json!(VALIDATION_SECRET);
+    key["effective_profile"]["effort"] = json!(VALIDATION_SECRET);
+    assert_key_rejected_without_secret(key);
+}
+
+#[test]
+fn compare_does_not_publish_malformed_local_runtime() {
+    let mut key = comparison_key();
+    key["selected_profile"]["local"]["runtime"] = json!(VALIDATION_SECRET);
+    key["effective_profile"]["local"]["runtime"] = json!(VALIDATION_SECRET);
+    assert_key_rejected_without_secret(key);
+}
+
 #[test]
 fn validate_rejects_lifecycle_traversal_and_hashes_the_resume_contract() {
     let root = tempfile::tempdir().unwrap();

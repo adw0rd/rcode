@@ -512,11 +512,27 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
             )),
             "Неизвестные поля профиля comparison key"
         );
+        if let Some(local) = fields.get("local").and_then(Value::as_object) {
+            ensure!(
+                local.keys().all(|field| matches!(
+                    field.as_str(),
+                    "profile"
+                        | "runtime"
+                        | "context_tokens"
+                        | "vision"
+                        | "key_required"
+                        | "thinking"
+                )),
+                "Неизвестные поля local профиля comparison key"
+            );
+        }
     }
     let selected: crate::config::ProviderSettings =
-        serde_json::from_value(key["selected_profile"].clone())?;
+        serde_json::from_value(key["selected_profile"].clone())
+            .map_err(|_| anyhow::anyhow!("Некорректный selected_profile comparison key"))?;
     let effective: crate::config::ProviderSettings =
-        serde_json::from_value(key["effective_profile"].clone())?;
+        serde_json::from_value(key["effective_profile"].clone())
+            .map_err(|_| anyhow::anyhow!("Некорректный effective_profile comparison key"))?;
     selected.validate()?;
     effective.validate()?;
     ensure!(
