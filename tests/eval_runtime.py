@@ -166,12 +166,12 @@ class RuntimeTests(unittest.TestCase):
         config={'version':1,'active':'gigachat','providers':{'gigachat':profile},'local':{'active':None,'profiles':{}}}
         script=("import json,os;from pathlib import Path;state=Path(os.environ['RCODE_HOME']);"
             "config=json.loads((state/'config.json').read_text());credentials=json.loads((state/'credentials.json').read_text());"
-            "assert 'synthetic-real-key' not in json.dumps(dict(os.environ));"
+            "secret='synthetic-real'+'-key';assert secret not in json.dumps(dict(os.environ));"
             "print(json.dumps({'config':config,'credentials':credentials,'mode':(state/'credentials.json').stat().st_mode&0o777,'env':dict(os.environ)}))")
         bootstrap={'mode':'agent','timeout_secs':5,'model':'fixture','profile_config':config,
             'profile_credential':'eval-placeholder-key','argv':['python3','-I','-S','-c',script]}
         self.assertNotIn('synthetic-real-key',json.dumps(bootstrap))
-        out,frames=self.invoke(bootstrap)
+        out,frames=self.invoke(bootstrap,interactive=True)
         self.assertEqual(out.returncode,0,out.stderr)
         self.assertNotIn('synthetic-real-key',json.dumps(frames))
         raw=b''.join(base64.b64decode(v['data']) for v in frames if v.get('type')=='agent_log' and v.get('channel')=='stdout')

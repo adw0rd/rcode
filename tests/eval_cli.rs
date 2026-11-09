@@ -84,6 +84,35 @@ fn validate_reads_a_suite_without_credentials_or_running_oracle_commands() {
         "invalid configuration must not be read by validate"
     );
 }
+
+#[test]
+fn validate_reports_missing_task_oracle_and_project_paths() {
+    for missing in [
+        "cases/py-add/task.md",
+        "oracles/py-add.json",
+        "cases/py-add/project",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let path = suite(root.path());
+        if missing.ends_with("/project") {
+            fs::remove_dir_all(root.path().join(missing)).unwrap();
+        } else {
+            fs::remove_file(root.path().join(missing)).unwrap();
+        }
+        let out = run(&home, &["validate", "--suite", path.to_str().unwrap()]);
+        assert!(!out.status.success());
+        let values = events(&out);
+        let error = values.iter().find(|v| v["type"] == "error").unwrap();
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains(missing),
+            "missing path {missing} was not reported: {message}"
+        );
+    }
+}
+
 #[test]
 fn validate_rejects_unknown_versions_and_unknown_fields() {
     let root = tempfile::tempdir().unwrap();

@@ -351,10 +351,12 @@ pub(crate) fn validate(path: &Path) -> Result<Suite> {
     let mut cases = Vec::new();
     let mut entries = 0;
     for c in m.cases {
-        let task = read(&root, &c.task, &mut total)?;
+        let task =
+            read(&root, &c.task, &mut total).with_context(|| format!("Чтение task {}", c.task))?;
         ensure!(!task.is_empty() && task.len() <= 16 * 1024, "Размер задачи");
         let text = String::from_utf8(task.clone()).context("Задача не UTF-8")?;
-        let raw = read(&root, &c.oracle, &mut total)?;
+        let raw = read(&root, &c.oracle, &mut total)
+            .with_context(|| format!("Чтение oracle {}", c.oracle))?;
         let oracle: Oracle = load_json(&raw)?;
         ensure!(
             oracle.version == 1
@@ -398,7 +400,8 @@ pub(crate) fn validate(path: &Path) -> Result<Suite> {
             &mut total,
             &mut entries,
             &mut files,
-        )?;
+        )
+        .with_context(|| format!("Чтение project {}", c.project))?;
         ensure!(!files.is_empty(), "Пустой исходный проект");
         let mut parts = BTreeMap::from([
             ("case".into(), serde_json::to_vec(&c)?),
