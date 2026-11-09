@@ -15,6 +15,94 @@ sys.path[:0]=[str(ROOT/'evals'),str(ROOT/'evals/runtime')]
 from host_docker import Docker,Failure
 from host_snapshot import extract_frozen
 
+
+class HostConfigTests(unittest.TestCase):
+    def test_gigachat_model_config_uses_native_loopback_provider(self):
+        import host
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS',
+            'auth_url':'https://ngw.devices.sberbank.ru:9443/api/v2/oauth','folder_id':None,
+            'base_url':'https://api.giga.chat/v1','ca_file':'/host/only/ca.pem','stream':True,
+            'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5,'local':None}
+        expected={'version':1,'active':'gigachat','providers':{'gigachat':{**profile,
+            'base_url':'http://127.0.0.1:18080/v1','auth_url':'http://127.0.0.1:18080/api/v2/oauth',
+            'ca_file':None,'stream':False}},'local':{'active':None,'profiles':{}}}
+        config=host.model_config(profile)
+        self.assertEqual(config,expected)
+        self.assertNotIn('provider_credential',config)
+        self.assertNotIn('eval-placeholder-key',json.dumps(config))
+
+    def test_local_model_config_remains_credential_free(self):
+        import host
+        profile={'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1',
+            'local':{'profile':'eval','key_required':False}}
+        config=host.model_config(profile)
+        self.assertEqual(config['active'],'local')
+        self.assertEqual(config['providers'],{})
+        self.assertEqual(config['local']['active'],'eval')
+        self.assertFalse(config['local']['profiles']['eval']['local']['key_required'])
+        self.assertNotIn('profile_credential',config)
+
+    def test_native_gigachat_request_and_response_are_not_converted_twice(self):
+        import host
+        from unittest.mock import patch
+        responses=[(200,{'access_token':'host-token','expires_at':4_000_000_000}),
+            (200,{'model':'GigaChat-3-Ultra','choices':[{'message':{'role':'assistant','content':'',
+                'function_call':{'name':'read_file','arguments':{'path':'a.rs'}},
+                'functions_state_id':'state-2'},'finish_reason':'function_call'}]})]
+        calls=[]
+        def exchange(operation,authorization,body):
+            calls.append((operation,authorization,body))
+            return responses.pop(0)
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS','stream':False,
+            'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5}
+        body={'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False,
+            'functions':[{'name':'read_file','description':'Read','parameters':{'type':'object'}}],
+            'function_call':'auto','messages':[{'role':'user','content':'read'},
+                {'role':'assistant','content':'','function_call':{'name':'read_file','arguments':{'path':'a.rs'}},
+                    'functions_state_id':'state-1'},
+                {'role':'function','name':'read_file','content':'{"ok":true}'}]}
+        with patch.object(host,'HttpsExchange',return_value=exchange):
+            gateway=host.Gateway(profile,{'max_steps':1,'max_requests':1},time.monotonic()+5,'Basic synthetic-key')
+            status,value=gateway.relay(body)
+        self.assertEqual(status,200)
+        self.assertIs(calls[1][2],body)
+        self.assertEqual(value['choices'][0]['message']['functions_state_id'],'state-2')
+        self.assertIn('function_call',value['choices'][0]['message'])
+        self.assertNotIn('tool_calls',value['choices'][0]['message'])
+        self.assertEqual(gateway.receipts[0]['requested_tool_names'],{'read_file':1})
+
+    def test_gigachat_agent_bootstrap_uses_provider_and_placeholder_only(self):
+        import host
+        from unittest.mock import patch
+        captured=[]
+        class Channel:
+            def receive(self,timeout=None):return {'type':'agent_done','exit_code':0}
+            def send(self,_value):pass
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def create(self,*_args,**_kwargs):return 'agent'
+            def start(self,_name,bootstrap,_deadline):captured.append(bootstrap);return Channel()
+            def remove(self,*_args):pass
+        class Pump:
+            def __init__(self,_gateway):pass
+            def deliver(self,_channel):pass
+            def close(self):pass
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS','stream':False}
+        invocation={'binary':'/unused/rcode','effective_profile':profile,'provider_credential':'Basic synthetic-real-key'}
+        item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
+        with patch.object(host,'RequestPump',Pump):
+            host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5)
+        bootstrap=captured[0]
+        self.assertIn('--provider',bootstrap['argv'])
+        self.assertEqual(bootstrap['argv'][bootstrap['argv'].index('--provider')+1],'gigachat')
+        self.assertNotIn('--profile',bootstrap['argv'])
+        self.assertEqual(bootstrap['profile_credential'],'eval-placeholder-key')
+        self.assertNotIn('synthetic-real-key',json.dumps(bootstrap))
+
+
+@unittest.skipUnless(all(os.environ.get(name) for name in ('RCODE_EVAL_DOCKER','RCODE_EVAL_SOCKET','RCODE_EVAL_IMAGE')),
+    'RCODE_EVAL_DOCKER, RCODE_EVAL_SOCKET and RCODE_EVAL_IMAGE are required for opt-in Docker host tests')
 class HostTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)

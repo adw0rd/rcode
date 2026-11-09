@@ -88,13 +88,19 @@ def child(path):
         # The host supplies credential-free settings. The same container URL
         # is reused for resume; no user's credentials or settings are copied.
         (state/'config.json').write_text(json.dumps(cfg['profile_config']))
+    credential=cfg.get('profile_credential')
+    if credential is not None:
+        if credential!='eval-placeholder-key' or cfg.get('profile_config') is None:raise ValueError('profile credential')
+        credentials=Path(env['RCODE_HOME'])/'credentials.json'
+        credentials.write_text(json.dumps({'version':1,'providers':{'gigachat':credential}}))
+        credentials.chmod(0o600)
     os.chdir(cfg['cwd'])
     os.execvpe(cfg['argv'][0],cfg['argv'],env)
 
-def execute(argv,cwd,uid,gid,seconds,limit=65536,profile_config=None,agent=False):
+def execute(argv,cwd,uid,gid,seconds,limit=65536,profile_config=None,profile_credential=None,agent=False):
     Path('/control').mkdir(exist_ok=True);path=Path('/control/child.json')
     if path.exists():path.chmod(0o600)
-    raw=json.dumps({'argv':argv,'cwd':cwd,'profile_config':profile_config},ensure_ascii=True).encode()
+    raw=json.dumps({'argv':argv,'cwd':cwd,'profile_config':profile_config,'profile_credential':profile_credential},ensure_ascii=True).encode()
     if len(raw)>65536:raise ValueError('child bootstrap limit')
     path.write_bytes(raw);path.chmod(0o444)
     p=subprocess.Popen(['python3','-I','-S','/eval/runtime.py','--child',str(path)],
@@ -255,7 +261,7 @@ def main():
             result.pop('stdout');result.pop('stderr');send({'type':'archive_done',**result})
         return 0
     if mode!='agent':raise ValueError('runtime mode')
-    if set(cfg)-{'mode','uid','gid','timeout_secs','argv','model','profile_config','seed_project','resume_state','hold','sentinel','agent_timeout_secs'}:raise ValueError('agent fields')
+    if set(cfg)-{'mode','uid','gid','timeout_secs','argv','model','profile_config','profile_credential','seed_project','resume_state','hold','sentinel','agent_timeout_secs'}:raise ValueError('agent fields')
     for flag in ['seed_project','resume_state','hold']:
         if type(cfg.get(flag,False)) is not bool:raise ValueError('agent flag')
     sentinel=cfg.get('sentinel')
@@ -297,7 +303,15 @@ def main():
             raise ValueError('request cancelled')
         finally:
             with pending_lock:pending.pop(i,None)
-    server=runtime_http.make_server(model,strict,relay,port=18080)
+    profile_config=cfg.get('profile_config')
+    gigachat=isinstance(profile_config,dict) and profile_config.get('active')=='gigachat'
+    oauth_scope=None
+    if gigachat:
+        try:oauth_scope=profile_config['providers']['gigachat']['scope']
+        except (KeyError,TypeError):raise ValueError('GigaChat scope') from None
+        if not isinstance(oauth_scope,str) or not oauth_scope:raise ValueError('GigaChat scope')
+    server=runtime_http.make_server(model,strict,relay,port=18080,
+        provider='gigachat' if gigachat else 'local',oauth_scope=oauth_scope)
     server_thread=threading.Thread(target=server.serve_forever,daemon=True);server_thread.start()
     def substitute(v):
         if v=='{base_url}':return 'http://127.0.0.1:18080/v1'
@@ -326,7 +340,8 @@ def main():
                         for fd in fds:os.close(fd)
                     time.sleep(.05)
             threading.Thread(target=watch,daemon=True).start()
-        p=execute(cmd['argv'],'/workspace',uid,gid,timeout,profile_config=substitute(cfg.get('profile_config')),agent=True)
+        p=execute(cmd['argv'],'/workspace',uid,gid,timeout,profile_config=substitute(profile_config),
+            profile_credential=cfg.get('profile_credential'),agent=True)
         result=capture(p,'',agent_timeout,limit=4*1024*1024,agent=True)
         result.pop('stdout');result.pop('stderr');send({'type':'agent_done',**result})
         if cfg.get('hold'):

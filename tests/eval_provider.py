@@ -406,21 +406,21 @@ class LocalGatewayRegressionTests(unittest.TestCase):
 
 
 class HostProviderBoundaryTests(unittest.TestCase):
-    def test_gigachat_agent_profile_is_credential_free_local_relay(self):
+    def test_gigachat_agent_profile_is_native_loopback_relay(self):
         import host
         profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS',
             'auth_url':'https://ngw.devices.sberbank.ru:9443/api/v2/oauth','folder_id':None,
             'base_url':'https://api.giga.chat/v1','stream':False,'max_output_tokens':8,
             'request_timeout_secs':5,'idle_timeout_secs':5,'local':None}
         config=host.model_config(profile)
-        effective=config['local']['profiles']['eval']
-        self.assertEqual(config['active'],'local')
-        self.assertEqual(config['providers'],{})
-        self.assertEqual(effective['kind'],'local')
-        self.assertEqual(effective['base_url'],'{base_url}')
-        self.assertIsNone(effective['auth_url'])
-        self.assertIsNone(effective['scope'])
-        self.assertFalse(effective['local']['key_required'])
+        effective=config['providers']['gigachat']
+        self.assertEqual(config['active'],'gigachat')
+        self.assertEqual(config['local'],{'active':None,'profiles':{}})
+        self.assertEqual(effective['kind'],'gigachat')
+        self.assertEqual(effective['base_url'],'http://127.0.0.1:18080/v1')
+        self.assertEqual(effective['auth_url'],'http://127.0.0.1:18080/api/v2/oauth')
+        self.assertIsNone(effective['ca_file'])
+        self.assertFalse(effective['stream'])
         self.assertNotIn('provider_credential',config)
 
     def test_receipt_metadata_rejects_reflected_credential_and_current_token(self):

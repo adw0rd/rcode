@@ -85,7 +85,11 @@ class Gateway:
         self.receipts.append(record);start=time.monotonic();connection=None;watcher=None;transport=[];stop_watch=threading.Event()
         try:
             if self.gigachat:
-                status,value=self.upstream.chat(giga_request(body,self.function_states),cancelled);value=openai_response(value,self.function_states)
+                native='function_call' in body or 'functions' in body
+                if native:status,value=self.upstream.chat(body,cancelled)
+                else:
+                    status,value=self.upstream.chat(giga_request(body,self.function_states),cancelled)
+                    value=openai_response(value,self.function_states)
             else:
                 remaining=self.deadline-time.monotonic()
                 if remaining<=0:raise Failure('generation deadline')
@@ -138,12 +142,17 @@ class Gateway:
             else:model=model if isinstance(model,str) and len(model)<=1024 else None
             record['response_model']=model
             record['requested_tools']=sum(len(c.get('message',{}).get('tool_calls',[])) for c in value.get('choices',[]) if isinstance(c,dict) and isinstance(c.get('message'),dict) and isinstance(c['message'].get('tool_calls',[]),list))
+            record['requested_tools']+=sum(1 for c in value.get('choices',[]) if isinstance(c,dict) and isinstance(c.get('message'),dict) and c['message'].get('function_call') is not None)
             names={}
             for choice in value.get('choices',[]):
                 if not isinstance(choice,dict):continue
-                calls=choice.get('message',{}).get('tool_calls',[]) if isinstance(choice.get('message'),dict) else []
+                message=choice.get('message',{}) if isinstance(choice.get('message'),dict) else {}
+                calls=message.get('tool_calls',[])
                 if calls is None:calls=[]
                 if not isinstance(calls,list) or len(calls)>128:raise Failure('model tool call bound')
+                native=message.get('function_call')
+                native_name=native.get('name') if isinstance(native,dict) else None
+                if isinstance(native_name,str) and 0<len(native_name)<=64 and native_name.isascii() and native_name.replace('_','').isalnum() and not self.sensitive(native_name):names[native_name]=names.get(native_name,0)+1
                 for call in calls:
                     name=call.get('function',{}).get('name') if isinstance(call,dict) and isinstance(call.get('function'),dict) else None
                     if isinstance(name,str) and 0<len(name)<=64 and name.isascii() and name.replace('_','').isalnum() and not self.sensitive(name):names[name]=names.get(name,0)+1
@@ -189,8 +198,12 @@ class RequestPump:
         if self.worker.is_alive():raise Failure('upstream exchange did not stop')
 
 def model_config(profile):
+    if profile.get('kind')=='gigachat':
+        effective={**profile,'base_url':'http://127.0.0.1:18080/v1',
+            'auth_url':'http://127.0.0.1:18080/api/v2/oauth','ca_file':None,'stream':False}
+        return {'version':1,'active':'gigachat','providers':{'gigachat':effective},
+            'local':{'active':None,'profiles':{}}}
     effective=dict(profile);effective['base_url']='{base_url}'
-    if effective.get('kind')=='gigachat':effective.update({'kind':'local','auth_url':None,'scope':None,'folder_id':None})
     effective['local']={**(profile.get('local') or {}),'profile':'eval','key_required':False}
     return {'version':1,'active':'local','providers':{},'local':{'active':'eval','profiles':{'eval':effective}}}
 
@@ -212,7 +225,9 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
     import uuid
     case=item['case'];channel=None;pump=None
     name=docker.create({'/fixture':Path(item['fixture']),'/agent/rcode':Path(invocation['binary'])},deadline,volumes=volumes)
-    argv=['/agent/rcode','-C','/workspace','--profile','eval','--json','--approval-mode','auto-edit','--allow-shell','--max-steps',str(case['max_steps'])]
+    gigachat=invocation['effective_profile'].get('kind')=='gigachat'
+    selection=['--provider','gigachat'] if gigachat else ['--profile','eval']
+    argv=['/agent/rcode','-C','/workspace',*selection,'--json','--approval-mode','auto-edit','--allow-shell','--max-steps',str(case['max_steps'])]
     if resume_id:argv+=['--resume',resume_id]
     argv+=['exec',resume_prompt if resume_id else item['task']]
     root_timeout=max(1,min(600,int(deadline-time.monotonic())))
@@ -221,6 +236,7 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
     bootstrap={'mode':'agent','uid':docker.uid,'gid':docker.uid,'timeout_secs':root_timeout,'agent_timeout_secs':agent_timeout,
         'seed_project':not bool(resume_id),'hold':True,'model':invocation['effective_profile']['model'],
         'profile_config':model_config(invocation['effective_profile']),'argv':argv}
+    if gigachat:bootstrap['profile_credential']='eval-placeholder-key'
     if sentinel:bootstrap['sentinel']=sentinel
     logs=hashlib.sha256();log_bytes=0;pending=bytearray();session_id=None;seen=False;cancel_sent=False;reported_tools={}
     try:
