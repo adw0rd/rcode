@@ -20,7 +20,7 @@ import urllib.parse
 
 from runtime import strict
 from host_docker import Docker,Failure
-from host_provider import GigaChatUpstream,HttpsExchange
+from host_provider import GigaChatUpstream,HttpsExchange,giga_request,openai_response
 from host_snapshot import extract_frozen
 
 PROTOCOL=2
@@ -65,11 +65,14 @@ class Gateway:
         self.gigachat=profile.get('kind')=='gigachat'
         if self.gigachat:
             exchange=HttpsExchange(deadline,profile['request_timeout_secs'],profile['idle_timeout_secs'],strict)
+            exchange.cancelled=lambda:CONTROL.cancelled
             self.upstream=GigaChatUpstream(credential,profile.get('scope','GIGACHAT_API_PERS'),exchange)
         else:
             self.url=urllib.parse.urlsplit(profile['base_url'])
             if self.url.scheme not in ('http','https') or self.url.username or self.url.password or self.url.query or self.url.fragment:raise Failure('endpoint shape')
             if self.url.hostname not in ('127.0.0.1','::1','localhost'):raise Failure('local literal loopback endpoint required')
+    def sensitive(self,value):
+        return self.gigachat and any(secret and secret in value for secret in self.upstream.secrets)
     def relay(self,body,cancelled=None):
         self.attempts+=1
         if self.attempts>self.case['max_requests']:return 429,{'error':{'message':'eval request limit'}}
@@ -82,7 +85,7 @@ class Gateway:
         self.receipts.append(record);start=time.monotonic();connection=None;watcher=None;transport=[];stop_watch=threading.Event()
         try:
             if self.gigachat:
-                status,value=self.upstream.chat(body)
+                status,value=self.upstream.chat(giga_request(body),cancelled);value=openai_response(value)
             else:
                 remaining=self.deadline-time.monotonic()
                 if remaining<=0:raise Failure('generation deadline')
@@ -130,7 +133,10 @@ class Gateway:
             if isinstance(usage,dict):
                 record['usage']={k:v for k,v in usage.items() if k in ('prompt_tokens','completion_tokens','total_tokens') and type(v) is int and v>=0} or None
             record['status']='received';record['http_status']=status
-            record['response_model']=value.get('model') if isinstance(value.get('model'),str) and len(value['model'])<=1024 else None
+            model=value.get('model')
+            if self.gigachat:model=model if model==self.profile['model'] and len(model)<=1024 and not self.sensitive(model) else None
+            else:model=model if isinstance(model,str) and len(model)<=1024 else None
+            record['response_model']=model
             record['requested_tools']=sum(len(c.get('message',{}).get('tool_calls',[])) for c in value.get('choices',[]) if isinstance(c,dict) and isinstance(c.get('message'),dict) and isinstance(c['message'].get('tool_calls',[]),list))
             names={}
             for choice in value.get('choices',[]):
@@ -140,7 +146,7 @@ class Gateway:
                 if not isinstance(calls,list) or len(calls)>128:raise Failure('model tool call bound')
                 for call in calls:
                     name=call.get('function',{}).get('name') if isinstance(call,dict) and isinstance(call.get('function'),dict) else None
-                    if isinstance(name,str) and 0<len(name)<=64 and name.isascii() and name.replace('_','').isalnum():names[name]=names.get(name,0)+1
+                    if isinstance(name,str) and 0<len(name)<=64 and name.isascii() and name.replace('_','').isalnum() and not self.sensitive(name):names[name]=names.get(name,0)+1
             record['requested_tool_names']=names
             return status,value
         except (Failure,OSError,ValueError,http.client.HTTPException):
