@@ -120,6 +120,10 @@ try:
         response = client.post("/todos", json={"title": "x" * 201})
         check(response.status_code == 422, "Title longer than 200 characters must return 422")
 
+        for payload in ({}, {"completed": True}):
+            response = client.post("/todos", json=payload)
+            check(response.status_code == 422, f"POST without required title must return 422: {payload}")
+
         for field in ("title", "completed"):
             response = client.post("/todos", json={"title": "Invalid", field: None})
             check(response.status_code == 400, f"POST with explicit null {field} must return 400")
@@ -172,9 +176,17 @@ try:
             "Empty PATCH /todos/999 returned an unexpected body",
         )
 
+        response = client.patch("/todos/2", json={"title": "  Второе обновлено  "})
+        check(response.status_code == 200, "Title-only PATCH must return 200")
+        renamed_second = {"id": 2, "title": "Второе обновлено", "completed": True}
+        check(response.json() == renamed_second, "Title-only PATCH returned an unexpected body")
+        response = client.get("/todos/2")
+        check(response.status_code == 200, "GET /todos/2 after title-only PATCH must return 200")
+        check(response.json() == renamed_second, "Title-only PATCH did not preserve id and completed")
+
         response = client.patch("/todos/2", json={"completed": False})
         check(response.status_code == 200, "PATCH completed from true to false must return 200")
-        updated_second = {"id": 2, "title": "Второе", "completed": False}
+        updated_second = {"id": 2, "title": "Второе обновлено", "completed": False}
         check(response.json() == updated_second, "PATCH completed from true to false returned an unexpected body")
 
         response = client.get("/todos/2")
@@ -184,8 +196,8 @@ try:
         for field in ("title", "completed"):
             response = client.patch("/todos/2", json={field: None})
             check(
-                response.status_code in (400, 422),
-                f"PATCH with explicit null {field} must be rejected",
+                response.status_code == 400,
+                f"PATCH with explicit null {field} must return 400",
             )
             response = client.get("/todos/2")
             check(response.json() == updated_second, f"Null {field} changed the todo")

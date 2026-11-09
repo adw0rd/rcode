@@ -39,10 +39,12 @@ def test_get_and_list_return_created_todos(client):
 
 
 def test_patch_updates_only_supplied_fields(client):
-    create(client)
+    create(client, completed=True)
     response = client.patch("/todos/1", json={"title": " Обновлено "})
     assert response.status_code == 200
-    assert response.json() == {"id": 1, "title": "Обновлено", "completed": False}
+    expected = {"id": 1, "title": "Обновлено", "completed": True}
+    assert response.json() == expected
+    assert client.get("/todos/1").json() == expected
 
 
 def test_patch_completed_from_true_to_false(client):
@@ -79,6 +81,14 @@ def test_explicit_null_is_rejected_on_create(client, field):
     response = client.post("/todos", json={"title": "Invalid", field: None})
     assert response.status_code == 400
     assert client.get("/todos").json() == []
+
+
+@pytest.mark.parametrize("payload", [{}, {"completed": True}])
+def test_missing_title_is_rejected_without_creating_or_consuming_id(client, payload):
+    response = client.post("/todos", json=payload)
+    assert response.status_code == 422
+    assert client.get("/todos").json() == []
+    assert create(client)["id"] == 1
 
 
 @pytest.mark.parametrize("title", ["", " ", "   ", "x" * 201])
