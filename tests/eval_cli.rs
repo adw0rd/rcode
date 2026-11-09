@@ -402,6 +402,7 @@ fn comparison_key() -> Value {
     effective.stream = false;
     let helpers: serde_json::Map<String, Value> = [
         "host.py",
+        "host_provider.py",
         "host_docker.py",
         "host_snapshot.py",
         "runtime.py",

@@ -17,6 +17,7 @@ use std::{
 };
 
 const HOST: &str = include_str!("../../evals/host.py");
+const PROVIDER: &str = include_str!("../../evals/host_provider.py");
 const DOCKER: &str = include_str!("../../evals/host_docker.py");
 const SNAPSHOT: &str = include_str!("../../evals/host_snapshot.py");
 const RUNTIME: &str = include_str!("../../evals/runtime/runtime.py");
@@ -209,6 +210,7 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     mode(&runtime, 0o755)?;
     let modules = [
         ("host.py", HOST),
+        ("host_provider.py", PROVIDER),
         ("host_docker.py", DOCKER),
         ("host_snapshot.py", SNAPSHOT),
         ("runtime.py", RUNTIME),
@@ -558,9 +560,10 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
     );
     let helpers = key["helpers"].as_object().context("Helper hashes")?;
     ensure!(
-        helpers.len() == 5
+        helpers.len() == 6
             && [
                 "host.py",
+                "host_provider.py",
                 "host_docker.py",
                 "host_snapshot.py",
                 "runtime.py",

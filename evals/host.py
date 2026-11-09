@@ -20,6 +20,7 @@ import urllib.parse
 
 from runtime import strict
 from host_docker import Docker,Failure
+from host_provider import GigaChatUpstream,HttpsExchange
 from host_snapshot import extract_frozen
 
 PROTOCOL=2
@@ -59,11 +60,16 @@ def probe_command(command):
     return {'argv':command['argv'],'stdin':command['stdin'],'timeout_secs':command['timeout_secs']}
 
 class Gateway:
-    def __init__(self,profile,case,deadline):
+    def __init__(self,profile,case,deadline,credential=None):
         self.profile=profile;self.case=case;self.deadline=deadline;self.attempts=0;self.generations=0;self.receipts=[]
-        self.url=urllib.parse.urlsplit(profile['base_url'])
-        if self.url.scheme not in ('http','https') or self.url.username or self.url.password or self.url.query or self.url.fragment:raise Failure('endpoint shape')
-        if self.url.hostname not in ('127.0.0.1','::1','localhost'):raise Failure('local literal loopback endpoint required')
+        self.gigachat=profile.get('kind')=='gigachat'
+        if self.gigachat:
+            exchange=HttpsExchange(deadline,profile['request_timeout_secs'],profile['idle_timeout_secs'],strict)
+            self.upstream=GigaChatUpstream(credential,profile.get('scope','GIGACHAT_API_PERS'),exchange)
+        else:
+            self.url=urllib.parse.urlsplit(profile['base_url'])
+            if self.url.scheme not in ('http','https') or self.url.username or self.url.password or self.url.query or self.url.fragment:raise Failure('endpoint shape')
+            if self.url.hostname not in ('127.0.0.1','::1','localhost'):raise Failure('local literal loopback endpoint required')
     def relay(self,body,cancelled=None):
         self.attempts+=1
         if self.attempts>self.case['max_requests']:return 429,{'error':{'message':'eval request limit'}}
@@ -75,51 +81,55 @@ class Gateway:
         record={'generation':self.generations,'status':'unknown','usage':None,'seconds':None}
         self.receipts.append(record);start=time.monotonic();connection=None;watcher=None;transport=[];stop_watch=threading.Event()
         try:
-            remaining=self.deadline-time.monotonic()
-            if remaining<=0:raise Failure('generation deadline')
-            host='127.0.0.1' if self.url.hostname=='localhost' else self.url.hostname
-            connection_class=http.client.HTTPSConnection if self.url.scheme=='https' else http.client.HTTPConnection
-            # Connect/handshake has a short independent bound so cancellation
-            # can join the exchange even before a transport becomes available.
-            kwargs={'timeout':min(1,remaining,self.profile['request_timeout_secs'])}
-            if self.url.scheme=='https':kwargs['context']=ssl.create_default_context()
-            connection=connection_class(host,self.url.port or (443 if self.url.scheme=='https' else 80),**kwargs)
-            # Socket timeouts alone do not bound a peer dripping header bytes.
-            # Keep the actual transport reference even if HTTPConnection drops
-            # its reference for a Connection: close response.
-            exchange_deadline=min(self.deadline,start+self.profile['request_timeout_secs'])
-            def abort():
-                if transport:
-                    try:transport[0].shutdown(socket.SHUT_RDWR)
-                    except OSError:pass
-                    transport[0].close()
-            def watch():
-                while not stop_watch.wait(.02):
-                    if time.monotonic()>=exchange_deadline or (CONTROL.cancelled or (cancelled is not None and cancelled.is_set())):abort();return
-            watcher=threading.Thread(target=watch,daemon=True);watcher.start()
-            connection.connect();transport.append(connection.sock)
-            if time.monotonic()>=exchange_deadline or (CONTROL.cancelled or (cancelled is not None and cancelled.is_set())):raise Failure('connect deadline/cancellation')
-            connection.sock.settimeout(min(exchange_deadline-time.monotonic(),self.profile['request_timeout_secs']))
-            payload=json.dumps(body,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode()
-            if len(payload)>2*1024*1024:raise Failure('request size')
-            connection.request('POST',self.url.path.rstrip('/')+'/chat/completions',body=payload,headers={'Content-Type':'application/json','Accept':'application/json'})
-            response=connection.getresponse();raw=bytearray()
-            while True:
+            if self.gigachat:
+                status,value=self.upstream.chat(body)
+            else:
                 remaining=self.deadline-time.monotonic()
-                if remaining<=0:raise Failure('response deadline')
-                if connection.sock:connection.sock.settimeout(min(remaining,self.profile['idle_timeout_secs']))
-                chunk=response.read1(min(65536,4*1024*1024+1-len(raw)))
-                if not chunk:break
-                raw.extend(chunk)
-                if len(raw)>4*1024*1024:raise Failure('response size')
-            value=strict(raw)
-            if not isinstance(value,dict):raise Failure('response shape')
-            # Never forward redirects, headers, cookies, or a second endpoint.
-            if 300<=response.status<400:raise Failure('redirect refused')
+                if remaining<=0:raise Failure('generation deadline')
+                host='127.0.0.1' if self.url.hostname=='localhost' else self.url.hostname
+                connection_class=http.client.HTTPSConnection if self.url.scheme=='https' else http.client.HTTPConnection
+                # Connect/handshake has a short independent bound so cancellation
+                # can join the exchange even before a transport becomes available.
+                kwargs={'timeout':min(1,remaining,self.profile['request_timeout_secs'])}
+                if self.url.scheme=='https':kwargs['context']=ssl.create_default_context()
+                connection=connection_class(host,self.url.port or (443 if self.url.scheme=='https' else 80),**kwargs)
+                # Socket timeouts alone do not bound a peer dripping header bytes.
+                # Keep the actual transport reference even if HTTPConnection drops
+                # its reference for a Connection: close response.
+                exchange_deadline=min(self.deadline,start+self.profile['request_timeout_secs'])
+                def abort():
+                    if transport:
+                        try:transport[0].shutdown(socket.SHUT_RDWR)
+                        except OSError:pass
+                        transport[0].close()
+                def watch():
+                    while not stop_watch.wait(.02):
+                        if time.monotonic()>=exchange_deadline or (CONTROL.cancelled or (cancelled is not None and cancelled.is_set())):abort();return
+                watcher=threading.Thread(target=watch,daemon=True);watcher.start()
+                connection.connect();transport.append(connection.sock)
+                if time.monotonic()>=exchange_deadline or (CONTROL.cancelled or (cancelled is not None and cancelled.is_set())):raise Failure('connect deadline/cancellation')
+                connection.sock.settimeout(min(exchange_deadline-time.monotonic(),self.profile['request_timeout_secs']))
+                payload=json.dumps(body,ensure_ascii=True,allow_nan=False,separators=(',',':')).encode()
+                if len(payload)>2*1024*1024:raise Failure('request size')
+                connection.request('POST',self.url.path.rstrip('/')+'/chat/completions',body=payload,headers={'Content-Type':'application/json','Accept':'application/json'})
+                response=connection.getresponse();raw=bytearray()
+                while True:
+                    remaining=self.deadline-time.monotonic()
+                    if remaining<=0:raise Failure('response deadline')
+                    if connection.sock:connection.sock.settimeout(min(remaining,self.profile['idle_timeout_secs']))
+                    chunk=response.read1(min(65536,4*1024*1024+1-len(raw)))
+                    if not chunk:break
+                    raw.extend(chunk)
+                    if len(raw)>4*1024*1024:raise Failure('response size')
+                value=strict(raw)
+                if not isinstance(value,dict):raise Failure('response shape')
+                # Never forward redirects, headers, cookies, or a second endpoint.
+                if 300<=response.status<400:raise Failure('redirect refused')
+                status=response.status
             usage=value.get('usage')
             if isinstance(usage,dict):
                 record['usage']={k:v for k,v in usage.items() if k in ('prompt_tokens','completion_tokens','total_tokens') and type(v) is int and v>=0} or None
-            record['status']='received';record['http_status']=response.status
+            record['status']='received';record['http_status']=status
             record['response_model']=value.get('model') if isinstance(value.get('model'),str) and len(value['model'])<=1024 else None
             record['requested_tools']=sum(len(c.get('message',{}).get('tool_calls',[])) for c in value.get('choices',[]) if isinstance(c,dict) and isinstance(c.get('message'),dict) and isinstance(c['message'].get('tool_calls',[]),list))
             names={}
@@ -132,7 +142,7 @@ class Gateway:
                     name=call.get('function',{}).get('name') if isinstance(call,dict) and isinstance(call.get('function'),dict) else None
                     if isinstance(name,str) and 0<len(name)<=64 and name.isascii() and name.replace('_','').isalnum():names[name]=names.get(name,0)+1
             record['requested_tool_names']=names
-            return response.status,value
+            return status,value
         except (Failure,OSError,ValueError,http.client.HTTPException):
             record['status']='cancelled_by_case' if CONTROL.cancelled or (cancelled is not None and cancelled.is_set()) else 'failed_or_incomplete'
             return 502,{'error':{'message':'eval selected endpoint request failed or incomplete'}}
@@ -174,7 +184,8 @@ class RequestPump:
 
 def model_config(profile):
     effective=dict(profile);effective['base_url']='{base_url}'
-    effective['local']={**profile['local'],'profile':'eval','key_required':False}
+    if effective.get('kind')=='gigachat':effective.update({'kind':'local','auth_url':None,'scope':None,'folder_id':None})
+    effective['local']={**(profile.get('local') or {}),'profile':'eval','key_required':False}
     return {'version':1,'active':'local','providers':{},'local':{'active':'eval','profiles':{'eval':effective}}}
 
 def check_isolation(docker,deadline):
@@ -255,7 +266,9 @@ def run_case(docker,invocation,item,temporary):
     case=item['case'];start=time.monotonic();deadline=start+case['timeout_secs'];work_deadline=deadline-12;docker.cleanup_deadline=deadline
     result={'id':case['id'],'case_sha256':item['sha256'],'language':case['language'],'category':case['category'],
         'status':'blocked','reason':None,'checks':[],'cleanup':'unknown','agent':None,'requests':[],'snapshot_sha256':None,'seconds':None}
-    storage=None;gateway=Gateway(invocation['effective_profile'],case,work_deadline-20)
+    profile=invocation['effective_profile']
+    credential=invocation.get('provider_credential') if profile.get('kind')=='gigachat' else None
+    storage=None;gateway=Gateway(profile,case,work_deadline-20,credential)
     try:
         volumes={dst:docker.volume(size,work_deadline) for dst,size in [('/workspace',128),('/agent-home',64)]}
         keeper=docker.create({},work_deadline,volumes=volumes,volumes_readonly=True)
