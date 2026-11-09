@@ -173,12 +173,15 @@ class HostConfigTests(unittest.TestCase):
                 if policy=='violation':
                     observe_tool_start(state,{'id':'shell','name':'run_command','arguments':'{"command":"git status synthetic-receipt-secret"}'})
                     observe_tool_result(state,{'id':'shell','name':'run_command','is_error':True})
-                if policy=='skill':
+                if policy in ('skill','replay'):
                     observe_tool_start(state,{'id':'call-1','name':'load_skill','arguments':json.dumps({'name':skill})})
                     observe_tool_result(state,{'id':'call-1','name':'load_skill','is_error':False})
+                if policy=='replay':
+                    observe_tool_start(state,{'id':'call-1','name':'load_skill','arguments':json.dumps({'name':'superpowers:using-superpowers'})})
                 return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+            required='superpowers:using-superpowers' if policy=='replay' else skill
             case={'id':'policy-'+policy,'language':'python','category':'fixture','timeout_secs':30,
-                'max_steps':2,'max_requests':2,'require_skills':[skill]}
+                'max_steps':2,'max_requests':2,'require_skills':[required]}
             item={'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture','oracle':{'prepare':[],'checks':[]}}
             invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}}
             with tempfile.TemporaryDirectory() as temp,patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64):
@@ -192,6 +195,10 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(missing['status'],'failed')
         self.assertEqual(missing['reason'],'required skills were not observed')
         self.assertFalse(missing['required_skills_observed'])
+        replay=run('replay')
+        self.assertEqual(replay['status'],'failed')
+        self.assertEqual(replay['reason'],'required skills were not observed')
+        self.assertFalse(replay['required_skills_observed'])
         passed=run('skill')
         self.assertEqual(passed['status'],'passed')
         self.assertEqual(passed['required_skills'],[skill])

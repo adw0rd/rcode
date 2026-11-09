@@ -26,6 +26,44 @@ class PolicyTests(unittest.TestCase):
         observe_tool_start(state, {'id': 'a', 'name': 'spawn_agent', 'arguments': '{}'})
         self.assertEqual(state['violations'], {'package_install', 'subagent'})
 
+    def test_replayed_skill_call_id_is_permanently_quarantined(self):
+        first = 'superpowers:using-superpowers'
+        second = 'superpowers:test-driven-development'
+        state = {'skills': {}, 'violations': set()}
+        observe_tool_start(state, {'id': 'same', 'name': 'load_skill',
+            'arguments': json.dumps({'name': first})})
+        observe_tool_result(state, {'id': 'same', 'name': 'load_skill', 'is_error': False})
+        self.assertTrue(required_skills_met(state, [first]))
+        observe_tool_start(state, {'id': 'same', 'name': 'load_skill',
+            'arguments': json.dumps({'name': second})})
+        self.assertFalse(required_skills_met(state, [first, second]))
+        observe_tool_result(state, {'id': 'same', 'name': 'load_skill', 'is_error': True})
+        observe_tool_result(state, {'id': 'same', 'name': 'load_skill', 'is_error': False})
+        self.assertFalse(required_skills_met(state, [first, second]))
+        observe_tool_start(state, {'id': 'distinct', 'name': 'load_skill',
+            'arguments': json.dumps({'name': first})})
+        observe_tool_result(state, {'id': 'distinct', 'name': 'load_skill', 'is_error': False})
+        self.assertTrue(required_skills_met(state, [first]))
+        self.assertFalse(required_skills_met(state, [second]))
+
+    def test_repeated_pending_start_and_single_result_do_not_count(self):
+        state = {'skills': {}, 'violations': set()}
+        skill = 'superpowers:test-driven-development'
+        for _ in range(2):
+            observe_tool_start(state, {'id': 'same', 'name': 'load_skill',
+                'arguments': json.dumps({'name': skill})})
+        observe_tool_result(state, {'id': 'same', 'name': 'load_skill', 'is_error': False})
+        self.assertFalse(required_skills_met(state, [skill]))
+
+    def test_failed_result_prevents_late_success_from_counting(self):
+        state = {'skills': {}, 'violations': set()}
+        skill = 'superpowers:test-driven-development'
+        observe_tool_start(state, {'id': 'call-1', 'name': 'load_skill',
+            'arguments': json.dumps({'name': skill})})
+        observe_tool_result(state, {'id': 'call-1', 'name': 'load_skill', 'is_error': True})
+        observe_tool_result(state, {'id': 'call-1', 'name': 'load_skill', 'is_error': False})
+        self.assertFalse(required_skills_met(state, [skill]))
+
     def test_mismatched_or_failed_skill_result_does_not_count(self):
         skill = 'superpowers:test-driven-development'
         for result in [
@@ -88,11 +126,43 @@ class PolicyTests(unittest.TestCase):
                 observe_tool_start(state, {'id': 'agent', 'name': name, 'arguments': '{}'})
                 self.assertEqual(state['violations'], {'subagent'})
 
-    def test_unrelated_shell_commands_do_not_create_violations(self):
+    def test_composed_shell_commands_cannot_bypass_violations(self):
+        cases = [
+            ('cd /tmp && git status', 'git'),
+            ('false || git status', 'git'),
+            ('true; curl https://example.invalid', 'network'),
+            ('printf x | nc host 80', 'network'),
+            ('printf x\nwget https://example.invalid', 'network'),
+            ('env python3 -m pip install pytest', 'package_install'),
+            ('env -i FOO=bar python3 -I -m pip install pytest', 'package_install'),
+            ('env -u FOO git status', 'git'),
+            ('python3 -I -m pip install pytest', 'package_install'),
+            ('sh -c "git status"', 'git'),
+            ('bash -c "curl https://example.invalid"', 'network'),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                observe_tool_result(state, {'id': 'shell', 'name': 'run_command', 'is_error': True})
+                self.assertIn(expected, state['violations'])
+
+    def test_malformed_quoting_fails_closed_without_retaining_command(self):
         state = {'skills': {}, 'violations': set()}
         observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
-            'arguments': json.dumps({'command': 'printf "git pip curl"'})})
-        self.assertEqual(state['violations'], set())
+            'arguments': json.dumps({'command': 'echo "unterminated synthetic-shell-secret'})})
+        self.assertTrue(state['violations'])
+        self.assertNotIn('synthetic-shell-secret', repr(state))
+
+    def test_unrelated_shell_commands_do_not_create_violations(self):
+        for command in ['printf "git pip curl"', 'echo git', 'echo python3 -m pip',
+                'sh -c "echo git"', 'env printf "curl ssh"']:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                self.assertEqual(state['violations'], set())
 
 
 if __name__ == '__main__':
