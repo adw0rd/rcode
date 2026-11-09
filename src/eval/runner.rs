@@ -226,12 +226,12 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     let frozen = root.join("rcode");
     fs::write(&frozen, &binary)?;
     mode(&frozen, 0o555)?;
-    let budgets:Vec<_>=suite.cases.iter().map(|c|json!({"id":c.case.id,"sha256":c.sha256,"max_steps":c.case.max_steps,"max_requests":c.case.max_requests,"timeout_secs":c.case.timeout_secs})).collect();
+    let budgets:Vec<_>=suite.cases.iter().map(|c|json!({"id":c.case.id,"sha256":c.sha256,"max_steps":c.case.max_steps,"max_requests":c.case.max_requests,"timeout_secs":c.case.timeout_secs,"require_skills":c.case.require_skills})).collect();
     let helper_hashes: BTreeMap<_, _> = modules
         .iter()
         .map(|(n, s)| (*n, sha(s.as_bytes())))
         .collect();
-    let key = json!({"suite_sha256":suite.sha256,"selected_profile":selected,"effective_profile":effective,"image":args.image,"helpers":helper_hashes,"case_budgets":budgets,"protocol":1,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"});
+    let key = json!({"suite_sha256":suite.sha256,"selected_profile":selected,"effective_profile":effective,"image":args.image,"helpers":helper_hashes,"case_budgets":budgets,"protocol":2,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"});
     let mut cases = Vec::new();
     for c in &suite.cases {
         let path = root.join(format!("fixture-{}", c.case.id));
@@ -484,7 +484,7 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
                 .as_str()
                 .and_then(|s| s.strip_prefix("sha256:"))
                 .is_some_and(hex)
-            && key["protocol"] == 1
+            && key["protocol"] == 2
             && key["steps_definition"] == "forwarded_model_generations_all_contexts"
             && key["permissions"] == json!({"approval_mode":"auto-edit","allow_shell":true})
             && key["transport"] == "explicit_non_streaming_json",
@@ -529,14 +529,31 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
     for c in rows {
         let fields = c.as_object().context("Case budget object")?;
         ensure!(
-            fields.len() == 5
-                && ["id", "sha256", "max_steps", "max_requests", "timeout_secs"]
-                    .iter()
-                    .all(|k| fields.contains_key(*k)),
+            fields.len() == 6
+                && [
+                    "id",
+                    "sha256",
+                    "max_steps",
+                    "max_requests",
+                    "timeout_secs",
+                    "require_skills"
+                ]
+                .iter()
+                .all(|k| fields.contains_key(*k)),
             "Неполный case budget"
         );
         let id = c["id"].as_str().context("Budget ID")?;
         let hash = c["sha256"].as_str().context("Case SHA")?;
+        let required_skills = c["require_skills"].as_array().context("Required skills")?;
+        let mut skill_ids = BTreeSet::new();
+        ensure!(
+            required_skills.iter().all(|skill| {
+                skill
+                    .as_str()
+                    .is_some_and(|id| manifest::valid_skill_id(id) && skill_ids.insert(id))
+            }),
+            "Некорректный или повторный required skill ID"
+        );
         ensure!(
             !id.is_empty()
                 && id.len() <= 64

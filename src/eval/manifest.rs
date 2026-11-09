@@ -32,6 +32,8 @@ pub(crate) struct Case {
     pub lifecycle: Option<Lifecycle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_tool_success: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require_skills: Vec<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +112,14 @@ fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+pub(super) fn valid_skill_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.split(':').all(|part| !part.is_empty())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
 }
 pub(crate) fn relative(path: &str) -> Result<()> {
     ensure!(
@@ -304,6 +314,13 @@ pub(crate) fn validate(path: &Path) -> Result<Suite> {
                 "Имя required tool"
             );
         }
+        let mut skill_ids = BTreeSet::new();
+        ensure!(
+            c.require_skills
+                .iter()
+                .all(|id| valid_skill_id(id) && skill_ids.insert(id.as_str())),
+            "Некорректный или повторный required skill ID"
+        );
         if let Some(lifecycle) = &c.lifecycle {
             relative(&lifecycle.interrupt_after_file)?;
             ensure!(

@@ -101,6 +101,31 @@ fn validate_rejects_unknown_versions_and_unknown_fields() {
         assert!(events(&out).iter().any(|v| v["type"] == "error"));
     }
 }
+#[test]
+fn validate_accepts_unique_skill_ids_and_rejects_duplicates() {
+    let root = tempfile::tempdir().unwrap();
+    let path = suite(root.path());
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["cases"][0]["require_skills"] = json!([
+        "superpowers:using-superpowers",
+        "superpowers:test-driven-development"
+    ]);
+    fs::write(&path, value.to_string()).unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let valid = run(&home, &["validate", "--suite", path.to_str().unwrap()]);
+    assert!(
+        valid.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&valid.stdout),
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    value["cases"][0]["require_skills"] = json!(["superpowers:x", "superpowers:x"]);
+    fs::write(&path, value.to_string()).unwrap();
+    let invalid = run(&home, &["validate", "--suite", path.to_str().unwrap()]);
+    assert!(!invalid.status.success());
+}
+
 #[cfg(unix)]
 #[test]
 fn validate_rejects_symlinked_project_files() {
@@ -289,6 +314,83 @@ fn compare_rejects_an_incomplete_key_even_when_both_reports_match() {
     assert!(!out.status.success());
 }
 
+#[test]
+fn compare_requires_protocol_two_and_validates_budget_skill_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let mut key = comparison_key();
+    key["protocol"] = json!(2);
+    key["case_budgets"][0]["require_skills"] = json!([
+        "superpowers:using-superpowers",
+        "superpowers:test-driven-development"
+    ]);
+    let mut report = json!({"version":1,"comparison_key":key,"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let valid = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stdout)
+    );
+
+    let mut invalid_keys = Vec::new();
+    let mut invalid = report["comparison_key"].clone();
+    invalid["protocol"] = json!(1);
+    invalid_keys.push(invalid);
+    let mut invalid = report["comparison_key"].clone();
+    invalid["case_budgets"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("require_skills");
+    invalid_keys.push(invalid);
+    let mut invalid = report["comparison_key"].clone();
+    invalid["case_budgets"][0]["unexpected"] = json!(true);
+    invalid_keys.push(invalid);
+    for skills in [
+        json!(["superpowers:x", "superpowers:x"]),
+        json!(["superpowers:"]),
+        json!([":using-superpowers"]),
+        json!(["superpowers::x"]),
+        json!(["superpowers:x y"]),
+        json!(["superpowers:é"]),
+        json!([format!("superpowers:{}", "x".repeat(117))]),
+        json!([42]),
+        json!("superpowers:x"),
+    ] {
+        let mut invalid = report["comparison_key"].clone();
+        invalid["case_budgets"][0]["require_skills"] = skills;
+        invalid_keys.push(invalid);
+    }
+    for key in invalid_keys {
+        report["comparison_key"] = key;
+        fs::write(&path, report.to_string()).unwrap();
+        let out = run(
+            root.path(),
+            &[
+                "compare",
+                "--baseline",
+                path.to_str().unwrap(),
+                "--candidate",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "invalid comparison key was trusted: {}",
+            report["comparison_key"]
+        );
+    }
+}
+
 fn comparison_key() -> Value {
     let selected = rcode::local::profile_settings(
         "fixture",
@@ -308,7 +410,7 @@ fn comparison_key() -> Value {
     .into_iter()
     .map(|k| (k.to_owned(), json!("c".repeat(64))))
     .collect();
-    json!({"suite_sha256":"a".repeat(64),"selected_profile":selected,"effective_profile":effective,"image":format!("sha256:{}","d".repeat(64)),"helpers":helpers,"case_budgets":[{"id":"a","sha256":"b".repeat(64),"max_steps":12,"max_requests":24,"timeout_secs":300}],"protocol":1,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"})
+    json!({"suite_sha256":"a".repeat(64),"selected_profile":selected,"effective_profile":effective,"image":format!("sha256:{}","d".repeat(64)),"helpers":helpers,"case_budgets":[{"id":"a","sha256":"b".repeat(64),"max_steps":12,"max_requests":24,"timeout_secs":300,"require_skills":["superpowers:using-superpowers","superpowers:test-driven-development"]}],"protocol":2,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"})
 }
 
 #[test]

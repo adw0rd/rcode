@@ -22,7 +22,7 @@ from runtime import strict
 from host_docker import Docker,Failure
 from host_snapshot import extract_frozen
 
-PROTOCOL=1
+PROTOCOL=2
 
 class Control:
     cancelled=False
