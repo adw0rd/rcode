@@ -61,7 +61,7 @@ def probe_command(command):
 
 class Gateway:
     def __init__(self,profile,case,deadline,credential=None):
-        self.profile=profile;self.case=case;self.deadline=deadline;self.attempts=0;self.generations=0;self.receipts=[]
+        self.profile=profile;self.case=case;self.deadline=deadline;self.attempts=0;self.generations=0;self.receipts=[];self.function_states={}
         self.gigachat=profile.get('kind')=='gigachat'
         if self.gigachat:
             exchange=HttpsExchange(deadline,profile['request_timeout_secs'],profile['idle_timeout_secs'],strict)
@@ -85,7 +85,7 @@ class Gateway:
         self.receipts.append(record);start=time.monotonic();connection=None;watcher=None;transport=[];stop_watch=threading.Event()
         try:
             if self.gigachat:
-                status,value=self.upstream.chat(giga_request(body),cancelled);value=openai_response(value)
+                status,value=self.upstream.chat(giga_request(body,self.function_states),cancelled);value=openai_response(value,self.function_states)
             else:
                 remaining=self.deadline-time.monotonic()
                 if remaining<=0:raise Failure('generation deadline')

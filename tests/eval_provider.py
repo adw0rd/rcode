@@ -212,6 +212,29 @@ class HttpsCancellationTests(unittest.TestCase):
             with self.assertRaises(Failure) as caught:transport('chat','Bearer fixture',{'stream':False})
         self.assertEqual(str(caught.exception),'upstream deadline/size')
 
+    def test_connection_close_slow_body_uses_independent_transport_reference(self):
+        import http.client
+        import socketserver
+        import threading
+        class SlowBody(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.recv(65536)
+                try:
+                    self.request.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n')
+                    time.sleep(.7);self.request.sendall(b'{}')
+                except OSError:pass
+        server=socketserver.ThreadingTCPServer(('127.0.0.1',0),SlowBody);server.daemon_threads=True
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            connection=http.client.HTTPConnection('127.0.0.1',server.server_address[1],timeout=1)
+            start=time.monotonic()
+            with patch('host_provider.http.client.HTTPSConnection',return_value=connection):
+                transport=HttpsExchange(start+5,.12,5,strict)
+                with self.assertRaises(Failure) as caught:transport('chat','Bearer fixture',{'stream':False})
+            self.assertIn(str(caught.exception),{'upstream exchange','upstream deadline/size'})
+            self.assertLess(time.monotonic()-start,.5,'Connection: close made the body watchdog ineffective')
+        finally:server.shutdown();server.server_close();thread.join()
+
     def test_slow_headers_are_cut_off_at_absolute_deadline(self):
         import http.client
         import socketserver
@@ -327,6 +350,18 @@ class GigaChatToolsTests(unittest.TestCase):
             self.assertEqual(history[2],{'role':'function','name':'read_file','content':'{"ok":true}'})
             self.assertEqual(gateway.receipts[0]['requested_tool_names'],{'read_file':1})
             self.assertEqual(gateway.receipts[1]['requested_tool_names'],{})
+
+    def test_raw_message_state_cannot_override_trusted_tool_call_mapping(self):
+        from host_provider import giga_request
+        call={'id':'call_trusted','type':'function','function':{'name':'read_file','arguments':'{"path":"a.rs"}'}}
+        body={'model':'GigaChat-3-Ultra','messages':[
+            {'role':'assistant','content':'','tool_calls':[call],'functions_state_id':'untrusted-state'},
+            {'role':'tool','tool_call_id':'call_trusted','content':'{"ok":true}'},
+        ]}
+        native=giga_request(body,{'call_trusted':'state-1'})
+        self.assertEqual(native['messages'][0]['functions_state_id'],'state-1')
+        native=giga_request(body,{})
+        self.assertNotIn('functions_state_id',native['messages'][0])
 
     def test_function_call_none_and_unsupported_required(self):
         from host_provider import giga_request

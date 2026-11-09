@@ -26,7 +26,7 @@ def giga_parameters(parameters):
     return out
 
 
-def giga_request(body):
+def giga_request(body,function_states=None):
     if not isinstance(body,dict):raise Failure('tool protocol')
     out=dict(body);tools=out.pop('tools',[]);choice=out.pop('tool_choice',None)
     if not isinstance(tools,list):raise Failure('tool protocol')
@@ -42,11 +42,11 @@ def giga_request(body):
     if choice not in ('auto','none'):raise Failure('tool choice unsupported')
     out['function_call']=choice
     if functions:out['functions']=functions
-    if 'messages' in out:out['messages']=giga_messages(out['messages'])
+    if 'messages' in out:out['messages']=giga_messages(out['messages'],function_states)
     return out
 
 
-def giga_messages(messages):
+def giga_messages(messages,function_states=None):
     if not isinstance(messages,list):raise Failure('tool protocol')
     output=[];index=0
     while index<len(messages):
@@ -74,7 +74,7 @@ def giga_messages(messages):
                 if content is None:content=''
                 if not isinstance(content,str):raise Failure('tool protocol')
                 assistant={'role':'assistant','content':content,'function_call':{'name':name,'arguments':arguments}}
-                if isinstance(message.get('functions_state_id'),str):assistant['functions_state_id']=message['functions_state_id']
+                if function_states is not None and identity in function_states:assistant['functions_state_id']=function_states[identity]
                 output.append(assistant)
                 text=matching[0].get('content')
                 if text is None:text=''
@@ -90,12 +90,11 @@ def giga_messages(messages):
             if content is None:content=''
             if not isinstance(role,str) or not isinstance(content,str):raise Failure('tool protocol')
             value={'role':role,'content':content}
-            if role=='assistant' and isinstance(message.get('functions_state_id'),str):value['functions_state_id']=message['functions_state_id']
             output.append(value);index+=1
     return output
 
 
-def openai_response(value):
+def openai_response(value,function_states=None):
     if not isinstance(value,dict) or not isinstance(value.get('choices'),list):return value
     output=dict(value);choices=[]
     for original in output['choices']:
@@ -106,7 +105,12 @@ def openai_response(value):
             name=call.get('name');arguments=call.get('arguments')
             if not isinstance(name,str) or not name or not isinstance(arguments,dict):raise Failure('tool protocol')
             choice=dict(choice);message=dict(choice['message']);message.pop('function_call',None)
-            message['tool_calls']=[{'id':'call_'+uuid.uuid4().hex,'type':'function','function':{
+            identity='call_'+uuid.uuid4().hex;state=message.pop('functions_state_id',None)
+            if function_states is not None and state is not None:
+                if not isinstance(state,str) or not state or len(state)>4096:raise Failure('tool protocol')
+                if identity not in function_states and len(function_states)>=128:raise Failure('tool state bound')
+                function_states[identity]=state
+            message['tool_calls']=[{'id':identity,'type':'function','function':{
                 'name':name,'arguments':json.dumps(arguments,ensure_ascii=True,allow_nan=False,separators=(',',':'))}}]
             choice['message']=message
             if choice.get('finish_reason')=='function_call':choice['finish_reason']='tool_calls'
@@ -125,7 +129,7 @@ class HttpsExchange:
                 if source is None:continue
                 if source.is_set() if hasattr(source,'is_set') else source():return True
             return False
-        connection=None;watcher=None;stop_watch=threading.Event()
+        connection=None;response=None;watcher=None;transport=[];stop_watch=threading.Event()
         try:
             if operation=='oauth':
                 host='ngw.devices.sberbank.ru';port=9443;path='/api/v2/oauth';content_type='application/x-www-form-urlencoded'
@@ -140,11 +144,12 @@ class HttpsExchange:
             connection=http.client.HTTPSConnection(host,port,timeout=min(1.0,remaining,self.request_timeout),context=ssl.create_default_context())
             exchange_deadline=min(self.deadline,time.monotonic()+self.request_timeout)
             def abort():
-                sock=connection.sock
+                sock=transport[0] if transport else connection.sock
                 if sock:
                     try:sock.shutdown(socket.SHUT_RDWR)
                     except OSError:pass
-                    sock.close()
+                    try:sock.close()
+                    except OSError:pass
             def watch():
                 while not stop_watch.wait(.02):
                     if time.monotonic()>=exchange_deadline or is_cancelled():abort();return
@@ -152,11 +157,14 @@ class HttpsExchange:
             headers={'Authorization':authorization,'Content-Type':content_type,'Accept':'application/json'}
             if operation=='oauth':headers['RqUID']=str(uuid.uuid4())
             connection.request('POST',path,body=payload,headers=headers)
+            if connection.sock:transport.append(connection.sock)
             response=connection.getresponse();raw=bytearray()
             while True:
-                remaining=self.deadline-time.monotonic()
+                remaining=min(self.deadline,exchange_deadline)-time.monotonic()
                 if remaining<=0:raise Failure('upstream deadline/size')
-                if connection.sock:connection.sock.settimeout(min(remaining,self.idle_timeout))
+                if is_cancelled():raise Failure('upstream cancelled')
+                sock=transport[0] if transport else connection.sock
+                if sock:sock.settimeout(min(remaining,self.idle_timeout))
                 chunk=response.read1(min(65536,4*1024*1024+1-len(raw)))
                 if not chunk:break
                 raw.extend(chunk)
@@ -172,6 +180,12 @@ class HttpsExchange:
         finally:
             stop_watch.set()
             if watcher:watcher.join(timeout=1)
+            if response and hasattr(response,'close'):
+                try:response.close()
+                except OSError:pass
+            if transport:
+                try:transport[0].close()
+                except OSError:pass
             if connection:
                 try:connection.close()
                 except OSError:pass

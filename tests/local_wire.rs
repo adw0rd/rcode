@@ -9,6 +9,8 @@ use rcode::{
 };
 use serde_json::{Value, json};
 use std::{
+    io::{BufRead, BufReader, Write},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -648,4 +650,130 @@ async fn localhost_never_falls_back_to_another_loopback_family() {
         0,
         "localhost must not reach [::1]"
     );
+}
+
+struct PythonGateway {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PythonGateway {
+    fn start() -> Self {
+        const SCRIPT: &str = r#"
+import json,sys,time
+sys.path[:0]=sys.argv[1:]
+import host
+responses=[
+    (200,{'access_token':'real-token-1','expires_at':4_000_000_000}),
+    (200,{'choices':[{'message':{'role':'assistant','content':'','function_call':{'name':'read_file','arguments':{'path':'a.rs'}},'functions_state_id':'state-1'},'finish_reason':'function_call'}]}),
+    (200,{'choices':[{'message':{'role':'assistant','content':'done'},'finish_reason':'stop'}]}),
+]
+calls=[]
+def exchange(operation,authorization,body):
+    calls.append({'operation':operation,'body':body})
+    return responses.pop(0)
+profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS','stream':False,'max_output_tokens':100000,'request_timeout_secs':5,'idle_timeout_secs':5}
+host.HttpsExchange=lambda *args:exchange
+gateway=host.Gateway(profile,{'max_steps':2,'max_requests':2},time.monotonic()+20,'Basic synthetic-key')
+for line in sys.stdin:
+    status,value=gateway.relay(json.loads(line))
+    print(json.dumps({'status':status,'value':value,'calls':calls}),flush=True)
+"#;
+        let mut child = Command::new("python3")
+            .args([
+                "-I",
+                "-S",
+                "-c",
+                SCRIPT,
+                concat!(env!("CARGO_MANIFEST_DIR"), "/evals"),
+                concat!(env!("CARGO_MANIFEST_DIR"), "/evals/runtime"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    fn call(&mut self, body: &Value) -> Value {
+        serde_json::to_writer(&mut self.stdin, body).unwrap();
+        self.stdin.write_all(b"\n").unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        assert!(self.stdout.read_line(&mut line).unwrap() > 0);
+        serde_json::from_str(&line).unwrap()
+    }
+}
+
+impl Drop for PythonGateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn gigachat_state_survives_real_local_completion_and_history_serialization() {
+    let gateway = Arc::new(Mutex::new(PythonGateway::start()));
+    let native_calls = Arc::new(Mutex::new(Vec::new()));
+    let server = {
+        let gateway = gateway.clone();
+        let native_calls = native_calls.clone();
+        Server::start(move |request, _| {
+            let reply = gateway.lock().unwrap().call(&request.json());
+            *native_calls.lock().unwrap() = reply["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|call| call["body"].clone())
+                .collect();
+            Response::json(
+                reply["status"].as_u64().unwrap() as u16,
+                reply["value"].clone(),
+            )
+        })
+    };
+    let mut settings = profile_settings(
+        "eval",
+        &server.base(),
+        LocalRuntime::OpenAi,
+        "GigaChat-3-Ultra",
+    );
+    settings.stream = false;
+    let mut client = ProviderClient::connect(settings, None).unwrap();
+    let definitions = tool();
+    let first = client
+        .complete(&[Message::user("read")], &definitions, &mut |_| {})
+        .await
+        .unwrap();
+    assert_eq!(first.tool_calls.len(), 1);
+    assert!(first.provider_meta.is_none());
+    let assistant = Message::assistant(&first);
+    let call = &first.tool_calls[0];
+    let second = client
+        .complete(
+            &[
+                Message::user("read"),
+                assistant,
+                Message::tool(call, "{\"ok\":true}"),
+            ],
+            &definitions,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.content, "done");
+    let openai = server.generations()[1].json();
+    assert!(openai["messages"][1].get("functions_state_id").is_none());
+    let native = native_calls.lock().unwrap();
+    assert_eq!(native[2]["messages"][1]["role"], "assistant");
+    assert_eq!(native[2]["messages"][1]["functions_state_id"], "state-1");
 }
