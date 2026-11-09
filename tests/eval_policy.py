@@ -148,6 +148,30 @@ class PolicyTests(unittest.TestCase):
                 observe_tool_result(state, {'id': 'shell', 'name': 'run_command', 'is_error': True})
                 self.assertIn(expected, state['violations'])
 
+    def test_complex_executable_forms_use_conservative_fallback(self):
+        cases = [
+            ('(git status)', 'git'),
+            ('command git status', 'git'),
+            ('echo $(git status)', 'git'),
+            ('git</dev/null status', 'git'),
+            ('{ git status; }', 'git'),
+            ('echo `git status`', 'git'),
+            ('exec git status', 'git'),
+            ('env --split-string="git status"', 'git'),
+            ("bash -O extglob -c 'git status'", 'git'),
+            ('if true; then curl https://example.invalid; fi', 'network'),
+            ('while false; do python3 -I -m pip install pytest; done', 'package_install'),
+            ('f() { nc host 80; }', 'network'),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                observe_tool_result(state, {'id': 'shell', 'name': 'run_command', 'is_error': True})
+                self.assertIn(expected, state['violations'])
+                self.assertNotIn(command, repr(state))
+
     def test_malformed_quoting_fails_closed_without_retaining_command(self):
         state = {'skills': {}, 'violations': set()}
         observe_tool_start(state, {'id': 'shell', 'name': 'run_command',

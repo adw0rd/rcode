@@ -1,3 +1,4 @@
+import re
 import shlex
 
 if __package__:
@@ -20,6 +21,25 @@ def _assignment(token):
     name, separator, _value = token.partition('=')
     return bool(separator and name and (name[0].isalpha() or name[0] == '_')
         and all(char.isalnum() or char == '_' for char in name))
+
+
+def _fallback_violations(command, state):
+    for match in re.finditer(r'(?<![\w.-])(?:[\w.-]+/)*(git|pip3?|curl|wget|nc|ssh)(?![\w.-])', command):
+        executable = match.group(1)
+        if executable == 'git':
+            state['violations'].add('git')
+        elif executable in ('pip', 'pip3'):
+            state['violations'].add('package_install')
+        else:
+            state['violations'].add('network')
+
+
+def _complex_form(tokens):
+    reserved = {'if', 'while', 'until', 'for', 'case', 'select', 'function', 'time',
+        'then', 'else', 'elif', 'fi', 'do', 'done', '{', '}'}
+    return any('`' in token or '$(' in token or '<' in token or '>' in token
+        or token in reserved or (token and all(char in '(){}' for char in token))
+        for token in tokens)
 
 
 def _python_pip(arguments):
@@ -55,10 +75,29 @@ def _classify_simple(tokens, state, depth):
             if token in ('-S', '--split-string') and index + 1 < len(tokens):
                 _classify_shell(tokens[index + 1], state, depth + 1)
                 return
+            if token.startswith('--split-string=') or (token.startswith('-S') and token != '-S'):
+                _classify_shell(token.split('=', 1)[1] if '=' in token else token[2:], state, depth + 1)
+                return
             if token in ('-u', '--unset', '-C', '--chdir'):
                 index += 2
                 continue
             if _assignment(token) or token.startswith('-'):
+                index += 1
+                continue
+            break
+        _classify_simple(tokens[index:], state, depth + 1)
+        return
+    if executable in ('command', 'exec'):
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token == '--':
+                index += 1
+                break
+            if executable == 'exec' and token == '-a':
+                index += 2
+                continue
+            if token.startswith('-'):
                 index += 1
                 continue
             break
@@ -81,9 +120,9 @@ def _classify_simple(tokens, state, depth):
             if index + 1 < len(tokens):
                 _classify_shell(tokens[index + 1], state, depth + 1)
             return
-        if token in ('-o', '--option'):
+        if token in ('-o', '-O', '+o', '+O', '--option'):
             index += 2
-        elif token.startswith('-'):
+        elif token.startswith(('-', '+')):
             index += 1
         else:
             return
@@ -94,12 +133,15 @@ def _classify_shell(command, state, depth=0):
         state['violations'].update(('git', 'package_install', 'network'))
         return
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
+        lexer = shlex.shlex(command, posix=True, punctuation_chars='();<>|&{}\n')
         lexer.whitespace_split = True
         lexer.whitespace = ' \t\r'
         tokens = list(lexer)
     except ValueError:
         state['violations'].update(('git', 'package_install', 'network'))
+        return
+    if _complex_form(tokens):
+        _fallback_violations(command, state)
         return
     simple = []
     for token in tokens:
