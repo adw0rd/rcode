@@ -88,6 +88,9 @@ def child(path):
         # The host supplies credential-free settings. The same container URL
         # is reused for resume; no user's credentials or settings are copied.
         (state/'config.json').write_text(json.dumps(cfg['profile_config']))
+    if cfg.get('skills_config') is not None:
+        state=Path(env['RCODE_HOME']);state.mkdir(parents=True,exist_ok=True)
+        (state/'skills.json').write_text(json.dumps(cfg['skills_config']))
     credential=cfg.get('profile_credential')
     if credential is not None:
         if credential!='eval-placeholder-key' or cfg.get('profile_config') is None:raise ValueError('profile credential')
@@ -97,10 +100,10 @@ def child(path):
     os.chdir(cfg['cwd'])
     os.execvpe(cfg['argv'][0],cfg['argv'],env)
 
-def execute(argv,cwd,uid,gid,seconds,limit=65536,profile_config=None,profile_credential=None,agent=False):
+def execute(argv,cwd,uid,gid,seconds,limit=65536,profile_config=None,profile_credential=None,skills_config=None,agent=False):
     Path('/control').mkdir(exist_ok=True);path=Path('/control/child.json')
     if path.exists():path.chmod(0o600)
-    raw=json.dumps({'argv':argv,'cwd':cwd,'profile_config':profile_config,'profile_credential':profile_credential},ensure_ascii=True).encode()
+    raw=json.dumps({'argv':argv,'cwd':cwd,'profile_config':profile_config,'profile_credential':profile_credential,'skills_config':skills_config},ensure_ascii=True).encode()
     if len(raw)>65536:raise ValueError('child bootstrap limit')
     path.write_bytes(raw);path.chmod(0o444)
     p=subprocess.Popen(['python3','-I','-S','/eval/runtime.py','--child',str(path)],
@@ -261,7 +264,7 @@ def main():
             result.pop('stdout');result.pop('stderr');send({'type':'archive_done',**result})
         return 0
     if mode!='agent':raise ValueError('runtime mode')
-    if set(cfg)-{'mode','uid','gid','timeout_secs','argv','model','profile_config','profile_credential','seed_project','resume_state','hold','sentinel','agent_timeout_secs'}:raise ValueError('agent fields')
+    if set(cfg)-{'mode','uid','gid','timeout_secs','argv','model','profile_config','profile_credential','skills_config','seed_project','resume_state','hold','sentinel','agent_timeout_secs'}:raise ValueError('agent fields')
     for flag in ['seed_project','resume_state','hold']:
         if type(cfg.get(flag,False)) is not bool:raise ValueError('agent flag')
     sentinel=cfg.get('sentinel')
@@ -341,7 +344,7 @@ def main():
                     time.sleep(.05)
             threading.Thread(target=watch,daemon=True).start()
         p=execute(cmd['argv'],'/workspace',uid,gid,timeout,profile_config=substitute(profile_config),
-            profile_credential=cfg.get('profile_credential'),agent=True)
+            profile_credential=cfg.get('profile_credential'),skills_config=cfg.get('skills_config'),agent=True)
         result=capture(p,'',agent_timeout,limit=4*1024*1024,agent=True)
         result.pop('stdout');result.pop('stderr');send({'type':'agent_done',**result})
         if cfg.get('hold'):

@@ -21,12 +21,13 @@ GID = os.getgid() or 10001
 
 
 class ChildBootstrapTests(unittest.TestCase):
-    def run_child(self,profile_credential):
+    def run_child(self,profile_credential,skills_config=None):
         with tempfile.TemporaryDirectory(prefix='rcode-eval-child-') as temp:
             root=Path(temp);home=root/'home';work=root/'work';work.mkdir()
             config={'kind':'gigachat','base_url':'http://127.0.0.1:18080/v1'}
             bootstrap={'cwd':str(work),'argv':['/bin/echo'],'profile_config':config}
             if profile_credential is not None:bootstrap['profile_credential']=profile_credential
+            if skills_config is not None:bootstrap['skills_config']=skills_config
             path=root/'child.json';path.write_text(json.dumps(bootstrap))
             env={'PATH':'/usr/bin:/bin','HOME':str(home),'RCODE_HOME':str(home/'state')}
             previous=Path.cwd();calls=[]
@@ -35,13 +36,14 @@ class ChildBootstrapTests(unittest.TestCase):
                     'runtime.os.execvpe',side_effect=lambda *args:calls.append(args)),patch.dict(os.environ,{},clear=True):
                     child(str(path))
             finally:os.chdir(previous)
-            state=home/'state';credentials=state/'credentials.json'
+            state=home/'state';credentials=state/'credentials.json';skills=state/'skills.json'
             saved=json.loads(credentials.read_text()) if credentials.exists() else None
             mode=credentials.stat().st_mode&0o777 if credentials.exists() else None
-            return json.loads((state/'config.json').read_text()),saved,mode,calls,env
+            linked=json.loads(skills.read_text()) if skills.exists() else None
+            return json.loads((state/'config.json').read_text()),saved,mode,calls,env,linked
 
     def test_gigachat_child_writes_only_placeholder_credential_with_private_mode(self):
-        config,credentials,mode,calls,env=self.run_child('eval-placeholder-key')
+        config,credentials,mode,calls,env,_linked=self.run_child('eval-placeholder-key')
         self.assertEqual(config['kind'],'gigachat')
         self.assertEqual(credentials,{'version':1,'providers':{'gigachat':'eval-placeholder-key'}})
         self.assertEqual(mode,0o600)
@@ -49,9 +51,15 @@ class ChildBootstrapTests(unittest.TestCase):
         self.assertNotIn('synthetic-real-key',json.dumps(env))
 
     def test_local_child_remains_credential_free(self):
-        _config,credentials,mode,_calls,_env=self.run_child(None)
+        _config,credentials,mode,_calls,_env,linked=self.run_child(None)
         self.assertIsNone(credentials)
         self.assertIsNone(mode)
+        self.assertIsNone(linked)
+
+    def test_child_writes_linked_skills_config_at_rcode_home(self):
+        expected={'version':1,'linked':{'superpowers':{'path':'/workspace/skill-sources/superpowers'}}}
+        *_unused,linked=self.run_child(None,expected)
+        self.assertEqual(linked,expected)
 
 
 @unittest.skipUnless(IMAGE,'RCODE_EVAL_IMAGE is required for opt-in Docker runtime tests')

@@ -245,6 +245,8 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
     bootstrap={'mode':'agent','uid':docker.uid,'gid':docker.uid,'timeout_secs':root_timeout,'agent_timeout_secs':agent_timeout,
         'seed_project':not bool(resume_id),'hold':True,'model':invocation['effective_profile']['model'],
         'profile_config':model_config(invocation['effective_profile']),'argv':argv}
+    if case.get('require_skills'):
+        bootstrap['skills_config']={'version':1,'linked':{'superpowers':{'path':'/workspace/skill-sources/superpowers'}}}
     if gigachat:bootstrap['profile_credential']='eval-placeholder-key'
     if sentinel:bootstrap['sentinel']=sentinel
     logs=hashlib.sha256();log_bytes=0;pending=bytearray();session_id=None;seen=False;cancel_sent=False;reported_tools={}

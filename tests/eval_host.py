@@ -99,6 +99,34 @@ class HostConfigTests(unittest.TestCase):
         self.assertNotIn('--profile',bootstrap['argv'])
         self.assertEqual(bootstrap['profile_credential'],'eval-placeholder-key')
         self.assertNotIn('synthetic-real-key',json.dumps(bootstrap))
+        self.assertNotIn('skills_config',bootstrap)
+
+    def test_agent_bootstrap_adds_linked_config_for_required_skills(self):
+        import host
+        from unittest.mock import patch
+        captured=[]
+        class Channel:
+            def receive(self,timeout=None):return {'type':'agent_done','exit_code':0}
+            def send(self,_value):pass
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def create(self,*_args,**_kwargs):return 'agent'
+            def start(self,_name,bootstrap,_deadline):captured.append(bootstrap);return Channel()
+            def remove(self,*_args):pass
+        class Pump:
+            def __init__(self,_gateway):pass
+            def deliver(self,_channel):pass
+            def close(self):pass
+        profile={'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}
+        invocation={'binary':'/unused/rcode','effective_profile':profile}
+        item={'case':{'max_steps':1,'require_skills':['superpowers:using-superpowers',
+            'superpowers:test-driven-development','superpowers:verification-before-completion']},
+            'fixture':'/unused/fixture','task':'fixture'}
+        with patch.object(host,'RequestPump',Pump):
+            host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5)
+        self.assertEqual(captured[0].get('skills_config'),{'version':1,'linked':{'superpowers':{
+            'path':'/workspace/skill-sources/superpowers'}}})
 
     def receipt_phase(self,events,state,resume_id=None):
         import host
