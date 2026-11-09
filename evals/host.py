@@ -74,12 +74,10 @@ class Gateway:
     def sensitive(self,value):
         if not self.gigachat:return False
         secrets={secret for secret in self.upstream.secrets if secret}
-        substrings={secret for secret in secrets if len(secret)>=8}
-        exact=secrets-substrings
         def walk(item):
             if isinstance(item,dict):return any(walk(key) or walk(nested) for key,nested in item.items())
             if isinstance(item,list):return any(walk(nested) for nested in item)
-            if isinstance(item,str):return item in exact or any(secret in item for secret in substrings)
+            if isinstance(item,str):return any(secret in item for secret in secrets)
             return False
         return walk(value)
     def relay(self,body,cancelled=None):

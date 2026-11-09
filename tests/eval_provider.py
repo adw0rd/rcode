@@ -59,7 +59,7 @@ class GigaChatOAuthTests(unittest.TestCase):
         self.assertEqual(responses,[])
 
     def test_credential_shape_failures_are_fixed(self):
-        for credential in ['',None,'Basic ','Basic fixture\r','fixture\n']:
+        for credential in ['',None,'Basic ','Basic x','Basic 1234567','Basic fixture\r','fixture\n']:
             with self.subTest(shape='invalid'):
                 with self.assertRaises(Failure) as caught:GigaChatUpstream(credential,'GIGACHAT_API_PERS',lambda *_args:None)
                 self.assertEqual(str(caught.exception),'credential shape')
@@ -69,6 +69,8 @@ class GigaChatOAuthTests(unittest.TestCase):
         cases=[
             ((201,valid),'oauth response'),((200,[]),'oauth response'),((200,{}),'oauth response'),
             ((200,{**valid,'access_token':''}),'oauth response'),
+            ((200,{**valid,'access_token':'x'}),'oauth response'),
+            ((200,{**valid,'access_token':'1234567'}),'oauth response'),
             ((200,{**valid,'expires_at':True}),'oauth response'),
             ((200,{**valid,'expires_at':1000}),'oauth expiry'),
         ]
@@ -454,12 +456,26 @@ class SensitivePayloadTests(unittest.TestCase):
         self.assertEqual([call[0] for call in calls],['oauth','chat','oauth','chat'])
         self.assert_safe_rejection(gateway,status,value,[previous,current,'synthetic-credential'])
 
-    def test_short_secrets_do_not_reject_unrelated_content(self):
-        gateway,_calls=self.gateway([(200,{'access_token':'x','expires_at':4_000_000_000}),
-            (200,{'choices':[{'message':{'role':'assistant','content':'ordinary content'}}]})],credential='Basic z')
-        status,value=gateway.relay(self.request())
-        self.assertEqual(status,200)
-        self.assertEqual(value['choices'][0]['message']['content'],'ordinary content')
+    def test_request_pump_rejects_short_token_before_bearer_reflection(self):
+        import host
+        gateway,calls=self.gateway([(200,{'access_token':'x','expires_at':4_000_000_000}),
+            (400,{'error':{'message':'Bearer x'}})])
+        frames=[]
+        class Channel:
+            def send(self,value):frames.append(value)
+        pump=host.RequestPump(gateway)
+        try:
+            pump.submit(1,self.request())
+            deadline=time.monotonic()+2
+            while not frames and time.monotonic()<deadline:
+                pump.deliver(Channel())
+                time.sleep(.01)
+            self.assertEqual(len(frames),1)
+            serialized=json.dumps(frames,ensure_ascii=True)
+            self.assertFalse('Bearer x' in serialized,'Short OAuth token reached an agent-visible response frame')
+            self.assertEqual(frames[0],{'type':'response','id':1,'status':502,'body':self.safe_error})
+            self.assertEqual([call[0] for call in calls],['oauth'])
+        finally:pump.close()
 
 
 class LocalGatewayRegressionTests(unittest.TestCase):

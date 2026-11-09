@@ -195,7 +195,7 @@ class GigaChatUpstream:
     def __init__(self,credential,scope,exchange,now=time.time):
         if not isinstance(credential,str) or not credential or '\r' in credential or '\n' in credential:raise Failure('credential shape')
         original=credential;credential=credential.removeprefix('Basic ')
-        if not credential:raise Failure('credential shape')
+        if len(credential)<8:raise Failure('credential shape')
         self.credential=credential;self.scope=scope;self.exchange=exchange;self.now=now;self.secrets={original,credential}
         self.token=None;self.expires_at=0
 
@@ -207,7 +207,7 @@ class GigaChatUpstream:
         status,value=self.call('oauth','Basic '+self.credential,{'scope':self.scope},cancelled)
         if status!=200 or not isinstance(value,dict):raise Failure('oauth response')
         token=value.get('access_token');expires=value.get('expires_at')
-        if not isinstance(token,str) or not token or type(expires) is not int:raise Failure('oauth response')
+        if not isinstance(token,str) or len(token)<8 or type(expires) is not int:raise Failure('oauth response')
         if expires>100_000_000_000:expires//=1000
         if expires<=self.now():raise Failure('oauth expiry')
         self.token=token;self.expires_at=expires;self.secrets.add(token)
