@@ -209,7 +209,7 @@ rcode --resume ID_СЕССИИ
 rcode eval validate --suite evals/manifest.json
 ```
 
-Для прогона нужны Python 3.12+, локальный Docker с Unix socket, Linux-бинарник проверяемой версии и явно выбранный local profile без ключа. Runtime готовится отдельно:
+Для прогона нужны Python 3.12+, локальный Docker с Unix socket, Linux-бинарник проверяемой версии и явно выбранный `--profile`: local profile без ключа либо `gigachat`. Runtime готовится отдельно:
 
 ```sh
 docker build --file evals/Dockerfile --tag rcode-eval-runtime evals
@@ -221,9 +221,35 @@ rcode --profile mlx eval run --suite evals/manifest.json \
 rcode eval compare --baseline baseline.json --candidate candidate.json
 ```
 
-`--non-streaming` явно выбирает JSON transport для этого прогона; профиль остаётся прежним. Runner исполняет проект и проверки в отдельных контейнерах с ограниченными ресурсами. Ожидаемые ответы остаются на хосте. Отчёт различает `passed`, `failed`, `blocked`, `unknown` и `not_run`; неопределённая очистка кейса исключает его PASS. `compare` требует одинаковых корпуса, бюджетов, профиля, runtime и helper-кода. Исходный macOS artifact и Linux rebuild учитываются раздельно.
+`--non-streaming` явно выбирает JSON transport для этого прогона; профиль остаётся прежним. Runner исполняет проект и проверки в отдельных контейнерах с ограниченными ресурсами; Docker задаёт границу изоляции недоверенного кода. Ожидаемые ответы остаются на хосте. Отчёт различает `passed`, `failed`, `blocked`, `unknown` и `not_run`; неопределённая очистка кейса исключает его PASS. `compare` требует одинаковых корпуса, бюджетов, профиля, runtime и helper-кода. Исходный macOS artifact и Linux rebuild учитываются раздельно.
 
 Корпус содержит 30 задач, включая прерывание/возобновление и загрузку Superpowers TDD. Наличие тестов не означает, что Qwen выполняет их все или поддерживает все Superpowers.
+
+### TODO API suite
+
+Отдельный suite `evals/todo-api/manifest.json` содержит один HTTP CRUD scaffold-кейс с тремя обязательными скиллами Superpowers. Проверка fixtures не обращается к модели:
+
+```sh
+rcode eval validate --suite evals/todo-api/manifest.json
+```
+
+Запуск с явным local profile:
+
+```sh
+rcode --profile mlx eval run --suite evals/todo-api/manifest.json --agent-binary ./artifacts/rcode-linux --series qwen-todo --image "$IMAGE" --docker-socket "$DOCKER_SOCKET" --report qwen-todo.json --non-streaming --yes
+```
+
+Запуск с нативным GigaChat profile:
+
+```sh
+rcode --profile gigachat eval run --suite evals/todo-api/manifest.json --agent-binary ./artifacts/rcode-linux --series gigachat-todo --image "$IMAGE" --docker-socket "$DOCKER_SOCKET" --report gigachat-todo.json --non-streaming --yes
+```
+
+Настоящий GigaChat Authorization Key и OAuth token остаются только в доверенном host runner. Контейнер получает лишь placeholder `eval-placeholder-key` и loopback-конфигурацию relay, а его сеть отключена (`--network=none`). Для GigaChat разрешены только официальные endpoints; проверка TLS не отключается.
+
+Этот runner использует protocol 2: его отчёты несовместимы с protocol 1 и не сравниваются с ними. Ровно три успешных required skill receipts подтверждают только загрузку перечисленных скиллов, а не полный Superpowers parity. `formal_violations` — классификация наблюдаемых tool receipts, а не полноценный анализатор shell.
+
+Функциональным PASS считается только общий `status: passed` кейса: агент успешно завершился, oracle checks прошли, required skills наблюдались, `formal_violations` пуст, очистка кейса и всего прогона — `confirmed_absent`. Controls отдельно проверяют, что исходный проект отклоняется, а исправленный проходит; они не выполняют model inference и не являются результатами модели.
 
 Для нативного адаптера GigaChat есть отдельный живой TDD-тест с оригинальным скиллом Superpowers: загрузка скилла, падение регрессии до изменения кода, успешные тесты после исправления и повторное обнаружение исходного бага. Он использует сохранённый ключ, API провайдера и временный проект с разрешённым shell на хосте; к контейнерному `eval run` этот тест не относится. Запуск явный:
 
