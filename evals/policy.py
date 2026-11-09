@@ -64,6 +64,8 @@ def _fallback_violations(tokens, state, depth):
         return
     command_position = True
     backtick = False
+    case_depth = 0
+    case_pattern = False
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -91,11 +93,33 @@ def _fallback_violations(tokens, state, depth):
             index += 1
             continue
         if all(char in ';&|\n' for char in token):
-            command_position = True
+            if token == '|' and case_pattern:
+                command_position = False
+            else:
+                command_position = True
+                if case_depth and token in (';;', ';;&', ';&'):
+                    case_pattern = True
         elif token in ('(', '{'):
+            command_position = True
+        elif token == ')' and case_pattern:
+            case_pattern = False
             command_position = True
         elif token in (')', '}', '()'):
             command_position = False
+        elif command_position and token == 'case':
+            case_depth += 1
+            case_pattern = False
+            command_position = False
+        elif token == 'in' and case_depth:
+            case_pattern = True
+            command_position = False
+        elif token == 'esac' and case_depth:
+            case_depth -= 1
+            case_pattern = False
+            command_position = False
+        elif (command_position and token.isdigit() and index + 1 < len(tokens)
+                and tokens[index + 1] and all(char in '<>&' for char in tokens[index + 1])):
+            pass
         elif '<' in token or '>' in token:
             if token in ('<', '>', '<<', '>>', '<<<', '<>', '>|', '>&', '<&'):
                 index += 1
@@ -105,8 +129,10 @@ def _fallback_violations(tokens, state, depth):
             command_position = True
         elif token in ('fi', 'done'):
             command_position = False
-        elif command_position and token in ('if', 'while', 'until', 'for', 'case', 'select',
+        elif command_position and token in ('if', 'while', 'until', 'for', 'select',
                 'function', 'time', 'coproc', '!'):
+            command_position = True
+        elif command_position and token in ('in', 'esac'):
             command_position = True
         elif command_position and not _assignment(token):
             _classify_simple([token, *tokens[index + 1:]], state, depth + 1)
@@ -118,7 +144,7 @@ def _fallback_violations(tokens, state, depth):
 
 def _complex_form(tokens):
     reserved = {'if', 'while', 'until', 'for', 'case', 'select', 'function', 'time',
-        'then', 'else', 'elif', 'fi', 'do', 'done', '{', '}'}
+        'then', 'else', 'elif', 'fi', 'do', 'done', 'in', 'esac', 'coproc', '!', '{', '}'}
     return any('`' in token or '$(' in token or '<' in token or '>' in token
         or token in reserved or (token and all(char in '(){}' for char in token))
         for token in tokens)

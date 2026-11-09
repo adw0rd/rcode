@@ -201,6 +201,32 @@ class PolicyTests(unittest.TestCase):
                     'arguments': json.dumps({'command': command})})
                 self.assertEqual(state['violations'], set())
 
+    def test_reserved_case_and_fd_redirection_restore_command_position(self):
+        cases = [
+            ('! git status', 'git'),
+            ("! c''url https://example.invalid", 'network'),
+            ('case x in x) git status;; esac', 'git'),
+            ("case x in x) c''url https://example.invalid;; esac", 'network'),
+            ("case x in x) python3 -m p''ip install pytest;; esac", 'package_install'),
+            ('2>/dev/null git status', 'git'),
+            ("2>/dev/null g''it status", 'git'),
+            ("2>/dev/null c''url https://example.invalid", 'network'),
+            ("2>/dev/null python3 -m p''ip install pytest", 'package_install'),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                self.assertIn(expected, state['violations'])
+                self.assertNotIn(command, repr(state))
+        for command in ['! echo git', 'case x in x) echo git;; esac', '2>/dev/null printf git']:
+            with self.subTest(command=command):
+                state = {'skills': {}, 'violations': set()}
+                observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
+                    'arguments': json.dumps({'command': command})})
+                self.assertEqual(state['violations'], set())
+
     def test_malformed_quoting_fails_closed_without_retaining_command(self):
         state = {'skills': {}, 'violations': set()}
         observe_tool_start(state, {'id': 'shell', 'name': 'run_command',
