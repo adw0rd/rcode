@@ -11,7 +11,7 @@ import time
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path[:0]=[str(ROOT/'evals'),str(ROOT/'evals/runtime')]
+sys.path[:0]=[str(ROOT),str(ROOT/'evals'),str(ROOT/'evals/runtime')]
 from host_docker import Docker,Failure
 from host_snapshot import extract_frozen
 
