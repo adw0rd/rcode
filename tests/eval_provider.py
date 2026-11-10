@@ -103,6 +103,7 @@ class FakeResponse:
 class FakeConnection:
     def __init__(self,raw=b'{}',status=200):
         self.response=FakeResponse(raw,status);self.sock=FakeSocket();self.requests=[];self.closed=False
+    def connect(self):pass
     def request(self,method,path,body=None,headers=None):
         self.requests.append((method,path,body,headers))
     def getresponse(self):return self.response
@@ -504,6 +505,46 @@ class LocalGatewayRegressionTests(unittest.TestCase):
             self.assertEqual(gateway.receipts[0]['response_model'],'upstream-local-model')
             self.assertEqual(seen,[None])
         finally:server.shutdown();server.server_close();thread.join()
+
+    def relay(self,connection,cancelled=None):
+        import host
+        profile={'base_url':'http://127.0.0.1:80/v1','model':'fixture','max_output_tokens':8,
+            'request_timeout_secs':1,'idle_timeout_secs':5}
+        with patch('host.http.client.HTTPConnection',return_value=connection):
+            gateway=host.Gateway(profile,{'max_steps':1,'max_requests':1},time.monotonic()+5)
+            status,value=gateway.relay({'model':'fixture','max_tokens':8,'stream':False},cancelled)
+        return gateway,status,value
+
+    def test_local_complete_body_after_request_deadline_is_not_received(self):
+        connection=FakeConnection(b'{"choices":[]}')
+        original=connection.response.read1;reads=0
+        def delayed_read(size):
+            nonlocal reads
+            reads+=1
+            if reads==1:time.sleep(1.1)
+            return original(size)
+        connection.response.read1=delayed_read
+        gateway,status,value=self.relay(connection)
+        self.assertEqual((status,value),(502,{'error':{'message':'eval selected endpoint request failed or incomplete'}}))
+        self.assertEqual(gateway.receipts[0]['status'],'failed_or_incomplete')
+        self.assertIsNone(gateway.receipts[0].get('http_status'))
+        self.assertTrue(connection.closed)
+
+    def test_local_cancellation_immediately_after_body_is_not_received(self):
+        import threading
+        cancelled=threading.Event();connection=FakeConnection(b'{"choices":[]}')
+        original=connection.response.read1;reads=0
+        def cancelling_read(size):
+            nonlocal reads
+            reads+=1
+            if reads==1:cancelled.set()
+            return original(size)
+        connection.response.read1=cancelling_read
+        gateway,status,value=self.relay(connection,cancelled)
+        self.assertEqual((status,value),(502,{'error':{'message':'eval selected endpoint request failed or incomplete'}}))
+        self.assertEqual(gateway.receipts[0]['status'],'cancelled_by_case')
+        self.assertIsNone(gateway.receipts[0].get('http_status'))
+        self.assertTrue(connection.closed)
 
 
 class HostProviderBoundaryTests(unittest.TestCase):

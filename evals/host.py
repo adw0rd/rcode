@@ -136,6 +136,8 @@ class Gateway:
                     if not chunk:break
                     raw.extend(chunk)
                     if len(raw)>4*1024*1024:raise Failure('response size')
+                if time.monotonic()>=exchange_deadline:raise Failure('response deadline')
+                if CONTROL.cancelled or (cancelled is not None and cancelled.is_set()):raise Failure('response cancelled')
                 value=strict(raw)
                 if not isinstance(value,dict):raise Failure('response shape')
                 # Never forward redirects, headers, cookies, or a second endpoint.
