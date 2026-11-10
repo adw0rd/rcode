@@ -83,11 +83,12 @@ class HostConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); path, spec = make_diagnostics(root)
             other = root/'other'; other.write_text('do not overwrite'); other.chmod(0o600)
+            replacement = root/'replacement'; replacement.touch(mode=0o600); replacement.chmod(0o600)
             path.unlink(); path.symlink_to(other)
             with self.assertRaises(Failure):
                 host.DiagnosticsWriter(spec)
             self.assertEqual(other.read_text(), 'do not overwrite')
-            path.unlink(); path.touch(mode=0o600); path.chmod(0o600)
+            path.unlink(); replacement.replace(path)
             with self.assertRaises(Failure):
                 host.DiagnosticsWriter(spec)
             current = path.stat()
