@@ -693,6 +693,51 @@ class HostTests(unittest.TestCase):
         self.assertEqual(len(result['snapshot_sha256']),64)
         self.assertFalse(self.docker.active or self.docker.volumes)
 
+    def test_diagnostics_sidecar_matches_policy_and_survives_cleanup(self):
+        import host
+        from unittest.mock import patch
+        fixture=self.root/'fixture';fixture.mkdir(mode=0o755)
+        (fixture/'value.txt').write_text('original')
+        temporary=self.root/'temporary';temporary.mkdir(mode=0o700)
+        diagnostics_path,spec=make_diagnostics(self.root)
+        writer=host.DiagnosticsWriter(spec)
+        profile={'base_url':'http://127.0.0.1:9/v1','model':'fixture','max_output_tokens':8,
+            'request_timeout_secs':5,'idle_timeout_secs':5}
+        item={'case':{'id':'diagnostics','language':'python','category':'fixture','timeout_secs':30,
+            'max_steps':2,'max_requests':2},'sha256':'f'*64,'fixture':str(fixture),'task':'fixture',
+            'oracle':{'prepare':[],'checks':[]}}
+        def phase(docker,_invocation,_item,volumes,gateway,deadline,**kwargs):
+            name=docker.create({'/fixture':fixture},deadline,volumes=volumes)
+            channel=docker.start(name,{'mode':'agent','uid':10001,'gid':10001,'timeout_secs':10,
+                'seed_project':True,'hold':True,'model':'fixture','profile_config':None,
+                'argv':['python3','-I','-S','-c',"from pathlib import Path;Path('value.txt').write_text('changed')"]},deadline)
+            try:
+                while True:
+                    done=channel.receive()
+                    if done['type']=='agent_done':break
+                docker.remove(name,deadline)
+                gateway.generations=1;gateway.attempts=1
+                gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+                host.observe_tool_start(kwargs['policy_state'],{'id':'pip','name':'run_command',
+                    'arguments':json.dumps({'command':'python3 -m pip install pytest'})},generation=1)
+                return {'done':done,'agent_reported_tool_successes':{},'session_id':None,
+                    'sentinel':False,'cancel_sent':False}
+            finally:channel.close()
+        with patch.object(host,'agent_phase',phase):
+            result=host.run_case(self.docker,{'effective_profile':profile},item,temporary,diagnostics=writer)
+        summary=writer.finish();raw=diagnostics_path.read_bytes()
+        self.assertEqual(result['formal_violations'],['package_install'])
+        self.assertEqual(result['status'],'failed')
+        self.assertTrue(summary['complete'])
+        self.assertEqual(summary['sha256'],hashlib.sha256(raw).hexdigest())
+        events=[json.loads(line) for line in raw.splitlines()]
+        self.assertEqual(len(events),summary['events'])
+        self.assertEqual(events[0]['command'],'python3 -m pip install pytest')
+        self.assertEqual(events[0]['generation'],1)
+        self.assertNotIn('pip install',json.dumps(result))
+        self.assertEqual((temporary/'diagnostics/value.txt').read_text(),'changed')
+        self.assertFalse(self.docker.active or self.docker.volumes)
+
     def test_real_sigint_during_cleanup_preserves_current_case_observations(self):
         import host,signal
         from unittest.mock import patch

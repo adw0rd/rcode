@@ -890,13 +890,9 @@ mod tests {
     fn diagnostics_target_is_new_private_and_identified() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("events.jsonl");
-        let target = super::diagnostics_target(
-            Some(&path),
-            &temp.path().join("report.json"),
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let target = super::diagnostics_target(Some(&path), &temp.path().join("report.json"), None)
+            .unwrap()
+            .unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert_eq!(metadata.len(), 0);
@@ -987,7 +983,8 @@ mod tests {
 
     #[test]
     fn diagnostics_summary_schema_is_strict_and_fail_closed() {
-        let complete = serde_json::json!({"complete":true,"sha256":"0".repeat(64),"events":0,"dropped":0});
+        let complete =
+            serde_json::json!({"complete":true,"sha256":"0".repeat(64),"events":0,"dropped":0});
         assert!(super::validate_diagnostics_summary(Some(&complete), 0).is_ok());
         let invalid = serde_json::json!({"complete":true,"sha256":null,"events":1,"dropped":0});
         assert!(super::validate_diagnostics_summary(Some(&invalid), 0).is_err());
