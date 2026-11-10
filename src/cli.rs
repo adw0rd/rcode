@@ -384,6 +384,11 @@ pub struct EvalRun {
         help = "Сохранить исходники кейсов в новый каталог для локального review"
     )]
     pub snapshots: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Сохранить formal violation receipts в новый local-only JSONL файл"
+    )]
+    pub diagnostics: Option<PathBuf>,
     #[arg(long)]
     pub agent_binary: PathBuf,
     #[arg(
@@ -507,6 +512,38 @@ mod agent_timeout_cli_tests {
             panic!("expected eval run")
         };
         assert_eq!(args.snapshots, Some(PathBuf::from("output")));
+    }
+
+    #[test]
+    fn eval_run_parses_diagnostics() {
+        let cli = Cli::try_parse_from([
+            "rcode",
+            "eval",
+            "run",
+            "--suite",
+            "suite",
+            "--report",
+            "report",
+            "--agent-binary",
+            "agent",
+            "--image",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "--docker-socket",
+            "socket",
+            "--series",
+            "series",
+            "--diagnostics",
+            "events.jsonl",
+        ])
+        .unwrap();
+        let Some(Command::Eval {
+            command: EvalCommand::Run(args),
+        }) = cli.command
+        else {
+            panic!("expected eval run")
+        };
+        assert_eq!(args.diagnostics, Some(PathBuf::from("events.jsonl")));
+        assert_eq!(args.snapshots, None);
     }
 
     #[test]
