@@ -12,6 +12,7 @@ from pathlib import Path
 import signal
 import ssl
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -35,6 +36,86 @@ def request_cancel(_signum=None,_frame=None):
     CONTROL.cancelled=True
 
 class AssessmentFailure(Failure):pass
+
+class DiagnosticsWriter:
+    def __init__(self,spec):
+        if not isinstance(spec,dict) or set(spec)!={'path','dev','ino'}:
+            raise Failure('diagnostics invocation')
+        if not isinstance(spec['path'],str) or type(spec['dev']) is not int or type(spec['ino']) is not int:
+            raise Failure('diagnostics invocation')
+        self.path=spec['path'];self.fd=None;self.poisoned=False
+        self.offset=0;self.events=0;self.dropped=0;self.sha256=hashlib.sha256()
+        flags=os.O_RDWR|os.O_APPEND|getattr(os,'O_NOFOLLOW',0)
+        try:
+            self.fd=os.open(self.path,flags)
+            value=os.fstat(self.fd)
+            valid=(stat.S_ISREG(value.st_mode) and value.st_dev==spec['dev']
+                and value.st_ino==spec['ino'] and value.st_nlink==1
+                and value.st_uid==os.geteuid() and stat.S_IMODE(value.st_mode)==0o600
+                and value.st_size==0)
+            if not valid:raise Failure('diagnostics identity')
+        except (Failure,OSError,ValueError):
+            if self.fd is not None:
+                try:os.close(self.fd)
+                except OSError:pass
+                self.fd=None
+            raise Failure('diagnostics open failed')
+
+    def summary(self):
+        if self.poisoned:
+            return {'complete':False,'sha256':None,'events':self.events,'dropped':self.dropped,
+                'error':'diagnostics_io_error'}
+        return {'complete':True,'sha256':self.sha256.hexdigest(),'events':self.events,'dropped':self.dropped}
+
+    def poison(self):
+        self.poisoned=True
+        if self.fd is None:return
+        try:os.ftruncate(self.fd,self.offset);os.fsync(self.fd)
+        except (OSError,TypeError,ValueError):pass
+
+    def commit(self,case,events,dropped):
+        if self.poisoned:return False
+        try:
+            raw=bytearray()
+            for event in events:
+                record={**event,'case':case}
+                raw.extend(json.dumps(record,ensure_ascii=True,allow_nan=False,
+                    separators=(',',':')).encode('utf-8')+b'\n')
+            view=memoryview(raw)
+            while view:
+                written=os.write(self.fd,view)
+                if written<=0:raise OSError('short diagnostics write')
+                view=view[written:]
+            os.fsync(self.fd)
+        except (OSError,TypeError,ValueError):
+            self.poison();return False
+        self.sha256.update(raw);self.offset+=len(raw)
+        self.events+=len(events);self.dropped+=dropped
+        return True
+
+    def finish(self):
+        if self.fd is None:return self.summary()
+        try:
+            if not self.poisoned:
+                os.fsync(self.fd);os.lseek(self.fd,0,os.SEEK_SET)
+                actual=hashlib.sha256();size=0;lines=0
+                while True:
+                    chunk=os.read(self.fd,65536)
+                    if not chunk:break
+                    actual.update(chunk);size+=len(chunk);lines+=chunk.count(b'\n')
+                if size!=self.offset or lines!=self.events or actual.digest()!=self.sha256.digest():
+                    raise Failure('diagnostics final digest')
+                os.close(self.fd);self.fd=None
+                directory=os.open(str(Path(self.path).parent),os.O_RDONLY|getattr(os,'O_DIRECTORY',0))
+                try:os.fsync(directory)
+                finally:os.close(directory)
+        except (Failure,OSError,ValueError):self.poison()
+        finally:
+            if self.fd is not None:
+                try:os.close(self.fd)
+                except OSError:pass
+                self.fd=None
+        return self.summary()
 
 def json_equal(a,b):
     if type(a) is not type(b):return False

@@ -14,9 +14,95 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'evals'),str(ROOT/'evals/runtime')]
 from host_docker import Docker,Failure
 from host_snapshot import extract_frozen
+import hashlib
+
+
+def make_diagnostics(root):
+    path = root / 'events.jsonl'
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    stat = path.stat()
+    return path, {'path': str(path), 'dev': stat.st_dev, 'ino': stat.st_ino}
 
 
 class HostConfigTests(unittest.TestCase):
+    def test_writer_commits_empty_and_exact_jsonl_digest(self):
+        import host
+        with tempfile.TemporaryDirectory() as temp:
+            path, spec = make_diagnostics(Path(temp))
+            writer = host.DiagnosticsWriter(spec)
+            self.assertTrue(writer.commit('case-1', [], 0))
+            summary = writer.finish()
+            self.assertEqual(summary, {'complete': True, 'sha256': hashlib.sha256(b'').hexdigest(),
+                'events': 0, 'dropped': 0})
+            self.assertEqual(path.read_bytes(), b'')
+
+    def test_writer_escapes_line_and_terminal_controls(self):
+        import host
+        with tempfile.TemporaryDirectory() as temp:
+            path, spec = make_diagnostics(Path(temp))
+            writer = host.DiagnosticsWriter(spec)
+            command = 'pip install #\u2028\x1b[31m'
+            event = {'version': 1, 'generation': 1, 'category': 'package_install', 'tool': 'run_command',
+                'call_id': 'a', 'call_id_truncated': False, 'command': command, 'command_truncated': False}
+            self.assertTrue(writer.commit('controls', [event], 0))
+            self.assertTrue(writer.finish()['complete'])
+            raw = path.read_bytes()
+            self.assertNotIn(b'\x1b', raw)
+            self.assertNotIn('\u2028'.encode('utf-8'), raw)
+            self.assertEqual(json.loads(raw)['command'], command)
+
+    def test_writer_rolls_back_partial_case_and_poisons_summary(self):
+        import host
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            path, spec = make_diagnostics(Path(temp))
+            writer = host.DiagnosticsWriter(spec)
+            event = {'version': 1, 'generation': 1, 'category': 'git', 'tool': 'run_command', 'call_id': 'a',
+                'call_id_truncated': False, 'command': 'git status', 'command_truncated': False}
+            self.assertTrue(writer.commit('first', [event], 0))
+            original = host.os.write
+            def partial(fd, data):
+                original(fd, bytes(data[:max(1, len(data)//2)]))
+                raise OSError('synthetic /secret/path/events.jsonl')
+            with patch.object(host.os, 'write', side_effect=partial):
+                self.assertFalse(writer.commit('second', [event], 0))
+            summary = writer.finish()
+            self.assertFalse(summary['complete'])
+            self.assertIsNone(summary['sha256'])
+            self.assertEqual(summary['error'], 'diagnostics_io_error')
+            self.assertEqual(summary['events'], 1)
+            lines = path.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])['case'], 'first')
+            self.assertNotIn('/secret/path', json.dumps(summary))
+
+    def test_writer_rejects_path_substitution_and_wrong_identity(self):
+        import host
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); path, spec = make_diagnostics(root)
+            other = root/'other'; other.write_text('do not overwrite'); other.chmod(0o600)
+            path.unlink(); path.symlink_to(other)
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            self.assertEqual(other.read_text(), 'do not overwrite')
+            path.unlink(); path.touch(mode=0o600); path.chmod(0o600)
+            os.link(path, root/'hardlink')
+            spec['dev'] = path.stat().st_dev; spec['ino'] = path.stat().st_ino
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            (root/'hardlink').unlink(); path.chmod(0o644)
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            path.chmod(0o600); path.write_text('nonempty')
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            path.write_text('')
+            with patch.object(host.os, 'geteuid', return_value=os.geteuid() + 1):
+                with self.assertRaises(Failure):
+                    host.DiagnosticsWriter(spec)
+
     def test_gigachat_model_config_uses_native_loopback_provider(self):
         import host
         profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS',
