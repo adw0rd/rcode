@@ -156,6 +156,27 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(code,1)
         self.assertEqual(report['cleanup'],'confirmed_absent')
 
+    def test_gigachat_failure_receipt_has_safe_operation_status_and_category(self):
+        import host
+        from unittest.mock import patch
+        class Exchange:
+            operation=None;status=None
+            def __call__(self,operation,_authorization,_body):
+                self.operation=operation;self.status=401
+                return 401,{'error':'synthetic-response-body'}
+        exchange=Exchange()
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS',
+            'stream':False,'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5}
+        with patch.object(host,'HttpsExchange',return_value=exchange):
+            gateway=host.Gateway(profile,{'max_steps':1,'max_requests':1},time.monotonic()+5,'Basic synthetic-key')
+            status,_value=gateway.relay({'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False,'messages':[]})
+        self.assertEqual(status,502)
+        receipt=gateway.receipts[0]
+        self.assertEqual(receipt['failure'],'oauth response')
+        self.assertEqual(receipt['upstream_operation'],'oauth')
+        self.assertEqual(receipt['http_status'],401)
+        self.assertNotIn('synthetic-response-body',json.dumps(receipt))
+
     def receipt_phase(self,events,state,resume_id=None):
         import host
         from unittest.mock import patch

@@ -156,6 +156,7 @@ def openai_response(value,function_states=None):
 class HttpsExchange:
     def __init__(self,deadline,request_timeout,idle_timeout,parse):
         self.deadline=deadline;self.request_timeout=request_timeout;self.idle_timeout=idle_timeout;self.parse=parse;self.cancelled=None
+        self.operation=None;self.status=None
 
     def __call__(self,operation,authorization,body,cancelled=None):
         def is_cancelled():
@@ -164,6 +165,7 @@ class HttpsExchange:
                 if source.is_set() if hasattr(source,'is_set') else source():return True
             return False
         connection=None;response=None;watcher=None;transport=[];stop_watch=threading.Event()
+        self.operation=operation;self.status=None
         try:
             if operation=='oauth':
                 host='ngw.devices.sberbank.ru';port=9443;path='/api/v2/oauth';content_type='application/x-www-form-urlencoded'
@@ -192,7 +194,7 @@ class HttpsExchange:
             if operation=='oauth':headers['RqUID']=str(uuid.uuid4())
             connection.request('POST',path,body=payload,headers=headers)
             if connection.sock:transport.append(connection.sock)
-            response=connection.getresponse();raw=bytearray()
+            response=connection.getresponse();self.status=response.status;raw=bytearray()
             while True:
                 remaining=min(self.deadline,exchange_deadline)-time.monotonic()
                 if remaining<=0:raise Failure('upstream deadline/size')
