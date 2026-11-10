@@ -189,6 +189,15 @@ class HttpsExchangeTests(unittest.TestCase):
                     self.assertEqual(str(caught.exception),message)
                     self.assertEqual(connection.closed,operation!='other')
 
+    def test_non_json_error_status_is_preserved_without_forwarding_the_body(self):
+        for raw,status in [(b'',429),(b'rate limited',400)]:
+            with self.subTest(status=status):
+                connection=FakeConnection(raw,status)
+                for _constructor,_context,transport in self.exchange(connection):
+                    actual,value=transport('chat','Bearer fixture',{'stream':False})
+                    self.assertEqual(actual,status)
+                    self.assertEqual(value,{})
+
     def test_non_finite_chat_json_is_a_fixed_exchange_failure(self):
         connection=FakeConnection()
         for _constructor,_context,transport in self.exchange(connection):

@@ -206,7 +206,10 @@ class HttpsExchange:
             if time.monotonic()>=exchange_deadline:raise Failure('upstream deadline/size')
             if is_cancelled():raise Failure('upstream cancelled')
             if 300<=response.status<400:raise Failure('upstream redirect')
-            value=self.parse(bytes(raw),4*1024*1024)
+            try:value=self.parse(bytes(raw),4*1024*1024)
+            except ValueError:
+                if 200<=response.status<300:raise
+                value={}
             if not isinstance(value,dict):raise Failure('upstream response shape')
             return response.status,value
         except (OSError,ValueError,http.client.HTTPException):
