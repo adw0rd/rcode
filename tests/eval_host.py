@@ -524,6 +524,36 @@ class HostTests(unittest.TestCase):
             with self.assertRaises(Failure):self.docker.remove(name,deadline)
             self.assertIn(name,self.docker.active)
         finally:self.docker.checked=checked
+    def test_persistent_snapshot_survives_case_and_matches_oracle(self):
+        import host
+        from unittest.mock import patch
+        fixture=self.root/'fixture';fixture.mkdir(mode=0o755);(fixture/'value.txt').write_text('original')
+        snapshots=self.root/'snapshots';snapshots.mkdir(mode=0o700)
+        temporary=self.root/'temporary';temporary.mkdir(mode=0o700)
+        profile={'base_url':'http://127.0.0.1:9/v1','model':'fixture','max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5}
+        item={'case':{'id':'persistent','language':'python','category':'fixture','timeout_secs':30,'max_steps':2,'max_requests':2},'sha256':'f'*64,'fixture':str(fixture),'task':'fixture',
+            'oracle':{'prepare':[],'checks':[{'id':'value','argv':['python3','-I','-S','-c',"print(open('value.txt').read())"],'stdin':'','timeout_secs':3,'expected_exit':0,'expected_stdout':'changed\n'}]}}
+        def phase(docker,_invocation,_item,volumes,gateway,deadline,**_kwargs):
+            name=docker.create({'/fixture':fixture},deadline,volumes=volumes)
+            channel=docker.start(name,{'mode':'agent','uid':10001,'gid':10001,'timeout_secs':10,'seed_project':True,'hold':True,'model':'fixture','profile_config':None,
+                'argv':['python3','-I','-S','-c',"from pathlib import Path;Path('value.txt').write_text('changed')"]},deadline)
+            try:
+                while True:
+                    done=channel.receive()
+                    if done['type']=='agent_done':break
+                docker.remove(name,deadline)
+                gateway.generations=1;gateway.attempts=1
+                gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+                return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+            finally:channel.close()
+        with patch.object(host,'agent_phase',phase):
+            result=host.run_case(self.docker,{'effective_profile':profile,'snapshots':str(snapshots)},item,temporary)
+        self.assertEqual(result['status'],'passed')
+        self.assertEqual((snapshots/'persistent/value.txt').read_text(),'changed')
+        self.assertEqual((fixture/'value.txt').read_text(),'original')
+        self.assertEqual(len(result['snapshot_sha256']),64)
+        self.assertFalse(self.docker.active or self.docker.volumes)
+
     def test_real_sigint_during_cleanup_preserves_current_case_observations(self):
         import host,signal
         from unittest.mock import patch

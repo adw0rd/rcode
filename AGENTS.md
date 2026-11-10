@@ -46,6 +46,7 @@
 
 - Проверка TODO fixtures без сети и модели: `rcode eval validate --suite evals/todo-api/manifest.json`. Отчёты protocol 2 несовместимы с protocol 1.
 - Docker controls требуют явные `RCODE_EVAL_DOCKER=/absolute/docker`, `RCODE_EVAL_SOCKET=/absolute/docker.sock` и полный `RCODE_EVAL_IMAGE=sha256:…`: `python3 tests/eval_todo_controls.py`, затем `python3 tests/eval_controls.py` без `RCODE_EVAL_CASES` для всех 30 кейсов. Те же env включают `tests/eval_runtime.py` и `tests/eval_host.py`; без env Docker-пропуски не считаются Docker-проверкой. Controls не выполняют inference и не являются результатами модели.
+- `--snapshots <новый-каталог>` сохраняет только `/workspace` каждого кейса для локального review через тот же `extract_frozen`, что и oracle. Существующий путь отклоняется; snapshots не входят в comparison key, не публикуются автоматически и не содержат `/agent-home` или credentials.
 - Настоящий GigaChat key разрешается получать только через `ConfigStore::credential_for` и передавать доверенному host runner через stdin; OAuth token живёт только в host relay. Они никогда не попадают в container argv/env/config/mount/logs/report; контейнер получает только placeholder `eval-placeholder-key`. Разрешены только официальные GigaChat endpoints, проверку TLS отключать нельзя.
 
 ## Принципы реализации
