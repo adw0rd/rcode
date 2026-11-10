@@ -84,6 +84,35 @@ fn validate_reads_a_suite_without_credentials_or_running_oracle_commands() {
         "invalid configuration must not be read by validate"
     );
 }
+
+#[test]
+fn validate_reports_missing_task_oracle_and_project_paths() {
+    for missing in [
+        "cases/py-add/task.md",
+        "oracles/py-add.json",
+        "cases/py-add/project",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let path = suite(root.path());
+        if missing.ends_with("/project") {
+            fs::remove_dir_all(root.path().join(missing)).unwrap();
+        } else {
+            fs::remove_file(root.path().join(missing)).unwrap();
+        }
+        let out = run(&home, &["validate", "--suite", path.to_str().unwrap()]);
+        assert!(!out.status.success());
+        let values = events(&out);
+        let error = values.iter().find(|v| v["type"] == "error").unwrap();
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains(missing),
+            "missing path {missing} was not reported: {message}"
+        );
+    }
+}
+
 #[test]
 fn validate_rejects_unknown_versions_and_unknown_fields() {
     let root = tempfile::tempdir().unwrap();
@@ -101,6 +130,31 @@ fn validate_rejects_unknown_versions_and_unknown_fields() {
         assert!(events(&out).iter().any(|v| v["type"] == "error"));
     }
 }
+#[test]
+fn validate_accepts_unique_skill_ids_and_rejects_duplicates() {
+    let root = tempfile::tempdir().unwrap();
+    let path = suite(root.path());
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["cases"][0]["require_skills"] = json!([
+        "superpowers:using-superpowers",
+        "superpowers:test-driven-development"
+    ]);
+    fs::write(&path, value.to_string()).unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let valid = run(&home, &["validate", "--suite", path.to_str().unwrap()]);
+    assert!(
+        valid.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&valid.stdout),
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    value["cases"][0]["require_skills"] = json!(["superpowers:x", "superpowers:x"]);
+    fs::write(&path, value.to_string()).unwrap();
+    let invalid = run(&home, &["validate", "--suite", path.to_str().unwrap()]);
+    assert!(!invalid.status.success());
+}
+
 #[cfg(unix)]
 #[test]
 fn validate_rejects_symlinked_project_files() {
@@ -289,6 +343,83 @@ fn compare_rejects_an_incomplete_key_even_when_both_reports_match() {
     assert!(!out.status.success());
 }
 
+#[test]
+fn compare_requires_protocol_two_and_validates_budget_skill_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let mut key = comparison_key();
+    key["protocol"] = json!(2);
+    key["case_budgets"][0]["require_skills"] = json!([
+        "superpowers:using-superpowers",
+        "superpowers:test-driven-development"
+    ]);
+    let mut report = json!({"version":1,"comparison_key":key,"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let valid = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stdout)
+    );
+
+    let mut invalid_keys = Vec::new();
+    let mut invalid = report["comparison_key"].clone();
+    invalid["protocol"] = json!(1);
+    invalid_keys.push(invalid);
+    let mut invalid = report["comparison_key"].clone();
+    invalid["case_budgets"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("require_skills");
+    invalid_keys.push(invalid);
+    let mut invalid = report["comparison_key"].clone();
+    invalid["case_budgets"][0]["unexpected"] = json!(true);
+    invalid_keys.push(invalid);
+    for skills in [
+        json!(["superpowers:x", "superpowers:x"]),
+        json!(["superpowers:"]),
+        json!([":using-superpowers"]),
+        json!(["superpowers::x"]),
+        json!(["superpowers:x y"]),
+        json!(["superpowers:é"]),
+        json!([format!("superpowers:{}", "x".repeat(117))]),
+        json!([42]),
+        json!("superpowers:x"),
+    ] {
+        let mut invalid = report["comparison_key"].clone();
+        invalid["case_budgets"][0]["require_skills"] = skills;
+        invalid_keys.push(invalid);
+    }
+    for key in invalid_keys {
+        report["comparison_key"] = key;
+        fs::write(&path, report.to_string()).unwrap();
+        let out = run(
+            root.path(),
+            &[
+                "compare",
+                "--baseline",
+                path.to_str().unwrap(),
+                "--candidate",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "invalid comparison key was trusted: {}",
+            report["comparison_key"]
+        );
+    }
+}
+
 fn comparison_key() -> Value {
     let selected = rcode::local::profile_settings(
         "fixture",
@@ -300,15 +431,141 @@ fn comparison_key() -> Value {
     effective.stream = false;
     let helpers: serde_json::Map<String, Value> = [
         "host.py",
+        "host_provider.py",
         "host_docker.py",
         "host_snapshot.py",
+        "policy.py",
         "runtime.py",
         "runtime_http.py",
     ]
     .into_iter()
     .map(|k| (k.to_owned(), json!("c".repeat(64))))
     .collect();
-    json!({"suite_sha256":"a".repeat(64),"selected_profile":selected,"effective_profile":effective,"image":format!("sha256:{}","d".repeat(64)),"helpers":helpers,"case_budgets":[{"id":"a","sha256":"b".repeat(64),"max_steps":12,"max_requests":24,"timeout_secs":300}],"protocol":1,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"})
+    json!({"suite_sha256":"a".repeat(64),"selected_profile":selected,"effective_profile":effective,"image":format!("sha256:{}","d".repeat(64)),"helpers":helpers,"case_budgets":[{"id":"a","sha256":"b".repeat(64),"max_steps":12,"max_requests":24,"timeout_secs":300,"require_skills":["superpowers:using-superpowers","superpowers:test-driven-development"]}],"protocol":2,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"})
+}
+
+#[test]
+fn compare_accepts_official_gigachat_and_rejects_unsafe_profile_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let mut key = comparison_key();
+    let mut selected = rcode::config::ProviderSettings::new(rcode::config::ProviderKind::GigaChat);
+    selected.model = "GigaChat-3-Ultra".into();
+    selected.base_url = None;
+    selected.auth_url = Some("https://ngw.devices.sberbank.ru:9443/api/v2/oauth".into());
+    let mut effective = selected.clone();
+    effective.stream = false;
+    key["selected_profile"] = json!(selected);
+    key["effective_profile"] = json!(effective);
+    let secret = "eval-synthetic-secret-7f4c9a";
+    assert!(!key.to_string().contains(secret));
+    let mut report = json!({"version":1,"comparison_key":key,"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let valid = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stdout)
+    );
+
+    let mut invalid_keys = Vec::new();
+    for (field, value) in [
+        ("base_url", json!("https://example.com/v1")),
+        ("auth_url", json!("https://example.com/oauth")),
+        ("ca_file", json!("custom-ca.pem")),
+        ("credential", json!(secret)),
+        ("token", json!(secret)),
+    ] {
+        let mut invalid = report["comparison_key"].clone();
+        invalid["selected_profile"][field] = value.clone();
+        invalid["effective_profile"][field] = value;
+        invalid_keys.push(invalid);
+    }
+    let mut invalid = report["comparison_key"].clone();
+    invalid["effective_profile"]["stream"] = json!(true);
+    invalid_keys.push(invalid);
+    for key in invalid_keys {
+        report["comparison_key"] = key;
+        fs::write(&path, report.to_string()).unwrap();
+        let out = run(
+            root.path(),
+            &[
+                "compare",
+                "--baseline",
+                path.to_str().unwrap(),
+                "--candidate",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(secret));
+    }
+}
+
+const VALIDATION_SECRET: &str = "eval-validation-secret-51c8e2";
+
+fn assert_key_rejected_without_secret(key: Value) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let report = json!({"version":1,"comparison_key":key,"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let out = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(!out.status.success(), "malformed comparison key accepted");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(VALIDATION_SECRET));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(VALIDATION_SECRET));
+}
+
+#[test]
+fn compare_rejects_unknown_nested_local_fields_without_publishing_values() {
+    for field in ["credential", "token"] {
+        let mut key = comparison_key();
+        key["selected_profile"]["local"][field] = json!(VALIDATION_SECRET);
+        key["effective_profile"]["local"][field] = json!(VALIDATION_SECRET);
+        assert_key_rejected_without_secret(key);
+    }
+}
+
+#[test]
+fn compare_does_not_publish_malformed_kind() {
+    let mut key = comparison_key();
+    key["selected_profile"]["kind"] = json!(VALIDATION_SECRET);
+    key["effective_profile"]["kind"] = json!(VALIDATION_SECRET);
+    assert_key_rejected_without_secret(key);
+}
+
+#[test]
+fn compare_does_not_publish_malformed_effort() {
+    let mut key = comparison_key();
+    key["selected_profile"]["effort"] = json!(VALIDATION_SECRET);
+    key["effective_profile"]["effort"] = json!(VALIDATION_SECRET);
+    assert_key_rejected_without_secret(key);
+}
+
+#[test]
+fn compare_does_not_publish_malformed_local_runtime() {
+    let mut key = comparison_key();
+    key["selected_profile"]["local"]["runtime"] = json!(VALIDATION_SECRET);
+    key["effective_profile"]["local"]["runtime"] = json!(VALIDATION_SECRET);
+    assert_key_rejected_without_secret(key);
 }
 
 #[test]
@@ -384,10 +641,89 @@ fn isolation_fixture() -> Value {
 }
 fn passed_fixture() -> Value {
     json!({"id":"a","case_sha256":"b".repeat(64),"status":"passed","cleanup":"confirmed_absent","generations":1,"request_attempts":1,"seconds":1.0,"operator_cancelled":false,"tool_requirement_observed":true,
+        "required_skills":["superpowers:using-superpowers","superpowers:test-driven-development"],"required_skills_observed":true,"formal_violations":[],
         "agent":{"type":"agent_done","exit_code":0,"signal":null,"leader_reaped":true,"pipes_complete":true,"timed_out":false,"cancelled":false,"truncated":false,"forced":false,"log_sha256":"f".repeat(64),"log_bytes":100},
         "checks":[{"id":"check","passed":true,"exit_code":0,"signal":null,"timed_out":false,"truncated":false,"prepare_failed":false,"stdout_sha256":"c".repeat(64)}],
         "requests":[{"generation":1,"status":"received","http_status":200,"usage":null}]})
 }
+
+#[test]
+fn compare_requires_exact_policy_receipts_for_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("report.json");
+    let report = json!({"version":1,"comparison_key":comparison_key(),"artifact":artifact_fixture(),"isolation":isolation_fixture(),"cleanup":"confirmed_absent","counts":{"passed":1,"failed":0,"blocked":0,"unknown":0,"not_run":0},"cases":[passed_fixture()]});
+    fs::write(&path, report.to_string()).unwrap();
+    let valid = run(
+        root.path(),
+        &[
+            "compare",
+            "--baseline",
+            path.to_str().unwrap(),
+            "--candidate",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        valid.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&valid.stdout),
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert_eq!(
+        report["comparison_key"]["helpers"]
+            .as_object()
+            .unwrap()
+            .len(),
+        7
+    );
+    let mut variants = Vec::new();
+    for field in [
+        "required_skills",
+        "required_skills_observed",
+        "formal_violations",
+    ] {
+        let mut changed = report.clone();
+        changed["cases"][0].as_object_mut().unwrap().remove(field);
+        variants.push(changed);
+    }
+    for (field, value) in [
+        ("required_skills", Value::Null),
+        ("required_skills_observed", json!(1)),
+        ("required_skills_observed", json!(false)),
+        ("formal_violations", json!({})),
+        ("formal_violations", json!(["git"])),
+        ("required_skills", json!(["superpowers:using-superpowers"])),
+        (
+            "required_skills",
+            json!([
+                "superpowers:test-driven-development",
+                "superpowers:using-superpowers"
+            ]),
+        ),
+    ] {
+        let mut changed = report.clone();
+        changed["cases"][0][field] = value;
+        variants.push(changed);
+    }
+    for changed in variants {
+        fs::write(&path, changed.to_string()).unwrap();
+        let out = run(
+            root.path(),
+            &[
+                "compare",
+                "--baseline",
+                path.to_str().unwrap(),
+                "--candidate",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "invalid policy PASS was trusted: {changed}"
+        );
+    }
+}
+
 #[test]
 fn compare_rejects_pass_without_isolation_binary_identity_or_positive_evidence() {
     let root = tempfile::tempdir().unwrap();

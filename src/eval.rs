@@ -1,6 +1,7 @@
 //! Explicit eval CLI. No provider/settings/process setup on metadata-only paths.
 mod json;
 mod manifest;
+mod profile;
 mod runner;
 use crate::{
     app::Events,

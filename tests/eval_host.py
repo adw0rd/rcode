@@ -11,10 +11,231 @@ import time
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path[:0]=[str(ROOT/'evals'),str(ROOT/'evals/runtime')]
+sys.path[:0]=[str(ROOT),str(ROOT/'evals'),str(ROOT/'evals/runtime')]
 from host_docker import Docker,Failure
 from host_snapshot import extract_frozen
 
+
+class HostConfigTests(unittest.TestCase):
+    def test_gigachat_model_config_uses_native_loopback_provider(self):
+        import host
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS',
+            'auth_url':'https://ngw.devices.sberbank.ru:9443/api/v2/oauth','folder_id':None,
+            'base_url':'https://api.giga.chat/v1','ca_file':'/host/only/ca.pem','stream':True,
+            'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5,'local':None}
+        expected={'version':1,'active':'gigachat','providers':{'gigachat':{**profile,
+            'base_url':'http://127.0.0.1:18080/v1','auth_url':'http://127.0.0.1:18080/api/v2/oauth',
+            'ca_file':None,'stream':False}},'local':{'active':None,'profiles':{}}}
+        config=host.model_config(profile)
+        self.assertEqual(config,expected)
+        self.assertNotIn('provider_credential',config)
+        self.assertNotIn('eval-placeholder-key',json.dumps(config))
+
+    def test_local_model_config_remains_credential_free(self):
+        import host
+        profile={'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1',
+            'local':{'profile':'eval','key_required':False}}
+        config=host.model_config(profile)
+        self.assertEqual(config['active'],'local')
+        self.assertEqual(config['providers'],{})
+        self.assertEqual(config['local']['active'],'eval')
+        self.assertFalse(config['local']['profiles']['eval']['local']['key_required'])
+        self.assertNotIn('profile_credential',config)
+
+    def test_native_gigachat_request_and_response_are_not_converted_twice(self):
+        import host
+        from unittest.mock import patch
+        responses=[(200,{'access_token':'host-token','expires_at':4_000_000_000}),
+            (200,{'model':'GigaChat-3-Ultra','choices':[{'message':{'role':'assistant','content':'',
+                'function_call':{'name':'read_file','arguments':{'path':'a.rs'}},
+                'functions_state_id':'state-2'},'finish_reason':'function_call'}]})]
+        calls=[]
+        def exchange(operation,authorization,body):
+            calls.append((operation,authorization,body))
+            return responses.pop(0)
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS','stream':False,
+            'max_output_tokens':8,'request_timeout_secs':5,'idle_timeout_secs':5}
+        body={'model':'GigaChat-3-Ultra','max_tokens':8,'stream':False,
+            'functions':[{'name':'read_file','description':'Read','parameters':{'type':'object'}}],
+            'function_call':'auto','messages':[{'role':'user','content':'read'},
+                {'role':'assistant','content':'','function_call':{'name':'read_file','arguments':{'path':'a.rs'}},
+                    'functions_state_id':'state-1'},
+                {'role':'function','name':'read_file','content':'{"ok":true}'}]}
+        with patch.object(host,'HttpsExchange',return_value=exchange):
+            gateway=host.Gateway(profile,{'max_steps':1,'max_requests':1},time.monotonic()+5,'Basic synthetic-key')
+            status,value=gateway.relay(body)
+        self.assertEqual(status,200)
+        self.assertIs(calls[1][2],body)
+        self.assertEqual(value['choices'][0]['message']['functions_state_id'],'state-2')
+        self.assertIn('function_call',value['choices'][0]['message'])
+        self.assertNotIn('tool_calls',value['choices'][0]['message'])
+        self.assertEqual(gateway.receipts[0]['requested_tool_names'],{'read_file':1})
+
+    def test_gigachat_agent_bootstrap_uses_provider_and_placeholder_only(self):
+        import host
+        from unittest.mock import patch
+        captured=[]
+        class Channel:
+            def receive(self,timeout=None):return {'type':'agent_done','exit_code':0}
+            def send(self,_value):pass
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def create(self,*_args,**_kwargs):return 'agent'
+            def start(self,_name,bootstrap,_deadline):captured.append(bootstrap);return Channel()
+            def remove(self,*_args):pass
+        class Pump:
+            def __init__(self,_gateway):pass
+            def deliver(self,_channel):pass
+            def close(self):pass
+        profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS','stream':False}
+        invocation={'binary':'/unused/rcode','effective_profile':profile,'provider_credential':'Basic synthetic-real-key'}
+        item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
+        with patch.object(host,'RequestPump',Pump):
+            host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5)
+        bootstrap=captured[0]
+        self.assertIn('--provider',bootstrap['argv'])
+        self.assertEqual(bootstrap['argv'][bootstrap['argv'].index('--provider')+1],'gigachat')
+        self.assertNotIn('--profile',bootstrap['argv'])
+        self.assertEqual(bootstrap['profile_credential'],'eval-placeholder-key')
+        self.assertNotIn('synthetic-real-key',json.dumps(bootstrap))
+        self.assertNotIn('skills_config',bootstrap)
+
+    def test_agent_bootstrap_adds_linked_config_for_required_skills(self):
+        import host
+        from unittest.mock import patch
+        captured=[]
+        class Channel:
+            def receive(self,timeout=None):return {'type':'agent_done','exit_code':0}
+            def send(self,_value):pass
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def create(self,*_args,**_kwargs):return 'agent'
+            def start(self,_name,bootstrap,_deadline):captured.append(bootstrap);return Channel()
+            def remove(self,*_args):pass
+        class Pump:
+            def __init__(self,_gateway):pass
+            def deliver(self,_channel):pass
+            def close(self):pass
+        profile={'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}
+        invocation={'binary':'/unused/rcode','effective_profile':profile}
+        item={'case':{'max_steps':1,'require_skills':['superpowers:using-superpowers',
+            'superpowers:test-driven-development','superpowers:verification-before-completion']},
+            'fixture':'/unused/fixture','task':'fixture'}
+        with patch.object(host,'RequestPump',Pump):
+            host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5)
+        self.assertEqual(captured[0].get('skills_config'),{'version':1,'linked':{'superpowers':{
+            'path':'/workspace/skill-sources/superpowers'}}})
+
+    def receipt_phase(self,events,state,resume_id=None):
+        import host
+        from unittest.mock import patch
+        class Channel:
+            def __init__(self,frames):self.frames=list(frames)
+            def receive(self,timeout=None):return self.frames.pop(0)
+            def send(self,_value):pass
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def create(self,*_args,**_kwargs):return 'agent'
+            def start(self,_name,_bootstrap,_deadline):
+                raw=b''.join(json.dumps(event).encode()+b'\n' for event in events)
+                return Channel([{'type':'agent_log','channel':'stdout','data':base64.b64encode(raw).decode()},
+                    {'type':'agent_done','exit_code':0}])
+            def remove(self,*_args):pass
+        class Pump:
+            def __init__(self,_gateway):pass
+            def deliver(self,_channel):pass
+            def close(self):pass
+        invocation={'binary':'/unused/rcode','effective_profile':{'kind':'local','model':'fixture','local':{}}}
+        item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
+        with patch.object(host,'RequestPump',Pump):
+            return host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5,
+                resume_id=resume_id,resume_prompt='continue' if resume_id else None,policy_state=state)
+
+    def test_agent_phase_observes_start_and_every_result(self):
+        from evals.policy import required_skills_met
+        state={'skills':{},'violations':set()};skill='superpowers:test-driven-development'
+        self.receipt_phase([
+            {'type':'tool_start','id':'shell','name':'run_command','arguments':'{"command":"git status"}'},
+            {'type':'tool_result','id':'shell','name':'run_command','is_error':True},
+            {'type':'tool_start','id':'call-1','name':'load_skill','arguments':json.dumps({'name':skill})},
+            {'type':'tool_result','id':'call-1','name':'load_skill','is_error':False}],state)
+        self.assertEqual(state['violations'],{'git'})
+        self.assertTrue(required_skills_met(state,[skill]))
+
+    def test_agent_phase_preserves_policy_state_across_resume(self):
+        from evals.policy import required_skills_met
+        state={'skills':{},'violations':set()};skill='superpowers:test-driven-development'
+        self.receipt_phase([{'type':'tool_start','id':'call-1','name':'load_skill',
+            'arguments':json.dumps({'name':skill})}],state)
+        self.assertFalse(required_skills_met(state,[skill]))
+        self.receipt_phase([{'type':'tool_result','id':'call-1','name':'load_skill','is_error':False}],
+            state,resume_id='00000000-0000-0000-0000-000000000001')
+        self.assertTrue(required_skills_met(state,[skill]))
+
+    def test_run_case_reports_policy_fields_and_exact_failure_reasons(self):
+        import host
+        from unittest.mock import patch
+        from evals.policy import observe_tool_start,observe_tool_result
+        skill='superpowers:test-driven-development'
+        class Channel:
+            def receive(self,timeout=None):return {'type':'storage_ready'}
+            def close(self):pass
+        class FakeDocker:
+            uid=10001;cleanup_deadline=None
+            def volume(self,_size,_deadline):return 'volume'
+            def create(self,*_args,**_kwargs):return 'container'
+            def start(self,*_args,**_kwargs):return Channel()
+            def archive(self,*_args):return b''
+            def remove(self,*_args):pass
+            def cleanup(self,*_args):pass
+        done={'type':'agent_done','exit_code':0,'signal':None,'leader_reaped':True,'pipes_complete':True,
+            'timed_out':False,'cancelled':False,'truncated':False,'forced':False}
+        def run(policy):
+            def phase(_docker,_invocation,_item,_volumes,gateway,_deadline,**kwargs):
+                gateway.generations=1;gateway.attempts=1
+                gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+                state=kwargs['policy_state']
+                if policy=='violation':
+                    observe_tool_start(state,{'id':'shell','name':'run_command','arguments':'{"command":"git status synthetic-receipt-secret"}'})
+                    observe_tool_result(state,{'id':'shell','name':'run_command','is_error':True})
+                if policy in ('skill','replay'):
+                    observe_tool_start(state,{'id':'call-1','name':'load_skill','arguments':json.dumps({'name':skill})})
+                    observe_tool_result(state,{'id':'call-1','name':'load_skill','is_error':False})
+                if policy=='replay':
+                    observe_tool_start(state,{'id':'call-1','name':'load_skill','arguments':json.dumps({'name':'superpowers:using-superpowers'})})
+                return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+            required='superpowers:using-superpowers' if policy=='replay' else skill
+            case={'id':'policy-'+policy,'language':'python','category':'fixture','timeout_secs':30,
+                'max_steps':2,'max_requests':2,'require_skills':[required]}
+            item={'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture','oracle':{'prepare':[],'checks':[]}}
+            invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}}
+            with tempfile.TemporaryDirectory() as temp,patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64):
+                return host.run_case(FakeDocker(),invocation,item,Path(temp))
+        violation=run('violation')
+        self.assertEqual(violation['status'],'failed')
+        self.assertEqual(violation['reason'],'formal task constraints violated')
+        self.assertEqual(violation['formal_violations'],['git'])
+        self.assertNotIn('synthetic-receipt-secret',json.dumps(violation))
+        missing=run('missing')
+        self.assertEqual(missing['status'],'failed')
+        self.assertEqual(missing['reason'],'required skills were not observed')
+        self.assertFalse(missing['required_skills_observed'])
+        replay=run('replay')
+        self.assertEqual(replay['status'],'failed')
+        self.assertEqual(replay['reason'],'required skills were not observed')
+        self.assertFalse(replay['required_skills_observed'])
+        passed=run('skill')
+        self.assertEqual(passed['status'],'passed')
+        self.assertEqual(passed['required_skills'],[skill])
+        self.assertTrue(passed['required_skills_observed'])
+        self.assertEqual(passed['formal_violations'],[])
+
+
+@unittest.skipUnless(all(os.environ.get(name) for name in ('RCODE_EVAL_DOCKER','RCODE_EVAL_SOCKET','RCODE_EVAL_IMAGE')),
+    'RCODE_EVAL_DOCKER, RCODE_EVAL_SOCKET and RCODE_EVAL_IMAGE are required for opt-in Docker host tests')
 class HostTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)

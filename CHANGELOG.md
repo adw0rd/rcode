@@ -2,6 +2,7 @@
 
 ## 0.9.3 — 2026-11-08
 
+- Добавлен изолированный TODO API suite: нативный GigaChat host relay с host-only credentials, eval protocol 2 (несовместим с protocol 1), receipt policy/required skills и offline Docker controls без model inference.
 - Добавлен режим финального ревью с доработкой и проверкой (`rcode --final-review-repair …` и `/final-review repair`): после read-only ревью выбранной моделью основная модель получает замечания как недоверенные данные (`<untrusted_final_review>`), может выполнить до 4 шагов (до 8 вызовов инструментов без субагентов и фонового handoff) для точечной проверки и возвращает исправленный ответ (`primary_repaired`) с фиксируемым статусом верификации (`verified_scoped`, `failed`, `not_run`, `unknown`).
 - При явном выборе скилла (`/skill ID` или `/ID` в начале строки) rcode загружает первую страницу `SKILL.md` через `load_skill` до первого запроса к модели; при ошибке чтения скилла запрос к API не отправляется.
 - На Linux и macOS файловый undo использует ограниченный приватный WAL: после сбоя он не повторяет записи автоматически, а `/undo` отказывает при внешних изменениях. На Windows сохраняется прежнее best-effort поведение.

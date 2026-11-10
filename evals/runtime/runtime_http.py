@@ -7,6 +7,7 @@ import socket
 import socketserver
 import threading
 import unittest
+import urllib.parse
 
 _MAX_BODY = 2 * 1024 * 1024
 _MAX_RESPONSE = 4 * 1024 * 1024
@@ -60,11 +61,13 @@ class _ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     request_queue_size = 4
     allow_reuse_address = False
 
-    def __init__(self, address, handler, model, parse_json, relay):
+    def __init__(self, address, handler, model, parse_json, relay, provider, oauth_scope):
         self._slots = threading.BoundedSemaphore(4)
         self.model = model
         self.parse_json = parse_json
         self.relay = relay
+        self.provider = provider
+        self.oauth_scope = oauth_scope
         super().__init__(address, handler, bind_and_activate=True)
 
     def process_request(self, request, client_address):
@@ -177,6 +180,23 @@ class _Handler(socketserver.BaseRequestHandler):
         if length > _MAX_BODY:
             raise _HTTPError(413)
         body = reader.exact(length)
+        if target == b"/api/v2/oauth" and self.server.provider == "gigachat":
+            if headers.get("content-type") != b"application/x-www-form-urlencoded":
+                raise _HTTPError(400)
+            try:
+                form = urllib.parse.parse_qs(
+                    body.decode("ascii"), keep_blank_values=True,
+                    strict_parsing=True, max_num_fields=2,
+                )
+            except (UnicodeError, ValueError):
+                raise _HTTPError(400)
+            if form != {"scope": [self.server.oauth_scope]}:
+                raise _HTTPError(400)
+            self._respond(200, {
+                "access_token": "eval-placeholder-token",
+                "expires_at": 4_000_000_000_000,
+            })
+            return
         if target != b"/v1/chat/completions":
             self._respond(404, {"error": "not found"})
             return
@@ -185,6 +205,8 @@ class _Handler(socketserver.BaseRequestHandler):
         except ValueError:
             raise _HTTPError(400)
         if not isinstance(value, dict):
+            raise _HTTPError(400)
+        if value.get("model") != self.server.model or value.get("stream") is not False:
             raise _HTTPError(400)
         try:
             result = self.server.relay(value)
@@ -213,36 +235,52 @@ class _Handler(socketserver.BaseRequestHandler):
         self.request.sendall(head + body)
 
 
-def make_server(model: str, parse_json, relay, port: int = 18080) -> socketserver.TCPServer:
+def make_server(model: str, parse_json, relay, port: int = 18080,
+                provider: str = "local", oauth_scope: str | None = None) -> socketserver.TCPServer:
     """Fixed container loopback endpoint; tests may request an ephemeral port."""
     if not isinstance(model, str):
         raise TypeError("model must be a string")
     if type(port) is not int or not (port == 0 or 1024 <= port <= 65535):
         raise ValueError("invalid loopback port")
-    return _ThreadedServer(("127.0.0.1", port), _Handler, model, parse_json, relay)
+    if provider not in ("local", "gigachat"):
+        raise ValueError("invalid eval provider")
+    return _ThreadedServer(
+        ("127.0.0.1", port), _Handler, model, parse_json, relay,
+        provider, oauth_scope,
+    )
 
 
 class _AdapterTests(unittest.TestCase):
     def setUp(self):
         self.seen = []
-        self.server = make_server(
+        self.gigachat_seen = []
+        self.server = self.start_server("local", self.seen)
+        self.gigachat_server = self.start_server("gigachat", self.gigachat_seen)
+
+    def start_server(self, provider, seen):
+        server = make_server(
             "test-model", json.loads,
-            lambda body: (200, self._relay(body)), port=0,
+            lambda body: (200, self._relay(seen, body)), port=0,
+            provider=provider, oauth_scope="GIGACHAT_API_PERS",
         )
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        server.test_thread = thread
+        return server
 
     def tearDown(self):
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
+        for server in (self.server, self.gigachat_server):
+            server.shutdown()
+            server.server_close()
+            server.test_thread.join(timeout=2)
 
-    def _relay(self, body):
-        self.seen.append(body)
+    def _relay(self, seen, body):
+        seen.append(body)
         return {"ok": True}
 
-    def request(self, method, path, body=None, headers=None):
-        conn = http.client.HTTPConnection(*self.server.server_address, timeout=2)
+    def request(self, method, path, body=None, headers=None, server=None):
+        server = server or self.server
+        conn = http.client.HTTPConnection(*server.server_address, timeout=2)
         conn.request(method, path, body=body, headers=headers or {})
         response = conn.getresponse()
         data = response.read()
@@ -254,8 +292,44 @@ class _AdapterTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/v1/models"), (200, {"object": "list", "data": [{"id": "test-model", "object": "model"}]}))
 
     def test_post_forwards_only_json_body(self):
-        self.assertEqual(self.request("POST", "/v1/chat/completions", '{"x":1}', {"Authorization": "secret"}), (200, {"ok": True}))
-        self.assertEqual(self.seen, [{"x": 1}])
+        body = '{"model":"test-model","stream":false,"x":1}'
+        self.assertEqual(self.request("POST", "/v1/chat/completions", body, {"Authorization": "secret"}), (200, {"ok": True}))
+        self.assertEqual(self.seen, [{"model": "test-model", "stream": False, "x": 1}])
+
+    def test_gigachat_oauth_returns_placeholder_without_retaining_authorization(self):
+        headers = {
+            "Authorization": "Basic synthetic-container-key",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        status, value = self.request(
+            "POST", "/api/v2/oauth", "scope=GIGACHAT_API_PERS", headers,
+            server=self.gigachat_server,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(value, {"access_token": "eval-placeholder-token", "expires_at": 4_000_000_000_000})
+        self.assertEqual(self.gigachat_seen, [])
+        self.assertNotIn("synthetic-container-key", json.dumps(value))
+
+    def test_gigachat_oauth_rejects_wrong_scope_and_files_route(self):
+        headers = {
+            "Authorization": "Basic synthetic-container-key",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        self.assertEqual(self.request(
+            "POST", "/api/v2/oauth", "scope=OTHER", headers,
+            server=self.gigachat_server,
+        )[0], 400)
+        self.assertEqual(self.request(
+            "POST", "/v1/files", "{}", {"Content-Type": "application/json"},
+            server=self.gigachat_server,
+        )[0], 404)
+        self.assertEqual(self.gigachat_seen, [])
+
+    def test_model_mismatch_and_streaming_are_rejected_before_relay(self):
+        for body in ('{"model":"other","stream":false}', '{"model":"test-model","stream":true}'):
+            with self.subTest(body=body):
+                self.assertEqual(self.request("POST", "/v1/chat/completions", body)[0], 400)
+        self.assertEqual(self.seen, [])
 
     def test_unknown_route(self):
         self.assertEqual(self.request("GET", "/elsewhere")[0], 404)

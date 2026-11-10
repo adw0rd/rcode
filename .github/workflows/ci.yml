@@ -44,6 +44,7 @@ jobs:
           echo "RCODE_EVAL_SOCKET=/var/run/docker.sock" >> "$GITHUB_ENV"
       - run: python3 evals/runtime/runtime_http.py
       - run: python3 tests/eval_runtime.py
+      - run: python3 tests/eval_policy.py
       - run: python3 tests/eval_host.py
       - run: python3 tests/eval_controls.py
   msrv:

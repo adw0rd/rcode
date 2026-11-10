@@ -3,7 +3,7 @@ use super::{json as strict_json, manifest};
 use crate::{
     app::Events,
     cli::{Cli, EvalRun},
-    config::{ConfigStore, CredentialState, ProviderKind},
+    config::{ConfigStore, ProviderKind},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -17,8 +17,10 @@ use std::{
 };
 
 const HOST: &str = include_str!("../../evals/host.py");
+const PROVIDER: &str = include_str!("../../evals/host_provider.py");
 const DOCKER: &str = include_str!("../../evals/host_docker.py");
 const SNAPSHOT: &str = include_str!("../../evals/host_snapshot.py");
+const POLICY: &str = include_str!("../../evals/policy.py");
 const RUNTIME: &str = include_str!("../../evals/runtime/runtime.py");
 const HTTP: &str = include_str!("../../evals/runtime/runtime_http.py");
 fn sha(bytes: &[u8]) -> String {
@@ -103,10 +105,9 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     let name = cli
         .profile
         .as_deref()
-        .context("Для eval run требуется явный --profile local")?;
+        .context("Для eval run требуется явный --profile local или gigachat")?;
     ensure!(
-        cli.provider.is_none_or(|p| p == ProviderKind::Local)
-            && cli.model.is_none()
+        cli.model.is_none()
             && cli.base_url.is_none()
             && cli.effort.is_none()
             && cli.folder_id.is_none()
@@ -146,44 +147,45 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     let suite = manifest::validate(&args.suite)?;
     let store = ConfigStore::new()?;
     let settings = store.load()?;
-    let selected = settings
-        .local
-        .profiles
-        .get(name)
-        .context("Нет выбранного local profile")?
-        .clone();
-    selected.validate()?;
+    let saved = if let Some(profile) = settings.local.profiles.get(name) {
+        Some(profile)
+    } else if name == "gigachat" {
+        settings.providers.get("gigachat")
+    } else {
+        None
+    }
+    .context("Нет выбранного local или GigaChat profile")?
+    .clone();
+    let credential = store.credential_for(&saved)?;
+    let selected = super::profile::select(&settings, name, credential)?;
     ensure!(
-        selected.kind == ProviderKind::Local
-            && selected.ca_file.is_none()
-            && selected.local.as_ref().is_some_and(|l| !l.key_required),
-        "V1 eval поддерживает credential-free local profile без custom CA"
+        cli.provider
+            .is_none_or(|provider| provider == selected.selected.kind),
+        "Глобальный --provider должен соответствовать явно выбранному eval profile"
     );
     ensure!(
-        matches!(
-            store.credential_for(&selected)?,
-            CredentialState::NotRequired
-        ),
-        "V1 eval не переносит ключи; нужен credential-free local profile"
-    );
-    ensure!(
-        !selected.stream || args.non_streaming,
+        !selected.selected.stream || args.non_streaming,
         "Профиль использует streaming. Для явного JSON transport добавьте --non-streaming; профиль не изменяется"
     );
-    let mut effective = selected.clone();
-    effective.stream = false;
-    let endpoint = effective
-        .base_url
-        .as_deref()
-        .context("Нет endpoint local")?;
-    let url = crate::local::validate_local_endpoint(endpoint)?;
-    ensure!(
-        matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
-        ),
-        "V1 eval требует literal loopback 127.0.0.1/localhost/::1"
-    );
+    let super::profile::Selected {
+        selected,
+        effective,
+        credential,
+    } = selected;
+    if selected.kind == ProviderKind::Local {
+        let endpoint = effective
+            .base_url
+            .as_deref()
+            .context("Нет endpoint local")?;
+        let url = crate::local::validate_local_endpoint(endpoint)?;
+        ensure!(
+            matches!(
+                url.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+            ),
+            "V1 eval требует literal loopback 127.0.0.1/localhost/::1"
+        );
+    }
     let binary = read(&args.agent_binary, 128 * 1024 * 1024)?;
     ensure!(
         binary.starts_with(b"\x7fELF"),
@@ -209,8 +211,10 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     mode(&runtime, 0o755)?;
     let modules = [
         ("host.py", HOST),
+        ("host_provider.py", PROVIDER),
         ("host_docker.py", DOCKER),
         ("host_snapshot.py", SNAPSHOT),
+        ("policy.py", POLICY),
         ("runtime.py", RUNTIME),
         ("runtime_http.py", HTTP),
     ];
@@ -226,25 +230,26 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     let frozen = root.join("rcode");
     fs::write(&frozen, &binary)?;
     mode(&frozen, 0o555)?;
-    let budgets:Vec<_>=suite.cases.iter().map(|c|json!({"id":c.case.id,"sha256":c.sha256,"max_steps":c.case.max_steps,"max_requests":c.case.max_requests,"timeout_secs":c.case.timeout_secs})).collect();
+    let budgets:Vec<_>=suite.cases.iter().map(|c|json!({"id":c.case.id,"sha256":c.sha256,"max_steps":c.case.max_steps,"max_requests":c.case.max_requests,"timeout_secs":c.case.timeout_secs,"require_skills":c.case.require_skills})).collect();
     let helper_hashes: BTreeMap<_, _> = modules
         .iter()
         .map(|(n, s)| (*n, sha(s.as_bytes())))
         .collect();
-    let key = json!({"suite_sha256":suite.sha256,"selected_profile":selected,"effective_profile":effective,"image":args.image,"helpers":helper_hashes,"case_budgets":budgets,"protocol":1,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"});
+    let key = json!({"suite_sha256":suite.sha256,"selected_profile":selected,"effective_profile":effective,"image":args.image,"helpers":helper_hashes,"case_budgets":budgets,"protocol":2,"steps_definition":"forwarded_model_generations_all_contexts","permissions":{"approval_mode":"auto-edit","allow_shell":true},"transport":"explicit_non_streaming_json"});
     let mut cases = Vec::new();
     for c in &suite.cases {
         let path = root.join(format!("fixture-{}", c.case.id));
         fixture(&path, &c.files)?;
         cases.push(json!({"case":c.case,"sha256":c.sha256,"task":c.task,"fixture":path,"oracle":oracle(&c.oracle)}));
     }
-    let invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
+    let invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"provider_credential":credential,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
     let input = serde_json::to_vec(&invocation)?;
     ensure!(
         input.len() <= 16 * 1024 * 1024,
         "Превышен лимит host invocation 16 МиБ"
     );
-    // Python and Docker receive no provider secrets or ambient Docker context.
+    // Only the trusted Python host receives the provider credential, via stdin.
+    // Docker receives no ambient Docker context or provider environment.
     // Keep stdin/out bounded. SIGINT goes to the same foreground process group;
     // Python owns cleanup and produces the honest interrupted report.
     let path = root.to_owned();
@@ -381,6 +386,21 @@ fn validate_pass(row: &Value, budget: &Value, isolation: &Value) -> Result<()> {
             .all(|k| isolation[*k] == true),
         "PASS без подтверждённой изоляции"
     );
+    let required_skills = row["required_skills"]
+        .as_array()
+        .context("Required skills PASS")?;
+    let budget_skills = budget["require_skills"]
+        .as_array()
+        .context("Required skills budget")?;
+    let violations = row["formal_violations"]
+        .as_array()
+        .context("Formal violations PASS")?;
+    ensure!(
+        row["required_skills_observed"].as_bool() == Some(true)
+            && violations.is_empty()
+            && required_skills == budget_skills,
+        "PASS без соблюдения формальных ограничений и required skills"
+    );
     let generations = row["generations"].as_u64().context("Generations PASS")?;
     let attempts = row["request_attempts"]
         .as_u64()
@@ -484,25 +504,71 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
                 .as_str()
                 .and_then(|s| s.strip_prefix("sha256:"))
                 .is_some_and(hex)
-            && key["protocol"] == 1
+            && key["protocol"] == 2
             && key["steps_definition"] == "forwarded_model_generations_all_contexts"
             && key["permissions"] == json!({"approval_mode":"auto-edit","allow_shell":true})
             && key["transport"] == "explicit_non_streaming_json",
         "Некорректный comparison key"
     );
+    for profile in [&key["selected_profile"], &key["effective_profile"]] {
+        let fields = profile.as_object().context("Profile object")?;
+        ensure!(
+            fields.keys().all(|field| matches!(
+                field.as_str(),
+                "kind"
+                    | "model"
+                    | "effort"
+                    | "base_url"
+                    | "folder_id"
+                    | "auth_url"
+                    | "scope"
+                    | "ca_file"
+                    | "stream"
+                    | "max_output_tokens"
+                    | "request_timeout_secs"
+                    | "idle_timeout_secs"
+                    | "local"
+            )),
+            "Неизвестные поля профиля comparison key"
+        );
+        if let Some(local) = fields.get("local").and_then(Value::as_object) {
+            ensure!(
+                local.keys().all(|field| matches!(
+                    field.as_str(),
+                    "profile"
+                        | "runtime"
+                        | "context_tokens"
+                        | "vision"
+                        | "key_required"
+                        | "thinking"
+                )),
+                "Неизвестные поля local профиля comparison key"
+            );
+        }
+    }
     let selected: crate::config::ProviderSettings =
-        serde_json::from_value(key["selected_profile"].clone())?;
+        serde_json::from_value(key["selected_profile"].clone())
+            .map_err(|_| anyhow::anyhow!("Некорректный selected_profile comparison key"))?;
     let effective: crate::config::ProviderSettings =
-        serde_json::from_value(key["effective_profile"].clone())?;
+        serde_json::from_value(key["effective_profile"].clone())
+            .map_err(|_| anyhow::anyhow!("Некорректный effective_profile comparison key"))?;
     selected.validate()?;
     effective.validate()?;
     ensure!(
-        selected.kind == ProviderKind::Local
-            && !effective.stream
-            && selected.local.as_ref().is_some_and(|l| !l.key_required)
-            && selected.ca_file.is_none(),
+        !effective.stream && selected.ca_file.is_none(),
         "Профиль comparison key не поддерживается"
     );
+    match selected.kind {
+        ProviderKind::Local => ensure!(
+            selected
+                .local
+                .as_ref()
+                .is_some_and(|local| !local.key_required),
+            "Профиль comparison key не поддерживается"
+        ),
+        ProviderKind::GigaChat => super::profile::validate_gigachat_endpoints(&selected)?,
+        _ => anyhow::bail!("Профиль comparison key не поддерживается"),
+    }
     let mut expected = key["selected_profile"].clone();
     expected["stream"] = json!(false);
     ensure!(
@@ -511,11 +577,13 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
     );
     let helpers = key["helpers"].as_object().context("Helper hashes")?;
     ensure!(
-        helpers.len() == 5
+        helpers.len() == 7
             && [
                 "host.py",
+                "host_provider.py",
                 "host_docker.py",
                 "host_snapshot.py",
+                "policy.py",
                 "runtime.py",
                 "runtime_http.py"
             ]
@@ -529,14 +597,31 @@ fn validate_key(key: &Value) -> Result<BTreeMap<String, String>> {
     for c in rows {
         let fields = c.as_object().context("Case budget object")?;
         ensure!(
-            fields.len() == 5
-                && ["id", "sha256", "max_steps", "max_requests", "timeout_secs"]
-                    .iter()
-                    .all(|k| fields.contains_key(*k)),
+            fields.len() == 6
+                && [
+                    "id",
+                    "sha256",
+                    "max_steps",
+                    "max_requests",
+                    "timeout_secs",
+                    "require_skills"
+                ]
+                .iter()
+                .all(|k| fields.contains_key(*k)),
             "Неполный case budget"
         );
         let id = c["id"].as_str().context("Budget ID")?;
         let hash = c["sha256"].as_str().context("Case SHA")?;
+        let required_skills = c["require_skills"].as_array().context("Required skills")?;
+        let mut skill_ids = BTreeSet::new();
+        ensure!(
+            required_skills.iter().all(|skill| {
+                skill
+                    .as_str()
+                    .is_some_and(|id| manifest::valid_skill_id(id) && skill_ids.insert(id))
+            }),
+            "Некорректный или повторный required skill ID"
+        );
         ensure!(
             !id.is_empty()
                 && id.len() <= 64

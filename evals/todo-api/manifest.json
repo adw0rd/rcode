@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "todo-api",
+      "language": "python",
+      "category": "scaffold",
+      "max_steps": 48,
+      "timeout_secs": 600,
+      "max_requests": 96,
+      "project": "cases/todo-api/project",
+      "task": "cases/todo-api/task.md",
+      "oracle": "oracles/todo-api.json",
+      "require_skills": [
+        "superpowers:using-superpowers",
+        "superpowers:test-driven-development",
+        "superpowers:verification-before-completion"
+      ]
+    }
+  ]
+}

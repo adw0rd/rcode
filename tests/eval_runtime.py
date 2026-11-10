@@ -5,16 +5,64 @@ import os
 from pathlib import Path
 import subprocess
 import shutil
+import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 DOCKER = os.environ.get('RCODE_EVAL_DOCKER', 'docker')
-IMAGE = os.environ['RCODE_EVAL_IMAGE']
+IMAGE = os.environ.get('RCODE_EVAL_IMAGE')
 RUNTIME = Path(__file__).resolve().parents[1]/'evals/runtime'
+sys.path.insert(0,str(RUNTIME))
+from runtime import child
 UID = os.getuid() or 10001
 GID = os.getgid() or 10001
 
+
+class ChildBootstrapTests(unittest.TestCase):
+    def run_child(self,profile_credential,skills_config=None):
+        with tempfile.TemporaryDirectory(prefix='rcode-eval-child-') as temp:
+            root=Path(temp);home=root/'home';work=root/'work';work.mkdir()
+            config={'kind':'gigachat','base_url':'http://127.0.0.1:18080/v1'}
+            bootstrap={'cwd':str(work),'argv':['/bin/echo'],'profile_config':config}
+            if profile_credential is not None:bootstrap['profile_credential']=profile_credential
+            if skills_config is not None:bootstrap['skills_config']=skills_config
+            path=root/'child.json';path.write_text(json.dumps(bootstrap))
+            env={'PATH':'/usr/bin:/bin','HOME':str(home),'RCODE_HOME':str(home/'state')}
+            previous=Path.cwd();calls=[]
+            try:
+                with patch('runtime.os.geteuid',return_value=10001),patch('runtime.environment',return_value=env),patch(
+                    'runtime.os.execvpe',side_effect=lambda *args:calls.append(args)),patch.dict(os.environ,{},clear=True):
+                    child(str(path))
+            finally:os.chdir(previous)
+            state=home/'state';credentials=state/'credentials.json';skills=state/'skills.json'
+            saved=json.loads(credentials.read_text()) if credentials.exists() else None
+            mode=credentials.stat().st_mode&0o777 if credentials.exists() else None
+            linked=json.loads(skills.read_text()) if skills.exists() else None
+            return json.loads((state/'config.json').read_text()),saved,mode,calls,env,linked
+
+    def test_gigachat_child_writes_only_placeholder_credential_with_private_mode(self):
+        config,credentials,mode,calls,env,_linked=self.run_child('eval-placeholder-key')
+        self.assertEqual(config['kind'],'gigachat')
+        self.assertEqual(credentials,{'version':1,'providers':{'gigachat':'eval-placeholder-key'}})
+        self.assertEqual(mode,0o600)
+        self.assertNotIn('synthetic-real-key',json.dumps(calls))
+        self.assertNotIn('synthetic-real-key',json.dumps(env))
+
+    def test_local_child_remains_credential_free(self):
+        _config,credentials,mode,_calls,_env,linked=self.run_child(None)
+        self.assertIsNone(credentials)
+        self.assertIsNone(mode)
+        self.assertIsNone(linked)
+
+    def test_child_writes_linked_skills_config_at_rcode_home(self):
+        expected={'version':1,'linked':{'superpowers':{'path':'/workspace/skill-sources/superpowers'}}}
+        *_unused,linked=self.run_child(None,expected)
+        self.assertEqual(linked,expected)
+
+
+@unittest.skipUnless(IMAGE,'RCODE_EVAL_IMAGE is required for opt-in Docker runtime tests')
 class RuntimeTests(unittest.TestCase):
     def invoke(self, bootstrap, interactive=False, project=None, patches=None):
         with tempfile.TemporaryDirectory(prefix='rcode-eval-runtime-') as temp:
@@ -110,6 +158,34 @@ class RuntimeTests(unittest.TestCase):
         done=next(v for v in frames if v.get('type')=='agent_done')
         self.assertEqual(done['exit_code'],0)
         self.assertTrue(done['leader_reaped'] and done['pipes_complete'])
+
+    def test_gigachat_bootstrap_contains_only_loopback_config_and_placeholder(self):
+        profile={'kind':'gigachat','model':'fixture','scope':'GIGACHAT_API_PERS',
+            'base_url':'http://127.0.0.1:18080/v1','auth_url':'http://127.0.0.1:18080/api/v2/oauth',
+            'ca_file':None,'stream':False}
+        config={'version':1,'active':'gigachat','providers':{'gigachat':profile},'local':{'active':None,'profiles':{}}}
+        script=("import json,os;from pathlib import Path;state=Path(os.environ['RCODE_HOME']);"
+            "config=json.loads((state/'config.json').read_text());credentials=json.loads((state/'credentials.json').read_text());"
+            "secret='synthetic-real'+'-key';assert secret not in json.dumps(dict(os.environ));"
+            "print(json.dumps({'config':config,'credentials':credentials,'mode':(state/'credentials.json').stat().st_mode&0o777,'env':dict(os.environ)}))")
+        bootstrap={'mode':'agent','timeout_secs':5,'model':'fixture','profile_config':config,
+            'profile_credential':'eval-placeholder-key','argv':['python3','-I','-S','-c',script]}
+        self.assertNotIn('synthetic-real-key',json.dumps(bootstrap))
+        out,frames=self.invoke(bootstrap,interactive=True)
+        self.assertEqual(out.returncode,0,out.stderr)
+        self.assertNotIn('synthetic-real-key',json.dumps(frames))
+        raw=b''.join(base64.b64decode(v['data']) for v in frames if v.get('type')=='agent_log' and v.get('channel')=='stdout')
+        result=json.loads(raw)
+        effective=result['config']['providers']['gigachat']
+        self.assertEqual(result['config']['active'],'gigachat')
+        self.assertEqual(effective['kind'],'gigachat')
+        self.assertEqual(effective['base_url'],'http://127.0.0.1:18080/v1')
+        self.assertEqual(effective['auth_url'],'http://127.0.0.1:18080/api/v2/oauth')
+        self.assertIsNone(effective['ca_file'])
+        self.assertFalse(effective['stream'])
+        self.assertEqual(result['credentials'],{'version':1,'providers':{'gigachat':'eval-placeholder-key'}})
+        self.assertEqual(result['mode'],0o600)
+        self.assertNotIn('synthetic-real-key',json.dumps(result['env']))
 
     def test_project_stdout_cannot_forge_a_root_protocol_frame(self):
         out,frames=self.invoke({'mode':'observe','timeout_secs':5,'prepare':[],
