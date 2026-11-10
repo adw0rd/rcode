@@ -12,6 +12,40 @@ import uuid
 from host_docker import Failure
 from runtime import strict
 
+GIGACHAT_ROOT_PEM = '''-----BEGIN CERTIFICATE-----
+MIIFwjCCA6qgAwIBAgICEAAwDQYJKoZIhvcNAQELBQAwcDELMAkGA1UEBhMCUlUx
+PzA9BgNVBAoMNlRoZSBNaW5pc3RyeSBvZiBEaWdpdGFsIERldmVsb3BtZW50IGFu
+ZCBDb21tdW5pY2F0aW9uczEgMB4GA1UEAwwXUnVzc2lhbiBUcnVzdGVkIFJvb3Qg
+Q0EwHhcNMjIwMzAxMjEwNDE1WhcNMzIwMjI3MjEwNDE1WjBwMQswCQYDVQQGEwJS
+VTE/MD0GA1UECgw2VGhlIE1pbmlzdHJ5IG9mIERpZ2l0YWwgRGV2ZWxvcG1lbnQg
+YW5kIENvbW11bmljYXRpb25zMSAwHgYDVQQDDBdSdXNzaWFuIFRydXN0ZWQgUm9v
+dCBDQTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAMfFOZ8pUAL3+r2n
+qqE0Zp52selXsKGFYoG0GM5bwz1bSFtCt+AZQMhkWQheI3poZAToYJu69pHLKS6Q
+XBiwBC1cvzYmUYKMYZC7jE5YhEU2bSL0mX7NaMxMDmH2/NwuOVRj8OImVa5s1F4U
+zn4Kv3PFlDBjjSjXKVY9kmjUBsXQrIHeaqmUIsPIlNWUnimXS0I0abExqkbdrXbX
+YwCOXhOO2pDUx3ckmJlCMUGacUTnylyQW2VsJIyIGA8V0xzdaeUXg0VZ6ZmNUr5Y
+Ber/EAOLPb8NYpsAhJe2mXjMB/J9HNsoFMBFJ0lLOT/+dQvjbdRZoOT8eqJpWnVD
+U+QL/qEZnz57N88OWM3rabJkRNdU/Z7x5SFIM9FrqtN8xewsiBWBI0K6XFuOBOTD
+4V08o4TzJ8+Ccq5XlCUW2L48pZNCYuBDfBh7FxkB7qDgGDiaftEkZZfApRg2E+M9
+G8wkNKTPLDc4wH0FDTijhgxR3Y4PiS1HL2Zhw7bD3CbslmEGgfnnZojNkJtcLeBH
+BLa52/dSwNU4WWLubaYSiAmA9IUMX1/RpfpxOxd4Ykmhz97oFbUaDJFipIggx5sX
+ePAlkTdWnv+RWBxlJwMQ25oEHmRguNYf4Zr/Rxr9cS93Y+mdXIZaBEE0KS2iLRqa
+OiWBki9IMQU4phqPOBAaG7A+eP8PAgMBAAGjZjBkMB0GA1UdDgQWBBTh0YHlzlpf
+BKrS6badZrHF+qwshzAfBgNVHSMEGDAWgBTh0YHlzlpfBKrS6badZrHF+qwshzAS
+BgNVHRMBAf8ECDAGAQH/AgEEMA4GA1UdDwEB/wQEAwIBhjANBgkqhkiG9w0BAQsF
+AAOCAgEAALIY1wkilt/urfEVM5vKzr6utOeDWCUczmWX/RX4ljpRdgF+5fAIS4vH
+tmXkqpSCOVeWUrJV9QvZn6L227ZwuE15cWi8DCDal3Ue90WgAJJZMfTshN4OI8cq
+W9E4EG9wglbEtMnObHlms8F3CHmrw3k6KmUkWGoa+/ENmcVl68u/cMRl1JbW2bM+
+/3A+SAg2c6iPDlehczKx2oa95QW0SkPPWGuNA/CE8CpyANIhu9XFrj3RQ3EqeRcS
+AQQod1RNuHpfETLU/A2gMmvn/w/sx7TB3W5BPs6rprOA37tutPq9u6FTZOcG1Oqj
+C/B7yTqgI7rbyvox7DEXoX7rIiEqyNNUguTk/u3SZ4VXE2kmxdmSh3TQvybfbnXV
+4JbCZVaqiZraqc7oZMnRoWrXRG3ztbnbes/9qhRGI7PqXqeKJBztxRTEVj8ONs1d
+WN5szTwaPIvhkhO3CO5ErU2rVdUr89wKpNXbBODFKRtgxUT70YpmJ46VVaqdAhOZ
+D9EUUn4YaeLaS8AjSF/h7UkjOibNc4qVDiPP+rkehFWM66PVnP1Msh93tc+taIfC
+EYVMxjh8zNbFuoc7fzvvrFILLe7ifvEIUqSVIC/AzplM/Jxw7buXFeGP1qVCBEHq
+391d/9RAfaZ12zkwFsl+IKwE/OZxW8AHa9i1p4GO0YSNuczzEm4=
+-----END CERTIFICATE-----'''.replace('\n','\r\n')
+
 
 def giga_parameters(parameters):
     def project(schema):
@@ -122,6 +156,7 @@ def openai_response(value,function_states=None):
 class HttpsExchange:
     def __init__(self,deadline,request_timeout,idle_timeout,parse):
         self.deadline=deadline;self.request_timeout=request_timeout;self.idle_timeout=idle_timeout;self.parse=parse;self.cancelled=None
+        self.operation=None;self.status=None;self.error_type=None
 
     def __call__(self,operation,authorization,body,cancelled=None):
         def is_cancelled():
@@ -130,6 +165,7 @@ class HttpsExchange:
                 if source.is_set() if hasattr(source,'is_set') else source():return True
             return False
         connection=None;response=None;watcher=None;transport=[];stop_watch=threading.Event()
+        self.operation=operation;self.status=None;self.error_type=None
         try:
             if operation=='oauth':
                 host='ngw.devices.sberbank.ru';port=9443;path='/api/v2/oauth';content_type='application/x-www-form-urlencoded'
@@ -141,7 +177,7 @@ class HttpsExchange:
             remaining=self.deadline-time.monotonic()
             if remaining<=0 or len(payload)>2*1024*1024:raise Failure('upstream deadline/size')
             if is_cancelled():raise Failure('upstream cancelled')
-            connection=http.client.HTTPSConnection(host,port,timeout=min(1.0,remaining,self.request_timeout),context=ssl.create_default_context())
+            connection=http.client.HTTPSConnection(host,port,timeout=min(1.0,remaining,self.request_timeout),context=ssl.create_default_context(cadata=GIGACHAT_ROOT_PEM))
             exchange_deadline=min(self.deadline,time.monotonic()+self.request_timeout)
             def abort():
                 sock=transport[0] if transport else connection.sock
@@ -157,8 +193,12 @@ class HttpsExchange:
             headers={'Authorization':authorization,'Content-Type':content_type,'Accept':'application/json'}
             if operation=='oauth':headers['RqUID']=str(uuid.uuid4())
             connection.request('POST',path,body=payload,headers=headers)
-            if connection.sock:transport.append(connection.sock)
-            response=connection.getresponse();raw=bytearray()
+            if connection.sock:
+                transport.append(connection.sock)
+                remaining=min(self.deadline,exchange_deadline)-time.monotonic()
+                if remaining<=0:raise Failure('upstream deadline/size')
+                connection.sock.settimeout(min(remaining,self.idle_timeout))
+            response=connection.getresponse();self.status=response.status;raw=bytearray()
             while True:
                 remaining=min(self.deadline,exchange_deadline)-time.monotonic()
                 if remaining<=0:raise Failure('upstream deadline/size')
@@ -172,10 +212,14 @@ class HttpsExchange:
             if time.monotonic()>=exchange_deadline:raise Failure('upstream deadline/size')
             if is_cancelled():raise Failure('upstream cancelled')
             if 300<=response.status<400:raise Failure('upstream redirect')
-            value=self.parse(bytes(raw),4*1024*1024)
+            try:value=self.parse(bytes(raw),4*1024*1024)
+            except ValueError:
+                if 200<=response.status<300:raise
+                value={}
             if not isinstance(value,dict):raise Failure('upstream response shape')
             return response.status,value
-        except (OSError,ValueError,http.client.HTTPException):
+        except (OSError,ValueError,http.client.HTTPException) as error:
+            self.error_type=type(error).__name__
             raise Failure('upstream exchange') from None
         finally:
             stop_watch.set()

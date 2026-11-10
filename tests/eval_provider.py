@@ -1,5 +1,6 @@
 """GigaChat host relay fixtures; no live API or real credentials."""
 import contextlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -144,6 +145,35 @@ class HttpsExchangeTests(unittest.TestCase):
                     self.assertTrue(connection.closed)
                     self.assertTrue(all(0<timeout<=5 for timeout in connection.sock.timeouts))
 
+    def test_response_headers_use_idle_timeout_not_connect_timeout(self):
+        connection=FakeConnection()
+        def response():
+            if not connection.sock.timeouts or connection.sock.timeouts[-1]<=1.0:
+                raise TimeoutError('sensitive transport detail')
+            return connection.response
+        connection.getresponse=response
+        for _constructor,_context,transport in self.exchange(connection):
+            status,_value=transport('chat','Bearer fixture',{'stream':False})
+            self.assertEqual(status,200)
+            self.assertGreater(connection.sock.timeouts[0],1.0)
+            self.assertLessEqual(connection.sock.timeouts[0],5)
+
+    def test_tls_uses_the_pinned_official_root_and_keeps_verification(self):
+        import hashlib
+        import ssl
+        from types import SimpleNamespace
+        connection=FakeConnection()
+        context=SimpleNamespace(verify_mode=ssl.CERT_REQUIRED,check_hostname=True)
+        with patch('host_provider.ssl.create_default_context',return_value=context) as factory,patch(
+            'host_provider.http.client.HTTPSConnection',return_value=connection):
+            transport=HttpsExchange(time.monotonic()+5,5,5,strict)
+            transport('chat','Bearer fixture',{'stream':False})
+        cadata=factory.call_args.kwargs['cadata'].encode()
+        self.assertEqual(hashlib.sha256(cadata).hexdigest(),
+            '936a43fea6e8e525bcc0f81acd9c3d21b4fc4b9b68acea7906d698005afc6504')
+        self.assertEqual(context.verify_mode,ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
     def test_oauth_rquid_is_unique_per_request(self):
         connections=[FakeConnection(b'{"access_token":"fixture","expires_at":4000000000}') for _ in range(2)]
         with patch('host_provider.http.client.HTTPSConnection',side_effect=connections):
@@ -173,11 +203,29 @@ class HttpsExchangeTests(unittest.TestCase):
                     self.assertEqual(str(caught.exception),message)
                     self.assertEqual(connection.closed,operation!='other')
 
+    def test_non_json_error_status_is_preserved_without_forwarding_the_body(self):
+        for raw,status in [(b'',429),(b'rate limited',400)]:
+            with self.subTest(status=status):
+                connection=FakeConnection(raw,status)
+                for _constructor,_context,transport in self.exchange(connection):
+                    actual,value=transport('chat','Bearer fixture',{'stream':False})
+                    self.assertEqual(actual,status)
+                    self.assertEqual(value,{})
+
     def test_non_finite_chat_json_is_a_fixed_exchange_failure(self):
         connection=FakeConnection()
         for _constructor,_context,transport in self.exchange(connection):
             with self.assertRaises(Failure) as caught:transport('chat','Bearer fixture',{'value':float('nan')})
             self.assertEqual(str(caught.exception),'upstream exchange')
+
+    def test_transport_failure_preserves_only_the_exception_type(self):
+        connection=FakeConnection()
+        def disconnect():
+            raise http.client.RemoteDisconnected('sensitive transport detail')
+        connection.getresponse=disconnect
+        for _constructor,_context,transport in self.exchange(connection):
+            with self.assertRaises(Failure):transport('chat','Bearer fixture',{'stream':False})
+            self.assertEqual(transport.error_type,'RemoteDisconnected')
 
     def test_deadline_request_size_and_transport_errors_are_fixed(self):
         for deadline,body,message in [

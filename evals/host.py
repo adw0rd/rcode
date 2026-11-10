@@ -168,7 +168,15 @@ class Gateway:
                     if isinstance(name,str) and 0<len(name)<=64 and name.isascii() and name.replace('_','').isalnum() and not self.sensitive(name):names[name]=names.get(name,0)+1
             record['requested_tool_names']=names
             return status,value
-        except (Failure,OSError,ValueError,http.client.HTTPException):
+        except (Failure,OSError,ValueError,http.client.HTTPException) as error:
+            if self.gigachat:
+                record['failure']=str(error) if isinstance(error,Failure) else type(error).__name__
+                operation=getattr(self.upstream.exchange,'operation',None)
+                if operation in ('oauth','chat'):record['upstream_operation']=operation
+                upstream_status=getattr(self.upstream.exchange,'status',None)
+                if type(upstream_status) is int:record['http_status']=upstream_status
+                failure_type=getattr(self.upstream.exchange,'error_type',None)
+                if isinstance(failure_type,str):record['failure_type']=failure_type
             record['status']='cancelled_by_case' if CONTROL.cancelled or (cancelled is not None and cancelled.is_set()) else 'failed_or_incomplete'
             return 502,{'error':{'message':'eval selected endpoint request failed or incomplete'}}
         finally:
