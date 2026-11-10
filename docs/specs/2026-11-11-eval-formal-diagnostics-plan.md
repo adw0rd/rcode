@@ -91,8 +91,25 @@ fn diagnostics_target_rejects_alias_collision_and_snapshots_nesting() {
 }
 
 #[test]
+fn diagnostics_target_rejects_symlink_non_utf8_and_directory_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = temp.path().join("report.json");
+    let dangling = temp.path().join("dangling");
+    std::os::unix::fs::symlink(temp.path().join("missing"), &dangling).unwrap();
+    assert!(super::diagnostics_target(Some(&dangling), &report, None).is_err());
+    let non_utf8 = temp.path().join(std::ffi::OsString::from_vec(vec![b'e', 0xff]));
+    assert!(super::diagnostics_target(Some(&non_utf8), &report, None).is_err());
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    assert!(super::diagnostics_target(Some(&directory), &report, None).is_err());
+    let trailing = std::path::PathBuf::from(format!("{}/", directory.display()));
+    assert!(super::diagnostics_target(Some(&trailing), &report, None).is_err());
+}
+
+#[test]
 fn invocation_diagnostics_contains_only_path_and_identity() {
-    let mut invocation = serde_json::json!({"version":1});
+    let mut invocation = serde_json::json!({"version":1,"comparison_key":{"protocol":2}});
+    let key = invocation["comparison_key"].clone();
     super::attach_diagnostics(&mut invocation, None);
     assert!(invocation.get("diagnostics").is_none());
     super::attach_diagnostics(&mut invocation, Some(super::DiagnosticsTarget {
@@ -101,6 +118,7 @@ fn invocation_diagnostics_contains_only_path_and_identity() {
     assert_eq!(invocation["diagnostics"], serde_json::json!({
         "path":"/absolute/events.jsonl", "dev":11, "ino":12,
     }));
+    assert_eq!(invocation["comparison_key"], key);
 }
 ```
 
@@ -131,6 +149,8 @@ struct DiagnosticsTarget {
 
 #[cfg(unix)]
 fn normalized_output(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    ensure!(!path.as_os_str().as_bytes().ends_with(b"/"), "Diagnostics должен быть файлом, не каталогом");
     let name = path.file_name().context("Нужен путь к новому файлу")?;
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     Ok(fs::canonicalize(parent)?.join(name))
@@ -225,11 +245,13 @@ class DiagnosticsPolicyTests(unittest.TestCase):
 
     def test_limits_unicode_and_malformed_arguments(self):
         state = diagnostic_state()
-        command = 'pip install #' + 'a' * 4090 + '\U0001f642' + '\ud800'
+        prefix = 'pip install #\ud800'
+        padding = 4094 - len(prefix.encode('utf-8', errors='replace'))
+        command = prefix + 'a' * padding + '\U0001f642'
         observe_tool_start(state, {'id':'x' * 300,'name':'run_command',
             'arguments':json.dumps({'command':command})}, generation=1)
         event = state['diagnostics'][0]
-        self.assertLessEqual(len(event['command'].encode('utf-8')), 4096)
+        self.assertEqual(len(event['command'].encode('utf-8')), 4094)
         self.assertTrue(event['command_truncated'])
         self.assertTrue(event['call_id_truncated'])
         self.assertLessEqual(len(event['call_id'].encode('utf-8')), 256)
@@ -237,6 +259,15 @@ class DiagnosticsPolicyTests(unittest.TestCase):
         for receipt in ({'name':'run_command','arguments':'{'},
                 {'name':'run_command','arguments':'{"command":null}'}):
             self.assertEqual(tool_violations(receipt), ())
+        agent_state = diagnostic_state()
+        observe_tool_start(agent_state, {'id':'agent','name':'spawn_agent',
+            'arguments':json.dumps({'command':'must not be retained'})}, generation=2)
+        self.assertIsNone(agent_state['diagnostics'][0]['command'])
+        controls = diagnostic_state()
+        control_command = 'pip install #\u2028\x1b[31m'
+        observe_tool_start(controls, {'id':'control','name':'run_command',
+            'arguments':json.dumps({'command':control_command})}, generation=1)
+        self.assertEqual(controls['diagnostics'][0]['command'], control_command)
 
     def test_category_limit_is_deterministic_at_63_plus_2(self):
         state = diagnostic_state()
@@ -291,8 +322,8 @@ def _record_diagnostics(state, receipt, categories, generation):
     if events is None:
         return
     arguments = _arguments(receipt)
-    command = arguments.get('command') if arguments else None
-    command, command_truncated = _bounded_text(command, 4096) if isinstance(command, str) else (None, False)
+    raw_command = arguments.get('command') if receipt.get('name') == 'run_command' and arguments else None
+    command, command_truncated = _bounded_text(raw_command, 4096) if isinstance(raw_command, str) else (None, False)
     identity = receipt.get('id')
     identity, identity_truncated = _bounded_text(identity, 256) if isinstance(identity, str) else (None, False)
     for category in categories:
@@ -362,10 +393,10 @@ git commit -m "feat(eval): записывать formal violation receipts"
 
 - [ ] **Step 1: Добавить failing writer fixtures**
 
-В `HostConfigTests` добавить helper и tests:
+В `tests/eval_host.py` добавить module-level helper, доступный обоим test classes, и tests в `HostConfigTests`:
 
 ```python
-def make_diagnostics(self, root):
+def make_diagnostics(root):
     path = root / 'events.jsonl'
     path.touch(mode=0o600)
     path.chmod(0o600)
@@ -375,7 +406,7 @@ def make_diagnostics(self, root):
 def test_writer_commits_empty_and_exact_jsonl_digest(self):
     import host
     with tempfile.TemporaryDirectory() as temp:
-        path, spec = self.make_diagnostics(Path(temp))
+        path, spec = make_diagnostics(Path(temp))
         writer = host.DiagnosticsWriter(spec)
         self.assertTrue(writer.commit('case-1', [], 0))
         summary = writer.finish()
@@ -383,11 +414,26 @@ def test_writer_commits_empty_and_exact_jsonl_digest(self):
             'events':0,'dropped':0})
         self.assertEqual(path.read_bytes(), b'')
 
+def test_writer_escapes_line_and_terminal_controls(self):
+    import host
+    with tempfile.TemporaryDirectory() as temp:
+        path, spec = make_diagnostics(Path(temp))
+        writer = host.DiagnosticsWriter(spec)
+        command = 'pip install #\u2028\x1b[31m'
+        event = {'version':1,'generation':1,'category':'package_install','tool':'run_command',
+            'call_id':'a','call_id_truncated':False,'command':command,'command_truncated':False}
+        self.assertTrue(writer.commit('controls', [event], 0))
+        self.assertTrue(writer.finish()['complete'])
+        raw = path.read_bytes()
+        self.assertNotIn(b'\x1b', raw)
+        self.assertNotIn('\u2028'.encode('utf-8'), raw)
+        self.assertEqual(json.loads(raw)['command'], command)
+
 def test_writer_rolls_back_partial_case_and_poisons_summary(self):
     import host
     from unittest.mock import patch
     with tempfile.TemporaryDirectory() as temp:
-        path, spec = self.make_diagnostics(Path(temp))
+        path, spec = make_diagnostics(Path(temp))
         writer = host.DiagnosticsWriter(spec)
         event = {'version':1,'generation':1,'category':'git','tool':'run_command','call_id':'a',
             'call_id_truncated':False,'command':'git status','command_truncated':False}
@@ -412,7 +458,7 @@ def test_writer_rejects_path_substitution_and_wrong_identity(self):
     import host
     from unittest.mock import patch
     with tempfile.TemporaryDirectory() as temp:
-        root = Path(temp); path, spec = self.make_diagnostics(root)
+        root = Path(temp); path, spec = make_diagnostics(root)
         other = root/'other'; other.write_text('do not overwrite'); other.chmod(0o600)
         path.unlink(); path.symlink_to(other)
         with self.assertRaises(Failure):
@@ -565,47 +611,129 @@ git commit -m "feat(eval): сохранять diagnostics fail-closed"
 - Modify: `evals/host.py:25,264-304,311-453`
 - Modify: `src/eval/runner.rs:278-323,333-409`
 - Test: `tests/eval_host.py`
+- Test: `tests/eval_cli.rs:251-277`
 - Test: `src/eval/runner.rs:714-771`
 
 - [ ] **Step 1: Добавить failing integration tests**
 
-В `test_agent_phase_observes_start_and_every_result` инициализировать state через `diagnostic_state()` из policy tests не импортируя другой test module:
+В `receipt_phase` использовать `types.SimpleNamespace` вместо `object()` и добавить явный generation fixture:
 
 ```python
-state={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+import types
+
+def receipt_phase(self, events, state, resume_id=None, generations=1):
+    import host
+    from unittest.mock import patch
+    class Channel:
+        def __init__(self, frames): self.frames=list(frames)
+        def receive(self, timeout=None): return self.frames.pop(0)
+        def send(self, _value): pass
+        def close(self): pass
+    class FakeDocker:
+        uid=10001
+        def create(self, *_args, **_kwargs): return 'agent'
+        def start(self, _name, _bootstrap, _deadline):
+            raw=b''.join(json.dumps(event).encode()+b'\n' for event in events)
+            return Channel([{'type':'agent_log','channel':'stdout','data':base64.b64encode(raw).decode()},
+                {'type':'agent_done','exit_code':0}])
+        def remove(self, *_args): pass
+    class Pump:
+        def __init__(self, _gateway): pass
+        def deliver(self, _channel): pass
+        def close(self): pass
+    invocation={'binary':'/unused/rcode','effective_profile':{'kind':'local','model':'fixture','local':{}}}
+    item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
+    with patch.object(host, 'RequestPump', Pump):
+        return host.agent_phase(FakeDocker(), invocation, item, {},
+            types.SimpleNamespace(generations=generations), time.monotonic()+5,
+            resume_id=resume_id, resume_prompt='continue' if resume_id else None, policy_state=state)
 ```
 
-После `receipt_phase` проверить:
+Добавить отдельный generation test, не меняя существующий skill/quarantine test:
 
 ```python
-self.assertEqual(state['diagnostics'][0]['generation'], 1)
+def test_agent_phase_propagates_generation(self):
+    state={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+    self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+        'arguments':'{"command":"git status"}'}], state, generations=1)
+    self.assertEqual(state['diagnostics'][0]['generation'], 1)
+    zero={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+    self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+        'arguments':'{"command":"git status"}'}], zero, generations=0)
+    self.assertIsNone(zero['diagnostics'][0]['generation'])
 ```
 
-Добавить host main test с poisoned writer и тремя кейсами, используя fake Docker без inference:
+Добавить multi-case test: первый кейс сначала `passed`, второй получает отказ commit, третий не запускается; финальный `finish()` также возвращает incomplete и обязан понизить первый кейс:
 
 ```python
-def test_poisoned_diagnostics_prevents_remaining_inference(self):
+def test_diagnostics_failure_blocks_previous_pass_and_skips_remaining_cases(self):
     import host
     from unittest.mock import patch
     class FakeDocker:
         def __init__(self,*_args): self.active={}; self.volumes={}; self.cleanup_deadline=None
         def cleanup(self,_deadline): pass
     class Writer:
-        poisoned = True
+        poisoned = False
+        def commit(self, case, _events, _dropped):
+            if case == '1':
+                return True
+            self.poisoned = True
+            return False
         def finish(self):
-            return {'complete':False,'sha256':None,'events':0,'dropped':0,'error':'diagnostics_io_error'}
+            return {'complete':False,'sha256':None,'events':1,'dropped':0,'error':'diagnostics_io_error'}
     invocation={'version':1,'comparison_key':{},'artifact':{},'docker':'/docker','socket':'/docker.sock',
         'image':'image','runtime':str(ROOT/'evals/runtime'),'diagnostics':{'path':'unused','dev':1,'ino':1},
         'cases':[{'case':{'id':str(n)},'sha256':'f'*64} for n in range(3)]}
+    calls = []
+    def run_case(_docker,_invocation,item,_temporary,diagnostics):
+        case_id = item['case']['id']; calls.append(case_id)
+        committed = diagnostics.commit(case_id, [], 0)
+        return {'id':case_id,'case_sha256':item['sha256'],
+            'status':'passed' if committed else 'blocked',
+            'reason':None if committed else 'diagnostics I/O failure','cleanup':'confirmed_absent'}
     stdin=io.TextIOWrapper(io.BytesIO(json.dumps(invocation).encode())); stdout=io.StringIO(); stderr=io.StringIO()
     with patch.object(host,'Docker',FakeDocker),patch.object(host,'check_isolation',return_value=None),patch.object(
-        host,'DiagnosticsWriter',return_value=Writer()),patch.object(host,'run_case') as run_case,patch.object(
+        host,'DiagnosticsWriter',return_value=Writer()),patch.object(host,'run_case',run_case),patch.object(
         host.sys,'stdin',stdin),patch.object(host.sys,'stdout',stdout),patch.object(host.sys,'stderr',stderr):
         code=host.main()
-    report=json.loads(stdout.getvalue()); run_case.assert_not_called()
+    report=json.loads(stdout.getvalue())
     self.assertEqual(code,1)
-    self.assertEqual([row['status'] for row in report['cases']], ['not_run'] * 3)
+    self.assertEqual(calls, ['1','2'])
+    self.assertEqual([row['status'] for row in report['cases']], ['blocked','blocked','not_run'])
+    self.assertEqual(report['cases'][0]['reason'], 'diagnostics I/O failure')
+    self.assertEqual(report['cases'][2]['cleanup'], 'confirmed_absent')
     self.assertFalse(report['diagnostics']['complete'])
+```
+
+В `tests/eval_cli.rs::run_requires_explicit_consent_before_reading_provider_configuration` добавить diagnostics аргумент и проверку отсутствия sidecar:
+
+```rust
+"--series", "candidate", "--diagnostics", "events.jsonl",
+```
+
+```rust
+assert!(!root.path().join("events.jsonl").exists());
+```
+
+В `test_agent_bootstrap_adds_linked_config_for_required_skills` добавить к invocation:
+
+```python
+invocation['diagnostics'] = {'path':'/host/only/formal-violations.jsonl','dev':11,'ino':12}
+binds = []
+```
+
+Заменить `FakeDocker.create` и добавить финальные assertions, проверяя реальный `agent_phase`:
+
+```python
+def create(self, bind_args, *_args, **_kwargs):
+    binds.append(bind_args)
+    return 'agent'
+```
+
+```python
+container_view = json.dumps({'bootstrap':captured[0],'binds':binds})
+self.assertNotIn('/host/only/formal-violations.jsonl', container_view)
+self.assertNotIn('diagnostics', container_view)
 ```
 
 В Rust tests добавить unit для новой `validate_diagnostics_summary`:
@@ -621,7 +749,28 @@ fn diagnostics_summary_schema_is_strict_and_fail_closed() {
         "error":"diagnostics_io_error"});
     assert!(super::validate_diagnostics_summary(Some(&failed), 0).is_ok());
     assert!(super::validate_diagnostics_summary(Some(&failed), 1).is_err());
+    let without_hash = serde_json::json!({"complete":false,"events":1,"dropped":0,
+        "error":"diagnostics_io_error"});
+    assert!(super::validate_diagnostics_summary(Some(&without_hash), 0).is_err());
     assert!(super::validate_diagnostics_summary(None, 1).is_ok());
+}
+
+#[test]
+fn cleanup_diagnostics_removes_only_the_same_empty_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("events.jsonl");
+    let report = temp.path().join("report.json");
+    let target = super::diagnostics_target(Some(&path), &report, None).unwrap().unwrap();
+    super::cleanup_diagnostics(&target);
+    assert!(!path.exists());
+    let target = super::diagnostics_target(Some(&path), &report, None).unwrap().unwrap();
+    let other = temp.path().join("other");
+    std::fs::write(&other, b"preserve").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&other, &path).unwrap();
+    super::cleanup_diagnostics(&target);
+    assert_eq!(std::fs::read(&other).unwrap(), b"preserve");
+    assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
 }
 ```
 
@@ -664,7 +813,7 @@ if diagnostics is not None:
 diagnostics = DiagnosticsWriter(invocation['diagnostics']) if 'diagnostics' in invocation else None
 ```
 
-В loop перед обычным `run_case` добавить:
+В loop строго после существующего `if CONTROL.cancelled or docker.active or docker.volumes` и перед обычным `run_case` добавить, чтобы cleanup failure имел приоритет над diagnostics skip:
 
 ```python
 if diagnostics is not None and diagnostics.poisoned:
@@ -674,18 +823,48 @@ if diagnostics is not None and diagnostics.poisoned:
 row = run_case(docker, invocation, item, root, diagnostics=diagnostics)
 ```
 
-После Docker cleanup и до `print(json.dumps(report...))`:
+После Docker cleanup, до подсчёта `counts` и `print(json.dumps(report...))`, финализировать writer и понизить любые предыдущие PASS при incomplete. Это сохраняет валидный report вместо отказа Rust validation:
 
 ```python
 if diagnostics is not None:
     report['diagnostics'] = diagnostics.finish()
+    if not report['diagnostics']['complete']:
+        for row in report['cases']:
+            if row['status'] == 'passed':
+                row['status'] = 'blocked'
+                row['reason'] = 'diagnostics I/O failure'
+```
+
+Итоговый return дополнительно защитить:
+
+```python
+return 0 if (counts['passed'] == len(report['cases'])
+    and report['cleanup'] == 'confirmed_absent'
+    and (diagnostics is None or report['diagnostics']['complete'] is True)) else 1
 ```
 
 При отсутствии флага invocation и report не получают новых ключей.
 
 - [ ] **Step 4: Подключить Rust invocation и spawn cleanup**
 
-После `attach_snapshots` использовать `snapshots` по ссылке для создания target и затем attach:
+Добавить cleanup, который использует `symlink_metadata` и identity, а не следует по symlink:
+
+```rust
+#[cfg(unix)]
+fn cleanup_diagnostics(target: &DiagnosticsTarget) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = fs::symlink_metadata(&target.path) else { return };
+    if metadata.file_type().is_file() && metadata.dev() == target.dev
+        && metadata.ino() == target.ino && metadata.len() == 0 {
+        let _ = fs::remove_file(&target.path);
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_diagnostics(_target: &DiagnosticsTarget) {}
+```
+
+После `attach_snapshots` создать target и сериализовать invocation; limit failure использует тот же cleanup:
 
 ```rust
 attach_snapshots(&mut invocation, snapshots.clone());
@@ -693,9 +872,16 @@ let diagnostics = diagnostics_target(
     args.diagnostics.as_deref(), &args.report, snapshots.as_deref(),
 )?;
 attach_diagnostics(&mut invocation, diagnostics.clone());
+let input = serde_json::to_vec(&invocation)?;
+if input.len() > 16 * 1024 * 1024 {
+    if let Some(target) = diagnostics.as_ref() {
+        cleanup_diagnostics(target);
+    }
+    anyhow::bail!("Превышен лимит host invocation 16 МиБ");
+}
 ```
 
-В `spawn_blocking` захватить `diagnostics_path = diagnostics.map(|value| PathBuf::from(value.path))`. Собрать команду отдельной переменной и при ошибке `spawn()` удалить только пустой созданный файл:
+В `spawn_blocking` захватить `diagnostics_for_cleanup = diagnostics.clone()`, собрать команду отдельной переменной и при ошибке `spawn()` вызвать identity cleanup:
 
 ```rust
 let mut command = Command::new(python);
@@ -712,17 +898,15 @@ command
 let mut child = match command.spawn() {
     Ok(child) => child,
     Err(error) => {
-        if let Some(path) = &diagnostics_path {
-            if std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(false) {
-                let _ = std::fs::remove_file(path);
-            }
+        if let Some(target) = diagnostics_for_cleanup.as_ref() {
+            cleanup_diagnostics(target);
         }
         return Err(error.into());
     }
 };
 ```
 
-Сохранить существующие env_clear, stdin/stdout bounds и ожидание процесса.
+Сохранить существующие stdin/stdout bounds и ожидание процесса.
 
 - [ ] **Step 5: Валидировать summary**
 
@@ -742,7 +926,7 @@ fn validate_diagnostics_summary(summary: Option<&Value>, passed: u64) -> Result<
             "Некорректная complete diagnostics");
         return Ok(());
     }
-    ensure!(summary["complete"] == false && summary["sha256"].is_null()
+    ensure!(summary["complete"] == false && summary.get("sha256") == Some(&Value::Null)
         && summary["error"] == "diagnostics_io_error" && passed == 0,
         "PASS с неполной diagnostics");
     Ok(())
@@ -753,6 +937,15 @@ fn validate_diagnostics_summary(summary: Option<&Value>, passed: u64) -> Result<
 
 ```rust
 validate_diagnostics_summary(report.get("diagnostics"), counts["passed"])?;
+```
+
+В `run` сразу после `validate_report` проверить opt-in identity, чтобы missing summary или unexpected summary не прошли незамеченными:
+
+```rust
+ensure!(
+    report.get("diagnostics").is_some() == args.diagnostics.is_some(),
+    "Несоответствие наличия diagnostics в отчёте"
+);
 ```
 
 - [ ] **Step 6: Подтвердить GREEN**
@@ -787,7 +980,7 @@ def test_diagnostics_sidecar_matches_policy_and_survives_cleanup(self):
     fixture = self.root/'fixture'; fixture.mkdir(mode=0o755)
     (fixture/'value.txt').write_text('original')
     temporary = self.root/'temporary'; temporary.mkdir(mode=0o700)
-    diagnostics_path, spec = self.make_diagnostics(self.root)
+    diagnostics_path, spec = make_diagnostics(self.root)
     writer = host.DiagnosticsWriter(spec)
     profile = {'base_url':'http://127.0.0.1:9/v1','model':'fixture','max_output_tokens':8,
         'request_timeout_secs':5,'idle_timeout_secs':5}
@@ -863,7 +1056,7 @@ rcode --profile gigachat eval run \
 
 В `AGENTS.md` добавить краткое правило и проверки `python3 tests/eval_policy.py`, `python3 tests/eval_host.py`; отметить, что `os.write` небуферизован, поэтому отдельный userspace `flush` не требуется.
 
-В design spec заменить нормальный per-case `flush + fsync` на `os.write + fsync`, а список ошибок `write, flush или fsync` — на `write или fsync`, чтобы документация совпадала с реализацией.
+Проверить, что design spec по-прежнему описывает небуферизованный `os.write + fsync` и downgrade прежних PASS при incomplete summary.
 
 - [ ] **Step 4: Локальные и стандартные проверки**
 
@@ -889,6 +1082,7 @@ Expected: все команды exit 0; live API не вызывается.
 Run:
 
 ```bash
+git check-ignore -q artifacts/todo-eval
 mkdir -p artifacts/todo-eval/build-target
 /Users/colinfrl/.local/bin/docker run --rm --network=none --platform linux/arm64 \
   -v "$PWD:/src:ro" -v "$PWD/artifacts/todo-eval/build-target:/target" \
@@ -899,7 +1093,7 @@ file artifacts/todo-eval/rcode-linux
 shasum -a 256 artifacts/todo-eval/rcode-linux
 /Users/colinfrl/.local/bin/docker run --rm --network=none --platform linux/arm64 \
   --entrypoint /agent/rcode -v "$PWD/artifacts/todo-eval/rcode-linux:/agent/rcode:ro" \
-  rcode-eval-runtime --version
+  sha256:98de9b6855a361f8caaca0b266ce4b1f5eeef5ce803857127a339296e513f57e --version
 ```
 
 Expected: Linux ELF запускается и новый SHA-256 зафиксирован; `artifacts` остаётся в `.git/info/exclude`, не добавляется в Git.

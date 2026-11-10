@@ -68,15 +68,16 @@ Sidecar покрывает все текущие источники `formal_viol
 
 ## Запись, ошибки и финализация
 
-Writer хранит `committed_offset`, инкрементальный SHA-256 и счётчики только для полностью завершённых case buffers. После каждого кейса он выполняет `flush` и `fsync`; только после успешного `fsync` обновляет `committed_offset`, digest и число записанных событий.
+Writer хранит `committed_offset`, инкрементальный SHA-256 и счётчики только для полностью завершённых case buffers. После каждого кейса он использует небуферизованный `os.write` и выполняет `fsync`; только после успешного `fsync` обновляет `committed_offset`, digest и число записанных событий.
 
-При любой ошибке `write`, `flush` или `fsync`:
+При любой ошибке `write` или `fsync`:
 
 1. Best-effort `ftruncate(committed_offset)` откатывает незавершённый case buffer, чтобы следующие записи не склеивались с оборванной JSON строкой.
 2. Writer переходит в `poisoned`; дальнейшие writes запрещены.
 3. Текущий кейс получает `blocked` с фиксированной причиной `diagnostics I/O failure` без host-пути, команды или текста `OSError`; Docker cleanup продолжается.
 4. Оставшиеся кейсы получают `not_run` без нового model inference, поскольку явно запрошенный diagnostics artifact больше не может быть полным.
 5. Итоговый summary имеет `complete: false`, `sha256: null`, `error: "diagnostics_io_error"` и счётчики только подтверждённо записанных/отброшенных лимитом событий.
+6. При incomplete summary после `finish` все прежние `passed` дополнительно переводятся в `blocked` с той же причиной до подсчёта `counts`, поэтому Rust принимает и сохраняет честный fail-closed report.
 
 При исправном I/O diagnostics не меняет formal/functional verdict. Fail-closed при ошибке explicitly requested artifact — отдельное поведение, а не скрытое изменение policy.
 
@@ -89,7 +90,7 @@ Writer хранит `committed_offset`, инкрементальный SHA-256 �
 ## Совместимость
 
 - Версия report protocol и состав comparison key не меняются; SHA-256 `host.py` и `policy.py` обновляются как обычное отражение новой версии helpers.
-- `validate_report` принимает top-level `diagnostics` только с описанной summary-схемой; PASS запрещён при `complete != true`, если diagnostics был запрошен. Без флага поле отсутствует.
+- `validate_report` принимает top-level `diagnostics` только с описанной summary-схемой; PASS запрещён при `complete != true`, если diagnostics был запрошен. Runner отдельно проверяет `report.contains("diagnostics") == args.diagnostics.is_some()`; без флага поле отсутствует.
 - Наличие флага не меняет comparison key для того же binary, suite, image и profile.
 - С `--diagnostics` report не содержит команд, tool call arguments или абсолютного diagnostics path.
 - Diagnostics не меняет policy classification, oracle, model budgets, transport или Docker cleanup и не делает красный кейс зелёным.
