@@ -379,6 +379,11 @@ pub struct EvalRun {
     pub suite: PathBuf,
     #[arg(long)]
     pub report: PathBuf,
+    #[arg(
+        long,
+        help = "Сохранить исходники кейсов в новый каталог для локального review"
+    )]
+    pub snapshots: Option<PathBuf>,
     #[arg(long)]
     pub agent_binary: PathBuf,
     #[arg(
@@ -410,8 +415,9 @@ pub struct EvalRun {
 
 #[cfg(test)]
 mod agent_timeout_cli_tests {
-    use super::Cli;
+    use super::{Cli, Command, EvalCommand};
     use clap::{CommandFactory, Parser};
+    use std::path::PathBuf;
 
     fn parsed_timeout(args: &[&str]) -> Result<Option<u64>, clap::Error> {
         let matches = Cli::command().try_get_matches_from(args)?;
@@ -470,6 +476,37 @@ mod agent_timeout_cli_tests {
                 "timeout {value} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn eval_run_parses_snapshots() {
+        let cli = Cli::try_parse_from([
+            "rcode",
+            "eval",
+            "run",
+            "--suite",
+            "suite",
+            "--report",
+            "report",
+            "--agent-binary",
+            "agent",
+            "--image",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "--docker-socket",
+            "socket",
+            "--series",
+            "series",
+            "--snapshots",
+            "output",
+        ])
+        .unwrap();
+        let Some(Command::Eval {
+            command: EvalCommand::Run(args),
+        }) = cli.command
+        else {
+            panic!("expected eval run")
+        };
+        assert_eq!(args.snapshots, Some(PathBuf::from("output")));
     }
 
     #[test]

@@ -100,6 +100,45 @@ fn oracle(value: &manifest::Oracle) -> Value {
         if let Some(s)=&c.expected_stdout{v["expected_stdout"]=json!(s);}else{v["expected_json"]=c.expected_json.clone().expect("validated expectation");}v}).collect();
     json!({"prepare":commands,"checks":checks})
 }
+#[cfg(unix)]
+fn snapshots_root(path: Option<&Path>) -> Result<Option<String>> {
+    use std::os::unix::fs::DirBuilderExt;
+    let Some(path) = path else { return Ok(None) };
+    let name = path.file_name().context("Нужен новый каталог snapshots")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let expected = fs::canonicalize(parent)?.join(name);
+    let mut builder = fs::DirBuilder::new();
+    builder
+        .mode(0o700)
+        .create(path)
+        .context("Создание нового каталога snapshots")?;
+    let root = fs::canonicalize(path)?;
+    ensure!(root == expected, "Путь snapshots изменился при создании");
+    let root = root
+        .to_str()
+        .context("Путь snapshots должен быть UTF-8")?
+        .to_owned();
+    ensure!(
+        !root.contains(','),
+        "Путь snapshots не должен содержать запятую"
+    );
+    Ok(Some(root))
+}
+
+#[cfg(not(unix))]
+fn snapshots_root(_path: Option<&Path>) -> Result<Option<String>> {
+    anyhow::bail!("Защищённый eval поддерживается только на Unix host")
+}
+
+fn attach_snapshots(invocation: &mut Value, snapshots: Option<String>) {
+    if let Some(path) = snapshots {
+        invocation["snapshots"] = json!(path);
+    }
+}
+
 pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i32> {
     ensure!(args.yes, "Для eval run требуется явное согласие --yes");
     let name = cli
@@ -144,6 +183,7 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         !args.report.try_exists()?,
         "Отчёт уже существует; выберите новый путь"
     );
+    let snapshots = snapshots_root(args.snapshots.as_deref())?;
     let suite = manifest::validate(&args.suite)?;
     let store = ConfigStore::new()?;
     let settings = store.load()?;
@@ -242,7 +282,8 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         fixture(&path, &c.files)?;
         cases.push(json!({"case":c.case,"sha256":c.sha256,"task":c.task,"fixture":path,"oracle":oracle(&c.oracle)}));
     }
-    let invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"provider_credential":credential,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
+    let mut invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"provider_credential":credential,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
+    attach_snapshots(&mut invocation, snapshots);
     let input = serde_json::to_vec(&invocation)?;
     ensure!(
         input.len() <= 16 * 1024 * 1024,
@@ -672,6 +713,52 @@ pub(super) fn compare(baseline: &Path, candidate: &Path, events: &Events) -> Res
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+    #[test]
+    fn snapshots_root_is_new_private_and_canonical() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshots");
+        let root = super::snapshots_root(Some(&path)).unwrap().unwrap();
+        assert_eq!(
+            root,
+            std::fs::canonicalize(&path).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(super::snapshots_root(Some(&path)).is_err());
+        assert!(super::snapshots_root(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshots_root_rejects_symlinks_and_docker_unsafe_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let broken = temp.path().join("broken");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &broken).unwrap();
+        assert!(super::snapshots_root(Some(&broken)).is_err());
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let valid = temp.path().join("valid");
+        std::os::unix::fs::symlink(&target, &valid).unwrap();
+        assert!(super::snapshots_root(Some(&valid)).is_err());
+        assert!(super::snapshots_root(Some(&temp.path().join("with,comma"))).is_err());
+        let non_utf8 = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b's', 0xff]));
+        assert!(super::snapshots_root(Some(&non_utf8)).is_err());
+    }
+
+    #[test]
+    fn invocation_snapshots_are_opt_in() {
+        let mut invocation = serde_json::json!({"version":1});
+        super::attach_snapshots(&mut invocation, None);
+        assert!(invocation.get("snapshots").is_none());
+        super::attach_snapshots(&mut invocation, Some("/absolute/snapshots".to_owned()));
+        assert_eq!(invocation["snapshots"], "/absolute/snapshots");
+    }
+
     #[test]
     fn executable_preserves_the_invocation_name_for_multicall_docker() {
         let temp = tempfile::tempdir().unwrap();
