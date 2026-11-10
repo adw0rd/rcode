@@ -175,6 +175,8 @@ class Gateway:
                 if operation in ('oauth','chat'):record['upstream_operation']=operation
                 upstream_status=getattr(self.upstream.exchange,'status',None)
                 if type(upstream_status) is int:record['http_status']=upstream_status
+                failure_type=getattr(self.upstream.exchange,'error_type',None)
+                if isinstance(failure_type,str):record['failure_type']=failure_type
             record['status']='cancelled_by_case' if CONTROL.cancelled or (cancelled is not None and cancelled.is_set()) else 'failed_or_incomplete'
             return 502,{'error':{'message':'eval selected endpoint request failed or incomplete'}}
         finally:

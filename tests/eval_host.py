@@ -160,7 +160,7 @@ class HostConfigTests(unittest.TestCase):
         import host
         from unittest.mock import patch
         class Exchange:
-            operation=None;status=None
+            operation=None;status=None;error_type='RemoteDisconnected'
             def __call__(self,operation,_authorization,_body):
                 self.operation=operation;self.status=401
                 return 401,{'error':'synthetic-response-body'}
@@ -175,6 +175,7 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(receipt['failure'],'oauth response')
         self.assertEqual(receipt['upstream_operation'],'oauth')
         self.assertEqual(receipt['http_status'],401)
+        self.assertEqual(receipt['failure_type'],'RemoteDisconnected')
         self.assertNotIn('synthetic-response-body',json.dumps(receipt))
 
     def receipt_phase(self,events,state,resume_id=None):

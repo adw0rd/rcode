@@ -156,7 +156,7 @@ def openai_response(value,function_states=None):
 class HttpsExchange:
     def __init__(self,deadline,request_timeout,idle_timeout,parse):
         self.deadline=deadline;self.request_timeout=request_timeout;self.idle_timeout=idle_timeout;self.parse=parse;self.cancelled=None
-        self.operation=None;self.status=None
+        self.operation=None;self.status=None;self.error_type=None
 
     def __call__(self,operation,authorization,body,cancelled=None):
         def is_cancelled():
@@ -165,7 +165,7 @@ class HttpsExchange:
                 if source.is_set() if hasattr(source,'is_set') else source():return True
             return False
         connection=None;response=None;watcher=None;transport=[];stop_watch=threading.Event()
-        self.operation=operation;self.status=None
+        self.operation=operation;self.status=None;self.error_type=None
         try:
             if operation=='oauth':
                 host='ngw.devices.sberbank.ru';port=9443;path='/api/v2/oauth';content_type='application/x-www-form-urlencoded'
@@ -214,7 +214,8 @@ class HttpsExchange:
                 value={}
             if not isinstance(value,dict):raise Failure('upstream response shape')
             return response.status,value
-        except (OSError,ValueError,http.client.HTTPException):
+        except (OSError,ValueError,http.client.HTTPException) as error:
+            self.error_type=type(error).__name__
             raise Failure('upstream exchange') from None
         finally:
             stop_watch.set()

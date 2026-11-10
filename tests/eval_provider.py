@@ -1,5 +1,6 @@
 """GigaChat host relay fixtures; no live API or real credentials."""
 import contextlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -203,6 +204,15 @@ class HttpsExchangeTests(unittest.TestCase):
         for _constructor,_context,transport in self.exchange(connection):
             with self.assertRaises(Failure) as caught:transport('chat','Bearer fixture',{'value':float('nan')})
             self.assertEqual(str(caught.exception),'upstream exchange')
+
+    def test_transport_failure_preserves_only_the_exception_type(self):
+        connection=FakeConnection()
+        def disconnect():
+            raise http.client.RemoteDisconnected('sensitive transport detail')
+        connection.getresponse=disconnect
+        for _constructor,_context,transport in self.exchange(connection):
+            with self.assertRaises(Failure):transport('chat','Bearer fixture',{'stream':False})
+            self.assertEqual(transport.error_type,'RemoteDisconnected')
 
     def test_deadline_request_size_and_transport_errors_are_fixed(self):
         for deadline,body,message in [
