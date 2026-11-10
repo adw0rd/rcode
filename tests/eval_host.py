@@ -128,6 +128,17 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(captured[0].get('skills_config'),{'version':1,'linked':{'superpowers':{
             'path':'/workspace/skill-sources/superpowers'}}})
 
+    def test_ambiguous_create_absence_is_rechecked_before_cleanup_is_confirmed(self):
+        from unittest.mock import patch
+        name='rcode-eval-delayed'
+        docker=Docker('/docker','/docker.sock',Path('/unused'),'sha256:'+'0'*64,Path('/runtime'))
+        docker.active[name]={'owner':'fixture-owner','id':None,'mode':None}
+        with patch.object(docker,'checked',side_effect=[b'',b'',name.encode()+b'\n']) as checked,patch('host_docker.time.sleep') as sleep:
+            with self.assertRaises(Failure):docker.remove(name,time.monotonic()+5)
+        self.assertEqual(checked.call_count,3)
+        sleep.assert_called_once_with(1.0)
+        self.assertIn(name,docker.active)
+
     def test_setup_timeout_gets_a_fresh_cleanup_deadline(self):
         import host
         from unittest.mock import patch

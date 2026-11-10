@@ -116,6 +116,7 @@ class Docker:
         # must show no exact name. A matching name is removed only if label matches.
         selector='id='+identity if record['id'] else 'name=^/'+name+'$'
         rows=self.checked(['ps','-a','--filter',selector,'--format','{{.Names}}'],deadline).decode().splitlines()
+        ambiguous_absence=record['id'] is None and not rows
         if rows:
             if rows!=[name]:raise Failure('container identity ambiguity')
             data=self.inspect(identity,deadline)
@@ -123,6 +124,11 @@ class Docker:
             self.checked(['rm','-f',identity],deadline)
         rows=self.checked(['ps','-a','--filter',selector,'--format','{{.ID}}'],deadline).strip()
         if rows:raise Failure('container still present')
+        if ambiguous_absence:
+            if deadline-time.monotonic()<1.0:raise Failure('container cleanup settling deadline')
+            time.sleep(1.0)
+            rows=self.checked(['ps','-a','--filter',selector,'--format','{{.ID}}'],deadline).strip()
+            if rows:raise Failure('container appeared after interrupted create')
         del self.active[name]
     def cleanup(self,deadline):
         previous=self.finalizing;self.finalizing=True
