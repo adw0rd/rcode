@@ -38,6 +38,7 @@ TODO eval фиксирует категории `package_install`, `git`, `netwo
 - `category`: одна из категорий formal violation;
 - `tool`: фактическое имя инструмента из `tool_start`;
 - `call_id`: строковый ID tool call либо `null` для отсутствующего или невалидного ID;
+- `call_id_truncated`: признак ограничения `call_id` до 256 байтов UTF-8 по корректной границе символа;
 - `command`: исходная shell-команда для `run_command`, иначе `null`;
 - `command_truncated`: признак ограничения длины команды.
 
