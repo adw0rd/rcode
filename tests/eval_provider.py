@@ -144,6 +144,22 @@ class HttpsExchangeTests(unittest.TestCase):
                     self.assertTrue(connection.closed)
                     self.assertTrue(all(0<timeout<=5 for timeout in connection.sock.timeouts))
 
+    def test_tls_uses_the_pinned_official_root_and_keeps_verification(self):
+        import hashlib
+        import ssl
+        from types import SimpleNamespace
+        connection=FakeConnection()
+        context=SimpleNamespace(verify_mode=ssl.CERT_REQUIRED,check_hostname=True)
+        with patch('host_provider.ssl.create_default_context',return_value=context) as factory,patch(
+            'host_provider.http.client.HTTPSConnection',return_value=connection):
+            transport=HttpsExchange(time.monotonic()+5,5,5,strict)
+            transport('chat','Bearer fixture',{'stream':False})
+        cadata=factory.call_args.kwargs['cadata'].encode()
+        self.assertEqual(hashlib.sha256(cadata).hexdigest(),
+            '936a43fea6e8e525bcc0f81acd9c3d21b4fc4b9b68acea7906d698005afc6504')
+        self.assertEqual(context.verify_mode,ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
     def test_oauth_rquid_is_unique_per_request(self):
         connections=[FakeConnection(b'{"access_token":"fixture","expires_at":4000000000}') for _ in range(2)]
         with patch('host_provider.http.client.HTTPSConnection',side_effect=connections):
