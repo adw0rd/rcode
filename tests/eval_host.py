@@ -190,14 +190,14 @@ class HostConfigTests(unittest.TestCase):
     def test_agent_bootstrap_adds_linked_config_for_required_skills(self):
         import host
         from unittest.mock import patch
-        captured=[]
+        captured=[];binds=[]
         class Channel:
             def receive(self,timeout=None):return {'type':'agent_done','exit_code':0}
             def send(self,_value):pass
             def close(self):pass
         class FakeDocker:
             uid=10001
-            def create(self,*_args,**_kwargs):return 'agent'
+            def create(self,bind_args,*_args,**_kwargs):binds.append(bind_args);return 'agent'
             def start(self,_name,bootstrap,_deadline):captured.append(bootstrap);return Channel()
             def remove(self,*_args):pass
         class Pump:
@@ -205,7 +205,8 @@ class HostConfigTests(unittest.TestCase):
             def deliver(self,_channel):pass
             def close(self):pass
         profile={'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}
-        invocation={'binary':'/unused/rcode','effective_profile':profile}
+        invocation={'binary':'/unused/rcode','effective_profile':profile,
+            'diagnostics':{'path':'/host/only/formal-violations.jsonl','dev':11,'ino':12}}
         item={'case':{'max_steps':1,'require_skills':['superpowers:using-superpowers',
             'superpowers:test-driven-development','superpowers:verification-before-completion']},
             'fixture':'/unused/fixture','task':'fixture'}
@@ -213,6 +214,9 @@ class HostConfigTests(unittest.TestCase):
             host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5)
         self.assertEqual(captured[0].get('skills_config'),{'version':1,'linked':{'superpowers':{
             'path':'/workspace/skill-sources/superpowers'}}})
+        container_view=json.dumps({'bootstrap':captured[0],'binds':binds},default=str)
+        self.assertNotIn('/host/only/formal-violations.jsonl',container_view)
+        self.assertNotIn('diagnostics',container_view)
 
     def test_ambiguous_create_absence_is_rechecked_before_cleanup_is_confirmed(self):
         from unittest.mock import patch
@@ -275,8 +279,9 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(receipt['failure_type'],'RemoteDisconnected')
         self.assertNotIn('synthetic-response-body',json.dumps(receipt))
 
-    def receipt_phase(self,events,state,resume_id=None):
+    def receipt_phase(self,events,state,resume_id=None,generations=1):
         import host
+        import types
         from unittest.mock import patch
         class Channel:
             def __init__(self,frames):self.frames=list(frames)
@@ -298,7 +303,8 @@ class HostConfigTests(unittest.TestCase):
         invocation={'binary':'/unused/rcode','effective_profile':{'kind':'local','model':'fixture','local':{}}}
         item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
         with patch.object(host,'RequestPump',Pump):
-            return host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5,
+            return host.agent_phase(FakeDocker(),invocation,item,{},
+                types.SimpleNamespace(generations=generations),time.monotonic()+5,
                 resume_id=resume_id,resume_prompt='continue' if resume_id else None,policy_state=state)
 
     def test_agent_phase_observes_start_and_every_result(self):
@@ -321,6 +327,53 @@ class HostConfigTests(unittest.TestCase):
         self.receipt_phase([{'type':'tool_result','id':'call-1','name':'load_skill','is_error':False}],
             state,resume_id='00000000-0000-0000-0000-000000000001')
         self.assertTrue(required_skills_met(state,[skill]))
+
+    def test_agent_phase_propagates_generation(self):
+        state={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+        self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+            'arguments':'{"command":"git status"}'}],state,generations=1)
+        self.assertEqual(state['diagnostics'][0]['generation'],1)
+        zero={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+        self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+            'arguments':'{"command":"git status"}'}],zero,generations=0)
+        self.assertIsNone(zero['diagnostics'][0]['generation'])
+
+    def test_diagnostics_failure_blocks_previous_pass_and_skips_remaining_cases(self):
+        import host
+        from unittest.mock import patch
+        class FakeDocker:
+            def __init__(self,*_args,**_kwargs):self.active={};self.volumes={};self.cleanup_deadline=None
+            def cleanup(self,_deadline):pass
+        class Writer:
+            poisoned=False
+            def commit(self,case,_events,_dropped):
+                if case=='1':return True
+                self.poisoned=True
+                return False
+            def finish(self):
+                return {'complete':False,'sha256':None,'events':1,'dropped':0,'error':'diagnostics_io_error'}
+        invocation={'version':1,'comparison_key':{},'artifact':{},'docker':'/docker','socket':'/docker.sock',
+            'image':'image','runtime':str(ROOT/'evals/runtime'),'diagnostics':{'path':'unused','dev':1,'ino':1},
+            'cases':[{'case':{'id':str(n)},'sha256':'f'*64} for n in range(1,4)]}
+        calls=[]
+        def run_case(_docker,_invocation,item,_temporary,diagnostics):
+            case_id=item['case']['id'];calls.append(case_id)
+            committed=diagnostics.commit(case_id,[],0)
+            return {'id':case_id,'case_sha256':item['sha256'],
+                'status':'passed' if committed else 'blocked',
+                'reason':None if committed else 'diagnostics I/O failure','cleanup':'confirmed_absent'}
+        stdin=io.TextIOWrapper(io.BytesIO(json.dumps(invocation).encode()));stdout=io.StringIO();stderr=io.StringIO()
+        with patch.object(host,'Docker',FakeDocker),patch.object(host,'check_isolation',return_value=None),patch.object(
+            host,'DiagnosticsWriter',return_value=Writer()),patch.object(host,'run_case',run_case),patch.object(
+            host.sys,'stdin',stdin),patch.object(host.sys,'stdout',stdout),patch.object(host.sys,'stderr',stderr):
+            code=host.main()
+        report=json.loads(stdout.getvalue())
+        self.assertEqual(code,1)
+        self.assertEqual(calls,['1','2'])
+        self.assertEqual([row['status'] for row in report['cases']],['blocked','blocked','not_run'])
+        self.assertEqual(report['cases'][0]['reason'],'diagnostics I/O failure')
+        self.assertEqual(report['cases'][2]['cleanup'],'confirmed_absent')
+        self.assertFalse(report['diagnostics']['complete'])
 
     def test_run_case_uses_persistent_snapshot_for_observer_when_enabled(self):
         import host

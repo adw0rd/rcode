@@ -367,7 +367,9 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
                             value=str(uuid.UUID(event['session_id']))
                             if session_id is not None and session_id!=value:raise Failure('multiple session bindings')
                             session_id=value
-                        if isinstance(event,dict) and event.get('type')=='tool_start':observe_tool_start(policy_state,event)
+                        if isinstance(event,dict) and event.get('type')=='tool_start':
+                            observe_tool_start(policy_state,event,
+                                generation=gateway.generations if type(getattr(gateway,'generations',None)) is int else None)
                         if isinstance(event,dict) and event.get('type')=='tool_result':
                             observe_tool_result(policy_state,event)
                             if event.get('is_error') is False:
@@ -389,9 +391,10 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
         finally:
             if channel:channel.close()
 
-def run_case(docker,invocation,item,temporary):
+def run_case(docker,invocation,item,temporary,diagnostics=None):
     case=item['case'];start=time.monotonic();deadline=start+case['timeout_secs'];work_deadline=deadline-12;docker.cleanup_deadline=deadline
     policy_state={'skills':{},'violations':set()};required_skills=case.get('require_skills',[])
+    if diagnostics is not None:policy_state.update({'diagnostics':[],'diagnostics_dropped':0})
     result={'id':case['id'],'case_sha256':item['sha256'],'language':case['language'],'category':case['category'],
         'status':'blocked','reason':None,'checks':[],'cleanup':'unknown','agent':None,'requests':[],'snapshot_sha256':None,'seconds':None,
         'required_skills':required_skills,'required_skills_observed':required_skills_met(policy_state,required_skills),'formal_violations':[]}
@@ -491,12 +494,17 @@ def run_case(docker,invocation,item,temporary):
                     result['status']='blocked';result['reason']='operator cancelled during finalization'
                 if result['seconds']>case['timeout_secs'] and result['status']=='passed':
                     result['status']='blocked';result['reason']='total case deadline exceeded'
+                if diagnostics is not None:
+                    committed=diagnostics.commit(case['id'],policy_state['diagnostics'],policy_state['diagnostics_dropped'])
+                    if not committed and result['status']!='unknown':
+                        result['status']='blocked';result['reason']='diagnostics I/O failure'
     return result
 
 def main():
     if sys.version_info<(3,12):raise Failure('Python 3.12 or newer required')
     invocation=strict(sys.stdin.buffer.read(16*1024*1024+1),16*1024*1024)
     if invocation.get('version')!=1:raise Failure('host invocation version')
+    diagnostics=DiagnosticsWriter(invocation['diagnostics']) if 'diagnostics' in invocation else None
     CONTROL.cancelled=False
     # A flag cannot unwind a finally block or lose an in-progress report.
     # Bounded transport loops observe it; cleanup deliberately ignores it.
@@ -512,7 +520,11 @@ def main():
                 if CONTROL.cancelled or docker.active or docker.volumes:
                     report['cases'].append({'id':item['case']['id'],'case_sha256':item['sha256'],'status':'not_run','reason':'previous cleanup or cancellation','cleanup':'unknown' if docker.active or docker.volumes else 'confirmed_absent'})
                     continue
-                row=run_case(docker,invocation,item,root);report['cases'].append(row)
+                if diagnostics is not None and diagnostics.poisoned:
+                    report['cases'].append({'id':item['case']['id'],'case_sha256':item['sha256'],
+                        'status':'not_run','reason':'diagnostics unavailable','cleanup':'confirmed_absent'})
+                    continue
+                row=run_case(docker,invocation,item,root,diagnostics=diagnostics);report['cases'].append(row)
                 print('eval '+row['id']+': '+row['status'],file=sys.stderr,flush=True)
         except (Failure,OSError,ValueError,KeyError,TypeError):
             done={c['id'] for c in report['cases']}
@@ -522,11 +534,18 @@ def main():
             signal.signal(signal.SIGINT,signal.SIG_IGN);signal.signal(signal.SIGTERM,signal.SIG_IGN)
             try:docker.cleanup(time.monotonic()+20);report['cleanup']='confirmed_absent'
             except (Failure,OSError,ValueError):report['cleanup']='unknown'
+    if diagnostics is not None:
+        report['diagnostics']=diagnostics.finish()
+        if not report['diagnostics']['complete']:
+            for row in report['cases']:
+                if row['status']=='passed':
+                    row['status']='blocked';row['reason']='diagnostics I/O failure'
     counts={k:sum(c['status']==k for c in report['cases']) for k in ['passed','failed','blocked','unknown','not_run']}
     report['counts']=counts
     report['residual_resources']={'containers':[{'name':name,**record} for name,record in docker.active.items()], 'volumes':[{'name':name,'owner':record['owner']} for name,record in docker.volumes.items()]}
     print(json.dumps(report,ensure_ascii=True,allow_nan=False,separators=(',',':')),flush=True)
-    return 0 if counts['passed']==len(report['cases']) and report['cleanup']=='confirmed_absent' else 1
+    return 0 if (counts['passed']==len(report['cases']) and report['cleanup']=='confirmed_absent'
+        and (diagnostics is None or report['diagnostics']['complete'] is True)) else 1
 
 if __name__=='__main__':
     try:raise SystemExit(main())
