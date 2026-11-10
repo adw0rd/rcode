@@ -169,10 +169,13 @@ impl Durable<'_> {
         if let Err(error) = self.jobs.check_start_capacity() {
             return Ok(ToolOutcome::error(format!("{error:#}")));
         }
-        ensure!(
-            !cancel.is_cancelled(),
-            "Задача отменена; shell не запускался"
-        );
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Задача отменена; shell не запускался",
+            )
+            .into());
+        }
         let reservation = self.jobs.reserve_start()?;
         let id = reservation.id().to_owned();
         let budget = self.artifacts.reserve_capacity(RECEIPT_RESERVE)?;
@@ -454,6 +457,44 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!root.join("escaped").exists());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_preflight_is_an_interrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let store = ConfigStore::at(temp.path().join("state")).unwrap();
+        let mut session = Session::new(&root, ProviderSettings::new(ProviderKind::Custom)).unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        tools.begin_turn().unwrap();
+        let events = Events::new(true);
+        let mut runtime = SessionRuntime::new(&session.dir(&store), &session.id, vec![]).unwrap();
+        let (artifacts, journal, jobs, _) = runtime.receipt_resources().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = Durable {
+            tools: &mut tools,
+            events: &events,
+            jobs,
+            journal: journal.unwrap(),
+            artifacts,
+            session: &mut session,
+            store: &store,
+        }
+        .run(
+            &ToolCall::new(
+                "run_command",
+                json!({"command":"printf unexpected > started"}),
+            ),
+            &json!({"command":"printf unexpected > started"}),
+            None,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(crate::app::exit_code(&error), 130, "{error:#}");
+        assert!(!root.join("started").exists());
     }
 
     #[tokio::test]

@@ -368,7 +368,7 @@ def run_case(docker,invocation,item,temporary):
         result['status']='passed' if functional and not result['formal_violations'] and result['required_skills_observed'] else 'failed'
         if result['formal_violations']:result['reason']='formal task constraints violated'
         elif not result['required_skills_observed']:result['reason']='required skills were not observed'
-        elif not success:result['reason']='agent did not finish successfully'
+        elif not success:result['reason']='agent time budget exhausted; verification incomplete' if done.get('timed_out') is True else 'agent did not finish successfully'
         elif gateway.generations==0:result['reason']='no model inference observed'
     except AssessmentFailure:
         result['status']='failed';result['reason']='required interruption/resume behavior was not observed'
@@ -394,7 +394,7 @@ def run_case(docker,invocation,item,temporary):
                 result['formal_violations']=sorted(policy_state['violations'])
                 result['requests']=gateway.receipts;result['request_attempts']=gateway.attempts;result['generations']=gateway.generations
                 result['seconds']=round(time.monotonic()-start,3)
-                if result['status']!='unknown' and any(r['status']=='failed_or_incomplete' or (r.get('http_status') is not None and not 200<=r['http_status']<300) for r in gateway.receipts):
+                if result['status']!='unknown' and result['reason']!='agent time budget exhausted; verification incomplete' and any(r['status']=='failed_or_incomplete' or (r.get('http_status') is not None and not 200<=r['http_status']<300) for r in gateway.receipts):
                     result['status']='blocked';result['reason']='selected endpoint exchange failed or incomplete'
                 result['operator_cancelled']=CONTROL.cancelled
                 if CONTROL.cancelled and result['status']=='passed':
@@ -430,7 +430,7 @@ def main():
                 if item['case']['id'] not in done:report['cases'].append({'id':item['case']['id'],'case_sha256':item['sha256'],'status':'blocked','reason':'isolation/setup/cancellation failed','cleanup':'unknown'})
         finally:
             signal.signal(signal.SIGINT,signal.SIG_IGN);signal.signal(signal.SIGTERM,signal.SIG_IGN)
-            try:docker.cleanup(docker.cleanup_deadline);report['cleanup']='confirmed_absent'
+            try:docker.cleanup(time.monotonic()+20);report['cleanup']='confirmed_absent'
             except (Failure,OSError,ValueError):report['cleanup']='unknown'
     counts={k:sum(c['status']==k for c in report['cases']) for k in ['passed','failed','blocked','unknown','not_run']}
     report['counts']=counts

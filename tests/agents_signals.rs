@@ -223,7 +223,7 @@ async fn immediate_sigint_cancels_workers_and_persists_usage_without_late_mutati
             }
             if code != 130 || agents[0]["status"] != "cancelled" {
                 failures.push(format!(
-                    "попытка {attempt}: exit={code}, agent={}",
+                    "попытка {attempt}: exit={code}, agent={}, events={events:?}",
                     agents[0]["status"]
                 ));
             }

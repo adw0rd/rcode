@@ -128,6 +128,34 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(captured[0].get('skills_config'),{'version':1,'linked':{'superpowers':{
             'path':'/workspace/skill-sources/superpowers'}}})
 
+    def test_setup_timeout_gets_a_fresh_cleanup_deadline(self):
+        import host
+        from unittest.mock import patch
+        class FakeDocker:
+            def __init__(self,*_args,**_kwargs):
+                self.active={};self.volumes={};self.cleanup_deadline=None
+            def cleanup(self,deadline):
+                if deadline<=time.monotonic():raise Failure('expired cleanup deadline')
+        def expire(_docker,_deadline):
+            raise Failure('simulated setup timeout')
+        invocation={'version':1,'comparison_key':{},'artifact':{},
+            'docker':'/docker','socket':'/docker.sock','image':'image','runtime':str(ROOT/'evals/runtime'),
+            'cases':[{'case':{'id':'setup-timeout'},'sha256':'f'*64}]}
+        stdin=io.TextIOWrapper(io.BytesIO(json.dumps(invocation).encode()))
+        stdout=io.StringIO();stderr=io.StringIO()
+        monotonic=host.time.monotonic
+        def expired(_docker,deadline):
+            host.time.monotonic=lambda:deadline+1
+            expire(_docker,deadline)
+        try:
+            with patch.object(host,'Docker',FakeDocker),patch.object(host,'check_isolation',expired),patch.object(
+                host.sys,'stdin',stdin),patch.object(host.sys,'stdout',stdout),patch.object(host.sys,'stderr',stderr):
+                code=host.main()
+        finally:host.time.monotonic=monotonic
+        report=json.loads(stdout.getvalue())
+        self.assertEqual(code,1)
+        self.assertEqual(report['cleanup'],'confirmed_absent')
+
     def receipt_phase(self,events,state,resume_id=None):
         import host
         from unittest.mock import patch
@@ -206,10 +234,14 @@ class HostConfigTests(unittest.TestCase):
                     observe_tool_result(state,{'id':'call-1','name':'load_skill','is_error':False})
                 if policy=='replay':
                     observe_tool_start(state,{'id':'call-1','name':'load_skill','arguments':json.dumps({'name':'superpowers:using-superpowers'})})
-                return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
-            required='superpowers:using-superpowers' if policy=='replay' else skill
+                agent_done=done
+                if policy=='timeout':
+                    agent_done={**done,'exit_code':None,'signal':15,'timed_out':True}
+                    gateway.receipts=[{'generation':1,'status':'failed_or_incomplete','usage':None}]
+                return {'done':agent_done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+            required=None if policy=='timeout' else ('superpowers:using-superpowers' if policy=='replay' else skill)
             case={'id':'policy-'+policy,'language':'python','category':'fixture','timeout_secs':30,
-                'max_steps':2,'max_requests':2,'require_skills':[required]}
+                'max_steps':2,'max_requests':2,'require_skills':[] if required is None else [required]}
             item={'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture','oracle':{'prepare':[],'checks':[]}}
             invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}}
             with tempfile.TemporaryDirectory() as temp,patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64):
@@ -232,6 +264,9 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(passed['required_skills'],[skill])
         self.assertTrue(passed['required_skills_observed'])
         self.assertEqual(passed['formal_violations'],[])
+        timeout=run('timeout')
+        self.assertEqual(timeout['status'],'failed',timeout)
+        self.assertEqual(timeout['reason'],'agent time budget exhausted; verification incomplete')
 
 
 @unittest.skipUnless(all(os.environ.get(name) for name in ('RCODE_EVAL_DOCKER','RCODE_EVAL_SOCKET','RCODE_EVAL_IMAGE')),
