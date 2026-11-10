@@ -193,7 +193,11 @@ class HttpsExchange:
             headers={'Authorization':authorization,'Content-Type':content_type,'Accept':'application/json'}
             if operation=='oauth':headers['RqUID']=str(uuid.uuid4())
             connection.request('POST',path,body=payload,headers=headers)
-            if connection.sock:transport.append(connection.sock)
+            if connection.sock:
+                transport.append(connection.sock)
+                remaining=min(self.deadline,exchange_deadline)-time.monotonic()
+                if remaining<=0:raise Failure('upstream deadline/size')
+                connection.sock.settimeout(min(remaining,self.idle_timeout))
             response=connection.getresponse();self.status=response.status;raw=bytearray()
             while True:
                 remaining=min(self.deadline,exchange_deadline)-time.monotonic()

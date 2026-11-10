@@ -145,6 +145,19 @@ class HttpsExchangeTests(unittest.TestCase):
                     self.assertTrue(connection.closed)
                     self.assertTrue(all(0<timeout<=5 for timeout in connection.sock.timeouts))
 
+    def test_response_headers_use_idle_timeout_not_connect_timeout(self):
+        connection=FakeConnection()
+        def response():
+            if not connection.sock.timeouts or connection.sock.timeouts[-1]<=1.0:
+                raise TimeoutError('sensitive transport detail')
+            return connection.response
+        connection.getresponse=response
+        for _constructor,_context,transport in self.exchange(connection):
+            status,_value=transport('chat','Bearer fixture',{'stream':False})
+            self.assertEqual(status,200)
+            self.assertGreater(connection.sock.timeouts[0],1.0)
+            self.assertLessEqual(connection.sock.timeouts[0],5)
+
     def test_tls_uses_the_pinned_official_root_and_keeps_verification(self):
         import hashlib
         import ssl
