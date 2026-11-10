@@ -236,6 +236,65 @@ class HostConfigTests(unittest.TestCase):
             state,resume_id='00000000-0000-0000-0000-000000000001')
         self.assertTrue(required_skills_met(state,[skill]))
 
+    def test_run_case_uses_persistent_snapshot_for_observer_when_enabled(self):
+        import host
+        from unittest.mock import patch
+        observation={'type':'observation','exit_code':0,'signal':None,'prepare_failed':False,
+            'truncated':False,'timed_out':False,'cancelled':False,'leader_reaped':True,
+            'pipes_complete':True,'stdout':base64.b64encode(b'true\n').decode()}
+        class Channel:
+            def __init__(self,frames):self.frames=frames
+            def receive(self,timeout=None):return self.frames.pop(0)
+            def close(self):pass
+        class FakeDocker:
+            uid=10001;cleanup_deadline=None
+            def __init__(self):self.binds=[];self.channels=[[{'type':'storage_ready'}],[observation]]
+            def volume(self,_size,_deadline):return 'volume'
+            def create(self,binds,_deadline,**_kwargs):self.binds.append(binds);return 'container'
+            def start(self,*_args,**_kwargs):return Channel(self.channels.pop(0))
+            def archive(self,*_args):return b''
+            def remove(self,*_args):pass
+            def cleanup(self,*_args):pass
+        done={'type':'agent_done','exit_code':0,'signal':None,'leader_reaped':True,'pipes_complete':True,
+            'timed_out':False,'cancelled':False,'truncated':False,'forced':False}
+        def phase(_docker,_invocation,_item,_volumes,gateway,_deadline,**_kwargs):
+            gateway.generations=1;gateway.attempts=1
+            gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+            return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+        case={'id':'persistent','language':'python','category':'fixture','timeout_secs':30,'max_steps':2,'max_requests':2}
+        check={'id':'contract','argv':['true'],'stdin':'','timeout_secs':1,'expected_exit':0,'expected_json':True}
+        item={'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture','oracle':{'prepare':[],'checks':[check]}}
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);snapshots=root/'snapshots';snapshots.mkdir(mode=0o700)
+            temporary=root/'temporary';temporary.mkdir(mode=0o700)
+            invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}},'snapshots':str(snapshots)}
+            docker=FakeDocker()
+            with patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64):
+                result=host.run_case(docker,invocation,item,temporary)
+            expected=snapshots/'persistent'
+            self.assertEqual(result['status'],'passed')
+            self.assertTrue(expected.is_dir())
+            self.assertEqual(docker.binds[1],{'/snapshot':expected})
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);temporary=root/'temporary';temporary.mkdir(mode=0o700)
+            invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}}
+            docker=FakeDocker()
+            with patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64):
+                result=host.run_case(docker,invocation,item,temporary)
+            self.assertEqual(result['status'],'passed')
+            self.assertEqual(docker.binds[1],{'/snapshot':temporary/'persistent'})
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);snapshots=root/'snapshots';snapshots.mkdir(mode=0o700)
+            temporary=root/'temporary';temporary.mkdir(mode=0o700)
+            invocation={'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}},'snapshots':str(snapshots)}
+            docker=FakeDocker()
+            with patch.object(host,'agent_phase',phase),patch.object(host,'extract_frozen',side_effect=OSError('synthetic write failure')):
+                result=host.run_case(docker,invocation,item,temporary)
+            self.assertEqual(result['status'],'blocked')
+            self.assertIsNone(result['snapshot_sha256'])
+            self.assertEqual(result['cleanup'],'confirmed_absent')
+            self.assertFalse((temporary/'persistent').exists())
+
     def test_run_case_reports_policy_fields_and_exact_failure_reasons(self):
         import host
         from unittest.mock import patch

@@ -344,7 +344,8 @@ def run_case(docker,invocation,item,temporary):
         docker.remove(keeper,work_deadline)
         storage.close();storage=None
         docker.cleanup(work_deadline)
-        snapshot=temporary/case['id'];snapshot.mkdir(mode=0o700)
+        snapshot_root=Path(invocation['snapshots']) if invocation.get('snapshots') is not None else temporary
+        snapshot=snapshot_root/case['id'];snapshot.mkdir(mode=0o700)
         result['snapshot_sha256']=extract_frozen(raw,snapshot)
         del raw
         for check in item['oracle']['checks']:
