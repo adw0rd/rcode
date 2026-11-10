@@ -88,8 +88,17 @@ class HostConfigTests(unittest.TestCase):
                 host.DiagnosticsWriter(spec)
             self.assertEqual(other.read_text(), 'do not overwrite')
             path.unlink(); path.touch(mode=0o600); path.chmod(0o600)
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            current = path.stat()
+            spec['dev'] = current.st_dev; spec['ino'] = current.st_ino + 1
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            spec['dev'] = current.st_dev + 1; spec['ino'] = current.st_ino
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
             os.link(path, root/'hardlink')
-            spec['dev'] = path.stat().st_dev; spec['ino'] = path.stat().st_ino
+            spec['dev'] = current.st_dev; spec['ino'] = current.st_ino
             with self.assertRaises(Failure):
                 host.DiagnosticsWriter(spec)
             (root/'hardlink').unlink(); path.chmod(0o644)
@@ -279,7 +288,7 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(receipt['failure_type'],'RemoteDisconnected')
         self.assertNotIn('synthetic-response-body',json.dumps(receipt))
 
-    def receipt_phase(self,events,state,resume_id=None,generations=1):
+    def receipt_phase(self,events,state,resume_id=None,generations=1,delivered_generation=None):
         import host
         import types
         from unittest.mock import patch
@@ -297,7 +306,8 @@ class HostConfigTests(unittest.TestCase):
                     {'type':'agent_done','exit_code':0}])
             def remove(self,*_args):pass
         class Pump:
-            def __init__(self,_gateway):pass
+            def __init__(self,_gateway):
+                if delivered_generation is not None:self.delivered_generation=delivered_generation
             def deliver(self,_channel):pass
             def close(self):pass
         invocation={'binary':'/unused/rcode','effective_profile':{'kind':'local','model':'fixture','local':{}}}
@@ -338,42 +348,103 @@ class HostConfigTests(unittest.TestCase):
             'arguments':'{"command":"git status"}'}],zero,generations=0)
         self.assertIsNone(zero['diagnostics'][0]['generation'])
 
+    def test_agent_phase_uses_delivered_not_requested_generation(self):
+        state={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+        self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+            'arguments':'{"command":"git status"}'}],state,generations=2,delivered_generation=1)
+        self.assertEqual(state['diagnostics'][0]['generation'],1)
+
+    def test_request_pump_tracks_only_delivered_generation(self):
+        import host
+        class Gateway:
+            generations=0
+            def relay(self,_body,_cancelled=None):
+                self.generations+=1
+                return 200,{'generation':self.generations}
+        class Channel:
+            def __init__(self):self.frames=[]
+            def send(self,value):self.frames.append(value)
+        gateway=Gateway();channel=Channel();pump=host.RequestPump(gateway)
+        try:
+            pump.submit(1,{})
+            deadline=time.monotonic()+2
+            while not channel.frames and time.monotonic()<deadline:
+                pump.deliver(channel);time.sleep(.001)
+            self.assertEqual(pump.delivered_generation,1)
+            pump.submit(2,{})
+            while gateway.generations!=2 and time.monotonic()<deadline:time.sleep(.001)
+            self.assertEqual(gateway.generations,2)
+            self.assertEqual(pump.delivered_generation,1)
+            while len(channel.frames)<2 and time.monotonic()<deadline:
+                pump.deliver(channel);time.sleep(.001)
+            self.assertEqual(pump.delivered_generation,2)
+        finally:pump.close()
+
     def test_diagnostics_failure_blocks_previous_pass_and_skips_remaining_cases(self):
         import host
         from unittest.mock import patch
+        class Channel:
+            def receive(self,timeout=None):return {'type':'storage_ready'}
+            def close(self):pass
         class FakeDocker:
+            uid=10001
             def __init__(self,*_args,**_kwargs):self.active={};self.volumes={};self.cleanup_deadline=None
+            def volume(self,_size,_deadline):return 'volume'
+            def create(self,*_args,**_kwargs):return 'container'
+            def start(self,*_args,**_kwargs):return Channel()
+            def archive(self,*_args):return b''
+            def remove(self,*_args):pass
             def cleanup(self,_deadline):pass
-        class Writer:
-            poisoned=False
-            def commit(self,case,_events,_dropped):
-                if case=='1':return True
-                self.poisoned=True
-                return False
-            def finish(self):
-                return {'complete':False,'sha256':None,'events':1,'dropped':0,'error':'diagnostics_io_error'}
-        invocation={'version':1,'comparison_key':{},'artifact':{},'docker':'/docker','socket':'/docker.sock',
-            'image':'image','runtime':str(ROOT/'evals/runtime'),'diagnostics':{'path':'unused','dev':1,'ino':1},
-            'cases':[{'case':{'id':str(n)},'sha256':'f'*64} for n in range(1,4)]}
+        done={'type':'agent_done','exit_code':0,'signal':None,'leader_reaped':True,'pipes_complete':True,
+            'timed_out':False,'cancelled':False,'truncated':False,'forced':False}
         calls=[]
-        def run_case(_docker,_invocation,item,_temporary,diagnostics):
+        def phase(_docker,_invocation,item,_volumes,gateway,_deadline,**kwargs):
             case_id=item['case']['id'];calls.append(case_id)
-            committed=diagnostics.commit(case_id,[],0)
-            return {'id':case_id,'case_sha256':item['sha256'],
-                'status':'passed' if committed else 'blocked',
-                'reason':None if committed else 'diagnostics I/O failure','cleanup':'confirmed_absent'}
-        stdin=io.TextIOWrapper(io.BytesIO(json.dumps(invocation).encode()));stdout=io.StringIO();stderr=io.StringIO()
-        with patch.object(host,'Docker',FakeDocker),patch.object(host,'check_isolation',return_value=None),patch.object(
-            host,'DiagnosticsWriter',return_value=Writer()),patch.object(host,'run_case',run_case),patch.object(
-            host.sys,'stdin',stdin),patch.object(host.sys,'stdout',stdout),patch.object(host.sys,'stderr',stderr):
-            code=host.main()
-        report=json.loads(stdout.getvalue())
+            gateway.generations=1;gateway.attempts=1
+            gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+            if case_id in ('1','3'):
+                host.observe_tool_start(kwargs['policy_state'],{'id':'shell','name':'run_command',
+                    'arguments':json.dumps({'command':'git status synthetic-case-'+case_id})},generation=1)
+            return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+        original=host.os.write;writes=0
+        def partial(fd,data):
+            nonlocal writes
+            writes+=1
+            if writes==1:return original(fd,data)
+            original(fd,bytes(data[:max(1,len(data)//2)]))
+            raise OSError('synthetic /secret/path/events.jsonl')
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics_path,spec=make_diagnostics(Path(temp))
+            cases=[]
+            for number in range(1,5):
+                case={'id':str(number),'language':'python','category':'fixture','timeout_secs':30,
+                    'max_steps':2,'max_requests':2}
+                cases.append({'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture',
+                    'oracle':{'prepare':[],'checks':[]}})
+            invocation={'version':1,'comparison_key':{},'artifact':{},'docker':'/docker','socket':'/docker.sock',
+                'image':'image','runtime':str(ROOT/'evals/runtime'),'diagnostics':spec,
+                'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}},
+                'cases':cases}
+            stdin=io.TextIOWrapper(io.BytesIO(json.dumps(invocation).encode()));stdout=io.StringIO();stderr=io.StringIO()
+            with patch.object(host,'Docker',FakeDocker),patch.object(host,'check_isolation',return_value=None),patch.object(
+                host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64),patch.object(
+                host.os,'write',side_effect=partial),patch.object(host.sys,'stdin',stdin),patch.object(
+                host.sys,'stdout',stdout),patch.object(host.sys,'stderr',stderr):
+                code=host.main()
+            report_text=stdout.getvalue();report=json.loads(report_text)
+            lines=diagnostics_path.read_text().splitlines()
+            self.assertEqual(len(lines),1)
+            self.assertEqual(json.loads(lines[0])['case'],'1')
+            self.assertNotIn(str(diagnostics_path),report_text)
+            self.assertNotIn('synthetic-case',report_text)
         self.assertEqual(code,1)
-        self.assertEqual(calls,['1','2'])
-        self.assertEqual([row['status'] for row in report['cases']],['blocked','blocked','not_run'])
-        self.assertEqual(report['cases'][0]['reason'],'diagnostics I/O failure')
-        self.assertEqual(report['cases'][2]['cleanup'],'confirmed_absent')
+        self.assertEqual(calls,['1','2','3'])
+        self.assertEqual([row['status'] for row in report['cases']],['failed','blocked','blocked','not_run'])
+        self.assertEqual(report['cases'][1]['reason'],'diagnostics I/O failure')
+        self.assertEqual(report['cases'][2]['reason'],'diagnostics I/O failure')
+        self.assertEqual(report['cases'][3]['cleanup'],'confirmed_absent')
         self.assertFalse(report['diagnostics']['complete'])
+        self.assertEqual(report['diagnostics']['events'],1)
 
     def test_run_case_uses_persistent_snapshot_for_observer_when_enabled(self):
         import host

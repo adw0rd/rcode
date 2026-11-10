@@ -34,7 +34,7 @@ TODO eval фиксирует категории `package_install`, `git`, `netwo
 
 - `version`: всегда `1`;
 - `case`: валидированный ID кейса;
-- `generation`: 1-based номер model generation на момент tool start либо `null`, если источник не связан с generation;
+- `generation`: 1-based номер последней доставленной контейнеру model generation, к чьему ответу относится tool start, либо `null`, если источник не связан с generation; следующий запрос в flight не увеличивает это значение;
 - `category`: одна из категорий formal violation;
 - `tool`: фактическое имя инструмента из `tool_start`;
 - `call_id`: строковый ID tool call либо `null` для отсутствующего или невалидного ID;

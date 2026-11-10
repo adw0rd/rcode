@@ -269,14 +269,16 @@ class Gateway:
 class RequestPump:
     """One upstream exchange at a time; Root control frames remain responsive."""
     def __init__(self,gateway):
-        self.gateway=gateway;self.jobs=queue.Queue(maxsize=4);self.results=queue.Queue(maxsize=4);self.stop=threading.Event();self.ids=set();self.submitted=0;self.failed=threading.Event()
+        self.gateway=gateway;self.jobs=queue.Queue(maxsize=4);self.results=queue.Queue(maxsize=4);self.stop=threading.Event();self.ids=set();self.submitted=0;self.failed=threading.Event();self.delivered_generation=None
         def work():
             while not self.stop.is_set():
                 try:identity,body=self.jobs.get(timeout=.05)
                 except queue.Empty:continue
                 try:
+                    before=gateway.generations
                     status,response=gateway.relay(body,self.stop)
-                    if not self.stop.is_set():self.results.put_nowait((identity,status,response))
+                    generation=gateway.generations if gateway.generations>before else None
+                    if not self.stop.is_set():self.results.put_nowait((identity,status,response,generation))
                 except Exception:
                     self.failed.set();return
         self.worker=threading.Thread(target=work,daemon=True);self.worker.start()
@@ -288,9 +290,10 @@ class RequestPump:
     def deliver(self,channel):
         if self.failed.is_set():raise Failure('upstream worker failed')
         while not self.stop.is_set():
-            try:identity,status,body=self.results.get_nowait()
+            try:identity,status,body,generation=self.results.get_nowait()
             except queue.Empty:return
             channel.send({'type':'response','id':identity,'status':status,'body':body})
+            if generation is not None:self.delivered_generation=generation
     def cancel(self):self.stop.set()
     def close(self):
         self.cancel();self.worker.join(timeout=2)
@@ -369,7 +372,8 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
                             session_id=value
                         if isinstance(event,dict) and event.get('type')=='tool_start':
                             observe_tool_start(policy_state,event,
-                                generation=gateway.generations if type(getattr(gateway,'generations',None)) is int else None)
+                                generation=getattr(pump,'delivered_generation',
+                                    gateway.generations if type(getattr(gateway,'generations',None)) is int else None))
                         if isinstance(event,dict) and event.get('type')=='tool_result':
                             observe_tool_result(policy_state,event)
                             if event.get('is_error') is False:
