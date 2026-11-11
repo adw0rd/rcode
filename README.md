@@ -227,7 +227,7 @@ rcode eval compare --baseline baseline.json --candidate candidate.json
 
 ### TODO API suite
 
-Отдельный suite `evals/todo-api/manifest.json` содержит один HTTP CRUD scaffold-кейс с тремя обязательными скиллами Superpowers. Проверка fixtures не обращается к модели:
+Отдельный suite `evals/todo-api/manifest.json` содержит один HTTP CRUD scaffold-кейс с тремя обязательными скиллами Superpowers. Видимое задание документирует все проверки независимого HTTP oracle; точные строки этого контракта защищены тестом `TodoOracleContractTests.test_task_documents_observable_http_contract`. Проверка fixtures не обращается к модели:
 
 ```sh
 rcode eval validate --suite evals/todo-api/manifest.json

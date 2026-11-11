@@ -133,15 +133,15 @@ Sequential implementation, no parallelization opportunity.
 
 ## Implementation Tasks
 
-- [ ] **T1 (P1, human: ~30min / CC: ~5min)** — eval contract — документировать полный HTTP-контракт TODO API
+- [x] **T1 (P1, human: ~30min / CC: ~5min)** — eval contract — документировать полный HTTP-контракт TODO API
   - Surfaced by: Architecture findings 1–3
   - Files: `evals/todo-api/cases/todo-api/task.md`, эта спецификация
   - Verify: `python3 tests/eval_todo_controls.py TodoOracleContractTests`
-- [ ] **T2 (P1, human: ~30min / CC: ~5min)** — tests — добавить prompt-contract regression test
+- [x] **T2 (P1, human: ~30min / CC: ~5min)** — tests — добавить prompt-contract regression test
   - Surfaced by: Test review finding 4
   - Files: `tests/eval_todo_controls.py`
   - Verify: RED до T1, GREEN после T1, затем Docker controls с success marker
-- [ ] **T3 (P2, human: ~1h / CC: ~15min)** — eval — проверить controls и сопоставимые live-прогоны
+- [x] **T3 (P2, human: ~1h / CC: ~15min)** — eval — проверить controls и сопоставимые live-прогоны
   - Surfaced by: Test review findings 6–7
   - Files: эта спецификация; manifest только читается
   - Verify: общий controls corpus, host tests, eval validate и свежие GigaChat/Qwen runs
@@ -177,12 +177,22 @@ Approval readiness: PASS; R1–R8 покрыты исходным approval и п
 |--------|---------|-----|------|--------|----------|
 | CEO Review | — | Scope & strategy | 0 | — | — |
 | Outside Review | Claude + Carbon via `agy` | Independent 2nd opinion | 3 | completed / partial unavailable | Claude: 8; Carbon: 5 partial |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 7 issues mapped to T1–T3, 0 critical gaps |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | COMPLETE | 7 issues mapped to T1–T3 и закрыты реализацией, 0 critical gaps |
 | Design Review | — | UI/UX gaps | 0 | — | — |
 | DX Review | — | Developer experience gaps | 0 | — | — |
 
 - **OUTSIDE COVERAGE:** Claude via `agy`, plan review completed with 8 findings; Carbon high/medium unavailable by timeout, 5 partial findings retained without completed coverage.
 - **CROSS-MODEL:** Claude и partial Carbon совпали по 201, 404, regression test и live inputs; каждое совпадение проверено по исходникам.
-- **VERDICT:** ENG REVIEW COMPLETE WITH MAPPED TASKS — реализация по T1–T3 ещё не выполнена; eng review required после изменений.
+- **VERDICT:** IMPLEMENTATION COMPLETE — T1–T3 выполнены и опубликованы в PR #8, merge commit `c5965cfc82e0760aab5267adf24b6d3bf857c92f`.
+
+## Implementation result 2026-11-12
+
+- Regression-тест дал RED по восьми отсутствующим строкам до изменения задания и GREEN после него. Host contract tests: 2 теста OK.
+- TODO Docker controls: `1/1 functional controls`; общий corpus: `30/30`; runtime: 11 тестов OK; host: 34 теста OK.
+- `eval validate`, `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` и `cargo test --all-targets` прошли на итоговом implementation diff. Все CI checks PR #8 зелёные перед merge.
+- Свежие live-прогоны использовали одинаковые binary SHA-256, image, suite/case hashes, helpers и budgets. У обоих observed required skills и ноль formal violations; cleanup `confirmed_absent`.
+- GigaChat: независимый HTTP oracle PASS, но общий verdict failed из-за исчерпания 48 генераций. Собственные тесты snapshot: 4 failed, 20 passed; отдельно подтверждено частичное изменение title при PATCH, который возвращает 400 из-за `completed: null`.
+- Qwen: общий verdict failed из-за 600-секундного deadline после 8 полученных и 1 отменённой генерации. Snapshot содержит только пустое FastAPI-приложение и fixture, HTTP oracle FAIL, тестов нет. Это timeout, а не exchange failure; budgets не изменялись.
+- Live-прогоны являются одним качественным примером на модель, а не статистической оценкой. Старый GigaChat report не использовался как baseline.
 
 NO UNRESOLVED DECISIONS
