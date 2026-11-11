@@ -269,11 +269,14 @@ fn run_requires_explicit_consent_before_reading_provider_configuration() {
             "/missing/socket",
             "--series",
             "candidate",
+            "--diagnostics",
+            "events.jsonl",
         ],
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--yes"));
     assert!(!root.path().join("report.json").exists());
+    assert!(!root.path().join("events.jsonl").exists());
 }
 #[test]
 fn compare_requires_identical_complete_configuration_and_never_counts_unknown_as_pass() {

@@ -14,9 +14,105 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT),str(ROOT/'evals'),str(ROOT/'evals/runtime')]
 from host_docker import Docker,Failure
 from host_snapshot import extract_frozen
+import hashlib
+
+
+def make_diagnostics(root):
+    path = root / 'events.jsonl'
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    stat = path.stat()
+    return path, {'path': str(path), 'dev': stat.st_dev, 'ino': stat.st_ino}
 
 
 class HostConfigTests(unittest.TestCase):
+    def test_writer_commits_empty_and_exact_jsonl_digest(self):
+        import host
+        with tempfile.TemporaryDirectory() as temp:
+            path, spec = make_diagnostics(Path(temp))
+            writer = host.DiagnosticsWriter(spec)
+            self.assertTrue(writer.commit('case-1', [], 0))
+            summary = writer.finish()
+            self.assertEqual(summary, {'complete': True, 'sha256': hashlib.sha256(b'').hexdigest(),
+                'events': 0, 'dropped': 0})
+            self.assertEqual(path.read_bytes(), b'')
+
+    def test_writer_escapes_line_and_terminal_controls(self):
+        import host
+        with tempfile.TemporaryDirectory() as temp:
+            path, spec = make_diagnostics(Path(temp))
+            writer = host.DiagnosticsWriter(spec)
+            command = 'pip install #\u2028\x1b[31m'
+            event = {'version': 1, 'generation': 1, 'category': 'package_install', 'tool': 'run_command',
+                'call_id': 'a', 'call_id_truncated': False, 'command': command, 'command_truncated': False}
+            self.assertTrue(writer.commit('controls', [event], 0))
+            self.assertTrue(writer.finish()['complete'])
+            raw = path.read_bytes()
+            self.assertNotIn(b'\x1b', raw)
+            self.assertNotIn('\u2028'.encode('utf-8'), raw)
+            self.assertEqual(json.loads(raw)['command'], command)
+
+    def test_writer_rolls_back_partial_case_and_poisons_summary(self):
+        import host
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            path, spec = make_diagnostics(Path(temp))
+            writer = host.DiagnosticsWriter(spec)
+            event = {'version': 1, 'generation': 1, 'category': 'git', 'tool': 'run_command', 'call_id': 'a',
+                'call_id_truncated': False, 'command': 'git status', 'command_truncated': False}
+            self.assertTrue(writer.commit('first', [event], 0))
+            original = host.os.write
+            def partial(fd, data):
+                original(fd, bytes(data[:max(1, len(data)//2)]))
+                raise OSError('synthetic /secret/path/events.jsonl')
+            with patch.object(host.os, 'write', side_effect=partial):
+                self.assertFalse(writer.commit('second', [event], 0))
+            summary = writer.finish()
+            self.assertFalse(summary['complete'])
+            self.assertIsNone(summary['sha256'])
+            self.assertEqual(summary['error'], 'diagnostics_io_error')
+            self.assertEqual(summary['events'], 1)
+            lines = path.read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])['case'], 'first')
+            self.assertNotIn('/secret/path', json.dumps(summary))
+
+    def test_writer_rejects_path_substitution_and_wrong_identity(self):
+        import host
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); path, spec = make_diagnostics(root)
+            other = root/'other'; other.write_text('do not overwrite'); other.chmod(0o600)
+            replacement = root/'replacement'; replacement.touch(mode=0o600); replacement.chmod(0o600)
+            path.unlink(); path.symlink_to(other)
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            self.assertEqual(other.read_text(), 'do not overwrite')
+            path.unlink(); replacement.replace(path)
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            current = path.stat()
+            spec['dev'] = current.st_dev; spec['ino'] = current.st_ino + 1
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            spec['dev'] = current.st_dev + 1; spec['ino'] = current.st_ino
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            os.link(path, root/'hardlink')
+            spec['dev'] = current.st_dev; spec['ino'] = current.st_ino
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            (root/'hardlink').unlink(); path.chmod(0o644)
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            path.chmod(0o600); path.write_text('nonempty')
+            with self.assertRaises(Failure):
+                host.DiagnosticsWriter(spec)
+            path.write_text('')
+            with patch.object(host.os, 'geteuid', return_value=os.geteuid() + 1):
+                with self.assertRaises(Failure):
+                    host.DiagnosticsWriter(spec)
+
     def test_gigachat_model_config_uses_native_loopback_provider(self):
         import host
         profile={'kind':'gigachat','model':'GigaChat-3-Ultra','scope':'GIGACHAT_API_PERS',
@@ -104,14 +200,14 @@ class HostConfigTests(unittest.TestCase):
     def test_agent_bootstrap_adds_linked_config_for_required_skills(self):
         import host
         from unittest.mock import patch
-        captured=[]
+        captured=[];binds=[]
         class Channel:
             def receive(self,timeout=None):return {'type':'agent_done','exit_code':0}
             def send(self,_value):pass
             def close(self):pass
         class FakeDocker:
             uid=10001
-            def create(self,*_args,**_kwargs):return 'agent'
+            def create(self,bind_args,*_args,**_kwargs):binds.append(bind_args);return 'agent'
             def start(self,_name,bootstrap,_deadline):captured.append(bootstrap);return Channel()
             def remove(self,*_args):pass
         class Pump:
@@ -119,7 +215,8 @@ class HostConfigTests(unittest.TestCase):
             def deliver(self,_channel):pass
             def close(self):pass
         profile={'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}}
-        invocation={'binary':'/unused/rcode','effective_profile':profile}
+        invocation={'binary':'/unused/rcode','effective_profile':profile,
+            'diagnostics':{'path':'/host/only/formal-violations.jsonl','dev':11,'ino':12}}
         item={'case':{'max_steps':1,'require_skills':['superpowers:using-superpowers',
             'superpowers:test-driven-development','superpowers:verification-before-completion']},
             'fixture':'/unused/fixture','task':'fixture'}
@@ -127,6 +224,9 @@ class HostConfigTests(unittest.TestCase):
             host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5)
         self.assertEqual(captured[0].get('skills_config'),{'version':1,'linked':{'superpowers':{
             'path':'/workspace/skill-sources/superpowers'}}})
+        container_view=json.dumps({'bootstrap':captured[0],'binds':binds},default=str)
+        self.assertNotIn('/host/only/formal-violations.jsonl',container_view)
+        self.assertNotIn('diagnostics',container_view)
 
     def test_ambiguous_create_absence_is_rechecked_before_cleanup_is_confirmed(self):
         from unittest.mock import patch
@@ -189,8 +289,9 @@ class HostConfigTests(unittest.TestCase):
         self.assertEqual(receipt['failure_type'],'RemoteDisconnected')
         self.assertNotIn('synthetic-response-body',json.dumps(receipt))
 
-    def receipt_phase(self,events,state,resume_id=None):
+    def receipt_phase(self,events,state,resume_id=None,generations=1,delivered_generation=None):
         import host
+        import types
         from unittest.mock import patch
         class Channel:
             def __init__(self,frames):self.frames=list(frames)
@@ -206,13 +307,15 @@ class HostConfigTests(unittest.TestCase):
                     {'type':'agent_done','exit_code':0}])
             def remove(self,*_args):pass
         class Pump:
-            def __init__(self,_gateway):pass
+            def __init__(self,_gateway):
+                if delivered_generation is not None:self.delivered_generation=delivered_generation
             def deliver(self,_channel):pass
             def close(self):pass
         invocation={'binary':'/unused/rcode','effective_profile':{'kind':'local','model':'fixture','local':{}}}
         item={'case':{'max_steps':1},'fixture':'/unused/fixture','task':'fixture'}
         with patch.object(host,'RequestPump',Pump):
-            return host.agent_phase(FakeDocker(),invocation,item,{},object(),time.monotonic()+5,
+            return host.agent_phase(FakeDocker(),invocation,item,{},
+                types.SimpleNamespace(generations=generations),time.monotonic()+5,
                 resume_id=resume_id,resume_prompt='continue' if resume_id else None,policy_state=state)
 
     def test_agent_phase_observes_start_and_every_result(self):
@@ -235,6 +338,114 @@ class HostConfigTests(unittest.TestCase):
         self.receipt_phase([{'type':'tool_result','id':'call-1','name':'load_skill','is_error':False}],
             state,resume_id='00000000-0000-0000-0000-000000000001')
         self.assertTrue(required_skills_met(state,[skill]))
+
+    def test_agent_phase_propagates_generation(self):
+        state={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+        self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+            'arguments':'{"command":"git status"}'}],state,generations=1)
+        self.assertEqual(state['diagnostics'][0]['generation'],1)
+        zero={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+        self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+            'arguments':'{"command":"git status"}'}],zero,generations=0)
+        self.assertIsNone(zero['diagnostics'][0]['generation'])
+
+    def test_agent_phase_uses_delivered_not_requested_generation(self):
+        state={'skills':{},'violations':set(),'diagnostics':[],'diagnostics_dropped':0}
+        self.receipt_phase([{'type':'tool_start','id':'shell','name':'run_command',
+            'arguments':'{"command":"git status"}'}],state,generations=2,delivered_generation=1)
+        self.assertEqual(state['diagnostics'][0]['generation'],1)
+
+    def test_request_pump_tracks_only_delivered_generation(self):
+        import host
+        class Gateway:
+            generations=0
+            def relay(self,_body,_cancelled=None):
+                self.generations+=1
+                return 200,{'generation':self.generations}
+        class Channel:
+            def __init__(self):self.frames=[]
+            def send(self,value):self.frames.append(value)
+        gateway=Gateway();channel=Channel();pump=host.RequestPump(gateway)
+        try:
+            pump.submit(1,{})
+            deadline=time.monotonic()+2
+            while not channel.frames and time.monotonic()<deadline:
+                pump.deliver(channel);time.sleep(.001)
+            self.assertEqual(pump.delivered_generation,1)
+            pump.submit(2,{})
+            while gateway.generations!=2 and time.monotonic()<deadline:time.sleep(.001)
+            self.assertEqual(gateway.generations,2)
+            self.assertEqual(pump.delivered_generation,1)
+            while len(channel.frames)<2 and time.monotonic()<deadline:
+                pump.deliver(channel);time.sleep(.001)
+            self.assertEqual(pump.delivered_generation,2)
+        finally:pump.close()
+
+    def test_diagnostics_failure_blocks_previous_pass_and_skips_remaining_cases(self):
+        import host
+        from unittest.mock import patch
+        class Channel:
+            def receive(self,timeout=None):return {'type':'storage_ready'}
+            def close(self):pass
+        class FakeDocker:
+            uid=10001
+            def __init__(self,*_args,**_kwargs):self.active={};self.volumes={};self.cleanup_deadline=None
+            def volume(self,_size,_deadline):return 'volume'
+            def create(self,*_args,**_kwargs):return 'container'
+            def start(self,*_args,**_kwargs):return Channel()
+            def archive(self,*_args):return b''
+            def remove(self,*_args):pass
+            def cleanup(self,_deadline):pass
+        done={'type':'agent_done','exit_code':0,'signal':None,'leader_reaped':True,'pipes_complete':True,
+            'timed_out':False,'cancelled':False,'truncated':False,'forced':False}
+        calls=[]
+        def phase(_docker,_invocation,item,_volumes,gateway,_deadline,**kwargs):
+            case_id=item['case']['id'];calls.append(case_id)
+            gateway.generations=1;gateway.attempts=1
+            gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+            if case_id in ('1','3'):
+                host.observe_tool_start(kwargs['policy_state'],{'id':'shell','name':'run_command',
+                    'arguments':json.dumps({'command':'git status synthetic-case-'+case_id})},generation=1)
+            return {'done':done,'agent_reported_tool_successes':{},'session_id':None,'sentinel':False,'cancel_sent':False}
+        original=host.os.write;writes=0
+        def partial(fd,data):
+            nonlocal writes
+            writes+=1
+            if writes==1:return original(fd,data)
+            original(fd,bytes(data[:max(1,len(data)//2)]))
+            raise OSError('synthetic /secret/path/events.jsonl')
+        with tempfile.TemporaryDirectory() as temp:
+            diagnostics_path,spec=make_diagnostics(Path(temp))
+            cases=[]
+            for number in range(1,5):
+                case={'id':str(number),'language':'python','category':'fixture','timeout_secs':30,
+                    'max_steps':2,'max_requests':2}
+                cases.append({'case':case,'sha256':'f'*64,'fixture':'/unused/fixture','task':'fixture',
+                    'oracle':{'prepare':[],'checks':[]}})
+            invocation={'version':1,'comparison_key':{},'artifact':{},'docker':'/docker','socket':'/docker.sock',
+                'image':'image','runtime':str(ROOT/'evals/runtime'),'diagnostics':spec,
+                'effective_profile':{'kind':'local','model':'fixture','base_url':'http://127.0.0.1:9/v1','local':{}},
+                'cases':cases}
+            stdin=io.TextIOWrapper(io.BytesIO(json.dumps(invocation).encode()));stdout=io.StringIO();stderr=io.StringIO()
+            with patch.object(host,'Docker',FakeDocker),patch.object(host,'check_isolation',return_value=None),patch.object(
+                host,'agent_phase',phase),patch.object(host,'extract_frozen',return_value='f'*64),patch.object(
+                host.os,'write',side_effect=partial),patch.object(host.sys,'stdin',stdin),patch.object(
+                host.sys,'stdout',stdout),patch.object(host.sys,'stderr',stderr):
+                code=host.main()
+            report_text=stdout.getvalue();report=json.loads(report_text)
+            lines=diagnostics_path.read_text().splitlines()
+            self.assertEqual(len(lines),1)
+            self.assertEqual(json.loads(lines[0])['case'],'1')
+            self.assertNotIn(str(diagnostics_path),report_text)
+            self.assertNotIn('synthetic-case',report_text)
+        self.assertEqual(code,1)
+        self.assertEqual(calls,['1','2','3'])
+        self.assertEqual([row['status'] for row in report['cases']],['failed','blocked','blocked','not_run'])
+        self.assertEqual(report['cases'][1]['reason'],'diagnostics I/O failure')
+        self.assertEqual(report['cases'][2]['reason'],'diagnostics I/O failure')
+        self.assertEqual(report['cases'][3]['cleanup'],'confirmed_absent')
+        self.assertFalse(report['diagnostics']['complete'])
+        self.assertEqual(report['diagnostics']['events'],1)
 
     def test_run_case_uses_persistent_snapshot_for_observer_when_enabled(self):
         import host
@@ -552,6 +763,51 @@ class HostTests(unittest.TestCase):
         self.assertEqual((snapshots/'persistent/value.txt').read_text(),'changed')
         self.assertEqual((fixture/'value.txt').read_text(),'original')
         self.assertEqual(len(result['snapshot_sha256']),64)
+        self.assertFalse(self.docker.active or self.docker.volumes)
+
+    def test_diagnostics_sidecar_matches_policy_and_survives_cleanup(self):
+        import host
+        from unittest.mock import patch
+        fixture=self.root/'fixture';fixture.mkdir(mode=0o755)
+        (fixture/'value.txt').write_text('original')
+        temporary=self.root/'temporary';temporary.mkdir(mode=0o700)
+        diagnostics_path,spec=make_diagnostics(self.root)
+        writer=host.DiagnosticsWriter(spec)
+        profile={'base_url':'http://127.0.0.1:9/v1','model':'fixture','max_output_tokens':8,
+            'request_timeout_secs':5,'idle_timeout_secs':5}
+        item={'case':{'id':'diagnostics','language':'python','category':'fixture','timeout_secs':30,
+            'max_steps':2,'max_requests':2},'sha256':'f'*64,'fixture':str(fixture),'task':'fixture',
+            'oracle':{'prepare':[],'checks':[]}}
+        def phase(docker,_invocation,_item,volumes,gateway,deadline,**kwargs):
+            name=docker.create({'/fixture':fixture},deadline,volumes=volumes)
+            channel=docker.start(name,{'mode':'agent','uid':10001,'gid':10001,'timeout_secs':10,
+                'seed_project':True,'hold':True,'model':'fixture','profile_config':None,
+                'argv':['python3','-I','-S','-c',"from pathlib import Path;Path('value.txt').write_text('changed')"]},deadline)
+            try:
+                while True:
+                    done=channel.receive()
+                    if done['type']=='agent_done':break
+                docker.remove(name,deadline)
+                gateway.generations=1;gateway.attempts=1
+                gateway.receipts=[{'generation':1,'status':'received','http_status':200,'usage':None}]
+                host.observe_tool_start(kwargs['policy_state'],{'id':'pip','name':'run_command',
+                    'arguments':json.dumps({'command':'python3 -m pip install pytest'})},generation=1)
+                return {'done':done,'agent_reported_tool_successes':{},'session_id':None,
+                    'sentinel':False,'cancel_sent':False}
+            finally:channel.close()
+        with patch.object(host,'agent_phase',phase):
+            result=host.run_case(self.docker,{'effective_profile':profile},item,temporary,diagnostics=writer)
+        summary=writer.finish();raw=diagnostics_path.read_bytes()
+        self.assertEqual(result['formal_violations'],['package_install'])
+        self.assertEqual(result['status'],'failed')
+        self.assertTrue(summary['complete'])
+        self.assertEqual(summary['sha256'],hashlib.sha256(raw).hexdigest())
+        events=[json.loads(line) for line in raw.splitlines()]
+        self.assertEqual(len(events),summary['events'])
+        self.assertEqual(events[0]['command'],'python3 -m pip install pytest')
+        self.assertEqual(events[0]['generation'],1)
+        self.assertNotIn('pip install',json.dumps(result))
+        self.assertEqual((temporary/'diagnostics/value.txt').read_text(),'changed')
         self.assertFalse(self.docker.active or self.docker.volumes)
 
     def test_real_sigint_during_cleanup_preserves_current_case_observations(self):

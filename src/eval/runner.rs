@@ -139,6 +139,108 @@ fn attach_snapshots(invocation: &mut Value, snapshots: Option<String>) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DiagnosticsTarget {
+    path: String,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn normalized_output(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    ensure!(
+        !path.as_os_str().as_bytes().ends_with(b"/"),
+        "Diagnostics должен быть файлом, не каталогом"
+    );
+    let name = path.file_name().context("Нужен путь к новому файлу")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+#[cfg(unix)]
+fn diagnostics_target(
+    path: Option<&Path>,
+    report: &Path,
+    snapshots: Option<&str>,
+) -> Result<Option<DiagnosticsTarget>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let expected = normalized_output(path)?;
+    ensure!(
+        expected != normalized_output(report)?,
+        "Diagnostics и report должны различаться"
+    );
+    if let Some(root) = snapshots {
+        ensure!(
+            !expected.starts_with(root),
+            "Diagnostics должен находиться вне snapshots"
+        );
+    }
+    let path = expected
+        .to_str()
+        .context("Путь diagnostics должен быть UTF-8")?
+        .to_owned();
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&expected)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.permissions().mode() & 0o777 == 0o600,
+        "Некорректные права diagnostics"
+    );
+    Ok(Some(DiagnosticsTarget {
+        path,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }))
+}
+
+#[cfg(not(unix))]
+fn diagnostics_target(
+    path: Option<&Path>,
+    _report: &Path,
+    _snapshots: Option<&str>,
+) -> Result<Option<DiagnosticsTarget>> {
+    if path.is_some() {
+        anyhow::bail!("Защищённый eval поддерживается только на Unix host")
+    }
+    Ok(None)
+}
+
+fn attach_diagnostics(invocation: &mut Value, target: Option<DiagnosticsTarget>) {
+    if let Some(target) = target {
+        invocation["diagnostics"] = json!({
+            "path": target.path, "dev": target.dev, "ino": target.ino,
+        });
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_diagnostics(target: &DiagnosticsTarget) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = fs::symlink_metadata(&target.path) else {
+        return;
+    };
+    if metadata.file_type().is_file()
+        && metadata.dev() == target.dev
+        && metadata.ino() == target.ino
+        && metadata.len() == 0
+    {
+        let _ = fs::remove_file(&target.path);
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_diagnostics(_target: &DiagnosticsTarget) {}
+
 pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i32> {
     ensure!(args.yes, "Для eval run требуется явное согласие --yes");
     let name = cli
@@ -283,21 +385,48 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         cases.push(json!({"case":c.case,"sha256":c.sha256,"task":c.task,"fixture":path,"oracle":oracle(&c.oracle)}));
     }
     let mut invocation = json!({"version":1,"comparison_key":key,"artifact":artifact,"effective_profile":effective,"provider_credential":credential,"docker":docker,"socket":socket,"image":args.image,"runtime":runtime,"binary":frozen,"cases":cases});
-    attach_snapshots(&mut invocation, snapshots);
+    attach_snapshots(&mut invocation, snapshots.clone());
+    let diagnostics = diagnostics_target(
+        args.diagnostics.as_deref(),
+        &args.report,
+        snapshots.as_deref(),
+    )?;
+    attach_diagnostics(&mut invocation, diagnostics.clone());
     let input = serde_json::to_vec(&invocation)?;
-    ensure!(
-        input.len() <= 16 * 1024 * 1024,
-        "Превышен лимит host invocation 16 МиБ"
-    );
+    if input.len() > 16 * 1024 * 1024 {
+        if let Some(target) = diagnostics.as_ref() {
+            cleanup_diagnostics(target);
+        }
+        anyhow::bail!("Превышен лимит host invocation 16 МиБ");
+    }
     // Only the trusted Python host receives the provider credential, via stdin.
     // Docker receives no ambient Docker context or provider environment.
     // Keep stdin/out bounded. SIGINT goes to the same foreground process group;
     // Python owns cleanup and produces the honest interrupted report.
     let path = root.to_owned();
     let runtime_path = runtime.clone();
+    let diagnostics_for_cleanup = diagnostics.clone();
     let output=tokio::task::spawn_blocking(move || ->Result<(std::process::ExitStatus,Vec<u8>)>{
-        let mut child=Command::new(python).args(["-I","-S","-c","import sys;sys.path[:0]=[sys.argv[1],sys.argv[2]];import host;raise SystemExit(host.main())"]).arg(&path).arg(runtime_path)
-            .env_clear().env("PATH","/usr/bin:/bin").env("HOME",&path).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let mut command = Command::new(python);
+        command
+            .args(["-I","-S","-c","import sys;sys.path[:0]=[sys.argv[1],sys.argv[2]];import host;raise SystemExit(host.main())"])
+            .arg(&path)
+            .arg(runtime_path)
+            .env_clear()
+            .env("PATH","/usr/bin:/bin")
+            .env("HOME",&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(target) = diagnostics_for_cleanup.as_ref() {
+                    cleanup_diagnostics(target);
+                }
+                return Err(error.into());
+            }
+        };
         let mut stdin=child.stdin.take().context("host stdin")?;let mut stdout=child.stdout.take().context("host stdout")?;
         let writer=std::thread::spawn(move ||stdin.write_all(&input));
         let mut bytes=Vec::new();stdout.by_ref().take(2*1024*1024+1).read_to_end(&mut bytes)?;
@@ -306,6 +435,10 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
     }).await??;
     let report = strict_json::parse(&output.1)?;
     let counts = validate_report(&report)?;
+    ensure!(
+        report.get("diagnostics").is_some() == args.diagnostics.is_some(),
+        "Несоответствие наличия diagnostics в отчёте"
+    );
     ensure!(
         report["comparison_key"] == key && report["artifact"] == artifact,
         "Host report identity mismatch"
@@ -330,6 +463,39 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         },
     )
 }
+fn validate_diagnostics_summary(summary: Option<&Value>, passed: u64) -> Result<()> {
+    let Some(summary) = summary else {
+        return Ok(());
+    };
+    let fields = summary.as_object().context("Diagnostics summary")?;
+    ensure!(
+        fields.keys().all(|key| matches!(
+            key.as_str(),
+            "complete" | "sha256" | "events" | "dropped" | "error"
+        )),
+        "Неизвестные поля diagnostics"
+    );
+    ensure!(
+        summary["events"].as_u64().is_some() && summary["dropped"].as_u64().is_some(),
+        "Счётчики diagnostics"
+    );
+    if summary["complete"] == true {
+        ensure!(
+            summary["sha256"].as_str().is_some_and(hex) && summary.get("error").is_none(),
+            "Некорректная complete diagnostics"
+        );
+        return Ok(());
+    }
+    ensure!(
+        summary["complete"] == false
+            && summary.get("sha256") == Some(&Value::Null)
+            && summary["error"] == "diagnostics_io_error"
+            && passed == 0,
+        "PASS с неполной diagnostics"
+    );
+    Ok(())
+}
+
 fn validate_report(report: &Value) -> Result<BTreeMap<String, u64>> {
     let obj = report.as_object().context("Eval report object")?;
     ensure!(
@@ -343,6 +509,7 @@ fn validate_report(report: &Value) -> Result<BTreeMap<String, u64>> {
                 | "cleanup"
                 | "counts"
                 | "residual_resources"
+                | "diagnostics"
         )) && report["version"] == 1,
         "Неизвестная версия/поля отчёта"
     );
@@ -405,6 +572,7 @@ fn validate_report(report: &Value) -> Result<BTreeMap<String, u64>> {
         serde_json::to_value(&counts)? == report["counts"],
         "Счётчики отчёта не совпадают с кейсами"
     );
+    validate_diagnostics_summary(report.get("diagnostics"), counts["passed"])?;
     Ok(counts)
 }
 
@@ -713,7 +881,149 @@ pub(super) fn compare(baseline: &Path, candidate: &Path, events: &Events) -> Res
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+    use std::os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, PermissionsExt},
+    };
+
+    #[test]
+    fn diagnostics_target_is_new_private_and_identified() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let target = super::diagnostics_target(Some(&path), &temp.path().join("report.json"), None)
+            .unwrap()
+            .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(target.dev, metadata.dev());
+        assert_eq!(target.ino, metadata.ino());
+        assert!(target.path.ends_with("/events.jsonl"));
+        assert!(
+            super::diagnostics_target(Some(&path), &temp.path().join("report.json"), None).is_err()
+        );
+        assert!(
+            super::diagnostics_target(None, &temp.path().join("report.json"), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn diagnostics_target_rejects_alias_collision_and_snapshots_nesting() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, temp.path().join("alias")).unwrap();
+        assert!(
+            super::diagnostics_target(
+                Some(&temp.path().join("alias/report.json")),
+                &real.join("report.json"),
+                None,
+            )
+            .is_err()
+        );
+        let snapshots = temp.path().join("snapshots");
+        std::fs::create_dir(&snapshots).unwrap();
+        let root = std::fs::canonicalize(&snapshots)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let nested = snapshots.join("events.jsonl");
+        assert!(
+            super::diagnostics_target(
+                Some(&nested),
+                &temp.path().join("report.json"),
+                Some(&root),
+            )
+            .is_err()
+        );
+        assert!(!nested.exists());
+    }
+
+    #[test]
+    fn diagnostics_target_rejects_symlink_non_utf8_and_directory_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let report = temp.path().join("report.json");
+        let dangling = temp.path().join("dangling");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &dangling).unwrap();
+        assert!(super::diagnostics_target(Some(&dangling), &report, None).is_err());
+        let non_utf8 = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'e', 0xff]));
+        assert!(super::diagnostics_target(Some(&non_utf8), &report, None).is_err());
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(super::diagnostics_target(Some(&directory), &report, None).is_err());
+        let trailing = std::path::PathBuf::from(format!("{}/", directory.display()));
+        assert!(super::diagnostics_target(Some(&trailing), &report, None).is_err());
+    }
+
+    #[test]
+    fn invocation_diagnostics_contains_only_path_and_identity() {
+        let mut invocation = serde_json::json!({"version":1,"comparison_key":{"protocol":2}});
+        let key = invocation["comparison_key"].clone();
+        super::attach_diagnostics(&mut invocation, None);
+        assert!(invocation.get("diagnostics").is_none());
+        super::attach_diagnostics(
+            &mut invocation,
+            Some(super::DiagnosticsTarget {
+                path: "/absolute/events.jsonl".into(),
+                dev: 11,
+                ino: 12,
+            }),
+        );
+        assert_eq!(
+            invocation["diagnostics"],
+            serde_json::json!({"path":"/absolute/events.jsonl","dev":11,"ino":12})
+        );
+        assert_eq!(invocation["comparison_key"], key);
+    }
+
+    #[test]
+    fn diagnostics_summary_schema_is_strict_and_fail_closed() {
+        let complete =
+            serde_json::json!({"complete":true,"sha256":"0".repeat(64),"events":0,"dropped":0});
+        assert!(super::validate_diagnostics_summary(Some(&complete), 0).is_ok());
+        let invalid = serde_json::json!({"complete":true,"sha256":null,"events":1,"dropped":0});
+        assert!(super::validate_diagnostics_summary(Some(&invalid), 0).is_err());
+        let failed = serde_json::json!({"complete":false,"sha256":null,"events":1,"dropped":0,
+            "error":"diagnostics_io_error"});
+        assert!(super::validate_diagnostics_summary(Some(&failed), 0).is_ok());
+        assert!(super::validate_diagnostics_summary(Some(&failed), 1).is_err());
+        let without_hash = serde_json::json!({"complete":false,"events":1,"dropped":0,
+            "error":"diagnostics_io_error"});
+        assert!(super::validate_diagnostics_summary(Some(&without_hash), 0).is_err());
+        assert!(super::validate_diagnostics_summary(None, 1).is_ok());
+    }
+
+    #[test]
+    fn cleanup_diagnostics_removes_only_the_same_empty_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let report = temp.path().join("report.json");
+        let target = super::diagnostics_target(Some(&path), &report, None)
+            .unwrap()
+            .unwrap();
+        super::cleanup_diagnostics(&target);
+        assert!(!path.exists());
+        let target = super::diagnostics_target(Some(&path), &report, None)
+            .unwrap()
+            .unwrap();
+        let other = temp.path().join("other");
+        std::fs::write(&other, b"preserve").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        super::cleanup_diagnostics(&target);
+        assert_eq!(std::fs::read(&other).unwrap(), b"preserve");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn snapshots_root_is_new_private_and_canonical() {

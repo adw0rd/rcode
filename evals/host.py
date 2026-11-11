@@ -12,6 +12,7 @@ from pathlib import Path
 import signal
 import ssl
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -35,6 +36,86 @@ def request_cancel(_signum=None,_frame=None):
     CONTROL.cancelled=True
 
 class AssessmentFailure(Failure):pass
+
+class DiagnosticsWriter:
+    def __init__(self,spec):
+        if not isinstance(spec,dict) or set(spec)!={'path','dev','ino'}:
+            raise Failure('diagnostics invocation')
+        if not isinstance(spec['path'],str) or type(spec['dev']) is not int or type(spec['ino']) is not int:
+            raise Failure('diagnostics invocation')
+        self.path=spec['path'];self.fd=None;self.poisoned=False
+        self.offset=0;self.events=0;self.dropped=0;self.sha256=hashlib.sha256()
+        flags=os.O_RDWR|os.O_APPEND|getattr(os,'O_NOFOLLOW',0)
+        try:
+            self.fd=os.open(self.path,flags)
+            value=os.fstat(self.fd)
+            valid=(stat.S_ISREG(value.st_mode) and value.st_dev==spec['dev']
+                and value.st_ino==spec['ino'] and value.st_nlink==1
+                and value.st_uid==os.geteuid() and stat.S_IMODE(value.st_mode)==0o600
+                and value.st_size==0)
+            if not valid:raise Failure('diagnostics identity')
+        except (Failure,OSError,ValueError):
+            if self.fd is not None:
+                try:os.close(self.fd)
+                except OSError:pass
+                self.fd=None
+            raise Failure('diagnostics open failed')
+
+    def summary(self):
+        if self.poisoned:
+            return {'complete':False,'sha256':None,'events':self.events,'dropped':self.dropped,
+                'error':'diagnostics_io_error'}
+        return {'complete':True,'sha256':self.sha256.hexdigest(),'events':self.events,'dropped':self.dropped}
+
+    def poison(self):
+        self.poisoned=True
+        if self.fd is None:return
+        try:os.ftruncate(self.fd,self.offset);os.fsync(self.fd)
+        except (OSError,TypeError,ValueError):pass
+
+    def commit(self,case,events,dropped):
+        if self.poisoned:return False
+        try:
+            raw=bytearray()
+            for event in events:
+                record={**event,'case':case}
+                raw.extend(json.dumps(record,ensure_ascii=True,allow_nan=False,
+                    separators=(',',':')).encode('utf-8')+b'\n')
+            view=memoryview(raw)
+            while view:
+                written=os.write(self.fd,view)
+                if written<=0:raise OSError('short diagnostics write')
+                view=view[written:]
+            os.fsync(self.fd)
+        except (OSError,TypeError,ValueError):
+            self.poison();return False
+        self.sha256.update(raw);self.offset+=len(raw)
+        self.events+=len(events);self.dropped+=dropped
+        return True
+
+    def finish(self):
+        if self.fd is None:return self.summary()
+        try:
+            if not self.poisoned:
+                os.fsync(self.fd);os.lseek(self.fd,0,os.SEEK_SET)
+                actual=hashlib.sha256();size=0;lines=0
+                while True:
+                    chunk=os.read(self.fd,65536)
+                    if not chunk:break
+                    actual.update(chunk);size+=len(chunk);lines+=chunk.count(b'\n')
+                if size!=self.offset or lines!=self.events or actual.digest()!=self.sha256.digest():
+                    raise Failure('diagnostics final digest')
+                os.close(self.fd);self.fd=None
+                directory=os.open(str(Path(self.path).parent),os.O_RDONLY|getattr(os,'O_DIRECTORY',0))
+                try:os.fsync(directory)
+                finally:os.close(directory)
+        except (Failure,OSError,ValueError):self.poison()
+        finally:
+            if self.fd is not None:
+                try:os.close(self.fd)
+                except OSError:pass
+                self.fd=None
+        return self.summary()
 
 def json_equal(a,b):
     if type(a) is not type(b):return False
@@ -188,14 +269,16 @@ class Gateway:
 class RequestPump:
     """One upstream exchange at a time; Root control frames remain responsive."""
     def __init__(self,gateway):
-        self.gateway=gateway;self.jobs=queue.Queue(maxsize=4);self.results=queue.Queue(maxsize=4);self.stop=threading.Event();self.ids=set();self.submitted=0;self.failed=threading.Event()
+        self.gateway=gateway;self.jobs=queue.Queue(maxsize=4);self.results=queue.Queue(maxsize=4);self.stop=threading.Event();self.ids=set();self.submitted=0;self.failed=threading.Event();self.delivered_generation=None
         def work():
             while not self.stop.is_set():
                 try:identity,body=self.jobs.get(timeout=.05)
                 except queue.Empty:continue
                 try:
+                    before=gateway.generations
                     status,response=gateway.relay(body,self.stop)
-                    if not self.stop.is_set():self.results.put_nowait((identity,status,response))
+                    generation=gateway.generations if gateway.generations>before else None
+                    if not self.stop.is_set():self.results.put_nowait((identity,status,response,generation))
                 except Exception:
                     self.failed.set();return
         self.worker=threading.Thread(target=work,daemon=True);self.worker.start()
@@ -207,9 +290,10 @@ class RequestPump:
     def deliver(self,channel):
         if self.failed.is_set():raise Failure('upstream worker failed')
         while not self.stop.is_set():
-            try:identity,status,body=self.results.get_nowait()
+            try:identity,status,body,generation=self.results.get_nowait()
             except queue.Empty:return
             channel.send({'type':'response','id':identity,'status':status,'body':body})
+            if generation is not None:self.delivered_generation=generation
     def cancel(self):self.stop.set()
     def close(self):
         self.cancel();self.worker.join(timeout=2)
@@ -286,7 +370,10 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
                             value=str(uuid.UUID(event['session_id']))
                             if session_id is not None and session_id!=value:raise Failure('multiple session bindings')
                             session_id=value
-                        if isinstance(event,dict) and event.get('type')=='tool_start':observe_tool_start(policy_state,event)
+                        if isinstance(event,dict) and event.get('type')=='tool_start':
+                            observe_tool_start(policy_state,event,
+                                generation=getattr(pump,'delivered_generation',
+                                    gateway.generations if type(getattr(gateway,'generations',None)) is int else None))
                         if isinstance(event,dict) and event.get('type')=='tool_result':
                             observe_tool_result(policy_state,event)
                             if event.get('is_error') is False:
@@ -308,9 +395,10 @@ def agent_phase(docker,invocation,item,volumes,gateway,deadline,sentinel=None,re
         finally:
             if channel:channel.close()
 
-def run_case(docker,invocation,item,temporary):
+def run_case(docker,invocation,item,temporary,diagnostics=None):
     case=item['case'];start=time.monotonic();deadline=start+case['timeout_secs'];work_deadline=deadline-12;docker.cleanup_deadline=deadline
     policy_state={'skills':{},'violations':set()};required_skills=case.get('require_skills',[])
+    if diagnostics is not None:policy_state.update({'diagnostics':[],'diagnostics_dropped':0})
     result={'id':case['id'],'case_sha256':item['sha256'],'language':case['language'],'category':case['category'],
         'status':'blocked','reason':None,'checks':[],'cleanup':'unknown','agent':None,'requests':[],'snapshot_sha256':None,'seconds':None,
         'required_skills':required_skills,'required_skills_observed':required_skills_met(policy_state,required_skills),'formal_violations':[]}
@@ -410,12 +498,17 @@ def run_case(docker,invocation,item,temporary):
                     result['status']='blocked';result['reason']='operator cancelled during finalization'
                 if result['seconds']>case['timeout_secs'] and result['status']=='passed':
                     result['status']='blocked';result['reason']='total case deadline exceeded'
+                if diagnostics is not None:
+                    committed=diagnostics.commit(case['id'],policy_state['diagnostics'],policy_state['diagnostics_dropped'])
+                    if not committed and result['status']!='unknown':
+                        result['status']='blocked';result['reason']='diagnostics I/O failure'
     return result
 
 def main():
     if sys.version_info<(3,12):raise Failure('Python 3.12 or newer required')
     invocation=strict(sys.stdin.buffer.read(16*1024*1024+1),16*1024*1024)
     if invocation.get('version')!=1:raise Failure('host invocation version')
+    diagnostics=DiagnosticsWriter(invocation['diagnostics']) if 'diagnostics' in invocation else None
     CONTROL.cancelled=False
     # A flag cannot unwind a finally block or lose an in-progress report.
     # Bounded transport loops observe it; cleanup deliberately ignores it.
@@ -431,7 +524,11 @@ def main():
                 if CONTROL.cancelled or docker.active or docker.volumes:
                     report['cases'].append({'id':item['case']['id'],'case_sha256':item['sha256'],'status':'not_run','reason':'previous cleanup or cancellation','cleanup':'unknown' if docker.active or docker.volumes else 'confirmed_absent'})
                     continue
-                row=run_case(docker,invocation,item,root);report['cases'].append(row)
+                if diagnostics is not None and diagnostics.poisoned:
+                    report['cases'].append({'id':item['case']['id'],'case_sha256':item['sha256'],
+                        'status':'not_run','reason':'diagnostics unavailable','cleanup':'confirmed_absent'})
+                    continue
+                row=run_case(docker,invocation,item,root,diagnostics=diagnostics);report['cases'].append(row)
                 print('eval '+row['id']+': '+row['status'],file=sys.stderr,flush=True)
         except (Failure,OSError,ValueError,KeyError,TypeError):
             done={c['id'] for c in report['cases']}
@@ -441,11 +538,18 @@ def main():
             signal.signal(signal.SIGINT,signal.SIG_IGN);signal.signal(signal.SIGTERM,signal.SIG_IGN)
             try:docker.cleanup(time.monotonic()+20);report['cleanup']='confirmed_absent'
             except (Failure,OSError,ValueError):report['cleanup']='unknown'
+    if diagnostics is not None:
+        report['diagnostics']=diagnostics.finish()
+        if not report['diagnostics']['complete']:
+            for row in report['cases']:
+                if row['status']=='passed':
+                    row['status']='blocked';row['reason']='diagnostics I/O failure'
     counts={k:sum(c['status']==k for c in report['cases']) for k in ['passed','failed','blocked','unknown','not_run']}
     report['counts']=counts
     report['residual_resources']={'containers':[{'name':name,**record} for name,record in docker.active.items()], 'volumes':[{'name':name,'owner':record['owner']} for name,record in docker.volumes.items()]}
     print(json.dumps(report,ensure_ascii=True,allow_nan=False,separators=(',',':')),flush=True)
-    return 0 if counts['passed']==len(report['cases']) and report['cleanup']=='confirmed_absent' else 1
+    return 0 if (counts['passed']==len(report['cases']) and report['cleanup']=='confirmed_absent'
+        and (diagnostics is None or report['diagnostics']['complete'] is True)) else 1
 
 if __name__=='__main__':
     try:raise SystemExit(main())

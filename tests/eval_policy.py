@@ -5,7 +5,70 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from evals.policy import observe_tool_start, observe_tool_result, required_skills_met
+from evals.policy import observe_tool_start, observe_tool_result, required_skills_met, tool_violations
+
+
+def diagnostic_state():
+    return {'skills': {}, 'violations': set(), 'diagnostics': [], 'diagnostics_dropped': 0}
+
+
+class DiagnosticsPolicyTests(unittest.TestCase):
+    def test_receipt_has_canonical_categories_generation_and_exact_command(self):
+        state = diagnostic_state()
+        command = 'git status; python3 -m pip install pytest'
+        observe_tool_start(state, {'id': 'call-1', 'name': 'run_command',
+            'arguments': json.dumps({'command': command})}, generation=7)
+        self.assertEqual([event['category'] for event in state['diagnostics']],
+            ['package_install', 'git'])
+        self.assertTrue(all(event['generation'] == 7 for event in state['diagnostics']))
+        self.assertTrue(all(event['command'] == command for event in state['diagnostics']))
+        self.assertEqual(tool_violations({'name': 'spawn_agent', 'arguments': '{}'}), ('subagent',))
+
+    def test_repeated_violations_are_retained_but_opt_out_retains_no_command(self):
+        state = diagnostic_state()
+        for command in ('git status', 'pip install pytest'):
+            observe_tool_start(state, {'id': 'call', 'name': 'run_command',
+                'arguments': json.dumps({'command': command})}, generation=1)
+        self.assertEqual(len(state['diagnostics']), 2)
+        plain = {'skills': {}, 'violations': set()}
+        observe_tool_start(plain, {'id': 'call', 'name': 'run_command',
+            'arguments': json.dumps({'command': 'git status synthetic-secret'})})
+        self.assertNotIn('synthetic-secret', repr(plain))
+
+    def test_limits_unicode_and_malformed_arguments(self):
+        state = diagnostic_state()
+        prefix = 'pip install #\ud800'
+        padding = 4094 - len(prefix.encode('utf-8', errors='replace'))
+        command = prefix + 'a' * padding + '\U0001f642'
+        observe_tool_start(state, {'id': 'x' * 300, 'name': 'run_command',
+            'arguments': json.dumps({'command': command})}, generation=1)
+        event = state['diagnostics'][0]
+        self.assertEqual(len(event['command'].encode('utf-8')), 4094)
+        self.assertTrue(event['command_truncated'])
+        self.assertTrue(event['call_id_truncated'])
+        self.assertLessEqual(len(event['call_id'].encode('utf-8')), 256)
+        self.assertNotIn('\ud800', repr(event['command']))
+        for receipt in ({'name': 'run_command', 'arguments': '{'},
+                {'name': 'run_command', 'arguments': '{"command":null}'}):
+            self.assertEqual(tool_violations(receipt), ())
+        agent_state = diagnostic_state()
+        observe_tool_start(agent_state, {'id': 'agent', 'name': 'spawn_agent',
+            'arguments': json.dumps({'command': 'must not be retained'})}, generation=2)
+        self.assertIsNone(agent_state['diagnostics'][0]['command'])
+        controls = diagnostic_state()
+        control_command = 'pip install #\u2028\x1b[31m'
+        observe_tool_start(controls, {'id': 'control', 'name': 'run_command',
+            'arguments': json.dumps({'command': control_command})}, generation=1)
+        self.assertEqual(controls['diagnostics'][0]['command'], control_command)
+
+    def test_category_limit_is_deterministic_at_63_plus_2(self):
+        state = diagnostic_state()
+        state['diagnostics'] = [{} for _ in range(63)]
+        observe_tool_start(state, {'id': 'call', 'name': 'run_command',
+            'arguments': json.dumps({'command': 'git status; pip install pytest'})}, generation=2)
+        self.assertEqual(len(state['diagnostics']), 64)
+        self.assertEqual(state['diagnostics_dropped'], 1)
+        self.assertEqual(state['diagnostics'][-1]['category'], 'package_install')
 
 
 class PolicyTests(unittest.TestCase):

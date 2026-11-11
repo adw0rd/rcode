@@ -257,6 +257,25 @@ rcode --resume latest --compact exec "Продолжи работу"
 
 Сохраняется только `/workspace`, без `/agent-home`, credentials, OAuth-токенов и истории провайдера. Snapshots — локальные артефакты: выбирайте исключённый из Git каталог и не публикуйте их автоматически. Без `--snapshots` исходники по-прежнему удаляются вместе с временным каталогом. Для review используйте только кейсы с заполненным `snapshot_sha256`: частичный каталог после ошибки не является завершённым snapshot.
 
+## Diagnostics formal violations
+
+`--diagnostics <новый-файл>` сохраняет в local-only JSONL только tool starts, нарушающие формальные ограничения eval. Для `run_command` записывается точная команда, поэтому файл может содержать чувствительные данные. Он создаётся с правами `0600`; существующий файл, каталог или symlink не перезаписывается. Путь должен находиться вне `--snapshots` и отличаться от `--report`.
+
+```bash
+rcode --profile gigachat eval run \
+  --suite evals/todo-api/manifest.json \
+  --agent-binary /absolute/rcode-linux \
+  --series gigachat-todo-diagnostics \
+  --image sha256:POLNOE_IMAGE_ID \
+  --docker-socket /absolute/docker.sock \
+  --report /absolute/artifacts/report.json \
+  --snapshots /absolute/artifacts/snapshots \
+  --diagnostics /absolute/artifacts/formal-violations.jsonl \
+  --non-streaming --yes
+```
+
+Report содержит только summary `complete`, `sha256`, `events`, `dropped`, без diagnostics path и команд; comparison key не меняется. Пустой sidecar без нарушений валиден и имеет SHA-256 пустого содержимого. При ошибке записи или финализации summary становится incomplete, PASS запрещён, оставшиеся кейсы не запускают модель. Diagnostics и snapshots не публикуются автоматически; выбирайте исключённый из Git каталог.
+
 ## Хранение и ограничения
 
 `RCODE_HOME` меняет каталог данных; он должен находиться вне проекта. Указание нового каталога не переносит старые данные автоматически. Настройки находятся в `config.json`, ключи — в `credentials.json`, разрешения проектов — в `permissions.json`, сессии — в `sessions/`, история ввода — в `input-history/`, скиллы — в `skills/` и `skills.json` с `skill-sources/`, пользовательские команды — в `commands/`. Сохраните весь каталог для резервной копии.

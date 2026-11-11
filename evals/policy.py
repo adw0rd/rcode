@@ -261,7 +261,57 @@ def _classify_shell(command, state, depth=0):
     _classify_simple(simple, state, depth)
 
 
-def observe_tool_start(state, receipt):
+CATEGORY_ORDER = ('package_install', 'git', 'network', 'subagent')
+DIAGNOSTICS_LIMIT = 64
+
+
+def tool_violations(receipt):
+    if not isinstance(receipt, dict):
+        return ()
+    name = receipt.get('name')
+    if name in ('spawn_agent', 'wait_agent'):
+        return ('subagent',)
+    if name != 'run_command':
+        return ()
+    arguments = _arguments(receipt)
+    command = arguments.get('command') if arguments else None
+    if not isinstance(command, str):
+        return ()
+    temporary = {'violations': set()}
+    _classify_shell(command, temporary)
+    return tuple(category for category in CATEGORY_ORDER if category in temporary['violations'])
+
+
+def _bounded_text(value, limit):
+    raw = value.encode('utf-8', errors='replace')
+    truncated = len(raw) > limit
+    return raw[:limit].decode('utf-8', errors='ignore'), truncated
+
+
+def _record_diagnostics(state, receipt, categories, generation):
+    events = state.get('diagnostics')
+    if events is None:
+        return
+    arguments = _arguments(receipt)
+    raw_command = (arguments.get('command')
+        if receipt.get('name') == 'run_command' and arguments else None)
+    command, command_truncated = (_bounded_text(raw_command, 4096)
+        if isinstance(raw_command, str) else (None, False))
+    identity = receipt.get('id')
+    identity, identity_truncated = (_bounded_text(identity, 256)
+        if isinstance(identity, str) else (None, False))
+    for category in categories:
+        if len(events) >= DIAGNOSTICS_LIMIT:
+            state['diagnostics_dropped'] = state.get('diagnostics_dropped', 0) + 1
+            continue
+        events.append({'version': 1,
+            'generation': generation if type(generation) is int and generation >= 1 else None,
+            'category': category, 'tool': receipt['name'], 'call_id': identity,
+            'call_id_truncated': identity_truncated, 'command': command,
+            'command_truncated': command_truncated})
+
+
+def observe_tool_start(state, receipt, generation=None):
     if not isinstance(receipt, dict):
         return
     name = receipt.get('name')
@@ -283,13 +333,10 @@ def observe_tool_start(state, receipt):
             state['skills'][call_id] = skill
             state.setdefault('pending_skills', set()).add(call_id)
         return
-    if name in ('spawn_agent', 'wait_agent'):
-        state['violations'].add('subagent')
-    if name != 'run_command' or not arguments:
-        return
-    command = arguments.get('command')
-    if isinstance(command, str):
-        _classify_shell(command, state)
+    categories = tool_violations(receipt)
+    state['violations'].update(categories)
+    if categories:
+        _record_diagnostics(state, receipt, categories, generation)
 
 
 def observe_tool_result(state, receipt):
