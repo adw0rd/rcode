@@ -23,6 +23,22 @@ class TodoOracleContractTests(unittest.TestCase):
             'id':'http-crud-contract','argv':['python3','-I','-c',script],
             'stdin':'','timeout_secs':60,'expected_exit':0,'expected_json':{'status':'ok'}}]})
 
+    def test_task_documents_observable_http_contract(self):
+        task=(ROOT/'evals/todo-api/cases/todo-api/task.md').read_text()
+        required=(
+            '- `GET /health` возвращает ровно статус 200 и JSON `{"status":"ok"}` без дополнительных полей.',
+            '- `POST /todos` возвращает 201, `GET /todos`, `GET /todos/{id}` и `PATCH /todos/{id}` возвращают 200, `DELETE /todos/{id}` возвращает 204 без тела.',
+            '- Объект TODO содержит ровно поля `id`, `title`, `completed`, без дополнительных полей. ID — последовательные положительные целые, начиная с 1; удалённые ID не переиспользуются. `GET /todos` сохраняет порядок создания.',
+            '- Отсутствие ключа `title` в теле POST отклоняй со статусом 422.',
+            '- Строковый `title` с длиной после trim вне диапазона 1–200 символов отклоняй со статусом 422 при POST и PATCH.',
+            '- Явный `null` для `title` или `completed` в POST/PATCH отклоняй со статусом 400.',
+            '- Пустой PATCH `{}` существующего ID отклоняй со статусом 400.',
+            '- Для отсутствующего ID при GET, PATCH и DELETE возвращай ровно статус 404 и JSON `{"detail":"Todo not found"}` независимо от тела запроса: проверка ID предшествует проверке PATCH.',
+        )
+        for line in required:
+            with self.subTest(line=line):
+                self.assertIn(line,task)
+
 @unittest.skipUnless(os.environ.get('RCODE_EVAL_IMAGE') and os.environ.get('RCODE_EVAL_SOCKET'),'opt-in Docker controls: set RCODE_EVAL_IMAGE and RCODE_EVAL_SOCKET')
 class TodoApiControls(eval_controls.CorpusControls):
     @classmethod
