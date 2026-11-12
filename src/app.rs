@@ -8331,7 +8331,8 @@ mod tests {
         let store = ConfigStore::at(base.path().join("state")).unwrap();
 
         // Part A: external CancellationToken cancels an in-progress ask_user immediately,
-        // and settle_tick settles a running start_command job BEFORE execute_ask_user returns.
+        // and on Linux/macOS settle_tick settles a running start_command job BEFORE execute_ask_user returns.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mut settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
             settings.base_url = Some("http://127.0.0.1:1/v1".into());
@@ -8413,34 +8414,6 @@ mod tests {
                     !executor.managed.as_deref().unwrap().pending(),
                     "start_command must settle via settle_tick while ask_user is open"
                 );
-
-                // External CancellationToken cancels an in-progress ask_user immediately.
-                push_ask_user_delayed_test_replies([(
-                    std::time::Duration::from_secs(5),
-                    crate::ask_user::AskOutcome::Selected(0),
-                )]);
-                let cancel_trigger = cancel.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-                    cancel_trigger.cancel();
-                });
-                let started = tokio::time::Instant::now();
-                let cancel_call = ToolCall::new(
-                    crate::ask_user::TOOL_NAME,
-                    json!({"questions":[{"question":"Отменить?","options":["Да","Нет"]}]}),
-                );
-                let out = executor
-                    .execute(&cancel_call, None, Some(&mut bg_session))
-                    .await
-                    .unwrap();
-                assert!(
-                    started.elapsed() < std::time::Duration::from_secs(1),
-                    "cancellation took {:?}",
-                    started.elapsed()
-                );
-                assert!(out.is_error);
-                assert!(out.content.contains("interrupted"), "{}", out.content);
-                assert!(cancel.is_cancelled());
             }
             bg_exec_rt
                 .finish_turn_saved(scope, false, &mut bg_session, &store, &[])
@@ -8451,13 +8424,72 @@ mod tests {
                 .await
                 .unwrap();
         }
+        {
+            let mut settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
+            settings.base_url = Some("http://127.0.0.1:1/v1".into());
+            let mut cancel_session = Session::new(&root, settings).unwrap();
+            let mut tools =
+                Tools::new(&root, &cancel_session.dir(&store).join("checkpoints")).unwrap();
+            let events = Events::new(true);
+            let cancel = CancellationToken::new();
+            let job_cancel = CancellationToken::new();
+            let mut cli = default_cli();
+            cli.interactive = true;
+            let mut executor = ToolExecutor {
+                tools: &mut tools,
+                events: &events,
+                cli: &cli,
+                cancel: &cancel,
+                plan: false,
+                denied: false,
+                last_error: false,
+                balance: None,
+                store: Some(&store),
+                skills: &SkillCatalog::empty(),
+                skill_page: SkillPage::default(),
+                artifacts: None,
+                turn_index: 1,
+                journal: None,
+                jobs: None,
+                managed: None,
+                job_cancel,
+                parent_scope_id: String::new(),
+                observations: None,
+                asked_questions: HashMap::new(),
+            };
+            push_ask_user_delayed_test_replies([(
+                std::time::Duration::from_secs(5),
+                crate::ask_user::AskOutcome::Selected(0),
+            )]);
+            let cancel_trigger = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                cancel_trigger.cancel();
+            });
+            let started = tokio::time::Instant::now();
+            let cancel_call = ToolCall::new(
+                crate::ask_user::TOOL_NAME,
+                json!({"questions":[{"question":"Отменить?","options":["Да","Нет"]}]}),
+            );
+            let out = executor
+                .execute(&cancel_call, None, Some(&mut cancel_session))
+                .await
+                .unwrap();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "cancellation took {:?}",
+                started.elapsed()
+            );
+            assert!(out.is_error);
+            assert!(out.content.contains("interrupted"), "{}", out.content);
+            assert!(cancel.is_cancelled());
+        }
 
-        // Part B: full turn where start_command settles via settle_managed AND a slow worker
-        // hits agent_timeout_secs while ask_user is waiting on user input.
+        // Part B: full turn where (on Linux/macOS) start_command settles via settle_managed AND
+        // (on all OSes) a slow worker hits agent_timeout_secs while ask_user is waiting on user input.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            let mut main_step = 0usize;
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
@@ -8518,47 +8550,55 @@ mod tests {
                             .await;
                         return;
                     }
-                    let _ = &mut main_step;
                     let tool_msgs: Vec<&Value> = body["messages"]
                         .as_array()
                         .unwrap()
                         .iter()
                         .filter(|m| m["role"] == "tool")
                         .collect();
-                    let reply = match tool_msgs.len() {
-                        0 => json!({
+                    let has_ask = tool_msgs
+                        .iter()
+                        .any(|m| m["tool_call_id"].as_str() == Some("call_ask_hold"));
+                    let has_wait = tool_msgs
+                        .iter()
+                        .any(|m| m["tool_call_id"].as_str() == Some("call_wait_slow"));
+                    let reply = if tool_msgs.is_empty() {
+                        let mut calls = Vec::new();
+                        if cfg!(any(target_os = "linux", target_os = "macos")) {
+                            calls.push(json!({
+                                "id": "call_bg_start",
+                                "type": "function",
+                                "function": {
+                                    "name": "start_command",
+                                    "arguments": json!({"command": "printf bg-settled-ok"}).to_string()
+                                }
+                            }));
+                        }
+                        calls.push(json!({
+                            "id": "call_slow_agent",
+                            "type": "function",
+                            "function": {
+                                "name": "spawn_agent",
+                                "arguments": json!({
+                                    "task": "SLOW_WORKER_DURING_ASK",
+                                    "name": "SLOW_EXP",
+                                    "role": "explorer"
+                                }).to_string()
+                            }
+                        }));
+                        json!({
                             "choices": [{
                                 "message": {
                                     "role": "assistant",
                                     "content": null,
-                                    "tool_calls": [
-                                        {
-                                            "id": "call_bg_start",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "start_command",
-                                                "arguments": json!({"command": "printf bg-settled-ok"}).to_string()
-                                            }
-                                        },
-                                        {
-                                            "id": "call_slow_agent",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "spawn_agent",
-                                                "arguments": json!({
-                                                    "task": "SLOW_WORKER_DURING_ASK",
-                                                    "name": "SLOW_EXP",
-                                                    "role": "explorer"
-                                                }).to_string()
-                                            }
-                                        }
-                                    ]
+                                    "tool_calls": calls
                                 },
                                 "finish_reason": "tool_calls"
                             }],
                             "usage": {"prompt_tokens": 40, "completion_tokens": 16}
-                        }),
-                        2 => json!({
+                        })
+                    } else if !has_ask {
+                        json!({
                             "choices": [{
                                 "message": {
                                     "role": "assistant",
@@ -8580,32 +8620,35 @@ mod tests {
                                 "finish_reason": "tool_calls"
                             }],
                             "usage": {"prompt_tokens": 60, "completion_tokens": 12}
-                        }),
-                        3 => {
-                            let spawn_receipt: Value =
-                                serde_json::from_str(tool_msgs[1]["content"].as_str().unwrap())
-                                    .unwrap();
-                            let agent_id = spawn_receipt["agent_id"].as_str().unwrap();
-                            json!({
-                                "choices": [{
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": null,
-                                        "tool_calls": [{
-                                            "id": "call_wait_slow",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "wait_agent",
-                                                "arguments": json!({"agent_id": agent_id}).to_string()
-                                            }
-                                        }]
-                                    },
-                                    "finish_reason": "tool_calls"
-                                }],
-                                "usage": {"prompt_tokens": 80, "completion_tokens": 10}
-                            })
-                        }
-                        _ => json!({
+                        })
+                    } else if !has_wait {
+                        let spawn_msg = tool_msgs
+                            .iter()
+                            .find(|m| m["tool_call_id"].as_str() == Some("call_slow_agent"))
+                            .unwrap();
+                        let spawn_receipt: Value =
+                            serde_json::from_str(spawn_msg["content"].as_str().unwrap()).unwrap();
+                        let agent_id = spawn_receipt["agent_id"].as_str().unwrap();
+                        json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": "call_wait_slow",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "wait_agent",
+                                            "arguments": json!({"agent_id": agent_id}).to_string()
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {"prompt_tokens": 80, "completion_tokens": 10}
+                        })
+                    } else {
+                        json!({
                             "choices": [{
                                 "message": {
                                     "role": "assistant",
@@ -8614,7 +8657,7 @@ mod tests {
                                 "finish_reason": "stop"
                             }],
                             "usage": {"prompt_tokens": 95, "completion_tokens": 12}
-                        }),
+                        })
                     };
                     let payload = reply.to_string();
                     let _ = socket
