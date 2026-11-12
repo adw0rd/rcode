@@ -102,6 +102,7 @@ async fn fault_case(mode: u8) -> Result<()> {
             job_cancel: parent_token,
             parent_scope_id: parent_id,
             observations: None,
+            asked_questions: std::collections::HashMap::new(),
         };
         HANDOFF_TEST_FAULT.with(|f| f.set(mode));
         let result = executor

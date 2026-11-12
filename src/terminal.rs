@@ -516,7 +516,7 @@ pub(crate) fn select_with_updates(
 }
 
 #[derive(Default)]
-struct Buffer {
+pub(crate) struct Buffer {
     text: String,
     cursor: usize,
 }
@@ -529,7 +529,20 @@ fn word_grapheme(g: &str) -> bool {
 }
 
 impl Buffer {
-    fn insert(&mut self, text: &str) {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    pub(crate) fn insert(&mut self, text: &str) {
         let available = MAX_INPUT.saturating_sub(self.text.len());
         let mut bytes = 0;
         for grapheme in text.graphemes(true) {
@@ -569,27 +582,27 @@ impl Buffer {
             .unwrap_or(self.text.len());
     }
 
-    fn left(&mut self) {
+    pub(crate) fn left(&mut self) {
         self.cursor = self.text[..self.cursor]
             .grapheme_indices(true)
             .next_back()
             .map_or(0, |(index, _)| index);
     }
 
-    fn right(&mut self) {
+    pub(crate) fn right(&mut self) {
         if let Some(grapheme) = self.text[self.cursor..].graphemes(true).next() {
             self.cursor += grapheme.len();
         }
     }
 
-    fn backspace(&mut self) {
+    pub(crate) fn backspace(&mut self) {
         let end = self.cursor;
         self.left();
         self.text.drain(self.cursor..end);
         self.normalize_cursor();
     }
 
-    fn delete(&mut self) {
+    pub(crate) fn delete(&mut self) {
         let start = self.cursor;
         self.right();
         self.text.drain(start..self.cursor);
@@ -602,7 +615,7 @@ impl Buffer {
     /// like shell editors — so `--vision` and `skills install` move as words.
     /// Word-left: skip whitespace behind the cursor, then a run of the same
     /// character class.
-    fn left_word(&mut self) {
+    pub(crate) fn left_word(&mut self) {
         while self.cursor > 0
             && self.text[..self.cursor]
                 .graphemes(true)
@@ -631,7 +644,7 @@ impl Buffer {
     }
 
     /// Word-right: skip a run of the current class, then whitespace.
-    fn right_word(&mut self) {
+    pub(crate) fn right_word(&mut self) {
         let word = word_grapheme;
         let Some(first) = self.text[self.cursor..].graphemes(true).next() else {
             return;
@@ -659,7 +672,7 @@ impl Buffer {
         self.cursor = start;
     }
 
-    fn delete_word(&mut self) {
+    pub(crate) fn delete_word(&mut self) {
         let end = self.cursor;
         while self.cursor > 0
             && self.text[..self.cursor]
@@ -681,19 +694,19 @@ impl Buffer {
         self.normalize_cursor();
     }
 
-    fn home(&mut self) {
+    pub(crate) fn home(&mut self) {
         self.cursor = self.text[..self.cursor]
             .rfind('\n')
             .map_or(0, |index| index + 1);
     }
 
-    fn end(&mut self) {
+    pub(crate) fn end(&mut self) {
         self.cursor += self.text[self.cursor..]
             .find('\n')
             .unwrap_or(self.text.len() - self.cursor);
     }
 
-    fn kill_end(&mut self) {
+    pub(crate) fn kill_end(&mut self) {
         let start = self.cursor;
         self.end();
         let end = if self.cursor == start && self.text.as_bytes().get(start) == Some(&b'\n') {

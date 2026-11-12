@@ -13,6 +13,7 @@ import select
 import signal
 import socketserver
 import struct
+import subprocess
 import sys
 import tempfile
 import termios
@@ -361,6 +362,111 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 13, "completion_tokens": 3},
             })
+            return
+        if loop_prompt in ("ASK_USER_SELECT", "ASK_USER_CUSTOM", "ASK_USER_ESC_AFTER_ERROR", "ASK_USER_CTRL_C"):
+            tool_names = [tool["function"]["name"] for tool in body.get("tools", [])]
+            assert "ask_user" in tool_names, f"interactive PTY request must advertise ask_user: {tool_names}"
+            turn = body["messages"][actual_user + 1:]
+            tool_msgs = [m for m in turn if m["role"] == "tool"]
+            if loop_prompt == "ASK_USER_CTRL_C":
+                assert not tool_msgs, f"Ctrl+C during ask_user must stop turn without follow-up request: {turn}"
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_ask_ctrlc", "type": "function", "function": {
+                               "name": "ask_user",
+                               "arguments": json.dumps({"questions": [{
+                                   "question": "Канал уведомлений?",
+                                   "options": ["Email (Рекомендуется)", "Webhook"],
+                               }]})}}]},
+                           "finish_reason": "tool_calls"}]})
+                return
+            if loop_prompt == "ASK_USER_SELECT":
+                if not tool_msgs:
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                               "tool_calls": [{"id": "call_ask_sel", "type": "function", "function": {
+                                   "name": "ask_user",
+                                   "arguments": json.dumps({"questions": [{
+                                       "question": "Формат отчёта?",
+                                       "options": ["JSON (Рекомендуется)", "Markdown"],
+                                   }]})}}]},
+                               "finish_reason": "tool_calls"}]})
+                else:
+                    receipt = json.loads(tool_msgs[-1]["content"])
+                    assert receipt["status"] == "answered", receipt
+                    assert receipt["answers"][0]["source"] == "option", receipt
+                    assert receipt["answers"][0]["option_index"] == 2, receipt
+                    assert receipt["answers"][0]["answer"] == "Markdown", receipt
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": "ASK_USER_SELECT_DONE"},
+                                             "finish_reason": "stop"}]})
+                return
+            if loop_prompt == "ASK_USER_CUSTOM":
+                if not tool_msgs:
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                               "tool_calls": [{"id": "call_ask_custom", "type": "function", "function": {
+                                   "name": "ask_user",
+                                   "arguments": json.dumps({"questions": [{
+                                       "question": "Целевой стек?",
+                                       "options": ["Rust (Рекомендуется)", "Python"],
+                                   }]})}}]},
+                               "finish_reason": "tool_calls"}]})
+                else:
+                    receipt = json.loads(tool_msgs[-1]["content"])
+                    assert receipt["status"] == "answered", receipt
+                    assert receipt["answers"][0]["source"] == "custom", receipt
+                    assert receipt["answers"][0]["option_index"] is None, receipt
+                    assert receipt["answers"][0]["answer"] == "Свой стек 👩🏽‍💻", receipt
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": "ASK_USER_CUSTOM_DONE"},
+                                             "finish_reason": "stop"}]})
+                return
+            if loop_prompt == "ASK_USER_ESC_AFTER_ERROR":
+                if len(tool_msgs) == 0:
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                               "tool_calls": [{"id": "call_missing_read", "type": "function", "function": {
+                                   "name": "read_file",
+                                   "arguments": json.dumps({"path": "missing_before_ask.txt"})}}]},
+                               "finish_reason": "tool_calls"}]})
+                elif len(tool_msgs) == 1:
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                               "tool_calls": [{"id": "call_ask_esc", "type": "function", "function": {
+                                   "name": "ask_user",
+                                   "arguments": json.dumps({"questions": [{
+                                       "question": "Создать шаблон?",
+                                       "options": ["Да (Рекомендуется)", "Нет"],
+                                   }]})}}]},
+                               "finish_reason": "tool_calls"}]})
+                else:
+                    assert not any(m["role"] == "user" for m in turn), f"unexpected recovery message: {turn}"
+                    receipt = json.loads(tool_msgs[-1]["content"])
+                    assert receipt["status"] == "cancelled", receipt
+                    assert receipt["answered_count"] == 0, receipt
+                    self.reply({"choices": [{"message": {"role": "assistant", "content": "ASK_USER_ESC_CLEAN_DONE"},
+                                             "finish_reason": "stop"}]})
+                return
+        if loop_prompt == "ASK_USER_R13_EXEC":
+            tool_names = [tool["function"]["name"] for tool in body.get("tools", [])]
+            assert "ask_user" in tool_names, f"resumed exec session with ask_user history must declare schema (R13): {tool_names}"
+            assert "Use ask_user" not in body["messages"][0]["content"], "non-interactive exec must not advertise ask_user in system prompt"
+            turn = body["messages"][actual_user + 1:]
+            tool_msgs = [m for m in turn if m["role"] == "tool"]
+            if len(tool_msgs) == 0:
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_ask_r13", "type": "function", "function": {
+                               "name": "ask_user",
+                               "arguments": json.dumps({"questions": [{
+                                   "question": "Ветка в exec?",
+                                   "options": ["main", "dev"],
+                               }]})}}]},
+                           "finish_reason": "tool_calls"}]})
+            elif len(tool_msgs) == 1:
+                err = json.loads(tool_msgs[-1]["content"])
+                assert err.get("error") == "non_interactive", err
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_list_r13", "type": "function", "function": {
+                               "name": "list_files",
+                               "arguments": json.dumps({"path": "."})}}]},
+                           "finish_reason": "tool_calls"}]})
+            else:
+                self.reply({"choices": [{"message": {"role": "assistant", "content": "ASK_USER_R13_EXEC_OK"},
+                                         "finish_reason": "stop"}]})
             return
         if prompt == "AGENT_VIEW_REQUEST":
             last = body["messages"][-1]
@@ -1085,6 +1191,91 @@ def main(binary):
             config = _json.loads(config_path.read_text())
             assert config["websearch"]["provider"] == "yandex", config
 
+            phase("ask_user panel")
+            # 1. Выбор варианта стрелкой + Enter; нижний колонтитул остаётся на последних 2 строках.
+            mark = terminal.mark()
+            terminal.send("ASK_USER_SELECT\r")
+            terminal.until(lambda: "Формат отчёта?" in terminal.text(mark) and "Свой вариант…" in terminal.text(mark),
+                           "ask_user option list panel")
+            terminal.assert_footer("alpha-one", "openrouter", "high", "ask")
+            terminal.pump(0)
+            time.sleep(0.18)
+            terminal.pump(0)
+            terminal.send("\x1b[B\r")
+            terminal.editor_after("ASK_USER_SELECT_DONE", mark)
+
+            # 2. Inline «Свой вариант…»: Unicode paste -> Esc в список с сохранением черновика -> Enter -> отправка.
+            mark = terminal.mark()
+            terminal.send("ASK_USER_CUSTOM\r")
+            terminal.until(lambda: "Целевой стек?" in terminal.text(mark) and "Свой вариант…" in terminal.text(mark),
+                           "ask_user custom option list")
+            terminal.pump(0)
+            time.sleep(0.18)
+            terminal.pump(0)
+            terminal.send("3\r")
+            terminal.until(
+                lambda: any("Свой ответ · Уточнение" in row for row in terminal.grid.rows())
+                and terminal.grid.cursor_visible,
+                "ask_user inline custom editor",
+            )
+            terminal.assert_footer("alpha-one", "openrouter", "high", "ask")
+            terminal.send("\x1b[200~Свой стек 👩🏽‍💻\x1b[201~")
+            terminal.until(
+                lambda: any("Свой стек" in row for row in terminal.grid.rows()),
+                "pasted custom text visible",
+            )
+            terminal.send("\x1b")
+            terminal.until(
+                lambda: any("↑/↓ — выбор" in row for row in terminal.grid.rows())
+                and not terminal.grid.cursor_visible,
+                "escape returns from custom input to option list",
+            )
+            time.sleep(0.18)
+            terminal.pump(0)
+            terminal.send("\r")
+            terminal.until(
+                lambda: any("Свой стек" in row for row in terminal.grid.rows())
+                and terminal.grid.cursor_visible,
+                "re-entering custom input preserves draft",
+            )
+            time.sleep(0.18)
+            terminal.pump(0)
+            terminal.send("\r")
+            terminal.editor_after("ASK_USER_CUSTOM_DONE", mark)
+
+            # 3. Ошибка инструмента перед ask_user + Esc в ask_user не вызывает лишний recovery-запрос.
+            before_esc = len(fixture.recorded())
+            mark = terminal.mark()
+            terminal.send("ASK_USER_ESC_AFTER_ERROR\r")
+            terminal.until(lambda: "Создать шаблон?" in terminal.text(mark),
+                           "ask_user panel after read_file error")
+            terminal.pump(0)
+            time.sleep(0.18)
+            terminal.pump(0)
+            terminal.send("\x1b")
+            terminal.editor_after("ASK_USER_ESC_CLEAN_DONE", mark)
+            assert len(fixture.recorded()) == before_esc + 3, (
+                f"expected exactly 3 requests without recovery, got {len(fixture.recorded()) - before_esc}"
+            )
+
+            # 4. Ctrl+C внутри открытой панели ask_user мгновенно прерывает ход и возвращает редактор.
+            before_ask_ctrlc = len(fixture.recorded())
+            mark = terminal.mark()
+            terminal.send("ASK_USER_CTRL_C\r")
+            terminal.until(lambda: "Канал уведомлений?" in terminal.text(mark),
+                           "ask_user panel before Ctrl+C")
+            terminal.pump(0)
+            time.sleep(0.12)
+            terminal.pump(0)
+            terminal.send("\x03")
+            terminal.editor_after("Ход прерван", mark)
+            assert len(fixture.recorded()) == before_ask_ctrlc + 1, (
+                f"Ctrl+C inside ask_user must not send a second model request, got {len(fixture.recorded()) - before_ask_ctrlc}"
+            )
+            mark = terminal.mark()
+            terminal.send("AFTER_CANCEL\r")
+            terminal.editor_after("READY_RECOVERED", mark)
+
             phase("approvals complete")
             # A real child API request stays pending while agent_update renders
             # in the viewport. Worker output must never displace the footer.
@@ -1261,9 +1452,47 @@ def main(binary):
                 plain.expect("READY_CUSTOM", plain_mark)
                 plain.expect("rcode ›", plain_mark)
                 assert fixture.recorded()[-1]["messages"][-1]["content"] == "AFTER_SESSION_LEASE_HANDOFF"
+                # --plain interactive ask_user: выбор по номеру и немедленный выход по Ctrl+C (SIGINT).
+                plain_mark = plain.mark()
+                plain.send("ASK_USER_SELECT\r")
+                plain.expect("Номер 1–3 (0 — отмена):", plain_mark)
+                plain.send("2\r")
+                plain.expect("ASK_USER_SELECT_DONE", plain_mark)
+                plain.expect("rcode ›", plain_mark)
+
+                before_plain_ctrlc = len(fixture.recorded())
+                plain_mark = plain.mark()
+                plain.send("ASK_USER_CTRL_C\r")
+                plain.expect("Номер 1–3 (0 — отмена):", plain_mark)
+                plain.send("\x03")
+                plain.expect("Ход прерван", plain_mark)
+                plain.expect("rcode ›", plain_mark)
+                assert len(fixture.recorded()) == before_plain_ctrlc + 1
+
                 plain.send("/exit\r")
                 plain.until(lambda:plain.status is not None,"plain exit")
                 assert plain.status == 0
+
+                # R13 end-to-end: rcode exec --json --resume <session> объявляет схему ask_user без guidance и возвращает non_interactive.
+                resumed_exec = subprocess.run(
+                    [binary, "-C", str(workspace), "exec", "--json", "--resume", new_session, "ASK_USER_R13_EXEC"],
+                    cwd=workspace,
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "TERM": "xterm-256color",
+                        "LANG": "C.UTF-8",
+                        "RCODE_HOME": str(home),
+                        "RCODE_CUSTOM_API_KEY": "pty-custom-fixture",
+                        "RCODE_OPENROUTER_API_KEY": "pty-router-fixture",
+                        "RCODE_GIGACHAT_AUTH_KEY": "pty-giga-fixture",
+                    },
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                assert resumed_exec.returncode == 0, f"exec --resume failed ({resumed_exec.returncode}): {resumed_exec.stdout}\n{resumed_exec.stderr}"
+                assert "ASK_USER_R13_EXEC_OK" in resumed_exec.stdout, resumed_exec.stdout
             finally:
                 fixture.release_balance.set()
                 plain.close()

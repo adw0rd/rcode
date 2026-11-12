@@ -102,6 +102,8 @@ pub struct Cli {
     pub command: Option<Command>,
     #[arg(help = "Начальный запрос для интерактивной сессии")]
     pub prompt: Option<String>,
+    #[arg(skip)]
+    pub(crate) interactive: bool,
 }
 impl Cli {
     pub fn permissions(&self) -> ApprovalMode {

@@ -1152,7 +1152,7 @@ fn assert_foreign_workflow_guidance_matches_advertised_tools(request: &Request) 
         );
     }
     assert!(prompt.contains("Use the declared schemas"));
-    assert!(prompt.contains("AskUserQuestion has no dedicated tool"));
+    assert!(prompt.contains("AskUserQuestion = ask_user when offered in this turn"));
     assert!(
         !names
             .iter()
