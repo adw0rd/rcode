@@ -346,7 +346,7 @@ impl AgentPool {
 
     pub fn definitions() -> Vec<ToolDefinition> {
         [
-            ("spawn_agent", "Запустить независимого субагента на текущем provider/model. Explorer и reviewer только читают; worker может менять файлы и запускать команды через те же разрешения приложения. До 3 одновременно и 6 за ход; результат нужно получить через wait_agent.",
+            ("spawn_agent", "Запустить субагента на текущем provider/model для параллельных или изолированных подзадач. Не вызывайте для простых или последовательных шагов (холодный контекст, на local общая очередь) и никогда при запрете субагентов в запросе. Explorer и reviewer только читают; worker меняет файлы и запускает команды с общими разрешениями (до 3 сразу, 6 за ход; сбор через wait_agent).",
              json!({"task":{"type":"string","minLength":1,"maxLength":MAX_TASK_CHARS},"name":{"type":"string","minLength":1,"maxLength":80},"role":{"type":"string","enum":["explorer","reviewer","worker"],"default":"explorer"}}), vec!["task"]),
             ("wait_agent", "Дождаться субагента и получить его результат и реальный usage. Повторный вызов возвращает сохранённый результат без нового API-запроса.",
              json!({"agent_id":{"type":"string"}}), vec!["agent_id"]),
