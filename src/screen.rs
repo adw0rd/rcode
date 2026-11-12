@@ -281,6 +281,11 @@ impl Screen {
             };
         });
     }
+    fn bump_input_epoch(&self) {
+        self.change(|s| {
+            s.input_epoch = s.input_epoch.wrapping_add(1);
+        });
+    }
     pub fn event(&self) -> io::Result<Event> {
         self.read_event(None)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
@@ -624,6 +629,80 @@ impl Screen {
         result
     }
 
+    /// Открывает отменяемую панель `ask_user` для одного вопроса. Панель живёт
+    /// в `Mode::Approval`, не перехватывает `stdin` в обход `Screen` и гарантированно
+    /// очищается при `Drop`.
+    pub fn begin_ask_question(
+        self: &Arc<Self>,
+        spec: &crate::ask_user::QuestionSpec,
+        index: usize,
+        total: usize,
+    ) -> AskPanel {
+        let size = terminal::size()
+            .ok()
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .unwrap_or((80, 24));
+        self.begin_ask_question_at_size(spec, index, total, size)
+    }
+
+    pub(crate) fn begin_ask_question_at_size(
+        self: &Arc<Self>,
+        spec: &crate::ask_user::QuestionSpec,
+        index: usize,
+        total: usize,
+        size: (u16, u16),
+    ) -> AskPanel {
+        let header = if total > 1 {
+            format!(
+                "\nУточнение ({}/{}): {}",
+                index + 1,
+                total,
+                ui::safe(&spec.question)
+            )
+        } else {
+            format!("\nУточнение: {}", ui::safe(&spec.question))
+        };
+        let mut transcript_block = header;
+        for (i, option) in spec.options.iter().enumerate() {
+            transcript_block.push_str(&format!("\n  {}. {}", i + 1, ui::safe(option)));
+        }
+        transcript_block.push_str(&format!(
+            "\n  {}. {}",
+            spec.options.len() + 1,
+            crate::ask_user::CUSTOM_OPTION_LABEL
+        ));
+        transcript_block.push_str("\n  (Не вводите пароли и API-ключи: ответ передаётся модели)");
+        self.line(&transcript_block);
+        self.change(|s| {
+            s.scroll = 0;
+            s.anchor = None;
+            // Гарантируем смену эпохи между соседними вопросами одной пачки.
+            s.panel = None;
+            s.mode = Mode::Busy;
+        });
+        let mut options = spec.options.clone();
+        options.push(crate::ask_user::CUSTOM_OPTION_LABEL.to_owned());
+        let title = if total > 1 {
+            format!("Уточнение ({}/{})", index + 1, total)
+        } else {
+            "Уточнение".to_owned()
+        };
+        let panel = AskPanel {
+            screen: Arc::clone(self),
+            title,
+            question: ui::safe(&spec.question),
+            options,
+            selected: 0,
+            option_hscroll: 0,
+            custom_mode: false,
+            draft: crate::terminal::Buffer::default(),
+            warning: None,
+            size: (size.0.max(1), size.1.max(1)),
+        };
+        panel.render_panel();
+        panel
+    }
+
     #[cfg(test)]
     pub(crate) fn test_screen() -> Arc<Self> {
         Self::new(Footer {
@@ -661,6 +740,372 @@ impl Screen {
             .join("\n")
     }
 }
+
+pub struct AskPanel {
+    screen: Arc<Screen>,
+    title: String,
+    question: String,
+    options: Vec<String>,
+    selected: usize,
+    option_hscroll: usize,
+    custom_mode: bool,
+    draft: crate::terminal::Buffer,
+    warning: Option<String>,
+    size: (u16, u16),
+}
+
+impl Drop for AskPanel {
+    fn drop(&mut self) {
+        self.screen.clear_panel();
+    }
+}
+
+impl AskPanel {
+    /// Неблокирующий или ограниченный по `timeout` шаг обработки событий панели.
+    pub fn step(&mut self, timeout: Duration) -> io::Result<Option<crate::ask_user::AskOutcome>> {
+        use crate::ask_user::{AskOutcome, MAX_ANSWER_CHARS};
+        let mut wait = timeout;
+        loop {
+            let Some(event) = self.screen.event_timeout(wait)? else {
+                return Ok(None);
+            };
+            wait = Duration::ZERO;
+            match event {
+                Event::Resize(w, h) => {
+                    self.size = (w.max(1), h.max(1));
+                    self.render_panel();
+                }
+                Event::Paste(pasted) if self.custom_mode => {
+                    let piece = crate::ask_user::sanitize_paste(&pasted);
+                    if !piece.is_empty() {
+                        let total_chars = self.draft.text().chars().count() + piece.chars().count();
+                        if total_chars > MAX_ANSWER_CHARS {
+                            self.warning = Some(format!(
+                                "Вставка отклонена ({total_chars} > {MAX_ANSWER_CHARS} симв.): сократите текст"
+                            ));
+                        } else {
+                            self.draft.insert(&piece);
+                            self.warning = None;
+                        }
+                        self.render_panel();
+                    }
+                }
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    if !self.custom_mode {
+                        match (k.code, k.modifiers) {
+                            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                return Ok(Some(AskOutcome::Interrupted));
+                            }
+                            (KeyCode::Esc, _) => return Ok(Some(AskOutcome::Dismissed)),
+                            (KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k'), _) => {
+                                self.selected = (self.selected + self.options.len() - 1)
+                                    % self.options.len().max(1);
+                                self.option_hscroll = 0;
+                                self.render_panel();
+                            }
+                            (KeyCode::Down | KeyCode::Tab | KeyCode::Char('j'), _) => {
+                                self.selected = (self.selected + 1) % self.options.len().max(1);
+                                self.option_hscroll = 0;
+                                self.render_panel();
+                            }
+                            (KeyCode::Left, _) => {
+                                self.option_hscroll = self.option_hscroll.saturating_sub(6);
+                                self.render_panel();
+                            }
+                            (KeyCode::Right, _) => {
+                                let safe_opt = ui::safe(&self.options[self.selected]);
+                                let count = safe_opt.graphemes(true).count();
+                                if self.option_hscroll + 6 < count {
+                                    self.option_hscroll += 6;
+                                }
+                                self.render_panel();
+                            }
+                            (KeyCode::Char(d @ '1'..='9'), m)
+                                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                            {
+                                let idx = (d as usize) - ('1' as usize);
+                                if idx < self.options.len() {
+                                    self.selected = idx;
+                                    self.option_hscroll = 0;
+                                    self.render_panel();
+                                }
+                            }
+                            (KeyCode::Enter, _) => {
+                                if self.selected + 1 == self.options.len() {
+                                    self.custom_mode = true;
+                                    self.warning = None;
+                                    self.screen.bump_input_epoch();
+                                    self.render_panel();
+                                    return Ok(None);
+                                }
+                                return Ok(Some(AskOutcome::Selected(self.selected)));
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match (k.code, k.modifiers) {
+                            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                return Ok(Some(AskOutcome::Interrupted));
+                            }
+                            (KeyCode::Esc, _) => {
+                                self.custom_mode = false;
+                                self.warning = None;
+                                self.screen.bump_input_epoch();
+                                self.render_panel();
+                                return Ok(None);
+                            }
+                            (KeyCode::Enter, m)
+                                if !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                            {
+                                let cleaned =
+                                    crate::ask_user::normalize_inline_text(self.draft.text());
+                                if cleaned.is_empty() {
+                                    self.warning = Some(
+                                        "Введите текст ответа или нажмите Esc для возврата".into(),
+                                    );
+                                    self.render_panel();
+                                } else if cleaned.chars().count() > MAX_ANSWER_CHARS {
+                                    self.warning = Some(format!(
+                                        "Превышен лимит {MAX_ANSWER_CHARS} символов; сократите ответ"
+                                    ));
+                                    self.render_panel();
+                                } else {
+                                    return Ok(Some(AskOutcome::Custom(cleaned)));
+                                }
+                            }
+                            (KeyCode::Enter, _) => {
+                                if self.draft.text().chars().count() < MAX_ANSWER_CHARS {
+                                    self.draft.insert(" ");
+                                    self.warning = None;
+                                } else {
+                                    self.warning = Some(format!(
+                                        "Лимит ответа — {MAX_ANSWER_CHARS} символов; сократите текст"
+                                    ));
+                                }
+                                self.render_panel();
+                            }
+                            (KeyCode::Backspace, m) => {
+                                if m.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) {
+                                    self.draft.delete_word();
+                                } else {
+                                    self.draft.backspace();
+                                }
+                                self.warning = None;
+                                self.render_panel();
+                            }
+                            (KeyCode::Delete, _) => {
+                                self.draft.delete();
+                                self.warning = None;
+                                self.render_panel();
+                            }
+                            (KeyCode::Left, m) => {
+                                if m.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
+                                    self.draft.left_word();
+                                } else {
+                                    self.draft.left();
+                                }
+                                self.render_panel();
+                            }
+                            (KeyCode::Right, m) => {
+                                if m.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
+                                    self.draft.right_word();
+                                } else {
+                                    self.draft.right();
+                                }
+                                self.render_panel();
+                            }
+                            (KeyCode::Home, _) => {
+                                self.draft.home();
+                                self.render_panel();
+                            }
+                            (KeyCode::End, _) => {
+                                self.draft.end();
+                                self.render_panel();
+                            }
+                            (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                self.draft.home();
+                                self.render_panel();
+                            }
+                            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                self.draft.end();
+                                self.render_panel();
+                            }
+                            (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                self.draft.clear();
+                                self.warning = None;
+                                self.render_panel();
+                            }
+                            (KeyCode::Char('w'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                self.draft.delete_word();
+                                self.warning = None;
+                                self.render_panel();
+                            }
+                            (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                self.draft.kill_end();
+                                self.warning = None;
+                                self.render_panel();
+                            }
+                            (KeyCode::Char(ch), m)
+                                if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                            {
+                                let piece = crate::ask_user::sanitize_paste(&ch.to_string());
+                                if !piece.is_empty() {
+                                    if self.draft.text().chars().count() + piece.chars().count()
+                                        > MAX_ANSWER_CHARS
+                                    {
+                                        self.warning = Some(format!(
+                                            "Лимит ответа — {MAX_ANSWER_CHARS} символов; сократите текст"
+                                        ));
+                                    } else {
+                                        self.draft.insert(&piece);
+                                        self.warning = None;
+                                    }
+                                    self.render_panel();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn render_panel(&self) {
+        let cols = usize::from(self.size.0.saturating_sub(1)).max(12);
+        let avail = usize::from(panel_height(self.size.1));
+        let max_rows = if avail >= 5 { avail - 1 } else { avail.max(2) };
+        let mut rows = Vec::new();
+        let mut styles = Vec::new();
+        let mut cursor = None;
+
+        if !self.custom_mode {
+            rows.push(format!("╭ {}: {}", self.title, self.question));
+            styles.push(Paint::Border);
+
+            let slots = max_rows.saturating_sub(2).max(1);
+            let total_opts = self.options.len();
+            let win_start = if total_opts <= slots {
+                0
+            } else {
+                self.selected
+                    .saturating_sub(slots / 2)
+                    .min(total_opts - slots)
+            };
+            let win_end = (win_start + slots).min(total_opts);
+            let inner_cols = cols.saturating_sub(4).max(4);
+            for (index, option) in self
+                .options
+                .iter()
+                .enumerate()
+                .skip(win_start)
+                .take(win_end - win_start)
+            {
+                let safe_opt = ui::safe(option);
+                let shown = if index == self.selected && self.option_hscroll > 0 {
+                    let tail: String = safe_opt.graphemes(true).skip(self.option_hscroll).collect();
+                    format!("…{}", clip(&tail, inner_cols.saturating_sub(1)))
+                } else {
+                    clip(&safe_opt, inner_cols)
+                };
+                rows.push(format!(
+                    "│ {} {}",
+                    if index == self.selected { "›" } else { " " },
+                    shown
+                ));
+                styles.push(if index == self.selected {
+                    Paint::Selected
+                } else {
+                    Paint::Normal
+                });
+            }
+            let hint = if cols >= 68 {
+                "╰ ↑/↓ — выбор · Enter — подтвердить · Esc — отмена · не вводите ключи"
+            } else {
+                "╰ ↑/↓ · Enter · Esc · без ключей"
+            };
+            rows.push(hint.to_owned());
+            styles.push(Paint::Muted);
+        } else {
+            rows.push(format!("╭ Свой ответ · {}: {}", self.title, self.question));
+            styles.push(Paint::Border);
+
+            let prefix = "│ › ";
+            let prefix_cols = UnicodeWidthStr::width(prefix);
+            let field_cols = cols.saturating_sub(prefix_cols + 1).max(4);
+            let (visible, cursor_col) =
+                horizontal_input_window(self.draft.text(), self.draft.cursor(), field_cols);
+            let input_row = rows.len();
+            rows.push(format!("{prefix}{visible}"));
+            styles.push(Paint::Normal);
+            cursor = Some((input_row, prefix_cols + cursor_col));
+
+            if let Some(warn) = &self.warning
+                && rows.len() + 1 < max_rows
+            {
+                rows.push(format!("│ ⚠ {}", ui::safe(warn)));
+                styles.push(Paint::Error);
+            }
+            let hint = if cols >= 68 {
+                "╰ Enter — отправить · Esc — к списку · до 400 симв., без ключей"
+            } else {
+                "╰ Enter · Esc · ≤400 · без ключей"
+            };
+            rows.push(hint.to_owned());
+            styles.push(Paint::Muted);
+        }
+
+        self.screen.set_panel(Panel {
+            rows,
+            styles,
+            cursor,
+            mode: Mode::Approval,
+        });
+    }
+}
+
+fn horizontal_input_window(text: &str, cursor_byte: usize, max_cols: usize) -> (String, usize) {
+    let before = ui::safe(&text[..cursor_byte.min(text.len())]);
+    let after = ui::safe(&text[cursor_byte.min(text.len())..]);
+    let mut items: Vec<(&str, usize)> = Vec::new();
+    for g in before.graphemes(true) {
+        items.push((g, UnicodeWidthStr::width(g).max(1)));
+    }
+    let cursor_idx = items.len();
+    for g in after.graphemes(true) {
+        items.push((g, UnicodeWidthStr::width(g).max(1)));
+    }
+    let mut start = 0usize;
+    loop {
+        let ellipsis = usize::from(start > 0);
+        let before_cols: usize = items[start..cursor_idx].iter().map(|(_, w)| *w).sum();
+        if ellipsis + before_cols <= max_cols || start >= cursor_idx {
+            break;
+        }
+        start += 1;
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    if start > 0 {
+        out.push('…');
+        used += 1;
+    }
+    let cursor_col = used
+        + items[start..cursor_idx]
+            .iter()
+            .map(|(_, w)| *w)
+            .sum::<usize>();
+    for (g, w) in &items[start..] {
+        if used + *w > max_cols {
+            break;
+        }
+        out.push_str(g);
+        used += *w;
+    }
+    (out, cursor_col.min(max_cols))
+}
+
 fn flat(text: &str) -> String {
     ui::safe(text).replace('\n', "\\n").replace('\t', "    ")
 }
@@ -1218,12 +1663,15 @@ fn render(frame: &Frame) -> io::Result<()> {
     queue!(out, EndSynchronizedUpdate)?;
     out.flush()
 }
-fn maximum_scroll(s: &State, width: u16, height: u16) -> usize {
-    let width = width.saturating_sub(1) as usize;
+fn history_viewport_rows(s: &State, height: u16) -> usize {
     let height = height.max(1) as usize;
     let available = height.saturating_sub(footer_rows(height));
     let panel = s.panel.as_ref().map_or(3, |p| p.rows.len()).min(available);
-    let body = available.saturating_sub(panel);
+    available.saturating_sub(panel)
+}
+fn maximum_scroll(s: &State, width: u16, height: u16) -> usize {
+    let width = width.saturating_sub(1) as usize;
+    let body = history_viewport_rows(s, height);
     let mut lines = s
         .history
         .iter()
@@ -1309,7 +1757,9 @@ fn route_at_size(screen: &Screen, event: Event, (width, height): (u16, u16)) {
                 .map(|a| max.saturating_sub(a))
                 .unwrap_or(s.scroll.min(max));
         }
-        let step = usize::from(height / 2).max(1);
+        let step = history_viewport_rows(&s, height)
+            .min(usize::from(height / 2))
+            .max(1);
         match &event {
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 let copy = has_selected_text(&s)
@@ -2318,5 +2768,264 @@ mod tests {
             screen.event_timeout(Duration::from_millis(1)).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn ask_panel_handles_custom_unicode_paste_limits_escape_and_burst_epochs() {
+        use crate::ask_user::{AskOutcome, MAX_ANSWER_CHARS, QuestionSpec};
+
+        let screen = Screen::test_screen();
+        let q1 = QuestionSpec {
+            question: "Какой движок хранения выбрать?".into(),
+            options: vec!["SQLite (Рекомендуется)".into(), "PostgreSQL".into()],
+        };
+        let q2 = QuestionSpec {
+            question: "Включить ли строгий режим?".into(),
+            options: vec!["Да (Рекомендуется)".into(), "Нет".into()],
+        };
+
+        // Question 1: navigate to "Свой вариант…", send a double-Enter burst,
+        // paste multiline Unicode, test >400 char rejection without truncation,
+        // test double-Esc burst returning to list (preserving draft), then submit custom.
+        let mut p1 = screen.begin_ask_question_at_size(&q1, 0, 2, (80, 24));
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        // Burst: two Enters queued before step() runs!
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        // Second Enter from burst was discarded by epoch bump; custom mode is open without warning.
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        assert!(p1.custom_mode && p1.warning.is_none());
+
+        // Multiline paste normalizes newlines to spaces and does NOT auto-submit.
+        route_at_size(
+            &screen,
+            Event::Paste("Привет 👩🏽‍💻\nвторая строка".into()),
+            (80, 24),
+        );
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        assert_eq!(p1.draft.text(), "Привет 👩🏽‍💻 вторая строка");
+
+        // Oversized paste (>400 chars) is rejected with warning and keeps existing draft intact.
+        route_at_size(
+            &screen,
+            Event::Paste("ы".repeat(MAX_ANSWER_CHARS)),
+            (80, 24),
+        );
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        assert!(p1.warning.as_deref().unwrap().contains("Вставка отклонена"));
+        assert_eq!(p1.draft.text(), "Привет 👩🏽‍💻 вторая строка");
+
+        // Burst of two Esc keys in custom mode returns to list WITHOUT dismissing the whole question!
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        assert!(!p1.custom_mode);
+        assert_eq!(p1.draft.text(), "Привет 👩🏽‍💻 вторая строка");
+
+        // Re-enter custom mode (draft still preserved!) and submit with a burst of two Enters.
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        assert_eq!(p1.step(Duration::ZERO).unwrap(), None);
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            (80, 24),
+        );
+        assert_eq!(
+            p1.step(Duration::ZERO).unwrap(),
+            Some(AskOutcome::Custom("Привет 👩🏽‍💻 вторая строка".into()))
+        );
+        drop(p1);
+        assert!(screen.state.lock().unwrap().panel.is_none());
+
+        // Question 2: trailing Enter from Q1's burst must NOT auto-confirm Q2!
+        let mut p2 = screen.begin_ask_question_at_size(&q2, 1, 2, (80, 24));
+        assert_eq!(p2.step(Duration::ZERO).unwrap(), None);
+        // Ctrl+C returns Interrupted.
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            (80, 24),
+        );
+        assert_eq!(
+            p2.step(Duration::ZERO).unwrap(),
+            Some(AskOutcome::Interrupted)
+        );
+    }
+
+    #[test]
+    fn ask_panel_preserves_footer_and_cursor_bounds_on_narrow_36x10_screen() {
+        use crate::ask_user::QuestionSpec;
+
+        let screen = Screen::test_screen();
+        let long_opt = format!("{} ХВОСТ_ВИДЕН", "👩🏽‍💻".repeat(10));
+        let long_question = "Какой профиль деплоя ЧАСТЬ_1 выбрать для стенда ЧАСТЬ_2 с учётом квот ЧАСТЬ_3 и окна миграции ЧАСТЬ_4 сегодня?";
+        let spec = QuestionSpec {
+            question: long_question.into(),
+            options: vec![
+                long_opt,
+                "Второй вариант".into(),
+                "Третий вариант".into(),
+                "Четвёртый вариант".into(),
+            ],
+        };
+        let mut panel = screen.begin_ask_question_at_size(&spec, 0, 1, (36, 10));
+        assert!(screen.history_text().contains("ХВОСТ_ВИДЕН"));
+        assert!(
+            screen
+                .history_text()
+                .contains("Не вводите пароли и API-ключи")
+        );
+
+        let frame = compose(&screen.state.lock().unwrap(), 36, 10);
+        assert!(frame.rows[8].0.contains("auto · ask"));
+        assert!(frame.rows[9].0.contains("Контекст"));
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|(text, _)| text.contains("без ключей")),
+            "{:?}",
+            frame.rows
+        );
+        // Selected row gets Paint::Selected.
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|(_, paint)| *paint == Paint::Selected)
+        );
+
+        // Stepping PageUp on 36x10 must expose EVERY wrapped transcript row in the viewport without skipping a single line.
+        let expected_rows: Vec<String> = transcript(&screen.state.lock().unwrap(), 35)
+            .into_iter()
+            .map(|(line, _)| line)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert!(expected_rows.len() >= 10, "{expected_rows:?}");
+        let mut seen_rows: std::collections::HashSet<String> = frame.rows[..frame.body_count]
+            .iter()
+            .map(|(line, _)| line.clone())
+            .collect();
+        for _ in 0..20 {
+            route_at_size(
+                &screen,
+                Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+                (36, 10),
+            );
+            let f = compose(&screen.state.lock().unwrap(), 36, 10);
+            for (line, _) in &f.rows[..f.body_count] {
+                seen_rows.insert(line.clone());
+            }
+        }
+        for expected in &expected_rows {
+            assert!(
+                seen_rows.contains(expected),
+                "PageUp on 36x10 skipped transcript line {expected:?}; seen={seen_rows:?}"
+            );
+        }
+        let joined_transcript = expected_rows.join("");
+        for marker in [
+            "ЧАСТЬ_1",
+            "ЧАСТЬ_2",
+            "ЧАСТЬ_3",
+            "ЧАСТЬ_4",
+            "Не вводите пароли",
+        ] {
+            assert!(joined_transcript.contains(marker));
+        }
+
+        // Horizontal scroll on ZWJ-expanded option reaches the full tail ("ХВОСТ_ВИДЕН") on 36x10.
+        let mut seen_option_text = String::new();
+        for _ in 0..20 {
+            route_at_size(
+                &screen,
+                Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+                (36, 10),
+            );
+            assert_eq!(panel.step(Duration::ZERO).unwrap(), None);
+            let scrolled = compose(&screen.state.lock().unwrap(), 36, 10);
+            for (text, paint) in &scrolled.rows {
+                if *paint == Paint::Selected {
+                    seen_option_text.push_str(text);
+                    seen_option_text.push('\n');
+                }
+            }
+        }
+        assert!(
+            seen_option_text.contains("ХВОСТ") && seen_option_text.contains("ИДЕН"),
+            "{seen_option_text}"
+        );
+
+        // Switch to custom mode on 36x10 and paste 60 Cyrillic chars: cursor stays in bounds and hint warns about keys!
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE)),
+            (36, 10),
+        );
+        route_at_size(
+            &screen,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            (36, 10),
+        );
+        assert_eq!(panel.step(Duration::ZERO).unwrap(), None);
+        route_at_size(
+            &screen,
+            Event::Paste(
+                "длинный пользовательский ответ для узкого терминала тридцать шесть".into(),
+            ),
+            (36, 10),
+        );
+        assert_eq!(panel.step(Duration::ZERO).unwrap(), None);
+        let custom_frame = compose(&screen.state.lock().unwrap(), 36, 10);
+        assert!(
+            custom_frame
+                .rows
+                .iter()
+                .any(|(text, _)| text.contains("без ключей")),
+            "{:?}",
+            custom_frame.rows
+        );
+        let (cursor_row, cursor_col) = custom_frame.cursor.expect("visible input cursor");
+        assert!(
+            cursor_row < 8 && cursor_col < 35,
+            "cursor=({cursor_row}, {cursor_col})"
+        );
+        assert!(custom_frame.rows[9].0.contains("Контекст"));
     }
 }

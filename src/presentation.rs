@@ -43,6 +43,16 @@ fn tool_detail(name: &str, args: &Value) -> String {
     if name == crate::web_search::TOOL_NAME {
         return text("query").unwrap_or_default().to_owned();
     }
+    if name == crate::ask_user::TOOL_NAME {
+        return args
+            .get("questions")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|first| first.get("question"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+    }
     text("path")
         .or_else(|| text("pattern"))
         .unwrap_or_default()

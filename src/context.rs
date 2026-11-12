@@ -302,6 +302,8 @@ const ESSENTIAL: &[&str] = &[
     "artifact_bytes",
     "artifact_sha256",
     "artifact_truncated",
+    "answered_count",
+    "total_questions",
 ];
 const ESSENTIAL_CHARS: usize = 400;
 /// Head of a non-JSON result kept by the last-resort receipt.
@@ -317,6 +319,9 @@ fn truncation_hint(tool: &str) -> &'static str {
         }
         "run_command" => {
             "Host shortened this output; the command ran once. With artifact_id, read_tool_output retrieves the saved result without rerunning it. Use start_line/max_lines or query; offset/max_bytes reads long lines. Without an artifact, use a narrower side-effect-free inspection; never repeat side effects to retrieve output."
+        }
+        "ask_user" => {
+            "Host shortened this ask_user receipt to fit the local model context; status, answered_count and total_questions are preserved. With artifact_id, read_tool_output retrieves the saved answers without re-asking the user. Never re-run ask_user to recover truncated output."
         }
         _ => {
             "Host shortened this result to fit the local model context. Narrow the request (path, pattern, offset, max_results) instead of repeating it."
