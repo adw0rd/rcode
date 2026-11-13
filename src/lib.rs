@@ -30,6 +30,9 @@ pub mod tools;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "tools_legacy.rs"]
 pub mod tools;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[allow(dead_code)]
+mod tools_legacy;
 pub mod vision;
 pub mod web_fetch;
 pub mod web_search;

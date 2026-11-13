@@ -326,3 +326,163 @@ async fn replaced_explicitly_granted_root_rejects_write() {
     assert_eq!(fs::read(moved.join("f")).unwrap(), b"user bytes\n");
     assert_eq!(fs::read(external.join("f")).unwrap(), b"user bytes\n");
 }
+
+#[tokio::test]
+async fn create_then_overwrite_succeeds_without_intermediate_read_and_detects_external_tamper() {
+    let mut f = Fixture::new();
+    assert!(!f.write("created.py", "v1\n").await.unwrap().is_error);
+    assert!(
+        !f.write("created.py", "v2\n").await.unwrap().is_error,
+        "authoring actor should retain verified snapshot after creating file"
+    );
+    assert_eq!(fs::read(f.root.join("created.py")).unwrap(), b"v2\n");
+
+    // External modification between writes must still be rejected.
+    fs::write(f.root.join("created.py"), b"external\n").unwrap();
+    let outcome = f.write("created.py", "v3\n").await;
+    assert!(rejected(&outcome));
+    assert_eq!(fs::read(f.root.join("created.py")).unwrap(), b"external\n");
+}
+
+#[tokio::test]
+async fn read_then_edit_then_write_updates_snapshot_while_unobserved_edit_does_not() {
+    let mut f = Fixture::new();
+    f.file("mod.py", b"alpha = 1\nbeta = 2\n");
+    assert!(!f.read("mod.py").await.unwrap().is_error);
+    let edited = f
+        .call(ToolCall::new(
+            "edit_file",
+            json!({"path":"mod.py","old_text":"alpha = 1","new_text":"alpha = 10"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!edited.is_error, "{}", edited.content);
+    let overwritten = f
+        .write("mod.py", "alpha = 100\nbeta = 200\n")
+        .await
+        .unwrap();
+    assert!(
+        !overwritten.is_error,
+        "edit_file on a previously observed file should advance the actor observation: {}",
+        overwritten.content
+    );
+    assert_eq!(
+        fs::read(f.root.join("mod.py")).unwrap(),
+        b"alpha = 100\nbeta = 200\n"
+    );
+
+    // Editing a file that was never read must not mint a full-file observation.
+    f.file("unread.py", b"one = 1\ntwo = 2\n");
+    let blind_edit = f
+        .call(ToolCall::new(
+            "edit_file",
+            json!({"path":"unread.py","old_text":"one = 1","new_text":"one = 10"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!blind_edit.is_error, "{}", blind_edit.content);
+    let follow_write = f.write("unread.py", "replaced\n").await;
+    assert!(
+        rejected(&follow_write),
+        "edit_file without prior read must not authorize blind write_file"
+    );
+    assert_eq!(
+        fs::read(f.root.join("unread.py")).unwrap(),
+        b"one = 10\ntwo = 2\n"
+    );
+}
+
+#[tokio::test]
+async fn stale_observation_survives_edit_file_and_blocks_explicit_hash_bypass() {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    let path = f.file("stale.py", b"keep = 1\ntarget = 2\n");
+    assert!(!f.read("stale.py").await.unwrap().is_error);
+
+    // External replacement changes inode and bytes while preserving `target = 2`.
+    let replacement = f.root.join("stale.replacement");
+    fs::write(&replacement, b"external = 99\ntarget = 2\n").unwrap();
+    fs::rename(&replacement, &path).unwrap();
+
+    let edited = f
+        .call(ToolCall::new(
+            "edit_file",
+            json!({"path":"stale.py","old_text":"target = 2","new_text":"target = 20"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!edited.is_error, "{}", edited.content);
+    let post_edit_bytes = b"external = 99\ntarget = 20\n";
+    assert_eq!(fs::read(&path).unwrap(), post_edit_bytes);
+
+    let without_hash = f.write("stale.py", "overwrite\n").await;
+    assert!(rejected(&without_hash));
+
+    let with_explicit_hash = f
+        .call(ToolCall::new(
+            "write_file",
+            json!({
+                "path": "stale.py",
+                "content": "overwrite\n",
+                "expected_sha256": format!("{:x}", Sha256::digest(post_edit_bytes)),
+            }),
+        ))
+        .await;
+    assert!(
+        rejected(&with_explicit_hash),
+        "stale observation must not be refreshed or erased by edit_file"
+    );
+    assert_eq!(fs::read(&path).unwrap(), post_edit_bytes);
+}
+
+#[tokio::test]
+async fn noop_write_records_verified_observation_but_noop_edit_and_undo_do_not() {
+    use sha2::{Digest, Sha256};
+    let mut f = Fixture::new();
+    f.file("noop.py", b"same = 1\n");
+    let same_hash = format!("{:x}", Sha256::digest(b"same = 1\n"));
+
+    // No-op edit without prior read must not mint an observation.
+    let noop_edit = f
+        .call(ToolCall::new(
+            "edit_file",
+            json!({"path":"noop.py","old_text":"same = 1","new_text":"same = 1"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!noop_edit.is_error);
+    assert!(rejected(&f.write("noop.py", "changed\n").await));
+
+    // No-op write_file with explicit sha256 supplies the full content and records observation.
+    let noop_write = f
+        .call(ToolCall::new(
+            "write_file",
+            json!({"path":"noop.py","content":"same = 1\n","expected_sha256":same_hash}),
+        ))
+        .await
+        .unwrap();
+    assert!(!noop_write.is_error);
+    assert!(!f.write("noop.py", "changed = 2\n").await.unwrap().is_error);
+
+    // Undo restores the previous version on a fresh inode and must not refresh read_snapshots.
+    f.tools.undo().unwrap();
+    assert_eq!(fs::read(f.root.join("noop.py")).unwrap(), b"same = 1\n");
+    assert!(
+        rejected(&f.write("noop.py", "after undo\n").await),
+        "undo must not grant an observation of restored bytes"
+    );
+
+    // Hard-linked file (nlink > 1) must not mint a write observation on no-op or allow modification.
+    let linked = f.file("linked.py", b"linked = 1\n");
+    fs::hard_link(&linked, f.root.join("linked_alias.py")).unwrap();
+    let linked_hash = format!("{:x}", Sha256::digest(b"linked = 1\n"));
+    let noop_linked = f
+        .call(ToolCall::new(
+            "write_file",
+            json!({"path":"linked.py","content":"linked = 1\n","expected_sha256":linked_hash}),
+        ))
+        .await
+        .unwrap();
+    assert!(!noop_linked.is_error);
+    assert!(rejected(&f.write("linked.py", "linked = 2\n").await));
+}
