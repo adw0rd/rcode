@@ -53,6 +53,18 @@ fn tool_detail(name: &str, args: &Value) -> String {
             .unwrap_or_default()
             .to_owned();
     }
+    if name == crate::memory_tool::READ_TOOL_NAME {
+        return text("id").unwrap_or_default().to_owned();
+    }
+    if name == crate::memory_tool::WRITE_TOOL_NAME {
+        let op = text("op").unwrap_or_default();
+        let scope = text("scope").unwrap_or_default();
+        let slug = text("name").unwrap_or_default();
+        if !op.is_empty() && !scope.is_empty() && !slug.is_empty() {
+            return format!("{op} {scope}/{slug}");
+        }
+        return text("name").unwrap_or_default().to_owned();
+    }
     text("path")
         .or_else(|| text("pattern"))
         .unwrap_or_default()
