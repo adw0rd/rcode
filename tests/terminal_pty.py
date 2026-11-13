@@ -468,6 +468,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply({"choices": [{"message": {"role": "assistant", "content": "ASK_USER_R13_EXEC_OK"},
                                          "finish_reason": "stop"}]})
             return
+        if loop_prompt == "MEMORY_AUTOEDIT_APPROVAL":
+            tool_names = [tool["function"]["name"] for tool in body.get("tools", [])]
+            turn = body["messages"][actual_user + 1:]
+            tool_msgs = [m for m in turn if m["role"] == "tool"]
+            if len(tool_msgs) == 0:
+                assert "write_memory" in tool_names, tool_names
+                assert "read_memory" not in tool_names, tool_names
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_pty_mem_w", "type": "function", "function": {
+                               "name": "write_memory",
+                               "arguments": json.dumps({
+                                   "op": "create",
+                                   "scope": "project",
+                                   "name": "conventions",
+                                   "description": "PTY conventions",
+                                   "content": "- [stated] Always run PTY smoke.\n",
+                               })}}]},
+                           "finish_reason": "tool_calls"}]})
+            elif len(tool_msgs) == 1:
+                receipt = json.loads(tool_msgs[-1]["content"])
+                assert receipt.get("id") == "project/conventions", receipt
+                assert "read_memory" in tool_names, tool_names
+                assert "<rcode_memory_index>" in body["messages"][0]["content"]
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_pty_mem_r", "type": "function", "function": {
+                               "name": "read_memory",
+                               "arguments": json.dumps({"id": "project/conventions"})}}]},
+                           "finish_reason": "tool_calls"}]})
+            else:
+                receipt = json.loads(tool_msgs[-1]["content"])
+                assert "Always run PTY smoke." in receipt.get("content", ""), receipt
+                self.reply({"choices": [{"message": {"role": "assistant", "content": "MEMORY_PTY_DONE"},
+                                         "finish_reason": "stop"}]})
+            return
         if prompt == "AGENT_VIEW_REQUEST":
             last = body["messages"][-1]
             if last["role"] != "tool":
@@ -1346,6 +1380,29 @@ def main(binary):
             terminal.send("\x1b[B\r")
             terminal.editor_after("✓ Разрешения: auto-edit", mark)
             terminal.command("/status", "Режим        auto-edit · shell по подтверждению")
+            terminal.expect_body("Память")
+
+            # Даже в режиме auto-edit запись межсессионной памяти через write_memory
+            # требует отдельного diff-подтверждения оператора!
+            phase("memory auto-edit diff approval and /memory commands")
+            mark = terminal.mark()
+            terminal.send("MEMORY_AUTOEDIT_APPROVAL\r")
+            terminal.until(
+                lambda: "Межсессионная память rcode" in terminal.text(mark)
+                and "› Отклонить" in terminal.grid.rows()[-4],
+                "write_memory diff approval panel even in auto-edit mode",
+            )
+            terminal.assert_footer("openrouter", "auto-edit")
+            terminal.send("Y\r")
+            terminal.editor_after("MEMORY_PTY_DONE", mark)
+            terminal.command("/memory", "Межсессионная память: включена")
+            terminal.expect_body("project/conventions")
+            terminal.command("/memory show project/conventions", "Always run PTY smoke.")
+            terminal.command("/memory log project/conventions", "История ревизий project/conventions")
+            terminal.command("/memory undo project/conventions", "✓ Откат заметки project/conventions выполнен.")
+            terminal.command("/memory off --project", "выключена")
+            terminal.command("/memory on --project", "включена")
+
             mark = terminal.mark()
             terminal.send(b"\x04")
             terminal.until(lambda: terminal.status is not None, "Ctrl+D exit")

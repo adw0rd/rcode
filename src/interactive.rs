@@ -1,13 +1,16 @@
 use crate::{
     app::{
-        Events, catalog_unit, configured_tools, context_budget, discover_skills, prepare_context,
+        Events, catalog_unit, catalog_unit_for_client, configured_tools,
+        context_budget_with_memory, discover_memory, discover_skills, prepare_context,
         skill_catalog, turn, user_shell,
     },
     balance::BalanceMonitor,
     cli::{ApprovalMode, Cli},
     config::{ConfigStore, Effort, ProviderKind, ProviderSettings, Settings},
     context::ContextBudget,
-    local_app, presentation,
+    local_app,
+    memory::{MemoryId, MemoryPolicy, MemoryProblem, MemorySnapshot, MemoryStore},
+    presentation,
     protocol::{Message, ModelInfo, ProviderMeta},
     provider::ProviderClient,
     skills::{CatalogEntry, CatalogUnit, LookupError, RenderedCatalog, SkillCatalog, SkillProblem},
@@ -467,6 +470,7 @@ fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) 
         workspace: session.root.display().to_string(),
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn status(
     session: &Session,
     runtime: &Cli,
@@ -475,6 +479,7 @@ fn status(
     models: &[ModelInfo],
     budget: &ContextBudget,
     skills: &str,
+    memory_line: &str,
 ) {
     notice!(
         "\nМодель       {} / {}\nEffort       {}\nРежим        {} · shell {}\nПапка        {}\nСессия       {}",
@@ -507,7 +512,7 @@ fn status(
             ui::safe(session.provider.base_url.as_deref().unwrap_or_default())
         );
     }
-    context(session, models, budget, skills);
+    context(session, models, budget, skills, memory_line);
     let mode = runtime.final_review_mode();
     let review = crate::final_review::model_target_summary_for_mode(settings, mode);
     notice!(
@@ -518,7 +523,13 @@ fn status(
     );
 }
 /// `skills`: the catalog line of `catalog_summary`.
-fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget, skills: &str) {
+fn context(
+    session: &Session,
+    models: &[ModelInfo],
+    budget: &ContextBudget,
+    skills: &str,
+    memory_line: &str,
+) {
     if budget.is_tokens() {
         // Local: estimated tokens against the server context; nothing is invented.
         notice!(
@@ -534,6 +545,7 @@ fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget, skil
             );
         }
         notice!("{skills}");
+        notice!("{memory_line}");
         notice!(
             "История сокращается автоматически перед запросом, когда приближается к лимиту. /compact сокращает её вручную, /clear создаёт новую сессию."
         );
@@ -548,7 +560,7 @@ fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget, skil
     );
     if budget.overhead > 0 {
         notice!(
-            "             из них ~{} — каталог скиллов и схема load_skill в каждом запросе",
+            "             из них ~{} — каталог скиллов, память и дополнительные схемы в каждом запросе",
             budget.overhead
         );
     }
@@ -562,6 +574,7 @@ fn context(session: &Session, models: &[ModelInfo], budget: &ContextBudget, skil
         );
     }
     notice!("{skills}");
+    notice!("{memory_line}");
     notice!(
         "При {} символах история сокращается автоматически перед запросом к API. /compact сокращает её вручную, /clear создаёт новую сессию.",
         budget.threshold()
@@ -610,6 +623,40 @@ fn catalog_summary(
         ),
     };
     line.push_str(" · /skills — подробности");
+    line
+}
+fn memory_summary(memory: &MemorySnapshot, unit: CatalogUnit, secrets: &[String]) -> String {
+    let mut line = match &memory.policy {
+        MemoryPolicy::DisabledForEval => "Память       отключена в eval".to_owned(),
+        MemoryPolicy::DisabledByConfig => "Память       выключена глобально".to_owned(),
+        MemoryPolicy::DisabledForProject => "Память       выключена для этого проекта".to_owned(),
+        MemoryPolicy::ManifestError(_) => "Память       недоступна (ошибка memory.json)".to_owned(),
+        MemoryPolicy::Enabled if memory.notes.is_empty() => {
+            "Память       пуста (0 заметок)".to_owned()
+        }
+        MemoryPolicy::Enabled => match memory.render_index(unit, secrets) {
+            Some(rendered) if !rendered.budget_exhausted => {
+                let mut s = format!(
+                    "Память       {} заметок, индекс ~{} {}",
+                    memory.notes.len(),
+                    rendered.cost,
+                    unit_label(unit)
+                );
+                if !rendered.omitted_ids.is_empty() {
+                    s.push_str(&format!(" · только id {}", rendered.omitted_ids.len()));
+                }
+                if rendered.omitted_count > 0 {
+                    s.push_str(&format!(" · опущено {}", rendered.omitted_count));
+                }
+                s
+            }
+            _ => format!(
+                "Память       индекс из {} не помещается в бюджет и опущен",
+                memory.notes.len()
+            ),
+        },
+    };
+    line.push_str(" · /memory — подробности");
     line
 }
 fn size(bytes: u64) -> String {
@@ -1068,7 +1115,7 @@ fn help(registry: &crate::commands::CommandRegistry) {
         notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
     }
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -1191,6 +1238,145 @@ fn command_problems(problems: &[crate::commands::CommandProblem], events: &Event
         notice!("! Команды: ещё предупреждений — {}", problems.len() - SHOWN);
     }
 }
+
+/// Memory discovery warnings, at most ten lines; shown again only when the set changes.
+fn memory_problems(problems: &[MemoryProblem], events: &Events) {
+    const SHOWN: usize = 10;
+    for problem in problems.iter().take(SHOWN) {
+        notice!("! {}", ui::safe(&events.redact(&problem.warning())));
+    }
+    if problems.len() > SHOWN {
+        notice!("! Память: ещё предупреждений — {}", problems.len() - SHOWN);
+    }
+}
+
+fn emit_memory_warnings(warnings: &[String], events: &Events) -> Result<()> {
+    for w in warnings {
+        let safe = events.redact_checked(w)?;
+        notice!("⚠ {safe}");
+    }
+    Ok(())
+}
+
+fn memory_command(
+    args: &[&str],
+    cli: &Cli,
+    plan: bool,
+    store: &ConfigStore,
+    session: &Session,
+    client: &ProviderClient,
+    events: &Events,
+) -> Result<()> {
+    if crate::memory::is_eval_environment(cli, store.root()) {
+        bail!("Межсессионная память отключена в изолированном режиме rcode eval");
+    }
+    crate::memory::ensure_storage_outside_project(store.root(), &session.root)?;
+    events.refresh_keys(store)?;
+    let secrets = events.secret_snapshot();
+    let mem_store = MemoryStore::new(store.root());
+    match args {
+        [] | ["status"] => {
+            let unit = catalog_unit_for_client(client, session);
+            let (_, text) = crate::memory_cli::build_status_report(
+                &session.root,
+                store,
+                &mem_store,
+                unit,
+                &secrets,
+                Some((session, cli, plan)),
+                plan,
+            )?;
+            let safe = events.redact_checked(&text)?;
+            notice!("\n{safe}");
+            Ok(())
+        }
+        ["show", id] => {
+            let (_, text) =
+                crate::memory_cli::format_note_show(&session.root, &mem_store, id, &secrets)?;
+            let safe = events.redact_checked(&text)?;
+            notice!("\n{safe}");
+            Ok(())
+        }
+        ["log", id] => {
+            let (_, text) =
+                crate::memory_cli::format_note_log(&session.root, &mem_store, id, &secrets)?;
+            let safe = events.redact_checked(&text)?;
+            notice!("\n{safe}");
+            Ok(())
+        }
+        ["undo", id] => {
+            let parsed = MemoryId::parse(id)?;
+            let out = mem_store.undo(&session.root, &parsed, None, false, &secrets, None)?;
+            emit_memory_warnings(&out.warnings, events)?;
+            notice!("✓ Откат заметки {parsed} выполнен.");
+            Ok(())
+        }
+        ["rm", "--purge", id] | ["rm", id, "--purge"] => {
+            let parsed = MemoryId::parse(id)?;
+            let deleted = mem_store.commit_delete(
+                &session.root,
+                &parsed,
+                crate::memory::DeleteCas::Any,
+                true,
+                &secrets,
+                None,
+            )?;
+            emit_memory_warnings(&deleted.warnings, events)?;
+            if deleted.deleted_sha256.is_some() {
+                notice!(
+                    "✓ Заметка {parsed} и её ревизии удалены (--purge). Уже отправленные сообщения текущей сессии остаются в истории диалога."
+                );
+            } else {
+                notice!(
+                    "✓ Оставшиеся ревизии уже удалённой заметки {parsed} очищены (--purge). Уже отправленные сообщения текущей сессии остаются в истории диалога."
+                );
+            }
+            Ok(())
+        }
+        ["rm", id] => {
+            let parsed = MemoryId::parse(id)?;
+            let deleted = mem_store.commit_delete(
+                &session.root,
+                &parsed,
+                crate::memory::DeleteCas::Any,
+                false,
+                &secrets,
+                None,
+            )?;
+            emit_memory_warnings(&deleted.warnings, events)?;
+            notice!("✓ Заметка {parsed} удалена (доступен откат через /memory undo {parsed}).");
+            Ok(())
+        }
+        ["on"] | ["on", "--project"] | ["off"] | ["off", "--project"] => {
+            let enable = args[0] == "on";
+            let project_only = args.len() == 2;
+            let (outcome, project_id) = crate::memory_cli::apply_enable_toggle(
+                &session.root,
+                &mem_store,
+                enable,
+                project_only,
+            )?;
+            emit_memory_warnings(&outcome.warnings, events)?;
+            let scope_label = if project_only {
+                format!("для проекта {project_id}")
+            } else {
+                "глобально".to_owned()
+            };
+            notice!(
+                "✓ Межсессионная память {scope_label}: {}. Уже отправленные сообщения текущей сессии остаются в истории диалога; настройка действует со следующего хода.",
+                if enable {
+                    "включена"
+                } else {
+                    "выключена"
+                }
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "Использование: /memory [status | show <scope/slug> | log <scope/slug> | undo <scope/slug> | rm [--purge] <scope/slug> | on [--project] | off [--project]]"
+        ),
+    }
+}
 /// `skills`: the snapshot `dispatch` discovered; later inputs rediscover.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -1207,12 +1393,21 @@ pub(crate) async fn run(
     execution.activate()?;
     execution.reconcile_receipts(session)?;
     let rich = events.display.is_rich();
+    let initial_memory = discover_memory(store, cli, &session.root, &events.secret_snapshot());
     let _screen = if rich {
         Some(crate::screen::start(footer(
             session,
             cli,
             cli.plan,
-            &context_budget(client, session, cli, cli.plan, &skills),
+            &context_budget_with_memory(
+                client,
+                session,
+                cli,
+                cli.plan,
+                &skills,
+                &initial_memory,
+                &events.secret_snapshot(),
+            ),
         ))?)
     } else {
         None
@@ -1255,7 +1450,15 @@ pub(crate) async fn run(
             session,
             store,
             0,
-            &context_budget(client, session, cli, plan, &skills),
+            &context_budget_with_memory(
+                client,
+                session,
+                cli,
+                plan,
+                &skills,
+                &initial_memory,
+                &events.secret_snapshot(),
+            ),
         )?)
     } else {
         None
@@ -1265,18 +1468,27 @@ pub(crate) async fn run(
         context.report(events);
     }
     let mut shown_problems = Vec::new();
+    let mut shown_memory_problems = Vec::new();
     let mut shown_command_problems: Vec<String> = Vec::new();
     let mut unsupported_shown: HashSet<String> = HashSet::new();
     let mut snapshot = Some(skills);
+    let mut memory_snapshot = Some(initial_memory);
     loop {
-        // New and changed skills are picked up without a restart; one turn
-        // keeps one snapshot (DESIGN §6.1).
+        // New and changed skills/memory notes are picked up without a restart;
+        // one turn keeps one snapshot.
         let skills = snapshot
             .take()
             .unwrap_or_else(|| discover_skills(store, &session.root));
         if skills.problems != shown_problems {
             skill_problems(&skills.problems, events);
             shown_problems = skills.problems.clone();
+        }
+        let memory = memory_snapshot.take().unwrap_or_else(|| {
+            discover_memory(store, &runtime, &session.root, &events.secret_snapshot())
+        });
+        if memory.problems != shown_memory_problems {
+            memory_problems(&memory.problems, events);
+            shown_memory_problems = memory.problems.clone();
         }
         let registry = crate::commands::CommandRegistry::discover(store.root(), &session.root);
         let command_fingerprints: Vec<String> = registry
@@ -1298,7 +1510,15 @@ pub(crate) async fn run(
         let mut menu = registry.menu();
         menu.extend(skill_menu(&skills, &registry));
         composer.set_commands(menu.clone());
-        let budget = context_budget(client, session, &runtime, plan, &skills);
+        let budget = context_budget_with_memory(
+            client,
+            session,
+            &runtime,
+            plan,
+            &skills,
+            &memory,
+            &events.secret_snapshot(),
+        );
         if let Some(screen) = crate::screen::current() {
             screen.set_footer(footer(session, &runtime, plan, &budget));
         }
@@ -1374,7 +1594,7 @@ pub(crate) async fn run(
         let first_word = input.split_whitespace().next().unwrap_or_default();
         if !matches!(
             first_word,
-            "/new" | "/clear" | "/resume" | "/help" | "/status" | "/exit" | "/quit"
+            "/new" | "/clear" | "/resume" | "/help" | "/status" | "/memory" | "/exit" | "/quit"
         ) && let Err(error) = execution.activate()
         {
             events.emit("error", json!({"message":events.redact(&format!("{error:#}. Исполнение сессии недоступно. Введите /exit; после перезапуска восстановите сессию через /resume."))}));
@@ -1497,7 +1717,8 @@ pub(crate) async fn run(
                     }Ok(())
                 },
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
-                "/status"=>{let rendered=skill_catalog(session,&skills);status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)));Ok(())},
+                "/status"=>{let rendered=skill_catalog(session,&skills);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&events.secret_snapshot()));status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
+                "/memory"=>memory_command(&args,&runtime,plan,store,session,client,events),
                 "/balance"=>{
                     if !args.is_empty(){bail!("/balance — баланс текущего провайдера; сменить провайдера: /provider");}
                     let cancel=tokio_util::sync::CancellationToken::new();
@@ -1517,7 +1738,7 @@ pub(crate) async fn run(
                     notice!("{}",events.redact(&agents_view(records,args.first().copied())?));
                     Ok(())
                 },
-                "/context"=>{let rendered=skill_catalog(session,&skills);context(session,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)));Ok(())},
+                "/context"=>{let rendered=skill_catalog(session,&skills);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&events.secret_snapshot()));context(session,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
                 "/skills"=>{
                     if !args.is_empty(){bail!("/skills — список скиллов; выбрать скилл: /skill ID [запрос]");}
                     let rendered=skill_catalog(session,&skills);
@@ -1575,7 +1796,7 @@ pub(crate) async fn run(
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
                         execution.reconcile_receipts(&mut restored)?;
                         restored.save(store)?;
-                        *session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        *session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }else if let Some(id)=id{
                         // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
                         let mut restored=Session::load(store,&id,&session.root)?;
@@ -1585,7 +1806,7 @@ pub(crate) async fn run(
                         next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                         next_execution.reconcile_receipts(&mut restored)?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let context=prepare_context(session,store,0,&context_budget(client,session,&runtime,plan,&skills))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _ if custom.is_some() => {

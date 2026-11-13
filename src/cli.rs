@@ -198,6 +198,133 @@ pub enum Command {
         #[command(subcommand)]
         command: WebsearchCommand,
     },
+    #[command(
+        about = "Межсессионная память пользователя (RCODE_HOME/memory)",
+        after_help = "Заметки хранятся приватно в RCODE_HOME/memory вне репозитория проекта.\nНе сохраняйте ключи и токены в заметки; для учётных данных используйте rcode connect."
+    )]
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemoryListScope {
+    Current,
+    Project,
+    Global,
+    AllProjects,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum MemoryClearScope {
+    Project,
+    Global,
+    Current,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum MemoryCommand {
+    #[command(about = "Показать статус памяти, бюджет индекса и предупреждения")]
+    Status,
+    #[command(about = "Список заметок памяти с фильтрацией по области и запросу")]
+    List {
+        #[arg(long, value_enum, default_value_t = MemoryListScope::Current)]
+        scope: MemoryListScope,
+        #[arg(long, help = "Фильтр по имени, aliases и описанию")]
+        query: Option<String>,
+    },
+    #[command(about = "Показать метаданные, SHA-256 и полный текст заметки")]
+    Show {
+        #[arg(value_name = "SCOPE/SLUG")]
+        id: String,
+    },
+    #[command(about = "Показать журнал ревизий заметки в .revisions/")]
+    Log {
+        #[arg(value_name = "SCOPE/SLUG")]
+        id: String,
+    },
+    #[command(about = "Показать diff между ревизией и текущим текстом заметки")]
+    Diff {
+        #[arg(value_name = "SCOPE/SLUG")]
+        id: String,
+        #[arg(value_name = "REV")]
+        revision: String,
+    },
+    #[command(
+        about = "Отредактировать заметку через $VISUAL/$EDITOR (приватный staging + CAS)",
+        after_help = "Открывает приватную временную копию (0600) без удержания блокировки хранилища и сохраняет результат атомарно через CAS.\nУчтите: внешний редактор ($VISUAL/$EDITOR) может создавать собственные swap/recovery-файлы вне контроля rcode."
+    )]
+    Edit {
+        #[arg(value_name = "SCOPE/SLUG")]
+        id: String,
+    },
+    #[command(about = "Удалить заметку (по умолчанию с сохранением ревизии для отката)")]
+    Rm {
+        #[arg(
+            long,
+            help = "Безвозвратно удалить заметку и все её ревизии в .revisions/ без создания новой копии"
+        )]
+        purge: bool,
+        #[arg(value_name = "SCOPE/SLUG")]
+        id: String,
+    },
+    #[command(
+        about = "Безопасно откатить заметку к предыдущей ревизии (с проверкой ручных правок)"
+    )]
+    Undo {
+        #[arg(value_name = "SCOPE/SLUG")]
+        id: String,
+        #[arg(long, value_name = "REV")]
+        revision: Option<String>,
+        #[arg(
+            long,
+            help = "Перезаписать файл даже при расхождении с последней ревизией (ручной правке)"
+        )]
+        force: bool,
+    },
+    #[command(about = "Очистить заметки выбранной области (по умолчанию текущий проект)")]
+    Clear {
+        #[arg(long, value_enum, default_value_t = MemoryClearScope::Project)]
+        scope: MemoryClearScope,
+        #[arg(
+            long,
+            help = "Удалить проектные заметки ВСЕХ проектов в RCODE_HOME/memory/projects"
+        )]
+        all_projects: bool,
+        #[arg(
+            long,
+            help = "Очистить также связанные ревизии в .revisions/ (архивные sessions/<id> не переписываются)"
+        )]
+        purge: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    #[command(about = "Включить межсессионную память глобально или для текущего проекта")]
+    Enable {
+        #[arg(long, help = "Включить только для текущего проекта")]
+        project: bool,
+    },
+    #[command(about = "Отключить межсессионную память глобально или для текущего проекта")]
+    Disable {
+        #[arg(long, help = "Отключить только для текущего проекта")]
+        project: bool,
+    },
+    #[command(about = "Настроить автоматическую запись без модального diff-подтверждения")]
+    AutoWrite {
+        #[arg(
+            long,
+            value_enum,
+            help = "Автоматическая запись проектных заметок (on|off)"
+        )]
+        project: Option<Toggle>,
+        #[arg(
+            long,
+            value_enum,
+            help = "Автоматическая запись глобальных заметок (on|off)"
+        )]
+        global: Option<Toggle>,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone)]

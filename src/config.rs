@@ -636,12 +636,26 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
 }
 
 impl ConfigStore {
-    pub fn new() -> Result<Self> {
-        let root = match env::var_os("RCODE_HOME") {
+    pub fn planned_root() -> Result<PathBuf> {
+        let raw = match env::var_os("RCODE_HOME") {
             Some(path) if !path.is_empty() => PathBuf::from(path),
             Some(_) => bail!("RCODE_HOME не должен быть пустым"),
             None => home_dir()?.join(".rcode"),
         };
+        if raw.as_os_str().is_empty() {
+            bail!("Путь к каталогу настроек не должен быть пустым");
+        }
+        if raw.is_absolute() {
+            Ok(raw)
+        } else {
+            Ok(env::current_dir()
+                .context("Не удалось определить текущий каталог")?
+                .join(raw))
+        }
+    }
+
+    pub fn new() -> Result<Self> {
+        let root = Self::planned_root()?;
         migrate_from_legacy(&root, legacy_home().as_deref())?;
         Self::at(root)
     }
@@ -1147,7 +1161,7 @@ fn backup_state_file(path: &Path) {
         return;
     };
     let backups = parent.join("backups");
-    if std::fs::create_dir_all(&backups).is_err() {
+    if ensure_private_directory(&backups).is_err() {
         return;
     }
     let stamp = std::time::SystemTime::now()

@@ -307,6 +307,11 @@ impl EvidenceCollector {
             tool,
             "read_file" | "search" | "list_files" | "run_command" | "write_file" | "edit_file"
         ) {
+            if redaction_incomplete
+                || (outcome.is_error && outcome.content.contains("\"redaction_failed\""))
+            {
+                self.incomplete_redaction = self.incomplete_redaction.saturating_add(1);
+            }
             self.excluded_non_evidence = self.excluded_non_evidence.saturating_add(1);
             return;
         }
@@ -477,9 +482,9 @@ pub fn packet(
         "observed_evidence": &observed.entries,
         "observed_evidence_omitted": observed.omitted,
         "limitations": if observed.omitted == 0 {
-            "Наблюдения относятся только к текущему ходу и включают только файловые и командные операции (read_file, search, list_files, run_command, write_file, edit_file); служебные вызовы хоста (load_skill, spawn_agent, wait_agent, update_plan и внутренние artifact_id) в observed_evidence не включаются по дизайну. Текст модели не является проверкой."
+            "Наблюдения относятся только к текущему ходу и включают только файловые и командные операции (read_file, search, list_files, run_command, write_file, edit_file); служебные вызовы хоста (load_skill, read_memory, write_memory, spawn_agent, wait_agent, update_plan и внутренние artifact_id) в observed_evidence не включаются по дизайну. Текст модели не является проверкой."
         } else {
-            "Часть наблюдений текущего хода опущена по лимиту; список неполон. В observed_evidence включаются только файловые и командные операции; служебные вызовы хоста (load_skill, spawn_agent, wait_agent, update_plan и внутренние artifact_id) не передаются по дизайну. Текст модели не является проверкой."
+            "Часть наблюдений текущего хода опущена по лимиту; список неполон. В observed_evidence включаются только файловые и командные операции; служебные вызовы хоста (load_skill, read_memory, write_memory, spawn_agent, wait_agent, update_plan и внутренние artifact_id) не передаются по дизайну. Текст модели не является проверкой."
         }
     });
     if !observed.clarifications.is_empty()
@@ -1295,6 +1300,77 @@ mod tests {
         );
         let blocked = guard.snapshot();
         assert_eq!(blocked.incomplete_redaction, 1);
+        assert!(ensure_complete(&blocked).is_err());
+    }
+
+    #[test]
+    fn memory_tools_are_excluded_as_non_evidence_and_fail_closed_on_redaction_error() {
+        let main = ProviderSettings::new(ProviderKind::Custom);
+        let events = crate::app::Events::new(false);
+        let read_call = ToolCall::new(
+            crate::memory_tool::READ_TOOL_NAME,
+            json!({"id": "project/arch"}),
+        );
+        let read_out = ToolOutcome::success(
+            json!({
+                "id": "project/arch",
+                "scope": "project",
+                "name": "arch",
+                "content": "Historical note",
+                "sha256": "a".repeat(64)
+            })
+            .to_string(),
+        );
+        let write_call = ToolCall::new(
+            crate::memory_tool::WRITE_TOOL_NAME,
+            json!({
+                "op": "create",
+                "scope": "project",
+                "name": "arch",
+                "description": "Architecture",
+                "content": "Historical note"
+            }),
+        );
+        let write_out = ToolOutcome::success(
+            json!({
+                "op": "create",
+                "id": "project/arch",
+                "sha256": "a".repeat(64)
+            })
+            .to_string(),
+        );
+        assert!(evidence(&read_call, &read_out, false, false).is_none());
+        assert!(evidence(&write_call, &write_out, false, false).is_none());
+
+        let collector = turn_collector(true).unwrap();
+        let mut guard = collector.lock().unwrap();
+        guard.observe(&read_call, &read_out, false, false);
+        guard.observe(&write_call, &write_out, false, false);
+        let snapshot = guard.snapshot();
+        assert!(snapshot.entries.is_empty());
+        assert_eq!(snapshot.excluded_non_evidence, 2);
+        assert_eq!(snapshot.incomplete_redaction, 0);
+        assert!(ensure_complete(&snapshot).is_ok());
+
+        let encoded = packet("Проверь модуль", "Черновик", &main, &snapshot, &events).unwrap();
+        let parsed: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["observed_evidence"], json!([]));
+        let limitations = parsed["limitations"].as_str().unwrap();
+        assert!(
+            limitations.contains("read_memory") && limitations.contains("write_memory"),
+            "{limitations}"
+        );
+
+        // Both redaction_failed and redaction_incomplete on memory tools block final_review fail-closed.
+        guard.observe(
+            &write_call,
+            &ToolOutcome::error(r#"{"error":"redaction_failed","message":"overload"}"#),
+            false,
+            false,
+        );
+        guard.observe(&read_call, &read_out, false, true);
+        let blocked = guard.snapshot();
+        assert_eq!(blocked.incomplete_redaction, 2);
         assert!(ensure_complete(&blocked).is_err());
     }
 }

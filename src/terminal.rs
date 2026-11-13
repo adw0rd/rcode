@@ -102,6 +102,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Скиллы: каталог, статус и стоимость",
     },
     CommandSpec {
+        name: "/memory",
+        description: "Межсессионная память: статус, просмотр, откат и очистка",
+    },
+    CommandSpec {
         name: "/context",
         description: "Использование контекста",
     },

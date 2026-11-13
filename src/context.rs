@@ -198,6 +198,16 @@ impl ContextBudget {
         self.limit.saturating_sub(self.scaled_overhead())
     }
 
+    /// Uncalibrated token allowance for blocks measured via `estimate_text_tokens`
+    /// before `scaled_overhead()` applies `self.calibration`.
+    pub fn uncalibrated_history_limit(&self) -> usize {
+        if self.unit == ContextUnit::EstimatedTokens && self.calibration > 1.0 {
+            (self.history_limit() as f64 / self.calibration).floor() as usize
+        } else {
+            self.history_limit()
+        }
+    }
+
     pub fn threshold(&self) -> usize {
         match self.unit {
             ContextUnit::Chars => AUTO_COMPACT_THRESHOLD.saturating_sub(self.scaled_overhead()),
@@ -304,6 +314,18 @@ const ESSENTIAL: &[&str] = &[
     "artifact_truncated",
     "answered_count",
     "total_questions",
+    "id",
+    "scope",
+    "name",
+    "updated_at",
+    "line_truncated",
+    "char_offset",
+    "next_char_offset",
+    "deleted_sha256",
+    "purged_revisions",
+    "committed",
+    "directory_durability",
+    "warning_note",
 ];
 const ESSENTIAL_CHARS: usize = 400;
 /// Head of a non-JSON result kept by the last-resort receipt.
@@ -322,6 +344,12 @@ fn truncation_hint(tool: &str) -> &'static str {
         }
         "ask_user" => {
             "Host shortened this ask_user receipt to fit the local model context; status, answered_count and total_questions are preserved. With artifact_id, read_tool_output retrieves the saved answers without re-asking the user. Never re-run ask_user to recover truncated output."
+        }
+        "read_memory" => {
+            "Host shortened this memory note page to fit the local model context; see rcode_truncated.fields.content. With complete_lines, every shown line is whole: continue with read_memory with the same id and start_line=next_line. With line_truncated or partial_line, continue with char_offset=next_char_offset on the same line or move to next_line. Do not reload the same range."
+        }
+        "write_memory" => {
+            "Host shortened this write_memory receipt to fit the local model context; status, id, sha256 and updated_at are preserved. Do not repeat write_memory or call read_memory just to confirm the write."
         }
         _ => {
             "Host shortened this result to fit the local model context. Narrow the request (path, pattern, offset, max_results) instead of repeating it."
@@ -369,6 +397,34 @@ fn line_paged(tool: &str) -> bool {
     matches!(tool, "read_file" | "load_skill")
 }
 
+fn json_string_chars(s: &str) -> usize {
+    serde_json::to_string(s).map_or(usize::MAX, |j| j.chars().count())
+}
+
+fn best_json_char_prefix(chars: &[char], budget: usize) -> usize {
+    if chars.is_empty() {
+        return 0;
+    }
+    let check = |len: usize| -> bool {
+        let s: String = chars[..len].iter().collect();
+        json_string_chars(&s) <= budget
+    };
+    if !check(1) {
+        return 1;
+    }
+    let mut low = 1usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if check(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
 fn shrink_object(
     tool: &str,
     mut object: Map<String, Value>,
@@ -382,14 +438,17 @@ fn shrink_object(
     let mut paging_hidden = false;
     let keys: Vec<String> = object.keys().cloned().collect();
     for key in keys {
-        let size = object[&key].to_string().chars().count();
+        let Some(current_val) = object.get(&key).cloned() else {
+            continue;
+        };
+        let size = current_val.to_string().chars().count();
         if size <= 256 {
             continue;
         }
         let budget = ((size as f64) * share) as usize;
         if ESSENTIAL.contains(&key.as_str()) {
             // Status fields keep their type; only long strings are shortened.
-            if let Value::String(text) = &object[&key]
+            if let Value::String(text) = &current_val
                 && text.chars().count() > ESSENTIAL_CHARS
             {
                 let (text, info) = bound_essential(text, budget);
@@ -398,7 +457,121 @@ fn shrink_object(
             }
             continue;
         }
-        match object[&key].clone() {
+        match current_val {
+            Value::String(text) if tool == "read_memory" && key == "content" => {
+                let start = object
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let total_lines = object
+                    .get("total_lines")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(start);
+                let orig_char_offset = object
+                    .get("char_offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let orig_line_truncated = object
+                    .get("line_truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                if !orig_line_truncated
+                    && orig_char_offset == 0
+                    && text
+                        .split_inclusive('\n')
+                        .next()
+                        .is_some_and(|line| json_string_chars(line) <= budget)
+                {
+                    let mut kept = String::new();
+                    let mut lines_kept = 0u64;
+                    for line in text.split_inclusive('\n') {
+                        let mut trial = kept.clone();
+                        trial.push_str(line);
+                        if json_string_chars(&trial) > budget && lines_kept > 0 {
+                            break;
+                        }
+                        if json_string_chars(&trial) > budget {
+                            break;
+                        }
+                        kept = trial;
+                        lines_kept += 1;
+                    }
+                    let next_line =
+                        (start + lines_kept <= total_lines).then_some(start + lines_kept);
+                    object.insert(key.clone(), kept.into());
+                    object.insert("next_line".into(), json!(next_line));
+                    object.remove("line_truncated");
+                    object.remove("char_offset");
+                    object.remove("next_char_offset");
+                    omitted.insert(
+                        key,
+                        json!({
+                            "complete_lines": true,
+                            "shown_lines": [start, start + lines_kept - 1],
+                            "next_line": next_line,
+                        }),
+                    );
+                } else {
+                    // Contiguous prefix slice only (never head+tail) so `next_char_offset`
+                    // stays exact across arbitrary rounds of truncation (`P2-5`).
+                    let first_line = text.split_inclusive('\n').next().unwrap_or_default();
+                    let clean_first = first_line.strip_suffix('\n').unwrap_or(first_line);
+                    let chars: Vec<char> = clean_first.chars().collect();
+                    let next_line = (start < total_lines).then_some(start + 1);
+                    if chars.is_empty() {
+                        object.insert(key.clone(), "\n".into());
+                        object.insert("next_line".into(), json!(next_line));
+                        omitted.insert(
+                            key,
+                            json!({
+                                "complete_lines": true,
+                                "shown_lines": [start, start],
+                                "next_line": next_line,
+                            }),
+                        );
+                    } else {
+                        let taken = best_json_char_prefix(&chars, budget);
+                        if taken < chars.len() || orig_line_truncated {
+                            let prefix: String = chars[..taken].iter().collect();
+                            let next_char = orig_char_offset + taken;
+                            object.insert(key.clone(), prefix.into());
+                            object.insert("line_truncated".into(), true.into());
+                            object.insert("char_offset".into(), json!(orig_char_offset));
+                            object.insert("next_char_offset".into(), json!(next_char));
+                            object.insert("next_line".into(), json!(next_line));
+                            omitted.insert(
+                                key,
+                                json!({
+                                    "partial_line": start,
+                                    "char_offset": orig_char_offset,
+                                    "shown_chars": taken,
+                                    "next_char_offset": next_char,
+                                    "complete_lines": false,
+                                    "next_line": next_line,
+                                }),
+                            );
+                        } else {
+                            let whole_tail = format!("{clean_first}\n");
+                            object.insert(key.clone(), whole_tail.into());
+                            if orig_char_offset > 0 {
+                                object.insert("line_truncated".into(), false.into());
+                                object.insert("char_offset".into(), json!(orig_char_offset));
+                                object.insert("next_char_offset".into(), Value::Null);
+                            }
+                            object.insert("next_line".into(), json!(next_line));
+                            omitted.insert(
+                                key,
+                                json!({
+                                    "complete_lines": orig_char_offset == 0,
+                                    "shown_lines": [start, start],
+                                    "next_line": next_line,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
             Value::String(text)
                 if line_paged(tool)
                     && key == "content"
@@ -562,12 +735,35 @@ fn essential_receipt(
     if original_next.is_some() && receipt.get("truncated").is_some_and(Value::is_boolean) {
         receipt.insert("truncated".into(), true.into());
     }
+    let memory_content_dropped =
+        tool == "read_memory" && !is_error && dropped.iter().any(|k| k == "content");
+    let (withdrawn_next_line, withdrawn_next_char) = if memory_content_dropped {
+        receipt.insert("is_error".into(), true.into());
+        receipt
+            .entry("error")
+            .or_insert_with(|| "budget_exhausted".into());
+        (
+            receipt.remove("next_line"),
+            receipt.remove("next_char_offset"),
+        )
+    } else {
+        (None, None)
+    };
     receipt.entry("is_error").or_insert_with(|| is_error.into());
     let mut truncated = json!({"original_chars": original, "hint": truncation_hint(tool)});
     if let Some(next) = original_next {
         truncated["original_next_offset"] = next;
         truncated["narrow_request"] = true.into();
         truncated["hint"] = pagination_hint(tool).into();
+    }
+    if memory_content_dropped {
+        if let Some(nl) = withdrawn_next_line {
+            truncated["withdrawn_next_line"] = nl;
+        }
+        if let Some(nc) = withdrawn_next_char {
+            truncated["withdrawn_next_char_offset"] = nc;
+        }
+        truncated["hint"] = "Context budget was too small to include even 1 character of read_memory content; no content was shown and cursors were withdrawn. Compact context before retrying.".into();
     }
     if !dropped.is_empty() {
         truncated["omitted_fields"] = json!(dropped);
@@ -1109,5 +1305,82 @@ mod tests {
         assert_eq!(value["skill"], "pack:debugging");
         assert_eq!(value["next_line"], 641);
         assert_eq!(value["is_error"], false);
+    }
+
+    #[test]
+    fn uncalibrated_history_limit_scales_down_for_calibration_and_runtime_context() {
+        let base = ContextBudget::for_provider(&local(), None, 1.0, 5_396);
+        assert_eq!(base.history_limit(), 20_000);
+        assert_eq!(base.uncalibrated_history_limit(), 20_000);
+
+        let calibrated = ContextBudget::for_provider(&local(), Some(16_384), 2.0, 3_000);
+        let server_remaining = calibrated.history_limit();
+        assert!(server_remaining < base.history_limit());
+        assert_eq!(
+            calibrated.uncalibrated_history_limit(),
+            (server_remaining as f64 / 2.0).floor() as usize
+        );
+    }
+
+    #[test]
+    fn read_memory_receipts_keep_whole_lines_and_essential_identity_fields() {
+        let budget = ContextBudget::for_provider(&local(), None, 1.0, 9000);
+        let limit = budget.receipt_limit().unwrap() / 3;
+        let cost = |text: &str| budget.measure(&Message::text("tool", text));
+        let lines: String = (1..=350)
+            .map(|line| format!("Rule {line}: run cargo test --locked before merging.\n"))
+            .collect();
+        let page = json!({
+            "id": "project/conventions",
+            "scope": "project",
+            "name": "conventions",
+            "description": "Project testing conventions",
+            "aliases": ["testing", "ci"],
+            "updated_at": "2026-11-13T00:00:00Z",
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "start_line": 11,
+            "total_lines": 500,
+            "next_line": 361,
+            "line_truncated": false,
+            "char_offset": 0,
+            "next_char_offset": Value::Null,
+            "content": lines,
+            "note": "Memory text is historical user data"
+        })
+        .to_string();
+        let bounded = bound_receipt(&budget, "read_memory", &page, limit, false);
+        assert!(cost(&bounded) <= limit);
+        let value: Value = serde_json::from_str(&bounded).unwrap();
+        let shown = value["content"].as_str().unwrap();
+        let next = value["next_line"].as_u64().unwrap();
+        assert!(shown.ends_with('\n') && next > 11 && next < 361, "{next}");
+        assert_eq!(shown.lines().count() as u64, next - 11);
+        assert!(lines.starts_with(shown));
+        assert_eq!(value["id"], "project/conventions");
+        assert_eq!(value["scope"], "project");
+        assert_eq!(value["name"], "conventions");
+        assert_eq!(value["updated_at"], "2026-11-13T00:00:00Z");
+        assert_eq!(
+            value["sha256"],
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(value["start_line"], 11);
+        assert_eq!(value["total_lines"], 500);
+        let fields = &value["rcode_truncated"]["fields"]["content"];
+        assert_eq!(fields["complete_lines"], true);
+        assert_eq!(fields["shown_lines"], json!([11, next - 1]));
+        let hint = value["rcode_truncated"]["hint"].as_str().unwrap();
+        assert!(hint.contains("read_memory") && hint.contains("start_line=next_line"));
+
+        // Last-resort receipt withdraws forward cursors and signals budget_exhausted so no text is skipped!
+        let tiny = bound_receipt(&budget, "read_memory", &page, 35, false);
+        let value: Value = serde_json::from_str(&tiny).unwrap();
+        assert_eq!(value["id"], "project/conventions");
+        assert_eq!(value["scope"], "project");
+        assert_eq!(value["name"], "conventions");
+        assert_eq!(value["start_line"], 11);
+        assert!(value.get("next_line").is_none(), "{tiny}");
+        assert_eq!(value["is_error"], true);
+        assert_eq!(value["error"], "budget_exhausted");
     }
 }
