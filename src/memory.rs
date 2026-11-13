@@ -1514,12 +1514,11 @@ enum DirSyncStatus {
 fn sync_dir(dir: &Dir) -> Result<DirSyncStatus> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
-        // SAFETY: `dir` is a valid open directory descriptor owned by `cap_std::fs::Dir`.
-        let rc = unsafe { libc::fsync(dir.as_raw_fd()) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error()).context("Ошибка fsync каталога памяти");
-        }
+        // On Linux, `cap_std::fs::Dir` holds an `O_PATH` fd where raw `fsync` returns `EBADF`;
+        // opening `.` yields a real directory descriptor that supports `sync_all()` on Linux & macOS.
+        dir.open(".")
+            .and_then(|f| f.sync_all())
+            .context("Ошибка fsync каталога памяти")?;
         Ok(DirSyncStatus::Synced)
     }
     #[cfg(not(unix))]
@@ -1720,22 +1719,30 @@ fn open_or_create_verified_backups_dir(root_dir: &Dir, rcode_home: &Path) -> Res
             );
             #[cfg(unix)]
             {
-                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::PermissionsExt;
                 ensure!(
                     after.uid() == current_euid(),
                     "Владелец каталога бэкапов ({}) изменился",
                     display.display()
                 );
                 // Older rcode versions (0.9.1–0.9.3) created RCODE_HOME/backups via create_dir_all (0755);
-                // tighten the verified fd to 0700 atomically before writing backups.
+                // open `.` to obtain a non-`O_PATH` directory fd on Linux before `fchmod(0700)`.
                 if after.mode() & 0o077 != 0 {
-                    let rc = unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) };
-                    ensure!(
-                        rc == 0,
-                        "Не удалось ужесточить права каталога {} до 0700: {}",
-                        display.display(),
-                        std::io::Error::last_os_error()
-                    );
+                    let real_dir = dir.open(".").with_context(|| {
+                        format!(
+                            "Не удалось открыть дескриптор каталога {}",
+                            display.display()
+                        )
+                    })?;
+                    real_dir
+                        .into_std()
+                        .set_permissions(fs::Permissions::from_mode(0o700))
+                        .with_context(|| {
+                            format!(
+                                "Не удалось ужесточить права каталога {} до 0700",
+                                display.display()
+                            )
+                        })?;
                     sync_dir(&dir)?;
                 }
                 verify_private_subdir_metadata(&dir.dir_metadata()?, &display)?;
@@ -3991,7 +3998,26 @@ mod tests {
         let out1 = store
             .commit_write(&project, &id, "create", None, &doc1, &[], None)
             .unwrap();
-        assert!(out1.warnings.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(out1.warnings.is_empty(), "{:?}", out1.warnings);
+            // Simulate legacy 0o755 `backups/` directory and verify `backup_memory_manifest` tightens it to 0o700 on Linux & macOS!
+            let backups = home.join("backups");
+            fs::create_dir_all(&backups).unwrap();
+            fs::set_permissions(&backups, fs::Permissions::from_mode(0o755)).unwrap();
+            backup_memory_manifest(&home).unwrap();
+            assert_eq!(
+                fs::metadata(&backups).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(
+            out1.warnings.iter().all(|w| w.contains("fsync")),
+            "{:?}",
+            out1.warnings
+        );
 
         // Block `backups` directory creation by placing a regular file at `RCODE_HOME/backups`
         // so `save_manifest_in_root` fails AFTER the note rename succeeds!
@@ -4018,7 +4044,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(!out2.warnings.is_empty());
+        assert!(
+            out2.warnings.iter().any(|w| w.contains("memory.json")),
+            "{:?}",
+            out2.warnings
+        );
         let reread = store.read_single_note(&project, &id, &[]).unwrap().unwrap();
         assert!(reread.0.body.contains("second"));
     }
