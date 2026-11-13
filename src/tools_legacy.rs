@@ -4,9 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::process::{ExitStatus, Stdio};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -20,7 +18,6 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
@@ -73,6 +70,8 @@ struct Snapshot {
     permissions: Permissions,
     #[cfg(unix)]
     identity: FileIdentity,
+    #[cfg(unix)]
+    nlink: u64,
 }
 
 #[cfg(unix)]
@@ -395,7 +394,7 @@ impl Tools {
             ),
             (
                 "edit_file",
-                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого host внешнего каталога (внешний путь — абсолютный). Совпадение единственное, кроме replace_all=true. Успешный ответ подтверждает выполнение правки; перечитывать файл для проверки не нужно. Доступно undo.",
+                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого host внешнего каталога (внешний путь — абсолютный). Не включайте префиксы номеров строк N\\t из read_file. Совпадение единственное, кроме replace_all=true. Успешный ответ подтверждает выполнение правки; перечитывать файл для проверки не нужно. Доступно undo.",
                 json!({"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}),
                 vec!["path", "old_text", "new_text"],
             ),
@@ -1176,6 +1175,7 @@ impl Tools {
                 ensure!(
                     current.identity == before.identity
                         && current.bytes == before.bytes
+                        && current.nlink == 1
                         && permission_mode(&current.permissions)
                             == permission_mode(&before.permissions)
                         && current.permissions.readonly() == before.permissions.readonly(),
@@ -1228,25 +1228,77 @@ impl Tools {
     ) -> Result<ToolOutcome> {
         let prepared = self.prepare(name, args, actor)?;
         check_cancel(cancel)?;
-        if prepared
+        let current_hash = prepared.before.as_ref().map(|s| sha256(&s.bytes));
+        let absolute = prepared
+            .root
+            .as_deref()
+            .unwrap_or(&self.root)
+            .join(&prepared.path);
+        let snapshot_key = (actor.map(str::to_owned), absolute.clone());
+        let had_matching_observation = match (
+            &prepared.before,
+            &current_hash,
+            self.read_snapshots.get(&snapshot_key),
+        ) {
+            (Some(before), Some(hash), Some(observation)) => {
+                #[cfg(unix)]
+                {
+                    observation.sha256 == *hash
+                        && observation.identity == before.identity
+                        && observation.binding == prepared.binding
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = before;
+                    observation.sha256 == *hash
+                }
+            }
+            _ => false,
+        };
+        let record_observation =
+            name == "write_file" || (name == "edit_file" && had_matching_observation);
+        if let Some(before) = prepared
             .before
             .as_ref()
-            .is_some_and(|b| b.bytes == prepared.after)
+            .filter(|b| b.bytes == prepared.after)
         {
+            #[cfg(unix)]
+            if name == "write_file" && before.nlink == 1 {
+                self.read_snapshots.insert(
+                    snapshot_key,
+                    ReadObservation {
+                        sha256: current_hash.expect("before hash present"),
+                        identity: before.identity,
+                        binding: prepared.binding,
+                    },
+                );
+            }
+            #[cfg(not(unix))]
+            if name == "write_file" {
+                let _ = before;
+                self.read_snapshots.insert(
+                    snapshot_key,
+                    ReadObservation {
+                        sha256: current_hash.expect("before hash present"),
+                    },
+                );
+            }
             return Ok(ToolOutcome::success(
                 "Содержимое уже совпадает; файл не изменён",
             ));
         }
+        #[cfg(unix)]
+        ensure!(
+            prepared
+                .before
+                .as_ref()
+                .is_none_or(|before| before.nlink == 1),
+            "Hard-linked files cannot be modified by file tools"
+        );
         let turn_index = self.ensure_turn()?;
         let old_state = self.checkpoints.clone();
-        let current_hash = prepared.before.as_ref().map(|s| sha256(&s.bytes));
         let after_hash = sha256(&prepared.after);
         let primary_root = &self.root;
-        let absolute = prepared
-            .root
-            .as_deref()
-            .unwrap_or(primary_root)
-            .join(&prepared.path);
         let turn = &mut self.checkpoints.turns[turn_index];
         if let Some(change) = turn
             .entries
@@ -1300,7 +1352,7 @@ impl Tools {
         let result = check_cancel(cancel).and_then(|()| {
             #[cfg(unix)]
             {
-                atomic_write_checked(
+                atomic_write_checked_proof(
                     &prepared.parent,
                     &prepared.name,
                     &prepared.after,
@@ -1311,20 +1363,47 @@ impl Tools {
             }
             #[cfg(not(unix))]
             {
-                atomic_workspace_write(
+                atomic_write_checked_proof(
                     &prepared.parent,
                     &prepared.name,
                     &prepared.after,
-                    current_hash.as_deref(),
                     mode,
                     readonly,
+                    || {
+                        ensure_hash(&prepared.parent, &prepared.name, current_hash.as_deref())?;
+                        Ok(prepared.parent.try_clone()?)
+                    },
                 )
             }
         });
-        if let Err(error) = result {
-            self.checkpoints = old_state;
-            self.persist()?;
-            return Err(error);
+        let published = match result {
+            Ok(published) => published,
+            Err(error) => {
+                self.checkpoints = old_state;
+                self.persist()?;
+                return Err(error);
+            }
+        };
+        if record_observation && let Some(proof) = published {
+            #[cfg(unix)]
+            self.read_snapshots.insert(
+                snapshot_key,
+                ReadObservation {
+                    sha256: after_hash.clone(),
+                    identity: proof.identity,
+                    binding: prepared.binding.clone(),
+                },
+            );
+            #[cfg(not(unix))]
+            {
+                let () = proof;
+                self.read_snapshots.insert(
+                    snapshot_key,
+                    ReadObservation {
+                        sha256: after_hash.clone(),
+                    },
+                );
+            }
         }
         let display_path = display_path(prepared.root.as_deref(), &prepared.path);
         Ok(ToolOutcome {
@@ -1348,11 +1427,6 @@ impl Tools {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<ToolOutcome> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            crate::foreground::standalone(self, args, cancel).await
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let (command, timeout) = command_args(args)?;
             check_cancel(cancel)?;
@@ -1897,6 +1971,11 @@ fn snapshot(dir: &Dir, path: &Path, limit: usize) -> Result<Option<Snapshot>> {
     let native_before = file.try_clone()?.into_std().metadata()?;
     #[cfg(unix)]
     let before_identity = identity(&native_before);
+    #[cfg(unix)]
+    let before_nlink = {
+        use std::os::unix::fs::MetadataExt;
+        native_before.nlink()
+    };
     let mut bytes = Vec::new();
     (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
     ensure!(
@@ -1909,6 +1988,7 @@ fn snapshot(dir: &Dir, path: &Path, limit: usize) -> Result<Option<Snapshot>> {
         let after = file.try_clone()?.into_std().metadata()?;
         ensure!(
             identity(&after) == before_identity
+                && after.nlink() == before_nlink
                 && after.len() == native_before.len()
                 && after.mtime() == native_before.mtime()
                 && after.mtime_nsec() == native_before.mtime_nsec()
@@ -1918,7 +1998,7 @@ fn snapshot(dir: &Dir, path: &Path, limit: usize) -> Result<Option<Snapshot>> {
         );
         let current = dir.open_with(path, &options)?.into_std().metadata()?;
         ensure!(
-            identity(&current) == before_identity,
+            identity(&current) == before_identity && current.nlink() == before_nlink,
             "Файл заменён во время чтения"
         );
     }
@@ -1927,6 +2007,8 @@ fn snapshot(dir: &Dir, path: &Path, limit: usize) -> Result<Option<Snapshot>> {
         permissions: metadata.permissions(),
         #[cfg(unix)]
         identity: before_identity,
+        #[cfg(unix)]
+        nlink: before_nlink,
     }))
 }
 
@@ -1981,6 +2063,14 @@ fn atomic_write(
     atomic_write_checked(dir, name, bytes, mode, readonly, || Ok(dir.try_clone()?))
 }
 
+#[cfg(unix)]
+struct PublishedProof {
+    identity: FileIdentity,
+}
+
+#[cfg(not(unix))]
+type PublishedProof = ();
+
 fn atomic_write_checked(
     dir: &Dir,
     name: &std::ffi::OsStr,
@@ -1989,8 +2079,33 @@ fn atomic_write_checked(
     readonly: Option<bool>,
     recheck: impl FnOnce() -> Result<Dir>,
 ) -> Result<()> {
+    atomic_write_checked_inner(dir, name, bytes, mode, readonly, false, recheck, || {}).map(|_| ())
+}
+
+fn atomic_write_checked_proof(
+    dir: &Dir,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+    mode: Option<u32>,
+    readonly: Option<bool>,
+    recheck: impl FnOnce() -> Result<Dir>,
+) -> Result<Option<PublishedProof>> {
+    atomic_write_checked_inner(dir, name, bytes, mode, readonly, true, recheck, || {})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn atomic_write_checked_inner(
+    dir: &Dir,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+    mode: Option<u32>,
+    readonly: Option<bool>,
+    verify_published: bool,
+    recheck: impl FnOnce() -> Result<Dir>,
+    after_rename: impl FnOnce(),
+) -> Result<Option<PublishedProof>> {
     let temporary = format!(".rcode-{}.tmp", uuid::Uuid::new_v4().simple());
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Option<PublishedProof>> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(not(unix))]
@@ -2016,9 +2131,33 @@ fn atomic_write_checked(
         #[cfg(unix)]
         let _ = readonly;
         file.sync_all()?;
+        #[cfg(unix)]
+        let staged_identity = identity(&file.try_clone()?.into_std().metadata()?);
         let target = recheck()?;
         dir.rename(&temporary, &target, name)?;
-        Ok(())
+        after_rename();
+        if !verify_published {
+            return Ok(None);
+        }
+        let Ok(Some(published)) = snapshot(&target, Path::new(name), MAX_FILE_BYTES) else {
+            return Ok(None);
+        };
+        if published.bytes != bytes {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            if published.identity != staged_identity || published.nlink != 1 {
+                return Ok(None);
+            }
+            Ok(Some(PublishedProof {
+                identity: staged_identity,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Some(()))
+        }
     })();
     if result.is_err() {
         let _ = dir.remove_file(&temporary);
@@ -2133,7 +2272,6 @@ pub(crate) fn command_args(args: &Value) -> Result<(&str, usize)> {
     );
     Ok((command, usize_arg(args, "timeout_secs", 60, 1, 300)?))
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn allowed_env(key: &str) -> bool {
     #[cfg(windows)]
     let normalized_key = key.to_ascii_uppercase();
@@ -2154,7 +2292,6 @@ fn allowed_env(key: &str) -> bool {
             | "PATHEXT"
     ) || key.starts_with("LC_")
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn capture(
     mut stream: impl AsyncRead + Unpin,
     budget: Arc<AtomicUsize>,
@@ -2177,11 +2314,9 @@ async fn capture(
     Ok(output)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct ProcessGroup {
     pid: Option<u32>,
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ProcessGroup {
     fn new(pid: Option<u32>) -> Self {
         Self { pid }
@@ -2201,13 +2336,11 @@ impl ProcessGroup {
         }
     }
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         self.kill();
     }
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exit_signal(status: &ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
@@ -3357,5 +3490,300 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(!f.root.join("escaped.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_write_observations_update_only_verified_author_context() {
+        let mut f = Fixture::new();
+        let cancel = CancellationToken::new();
+        assert!(
+            !f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"a.py","content":"v1\n"}),
+                    &cancel,
+                    Some("worker-a"),
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"a.py","content":"v2\n"}),
+                    &cancel,
+                    Some("worker-a"),
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"a.py","content":"hijack\n"}),
+                    &cancel,
+                    Some("worker-b"),
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+
+        // read -> edit -> write updates observation; unobserved edit and undo do not.
+        f.file("edit.py", "one = 1\ntwo = 2\n");
+        assert!(
+            !f.tools
+                .execute_for("read_file", &json!({"path":"edit.py"}), &cancel, None)
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !f.tools
+                .execute_for(
+                    "edit_file",
+                    &json!({"path":"edit.py","old_text":"one = 1","new_text":"one = 10"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"edit.py","content":"one = 100\ntwo = 200\n"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        f.tools.undo().unwrap();
+        assert!(
+            f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"edit.py","content":"after undo\n"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error,
+            "undo must not refresh legacy read_snapshots"
+        );
+
+        f.file("blind.py", "x = 1\n");
+        assert!(
+            !f.tools
+                .execute_for(
+                    "edit_file",
+                    &json!({"path":"blind.py","old_text":"x = 1","new_text":"x = 2"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"blind.py","content":"blind\n"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+
+        // No-op write records observation for nlink == 1, while hardlink nlink > 1 does not.
+        f.file("noop.py", "same = 1\n");
+        assert!(
+            !f.tools
+                .execute_for(
+                    "edit_file",
+                    &json!({"path":"noop.py","old_text":"same = 1","new_text":"same = 1"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"noop.py","content":"changed\n"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({
+                        "path": "noop.py",
+                        "content": "same = 1\n",
+                        "expected_sha256": hash(b"same = 1\n"),
+                    }),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        assert!(
+            !f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({"path":"noop.py","content":"changed = 2\n"}),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+
+        #[cfg(unix)]
+        {
+            f.file("linked.py", "linked = 1\n");
+            fs::hard_link(f.root.join("linked.py"), f.root.join("linked_alias.py")).unwrap();
+            let noop_hardlink = f
+                .tools
+                .execute_for(
+                    "write_file",
+                    &json!({
+                        "path": "linked.py",
+                        "content": "linked = 1\n",
+                        "expected_sha256": hash(b"linked = 1\n"),
+                    }),
+                    &cancel,
+                    Some("hl-actor"),
+                )
+                .await
+                .unwrap();
+            assert!(!noop_hardlink.is_error);
+            assert!(
+                !f.tools
+                    .read_snapshots
+                    .contains_key(&(Some("hl-actor".into()), f.root.join("linked.py"))),
+                "hard-linked file must not mint a no-op write observation"
+            );
+            let modify_hardlink = f
+                .tools
+                .execute_for(
+                    "write_file",
+                    &json!({
+                        "path": "linked.py",
+                        "content": "linked = 2\n",
+                        "expected_sha256": hash(b"linked = 1\n"),
+                    }),
+                    &cancel,
+                    Some("hl-actor"),
+                )
+                .await
+                .unwrap();
+            assert!(modify_hardlink.is_error);
+        }
+    }
+
+    #[test]
+    fn legacy_published_proof_rejects_post_rename_byte_and_identity_tampering() {
+        let f = Fixture::new();
+        let dir = Dir::open_ambient_dir(&f.root, cap_std::ambient_authority()).unwrap();
+
+        let ok = atomic_write_checked_inner(
+            &dir,
+            std::ffi::OsStr::new("verified.txt"),
+            b"expected\n",
+            None,
+            None,
+            true,
+            || Ok(dir.try_clone()?),
+            || {},
+        )
+        .unwrap();
+        assert!(ok.is_some());
+
+        let byte_tampered = atomic_write_checked_inner(
+            &dir,
+            std::ffi::OsStr::new("tampered.txt"),
+            b"expected\n",
+            None,
+            None,
+            true,
+            || Ok(dir.try_clone()?),
+            || {
+                fs::write(f.root.join("tampered.txt"), b"foreign\n").unwrap();
+            },
+        )
+        .unwrap();
+        assert!(
+            byte_tampered.is_none(),
+            "post-rename byte change must withhold proof"
+        );
+
+        #[cfg(unix)]
+        {
+            let replacement = f.root.join("replacement.txt");
+            fs::write(&replacement, b"expected\n").unwrap();
+            let inode_tampered = atomic_write_checked_inner(
+                &dir,
+                std::ffi::OsStr::new("inode.txt"),
+                b"expected\n",
+                None,
+                None,
+                true,
+                || Ok(dir.try_clone()?),
+                || {
+                    fs::rename(&replacement, f.root.join("inode.txt")).unwrap();
+                },
+            )
+            .unwrap();
+            assert!(
+                inode_tampered.is_none(),
+                "post-rename inode replacement with identical bytes must withhold proof"
+            );
+
+            let hardlinked = atomic_write_checked_inner(
+                &dir,
+                std::ffi::OsStr::new("hardlinked.txt"),
+                b"expected\n",
+                None,
+                None,
+                true,
+                || Ok(dir.try_clone()?),
+                || {
+                    fs::hard_link(
+                        f.root.join("hardlinked.txt"),
+                        f.root.join("hardlinked_alias.txt"),
+                    )
+                    .unwrap();
+                },
+            )
+            .unwrap();
+            assert!(
+                hardlinked.is_none(),
+                "post-rename hardlink must withhold proof"
+            );
+        }
     }
 }

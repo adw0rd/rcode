@@ -981,7 +981,7 @@ impl Tools {
             ),
             (
                 "edit_file",
-                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого host внешнего каталога (внешний путь — абсолютный). Совпадение единственное, кроме replace_all=true. Успешный ответ подтверждает выполнение правки; перечитывать файл для проверки не нужно. Доступно undo.",
+                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого host внешнего каталога (внешний путь — абсолютный). Не включайте префиксы номеров строк N\\t из read_file. Совпадение единственное, кроме replace_all=true. Успешный ответ подтверждает выполнение правки; перечитывать файл для проверки не нужно. Доступно undo.",
                 json!({"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}),
                 vec!["path", "old_text", "new_text"],
             ),
@@ -2839,11 +2839,62 @@ impl Tools {
             "WAL orphan budget reserves the remaining capacity for undo"
         );
         check_cancel(cancel)?;
-        if prepared
+        let current_hash = prepared.before.as_ref().map(|s| sha256(&s.bytes));
+        let primary_root = self.root.clone();
+        let absolute = prepared
+            .root
+            .as_deref()
+            .unwrap_or(&primary_root)
+            .join(&prepared.path);
+        let snapshot_key = (actor.map(str::to_owned), absolute.clone());
+        let had_matching_observation = match (
+            &prepared.before,
+            &current_hash,
+            self.read_snapshots.get(&snapshot_key),
+        ) {
+            (Some(before), Some(hash), Some(observation)) => {
+                #[cfg(unix)]
+                {
+                    observation.sha256 == *hash
+                        && observation.identity == before.identity
+                        && observation.binding == prepared.binding
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = before;
+                    observation.sha256 == *hash
+                }
+            }
+            _ => false,
+        };
+        let record_observation =
+            name == "write_file" || (name == "edit_file" && had_matching_observation);
+        if let Some(before) = prepared
             .before
             .as_ref()
-            .is_some_and(|b| b.bytes == prepared.after)
+            .filter(|b| b.bytes == prepared.after)
         {
+            #[cfg(unix)]
+            if name == "write_file" && before.nlink == 1 {
+                self.read_snapshots.insert(
+                    snapshot_key,
+                    ReadObservation {
+                        sha256: current_hash.expect("before hash present"),
+                        identity: before.identity,
+                        binding: prepared.binding,
+                    },
+                );
+            }
+            #[cfg(not(unix))]
+            if name == "write_file" {
+                let _ = before;
+                self.read_snapshots.insert(
+                    snapshot_key,
+                    ReadObservation {
+                        sha256: current_hash.expect("before hash present"),
+                    },
+                );
+            }
             return Ok(ToolOutcome::success(
                 "Содержимое уже совпадает; файл не изменён",
             ));
@@ -2858,14 +2909,7 @@ impl Tools {
         );
         let turn_index = self.ensure_turn()?;
         let old_state = self.checkpoints.clone();
-        let current_hash = prepared.before.as_ref().map(|s| sha256(&s.bytes));
         let after_hash = sha256(&prepared.after);
-        let primary_root = self.root.clone();
-        let absolute = prepared
-            .root
-            .as_deref()
-            .unwrap_or(&primary_root)
-            .join(&prepared.path);
         let existing = self.checkpoints.turns[turn_index]
             .entries
             .iter()
@@ -3174,6 +3218,7 @@ impl Tools {
                             .is_some_and(|s| s.permissions.readonly()),
                 "Published file identity does not match prepared stage"
             );
+            let published_identity = published.identity;
             drop(stage_directory);
             let recoverable = self.checkpoints.clone();
             let turn = self
@@ -3233,6 +3278,16 @@ impl Tools {
             self.wal_fault(WalFaultPoint::ProgressPersisted { index: 0 });
             #[cfg(all(test, unix))]
             self.wal_fault(WalFaultPoint::Finalized);
+            if record_observation {
+                self.read_snapshots.insert(
+                    snapshot_key,
+                    ReadObservation {
+                        sha256: after_hash.clone(),
+                        identity: published_identity,
+                        binding: prepared.binding.clone(),
+                    },
+                );
+            }
         }
         #[cfg(not(unix))]
         {
@@ -6062,6 +6117,105 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(!f.root.join("escaped.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_observations_stay_isolated_per_actor_and_skip_uncommitted_wal_writes() {
+        let mut f = Fixture::new();
+        let cancel = CancellationToken::new();
+
+        // Worker A creates a file and can overwrite it, while Worker B has no observation.
+        let created = f
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({"path":"shared.py","content":"v1\n"}),
+                &cancel,
+                Some("worker-a"),
+            )
+            .await
+            .unwrap();
+        assert!(!created.is_error, "{}", created.content);
+
+        let worker_b_blind = f
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({"path":"shared.py","content":"hijack\n"}),
+                &cancel,
+                Some("worker-b"),
+            )
+            .await
+            .unwrap();
+        assert!(worker_b_blind.is_error);
+
+        // Worker B reads v1, then Worker A writes v2: Worker B's observation stays stale
+        // and blocks even an explicit expected_sha256 for v2 until Worker B re-reads.
+        let worker_b_read = f
+            .tools
+            .execute_for(
+                "read_file",
+                &json!({"path":"shared.py"}),
+                &cancel,
+                Some("worker-b"),
+            )
+            .await
+            .unwrap();
+        assert!(!worker_b_read.is_error);
+
+        let worker_a_v2 = f
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({"path":"shared.py","content":"v2\n"}),
+                &cancel,
+                Some("worker-a"),
+            )
+            .await
+            .unwrap();
+        assert!(!worker_a_v2.is_error, "{}", worker_a_v2.content);
+
+        let worker_b_explicit = f
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({
+                    "path": "shared.py",
+                    "content": "v3\n",
+                    "expected_sha256": hash(b"v2\n"),
+                }),
+                &cancel,
+                Some("worker-b"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            worker_b_explicit.is_error,
+            "stale actor observation must not be deleted or updated by another actor's write"
+        );
+
+        // If WAL final persistence fails after workspace publication, no new observation is granted.
+        f.tools.fail_store_after_wal_point(
+            WalFaultPoint::BeforeFinalPersist,
+            crate::file_wal::StoreFaultPoint::ManifestBeforeRename,
+            libc::EIO,
+        );
+        let uncommitted = f
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({"path":"uncommitted.py","content":"staged\n"}),
+                &cancel,
+                Some("worker-a"),
+            )
+            .await;
+        assert!(uncommitted.is_err());
+        assert!(
+            !f.tools
+                .read_snapshots
+                .contains_key(&(Some("worker-a".into()), f.root.join("uncommitted.py"))),
+            "failed WAL finalize must never record a read observation"
+        );
     }
 }
 

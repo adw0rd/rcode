@@ -8298,6 +8298,7 @@ mod tests {
         assert!(desc("read_file").contains("Не перечитывайте файл сразу после успешного"));
         assert!(desc("write_file").contains("перечитывать файл для проверки записи не нужно"));
         assert!(desc("edit_file").contains("перечитывать файл для проверки не нужно"));
+        assert!(desc("edit_file").contains("Не включайте префиксы номеров строк"));
 
         let spawn_desc = AgentPool::definitions()
             .into_iter()
