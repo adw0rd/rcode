@@ -86,6 +86,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Настроить разрешения инструментов",
     },
     CommandSpec {
+        name: "/sandbox",
+        description: "OS-песочница для команд shell модели",
+    },
+    CommandSpec {
         name: "/resume",
         description: "Продолжить сохранённую сессию",
     },

@@ -20,6 +20,7 @@ fn spec(root: &std::path::Path, turn: u64, actor: Option<&str>) -> JobSpec {
         lifetime: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(60),
         stdin: false,
+        sandbox: Default::default(),
     }
 }
 

@@ -46,6 +46,7 @@ pub(crate) fn prepare(root: &Path, args: &Value, origin: JobOrigin) -> Result<Jo
         lifetime: Duration::from_secs(seconds as u64),
         idle_timeout: Duration::from_secs(seconds as u64),
         stdin: false,
+        sandbox: crate::sandbox::PreparedSandbox::off(),
     })
 }
 
@@ -79,7 +80,11 @@ pub(crate) async fn wait(
     .context("Foreground deadline exceeded; cleanup remains unconfirmed")?
 }
 
-fn outcome(view: &JobSnapshot, delivery_cancelled: bool) -> ToolOutcome {
+fn outcome(
+    view: &JobSnapshot,
+    delivery_cancelled: bool,
+    sandbox: &crate::sandbox::SandboxReceiptMeta,
+) -> ToolOutcome {
     let reason = if delivery_cancelled {
         Some("worker_unavailable")
     } else if !view.cleanup_complete {
@@ -102,7 +107,8 @@ fn outcome(view: &JobSnapshot, delivery_cancelled: bool) -> ToolOutcome {
         "shell_changes_managed":false,"note":crate::tools::SHELL_NOTE,
         "termination":"process_group","cleanup_complete":view.cleanup_complete,
         "cleanup_warning":view.cleanup_warning,"output_truncated":view.output_truncated,
-        "redaction_incomplete":view.redaction_incomplete || delivery_cancelled,"utf8_lossy":view.utf8_lossy})
+        "redaction_incomplete":view.redaction_incomplete || delivery_cancelled,"utf8_lossy":view.utf8_lossy,
+        "sandbox":sandbox})
     .to_string();
     ToolOutcome {
         is_error: reason.is_some() || view.exit_code != Some(0) || view.signal.is_some(),
@@ -119,6 +125,7 @@ fn outcome(view: &JobSnapshot, delivery_cancelled: bool) -> ToolOutcome {
 fn complete(
     view: &JobSnapshot,
     worker: Option<&AgentRequest>,
+    sandbox: &crate::sandbox::SandboxReceiptMeta,
     save: impl FnOnce(ToolOutcome) -> Result<ToolOutcome>,
 ) -> Result<ToolOutcome> {
     if let Some(worker) = worker {
@@ -126,10 +133,11 @@ fn complete(
             save(outcome(
                 view,
                 !open || worker.reply.is_closed() || worker.cancel.is_cancelled(),
+                sandbox,
             ))
         })
     } else {
-        save(outcome(view, false))
+        save(outcome(view, false, sandbox))
     }
 }
 
@@ -149,9 +157,10 @@ impl Durable<'_> {
         args: &Value,
         worker: Option<&AgentRequest>,
         cancel: &CancellationToken,
+        authority: crate::sandbox::ExecutionAuthority,
     ) -> Result<ToolOutcome> {
         let owner = worker.map(|a| a.agent_id.as_str());
-        let spec = match prepare(
+        let mut spec = match prepare(
             self.tools.root(),
             args,
             JobOrigin {
@@ -176,6 +185,19 @@ impl Durable<'_> {
             )
             .into());
         }
+        let sandbox = match crate::sandbox::PreparedSandbox::prepare(
+            authority.policy(),
+            self.tools.root(),
+            &self.tools.extra_directories(),
+            Some(self.store.root()),
+            &secrets,
+        ) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return Ok(ToolOutcome::error(format!("{error:#}"))),
+        };
+        sandbox.apply_to_env(&mut spec.env);
+        let sandbox_meta = sandbox.receipt_meta();
+        spec.sandbox = sandbox;
         let reservation = self.jobs.reserve_start()?;
         let id = reservation.id().to_owned();
         let budget = self.artifacts.reserve_capacity(RECEIPT_RESERVE)?;
@@ -183,7 +205,8 @@ impl Durable<'_> {
         self.tools.mark_shell_used()?;
         let intent = json!({"command_id":id,"arguments":args,"kind":spec.kind,
             "origin":spec.origin,"argv":spec.argv,"cwd":spec.cwd,"stdin":false,
-            "lifetime_ms":spec.lifetime.as_millis(),"idle_ms":spec.idle_timeout.as_millis()});
+            "lifetime_ms":spec.lifetime.as_millis(),"idle_ms":spec.idle_timeout.as_millis(),
+            "sandbox":sandbox_meta});
         let pending = crate::operation_receipts::begin(
             self.journal,
             &artifacts,
@@ -221,7 +244,7 @@ impl Durable<'_> {
         let result = self
             .jobs
             .publish_snapshot(&view, |current| {
-                complete(current, worker, |outcome| {
+                complete(current, worker, &sandbox_meta, |outcome| {
                     crate::operation_receipts::finish(
                         pending,
                         self.journal,
@@ -266,7 +289,8 @@ pub(crate) async fn standalone(
     let result: Result<ToolOutcome> = async {
         let started = jobs.start(spec, scope.clone()).await?;
         let view = wait(&jobs, None, &started.id, None, &scope).await?;
-        jobs.publish_snapshot(&view, |view| Ok(outcome(view, false)))
+        let off_meta = crate::sandbox::SandboxReceiptMeta::off();
+        jobs.publish_snapshot(&view, |view| Ok(outcome(view, false, &off_meta)))
             .await
     }
     .await;
@@ -361,7 +385,15 @@ mod tests {
                 session: &mut session,
                 store: &store,
             }
-            .run(&call, &json!({"command":command}), actor, &cancel)
+            .run(
+                &call,
+                &json!({"command":command}),
+                actor,
+                &cancel,
+                crate::sandbox::ExecutionAuthority::ModelTool(
+                    crate::sandbox::EffectiveSandboxPolicy::off(),
+                ),
+            )
             .await;
             if closed_before {
                 trigger.abort();
@@ -490,6 +522,9 @@ mod tests {
             &json!({"command":"printf unexpected > started"}),
             None,
             &cancel,
+            crate::sandbox::ExecutionAuthority::ModelTool(
+                crate::sandbox::EffectiveSandboxPolicy::off(),
+            ),
         )
         .await
         .unwrap_err();
@@ -537,8 +572,11 @@ mod tests {
             transfers: Default::default(),
         };
         drop(receiver); // after confirmed EOF, before durable publication
+        let off_meta = crate::sandbox::SandboxReceiptMeta::off();
         let receipt = jobs
-            .publish_snapshot(&view, |current| complete(current, Some(&worker), Ok))
+            .publish_snapshot(&view, |current| {
+                complete(current, Some(&worker), &off_meta, Ok)
+            })
             .await
             .unwrap();
         assert!(receipt.is_error);

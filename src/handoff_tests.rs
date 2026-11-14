@@ -41,6 +41,7 @@ async fn fault_case(mode: u8) -> Result<()> {
         lifetime: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(60),
         stdin: false,
+        sandbox: Default::default(),
     };
     let id = runtime
         .start_approved_job(

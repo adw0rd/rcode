@@ -2,6 +2,7 @@
 
 ## Не выпущено
 
+- Добавлена опциональная OS-песочница для команд shell модели (`run_command`, `start_command`, `handoff_command`, субагенты `worker`, этап `--final-review-repair`) на macOS (`Seatbelt` `deny default`) и Linux (`Landlock ABI ≥ 3`, `CLOSE_RANGE_CLOEXEC` и `seccomp-bpf` против `io_uring_*`, `chown*`/`*xattr*` и именованных/абстрактных `AF_UNIX`): флаги `--sandbox off|workspace-write|read-only` и `--sandbox-network on|off`, команды `rcode sandbox [status|mode|network]` и интерактивный `/sandbox` с сохранением на проект в `permissions.json`, изолированный `0700` `TMPDIR` на каждое задание с очисткой после подтверждённого завершения процесса, поддержка внешних `git worktree` только при взаимно проверенном backlink и fail-closed отказ на неподдерживаемых ОС и старых ядрах без отката к запуску без изоляции.
 - Файловые инструменты `write_file` и `edit_file` обновляют снимок чтения (`read_snapshots`) текущего актора проверенной опубликованной версией файла после успешного коммита, устраняя холостые циклы принудительного повторного `read_file` между последовательными правками одного актора при сохранении защиты от внешних изменений и изоляции между субагентами.
 - В описании `edit_file` явно указано не копировать префиксы номеров строк `N\t` из вывода `read_file`.
 

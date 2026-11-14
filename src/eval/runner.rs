@@ -259,6 +259,8 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
             && cli.add_dir.is_empty()
             && cli.approval_mode.is_none()
             && !cli.allow_shell
+            && cli.sandbox.is_none()
+            && cli.sandbox_network.is_none()
             && cli.prompt.is_none()
             && cli.max_steps == 32
             && cli.directory == Path::new("."),

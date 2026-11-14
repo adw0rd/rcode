@@ -495,6 +495,9 @@ struct ProjectPermissions {
     /// пользователь явно выдал грант в диалоге удаления.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     delete_scopes: BTreeMap<PathBuf, Vec<PathBuf>>,
+    /// Проектная политика OS-песочницы для команд shell модели (`rcode sandbox`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sandbox: BTreeMap<PathBuf, crate::sandbox::ProjectSandbox>,
 }
 
 impl Default for ProjectPermissions {
@@ -504,6 +507,7 @@ impl Default for ProjectPermissions {
             projects: BTreeMap::new(),
             shell_allow: BTreeMap::new(),
             delete_scopes: BTreeMap::new(),
+            sandbox: BTreeMap::new(),
         }
     }
 }
@@ -704,6 +708,32 @@ impl ConfigStore {
         let _lock = lock_state_file(&self.root.join("permissions.lock"))?;
         let mut permissions = self.load_permissions()?;
         permissions.projects.insert(root, mode);
+        write_private_json(&self.root.join("permissions.json"), &permissions)
+    }
+
+    pub fn project_sandbox(&self, root: &Path) -> Result<crate::sandbox::ProjectSandbox> {
+        let root = root.canonicalize()?;
+        Ok(self
+            .load_permissions()?
+            .sandbox
+            .get(&root)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    pub fn save_project_sandbox(
+        &self,
+        root: &Path,
+        sandbox: crate::sandbox::ProjectSandbox,
+    ) -> Result<()> {
+        let root = root.canonicalize()?;
+        let _lock = lock_state_file(&self.root.join("permissions.lock"))?;
+        let mut permissions = self.load_permissions()?;
+        if sandbox.is_default() {
+            permissions.sandbox.remove(&root);
+        } else {
+            permissions.sandbox.insert(root, sandbox);
+        }
         write_private_json(&self.root.join("permissions.json"), &permissions)
     }
 

@@ -70,6 +70,20 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        value_enum,
+        help = "OS-песочница для команд shell модели: off, workspace-write или read-only"
+    )]
+    pub sandbox: Option<crate::sandbox::SandboxMode>,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        help = "Доступ к IP-сети внутри OS-песочницы shell: on или off"
+    )]
+    pub sandbox_network: Option<Toggle>,
+    #[arg(
+        long,
+        global = true,
         help = "Только исследование и план, без изменений и shell"
     )]
     pub plan: bool,
@@ -104,6 +118,8 @@ pub struct Cli {
     pub prompt: Option<String>,
     #[arg(skip)]
     pub(crate) interactive: bool,
+    #[arg(skip)]
+    pub(crate) effective_sandbox: crate::sandbox::EffectiveSandboxPolicy,
 }
 impl Cli {
     pub fn permissions(&self) -> ApprovalMode {
@@ -125,6 +141,17 @@ impl Cli {
         let mut resolved = self.clone();
         resolved.approval_mode = Some(self.approval_mode.unwrap_or(saved));
         resolved
+    }
+
+    pub fn resolve_sandbox(&mut self, saved: crate::sandbox::ProjectSandbox) -> anyhow::Result<()> {
+        let policy = crate::sandbox::EffectiveSandboxPolicy::resolve(
+            saved,
+            self.sandbox,
+            self.sandbox_network,
+        )?;
+        crate::sandbox::ensure_mode_supported(policy.mode)?;
+        self.effective_sandbox = policy;
+        Ok(())
     }
 
     pub fn final_review_mode(&self) -> crate::final_review::FinalReviewMode {
@@ -205,6 +232,30 @@ pub enum Command {
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
+    },
+    #[command(
+        about = "OS-песочница для команд shell модели (macOS Seatbelt / Linux Landlock + seccomp)",
+        after_help = "Песочница ограничивает run_command и start_command модели и субагентов.\nРазрешения (--allow-shell, full-access) не отключают включённую песочницу."
+    )]
+    Sandbox {
+        #[command(subcommand)]
+        command: Option<SandboxCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum SandboxCommand {
+    #[command(about = "Показать поддержку ОС/ядра и эффективную политику песочницы проекта")]
+    Status,
+    #[command(about = "Сохранить режим песочницы для текущего проекта (-C)")]
+    Mode {
+        #[arg(value_enum)]
+        mode: crate::sandbox::SandboxMode,
+    },
+    #[command(about = "Сохранить доступ к IP-сети внутри песочницы для текущего проекта (-C)")]
+    Network {
+        #[arg(value_enum)]
+        state: Toggle,
     },
 }
 

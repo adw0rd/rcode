@@ -411,6 +411,32 @@ impl Tools {
         }).collect()
     }
 
+    pub fn definitions_for_sandbox(
+        policy: crate::sandbox::EffectiveSandboxPolicy,
+    ) -> Vec<ToolDefinition> {
+        let mut defs = Self::definitions();
+        if !policy.is_active() {
+            return defs;
+        }
+        let net = if policy.network { "on" } else { "off" };
+        let run_desc = match policy.mode {
+            crate::sandbox::SandboxMode::Off => unreachable!("checked is_active()"),
+            crate::sandbox::SandboxMode::WorkspaceWrite => format!(
+                "Выполнить shell-команду внутри активной OS-песочницы (режим workspace-write, сеть {net}) после разрешения приложения. Рабочий каталог — проект; чтение вне проекта/разрешённых каталогов и системного рантайма заблокировано, запись разрешена только в рабочем каталоге, разрешённых внешних каталогах и приватном TMPDIR команды. Ошибка outside_workspace у write_file означает запросить разрешение на внешний каталог или использовать разрешённый путь без обхода отказа пользователя, ignore, ограничений секретных файлов и OS-песочницы. Env ограничен, вывод до 64 KiB, timeout 60 сек (макс. 300). Shell-изменения не управляются undo."
+            ),
+            crate::sandbox::SandboxMode::ReadOnly => format!(
+                "Выполнить shell-команду внутри активной read-only OS-песочницы (режим read-only, сеть {net}) после разрешения приложения. Рабочий каталог — проект; чтение вне проекта/разрешённых каталогов и системного рантайма заблокировано, запись в проект и внешние каталоги запрещена ядром ОС (доступна только в приватный TMPDIR команды). Для разрешённых изменений файлов используйте write_file/edit_file; нельзя обходить отказ пользователя, ignore, ограничения секретных файлов и OS-песочницы. Env ограничен, вывод до 64 KiB, timeout 60 сек (макс. 300). Shell-изменения не управляются undo."
+            ),
+        };
+        for def in &mut defs {
+            if def.name == "run_command" {
+                def.description = run_desc;
+                break;
+            }
+        }
+        defs
+    }
+
     pub fn preview(&self, name: &str, args: &Value) -> Result<Option<String>> {
         self.preview_for(name, args, None)
     }
