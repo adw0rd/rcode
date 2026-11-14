@@ -86,6 +86,20 @@ impl Drop for ManagedPollGuard {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) struct PreSpawnCancelled(pub(crate) &'static str);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::fmt::Display for PreSpawnCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::error::Error for PreSpawnCancelled {}
+
 #[derive(Debug)]
 pub struct JobSpec {
     /// Host-selected execution kind. Never deserialize this from model arguments.
@@ -938,7 +952,9 @@ impl JobsSupervisor {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            ensure!(!cancel.is_cancelled(), "scope cancelled");
+            if cancel.is_cancelled() {
+                return Err(PreSpawnCancelled("scope cancelled").into());
+            }
             ensure!(!self.core.cancel.is_cancelled(), "supervisor closing");
             let (credentials, credential_epoch) = {
                 let state = lock(&self.core.state);
@@ -946,7 +962,9 @@ impl JobsSupervisor {
                 (Arc::clone(&state.credentials), state.credential_epoch)
             };
             validate(&mut spec, credentials.patterns())?;
-            ensure!(!cancel.is_cancelled(), "scope cancelled");
+            if cancel.is_cancelled() {
+                return Err(PreSpawnCancelled("scope cancelled").into());
+            }
             // Includes actual Linux mount/namespace visibility validation before spawn.
             platform::members_gone(0, Instant::now() + CLEANUP)?;
             let out_redactor = credentials.stream()?;
@@ -996,7 +1014,9 @@ impl JobsSupervisor {
                 let old = state.completed.remove(pos).expect("position exists");
                 state.records.remove(&old);
             }
-            ensure!(!cancel.is_cancelled(), "scope cancelled");
+            if cancel.is_cancelled() {
+                return Err(PreSpawnCancelled("scope cancelled").into());
+            }
             let mut process = platform::spawn(&spec)?;
             let shell_tmp = spec.sandbox.take_shell_tmp_for_spawned();
             let view = JobSnapshot {

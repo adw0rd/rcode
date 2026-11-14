@@ -3010,6 +3010,7 @@ impl ToolExecutor<'_> {
                 original_args,
                 actor,
                 cancel,
+                self.cancel,
                 crate::sandbox::ExecutionAuthority::ModelTool(self.cli.effective_sandbox),
             )
             .await;
@@ -3760,6 +3761,7 @@ pub(crate) async fn user_shell(
                 &call,
                 &serde_json::from_str(&call.function.arguments)?,
                 None,
+                &cancel,
                 &cancel,
                 crate::sandbox::ExecutionAuthority::OperatorBang,
             )

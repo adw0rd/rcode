@@ -486,12 +486,15 @@ impl ShellTmp {
                 continue;
             }
             validate_grant_against_sensitive_roots(&candidate, rcode_home, home_dir)?;
-            let mut builder = std::fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
+                let mut b = std::fs::DirBuilder::new();
+                b.mode(0o700);
+                b
+            };
+            #[cfg(not(unix))]
+            let builder = std::fs::DirBuilder::new();
             match builder.create(&candidate) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -547,7 +550,7 @@ impl ShellTmp {
         &self.path
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
     pub(crate) fn mark_spawned(&mut self) {
         if self.lifecycle == ShellTmpLifecycle::Unspawned {
             self.lifecycle = ShellTmpLifecycle::Spawned;
@@ -666,6 +669,12 @@ fn force_remove_tree_nofollow(
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn stat_dev_ino(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+#[cfg(unix)]
 fn restore_unix_dir_mode_nofollow(
     parent_dir: &cap_std::fs::Dir,
     name: &str,
@@ -695,7 +704,7 @@ fn restore_unix_dir_mode_nofollow(
             (st_before.st_mode & libc::S_IFMT) == libc::S_IFDIR && st_before.st_uid == euid,
             "Запись {name} в TMPDIR не является обычным каталогом текущего пользователя"
         );
-        let actual_id = (st_before.st_dev as u64, st_before.st_ino as u64);
+        let actual_id = stat_dev_ino(&st_before);
         if let Some(exp) = expected_id {
             ensure!(
                 actual_id == exp,
@@ -734,7 +743,7 @@ fn restore_unix_dir_mode_nofollow(
         ensure!(
             (st_after.st_mode & libc::S_IFMT) == libc::S_IFDIR
                 && st_after.st_uid == euid
-                && (st_after.st_dev as u64, st_after.st_ino as u64) == actual_id,
+                && stat_dev_ino(&st_after) == actual_id,
             "Идентичность каталога {name} изменилась после восстановления прав"
         );
         Ok(actual_id)
@@ -762,7 +771,7 @@ fn restore_unix_dir_mode_nofollow(
             (st.st_mode & libc::S_IFMT) == libc::S_IFDIR && st.st_uid == euid,
             "Запись {name} в TMPDIR не является обычным каталогом текущего пользователя"
         );
-        let actual_id = (st.st_dev as u64, st.st_ino as u64);
+        let actual_id = stat_dev_ino(&st);
         if let Some(exp) = expected_id {
             ensure!(
                 actual_id == exp,
@@ -1116,7 +1125,7 @@ impl PreparedSandbox {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
@@ -1808,7 +1817,7 @@ fn canonical_writable_dir_verified(path: &Path) -> Result<VerifiedDir> {
     canonical_writable_dir_verified_with(path, || {})
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn canonical_writable_dir_with(path: &Path, after_open: impl FnOnce()) -> Result<PathBuf> {
     Ok(canonical_writable_dir_verified_with(path, after_open)?.path)
 }
@@ -1835,7 +1844,7 @@ fn canonical_writable_dir_verified_with(
         if unsafe { libc::fstat(opened.as_raw_fd(), &mut st) } != 0 {
             return Err(std::io::Error::last_os_error()).context("fstat открытого каталога");
         }
-        (st.st_dev as u64, st.st_ino as u64)
+        stat_dev_ino(&st)
     };
     #[cfg(not(unix))]
     let before = opened.dir_metadata()?;
@@ -1855,7 +1864,7 @@ fn canonical_writable_dir_verified_with(
         drop(opened);
         let (opath_fd, st) = linux::open_canonical_opath_nofollow(&absolute, true)?;
         ensure!(
-            (st.st_dev as u64) == before_dev && (st.st_ino as u64) == before_ino,
+            stat_dev_ino(&st) == (before_dev, before_ino),
             "Каталог исполнения изменился"
         );
         Ok(VerifiedDir {
@@ -1876,7 +1885,7 @@ fn canonical_writable_dir_verified_with(
             return Err(std::io::Error::last_os_error()).context("fstat проверенного каталога");
         }
         ensure!(
-            (st.st_dev as u64) == before_dev && (st.st_ino as u64) == before_ino,
+            stat_dev_ino(&st) == (before_dev, before_ino),
             "Каталог исполнения изменился"
         );
         Ok(VerifiedDir {
@@ -2852,9 +2861,7 @@ mod linux {
             })?;
         let euid = unsafe { libc::geteuid() };
         ensure!(
-            (st.st_dev as u64) == shell_tmp.dev
-                && (st.st_ino as u64) == shell_tmp.ino
-                && st.st_uid == euid,
+            super::stat_dev_ino(&st) == (shell_tmp.dev, shell_tmp.ino) && st.st_uid == euid,
             "Идентичность TMPDIR {} изменилась во время подготовки Landlock",
             shell_tmp.path().display()
         );
