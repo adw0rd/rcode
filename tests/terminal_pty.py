@@ -184,7 +184,7 @@ class Terminal:
         # Submit a prepared command as one paste. Explicit send() scenarios
         # below still exercise individual keys, completion, paste and resize.
         self.send("\x1b[200~" + command + "\x1b[201~\r")
-        if command in ["/model", "/effort", "/provider", "/permissions"]:
+        if command in ["/model", "/effort", "/provider", "/permissions", "/sandbox"]:
             self.expect(expected, mark)
             self.until(lambda: self.grid.cursor_visible
                        and any(expected in row for row in self.grid.rows()[:-2])
@@ -1402,6 +1402,17 @@ def main(binary):
             terminal.command("/memory undo project/conventions", "✓ Откат заметки project/conventions выполнен.")
             terminal.command("/memory off --project", "выключена")
             terminal.command("/memory on --project", "включена")
+
+            phase("sandbox picker, status, and footer badge")
+            terminal.command("/sandbox", "OS-песочница shell модели")
+            mark = terminal.mark()
+            terminal.send("\x1b[B\r")
+            terminal.editor_after("✓ OS-песочница: workspace-write", mark)
+            terminal.assert_footer("openrouter", "auto-edit", "sandbox: workspace-write")
+            terminal.command("/sandbox status", "Бэкенд ОС")
+            terminal.command("/status", "Песочница    workspace-write")
+            terminal.command("/sandbox off", "✓ OS-песочница: выключена")
+            terminal.assert_footer("openrouter", "auto-edit")
 
             mark = terminal.mark()
             terminal.send(b"\x04")

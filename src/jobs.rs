@@ -86,7 +86,21 @@ impl Drop for ManagedPollGuard {
     }
 }
 
-#[derive(Clone, Debug)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub(crate) struct PreSpawnCancelled(pub(crate) &'static str);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::fmt::Display for PreSpawnCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl std::error::Error for PreSpawnCancelled {}
+
+#[derive(Debug)]
 pub struct JobSpec {
     /// Host-selected execution kind. Never deserialize this from model arguments.
     pub kind: JobKind,
@@ -97,6 +111,7 @@ pub struct JobSpec {
     pub lifetime: Duration,
     pub idle_timeout: Duration,
     pub stdin: bool,
+    pub sandbox: crate::sandbox::PreparedSandbox,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -355,6 +370,7 @@ struct Record {
     // Once evidence is missing, later observations cannot silently repair it.
     cleanup_uncertain: bool,
     pgid: Option<i32>,
+    shell_tmp: Option<crate::sandbox::ShellTmp>,
     #[cfg(test)]
     panic_run: bool,
 }
@@ -522,6 +538,14 @@ pub(crate) fn allowed_env(key: &str) -> bool {
         && key.len() > 3
         && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
 }
+fn allowed_job_env(sandbox_active: bool, key: &str, value: &str) -> bool {
+    allowed_env(key)
+        || (sandbox_active
+            && matches!(
+                (key, value),
+                ("GIT_CONFIG_NOSYSTEM", "1") | ("GIT_CONFIG_GLOBAL", "/dev/null")
+            ))
+}
 fn validate(spec: &mut JobSpec, patterns: &[Vec<u8>]) -> Result<()> {
     ensure!(
         !spec.argv.is_empty() && spec.argv.len() <= 128 && !spec.argv[0].is_empty(),
@@ -568,7 +592,9 @@ fn validate(spec: &mut JobSpec, patterns: &[Vec<u8>]) -> Result<()> {
     }
     for (key, value) in &spec.env {
         ensure!(
-            allowed_env(key) && !key.contains('\0') && !value.contains('\0'),
+            allowed_job_env(spec.sandbox.is_active(), key, value)
+                && !key.contains('\0')
+                && !value.contains('\0'),
             "environment rejected"
         );
         ensure!(
@@ -579,6 +605,19 @@ fn validate(spec: &mut JobSpec, patterns: &[Vec<u8>]) -> Result<()> {
     spec.cwd = std::fs::canonicalize(&spec.cwd)
         .map_err(|_| anyhow::anyhow!("invalid working directory"))?;
     ensure!(spec.cwd.is_dir(), "invalid working directory");
+    #[cfg(unix)]
+    if let Some((ws_dev, ws_ino)) = spec.sandbox.workspace_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let cwd_meta = std::fs::symlink_metadata(&spec.cwd)
+            .map_err(|_| anyhow::anyhow!("invalid working directory"))?;
+        ensure!(
+            !cwd_meta.file_type().is_symlink()
+                && cwd_meta.is_dir()
+                && cwd_meta.dev() == ws_dev
+                && cwd_meta.ino() == ws_ino,
+            "working directory changed since sandbox preparation"
+        );
+    }
     ensure!(
         !has_secret(spec.cwd.as_os_str().as_encoded_bytes(), patterns),
         "working directory rejected"
@@ -913,7 +952,9 @@ impl JobsSupervisor {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            ensure!(!cancel.is_cancelled(), "scope cancelled");
+            if cancel.is_cancelled() {
+                return Err(PreSpawnCancelled("scope cancelled").into());
+            }
             ensure!(!self.core.cancel.is_cancelled(), "supervisor closing");
             let (credentials, credential_epoch) = {
                 let state = lock(&self.core.state);
@@ -921,7 +962,9 @@ impl JobsSupervisor {
                 (Arc::clone(&state.credentials), state.credential_epoch)
             };
             validate(&mut spec, credentials.patterns())?;
-            ensure!(!cancel.is_cancelled(), "scope cancelled");
+            if cancel.is_cancelled() {
+                return Err(PreSpawnCancelled("scope cancelled").into());
+            }
             // Includes actual Linux mount/namespace visibility validation before spawn.
             platform::members_gone(0, Instant::now() + CLEANUP)?;
             let out_redactor = credentials.stream()?;
@@ -971,8 +1014,11 @@ impl JobsSupervisor {
                 let old = state.completed.remove(pos).expect("position exists");
                 state.records.remove(&old);
             }
-            ensure!(!cancel.is_cancelled(), "scope cancelled");
+            if cancel.is_cancelled() {
+                return Err(PreSpawnCancelled("scope cancelled").into());
+            }
             let mut process = platform::spawn(&spec)?;
+            let shell_tmp = spec.sandbox.take_shell_tmp_for_spawned();
             let view = JobSnapshot {
                 kind: spec.kind,
                 id: id.clone(),
@@ -1027,6 +1073,7 @@ impl JobsSupervisor {
                     resource: true,
                     cleanup_uncertain: false,
                     pgid: Some(process.pgid),
+                    shell_tmp,
                     #[cfg(test)]
                     panic_run: false,
                 },
@@ -1476,6 +1523,35 @@ fn tail_capacity(payload: &Payload, bytes: usize) -> Option<usize> {
     Some(len.div_ceil(BLOCK).saturating_sub(payload.blocks.len()) * BLOCK)
 }
 async fn finalize(core: &Core, id: String, outcome: RunOutcome) {
+    if outcome.cleanup_complete {
+        let shell_tmp = {
+            let mut state = lock(&core.state);
+            let r = state.records.get_mut(&id).expect("live record retained");
+            if !r.cleanup_uncertain {
+                r.shell_tmp.take()
+            } else {
+                None
+            }
+        };
+        if let Some(mut shell_tmp) = shell_tmp {
+            let cleanup_res =
+                tokio::task::spawn_blocking(move || shell_tmp.cleanup_confirmed()).await;
+            let err_msg = match cleanup_res {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(format!("tmpdir cleanup failed: {err:#}")),
+                Err(_) => Some("tmpdir cleanup panicked".to_owned()),
+            };
+            if let Some(msg) = err_msg {
+                let mut state = lock(&core.state);
+                state.sticky_unknown = true;
+                let r = state.records.get_mut(&id).expect("live record retained");
+                r.cleanup_uncertain = true;
+                if r.view.reason.is_none() {
+                    r.view.reason = Some(msg);
+                }
+            }
+        }
+    }
     loop {
         let changed = core.changed.notified();
         tokio::pin!(changed);
@@ -1780,9 +1856,23 @@ mod platform {
         }
     }
     pub(super) fn spawn(spec: &JobSpec) -> Result<Process> {
-        let mut cmd = Command::new(&spec.argv[0]);
-        cmd.args(&spec.argv[1..])
-            .current_dir(&spec.cwd)
+        #[cfg(target_os = "macos")]
+        let mut cmd = if let Some(profile) = spec.sandbox.macos_profile() {
+            let mut cmd = Command::new("/usr/bin/sandbox-exec");
+            cmd.arg("-p").arg(profile).arg("--").args(&spec.argv);
+            cmd
+        } else {
+            let mut cmd = Command::new(&spec.argv[0]);
+            cmd.args(&spec.argv[1..]);
+            cmd
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut cmd = {
+            let mut cmd = Command::new(&spec.argv[0]);
+            cmd.args(&spec.argv[1..]);
+            cmd
+        };
+        cmd.current_dir(&spec.cwd)
             .env_clear()
             .envs(spec.env.iter().cloned())
             .env("PWD", &spec.cwd)
@@ -1794,10 +1884,33 @@ mod platform {
         });
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        let expected_cwd = spec.sandbox.workspace_identity();
+        #[cfg(target_os = "linux")]
+        let linux_sandbox = spec
+            .sandbox
+            .linux_pre_exec_parts()
+            .map(|(fd, filter)| (fd, filter.as_ptr() as usize, filter.len()));
         unsafe {
-            cmd.as_std_mut().pre_exec(|| {
+            cmd.as_std_mut().pre_exec(move || {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if let Some((ws_dev, ws_ino)) = expected_cwd {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    if libc::stat(c".".as_ptr(), &mut st) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if (st.st_dev as u64) != ws_dev || (st.st_ino as u64) != ws_ino {
+                        return Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                if let Some((ruleset_fd, filter_ptr, filter_len)) = linux_sandbox {
+                    let filter = std::slice::from_raw_parts(
+                        filter_ptr as *const crate::sandbox::BpfInsn,
+                        filter_len,
+                    );
+                    crate::sandbox::PreparedSandbox::apply_linux_in_child(ruleset_fd, filter)?;
                 }
                 Ok(())
             });
@@ -2602,6 +2715,7 @@ mod tests {
             lifetime: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(60),
             stdin: false,
+            sandbox: Default::default(),
         }
     }
     async fn terminal(s: &JobsSupervisor, id: &str) -> JobSnapshot {

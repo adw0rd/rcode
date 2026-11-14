@@ -2233,6 +2233,7 @@ mod tests {
                 lifetime: Duration::from_secs(60),
                 idle_timeout: Duration::from_secs(60),
                 stdin: false,
+                sandbox: Default::default(),
             },
             CancellationToken::new(),
         )
@@ -2332,7 +2333,7 @@ mod tests {
             jobs.start_reserved(reservation, JobSpec { kind: JobKind::Managed,
             argv: vec!["/bin/sh".into(), "-c".into(), "printf before; printf olderr >&2; while [ ! -f release ]; do sleep 0.01; done; printf after; printf newerr >&2; sleep 30".into()],
             cwd: session.root.clone(), env: vec![], origin, lifetime: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(60), stdin: false }, worker.clone()).await.unwrap();
+            idle_timeout: Duration::from_secs(60), stdin: false, sandbox: Default::default() }, worker.clone()).await.unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let view = jobs
@@ -3050,6 +3051,7 @@ mod tests {
             lifetime: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(60),
             stdin: false,
+            sandbox: Default::default(),
         };
         // The native effect is admitted only after its durable intent exists.
         assert_eq!(

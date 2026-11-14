@@ -67,6 +67,7 @@ pub mod task_state;
 
 pub mod instructions;
 pub mod sandbox;
+pub mod sandbox_cli;
 
 mod artifact_quota;
 pub mod artifacts;

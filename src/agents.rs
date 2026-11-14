@@ -270,6 +270,7 @@ pub struct AgentPool {
     max_steps: u32,
     timeout: Duration,
     read_only: bool,
+    sandbox: crate::sandbox::EffectiveSandboxPolicy,
     requests: mpsc::Sender<AgentRequest>,
     workers: Vec<Worker>,
     accounted: Usage,
@@ -319,6 +320,10 @@ impl AgentPool {
         self.timeout = timeout;
         self
     }
+    pub(crate) fn with_sandbox(mut self, sandbox: crate::sandbox::EffectiveSandboxPolicy) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
     pub fn new(
         client: ProviderClient,
         system_prompt: String,
@@ -335,6 +340,7 @@ impl AgentPool {
                 max_steps: max_steps.clamp(1, 8),
                 timeout: DEADLINE,
                 read_only,
+                sandbox: crate::sandbox::EffectiveSandboxPolicy::off(),
                 requests,
                 workers: Vec::new(),
                 accounted: Usage::default(),
@@ -482,6 +488,7 @@ impl AgentPool {
             cancel: cancel.clone(),
             max_steps: self.max_steps,
             read_only: self.read_only || args.role != AgentRole::Worker,
+            sandbox: self.sandbox,
             stats: stats.clone(),
             secrets: self.secrets.clone(),
             transfers: transfers.clone(),
@@ -758,6 +765,7 @@ struct WorkerTask {
     cancel: CancellationToken,
     max_steps: u32,
     read_only: bool,
+    sandbox: crate::sandbox::EffectiveSandboxPolicy,
     stats: Arc<Mutex<UsageStats>>,
     secrets: Arc<Mutex<Vec<String>>>,
     transfers: Arc<Mutex<Vec<TransferredCommand>>>,
@@ -812,7 +820,7 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
         Message::text("system", system),
         Message::user(task.task.clone()),
     ];
-    let definitions: Vec<_> = Tools::definitions()
+    let definitions: Vec<_> = Tools::definitions_for_sandbox(task.sandbox)
         .into_iter()
         .filter(|definition| !task.read_only || readonly_tool(&definition.name))
         .chain(crate::job_tools::offered(!task.read_only))

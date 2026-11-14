@@ -394,7 +394,8 @@ impl ManagedJobs {
         lifetime.id = call.id.clone();
         let request = json!({"command_id":id,"arguments":args,"origin":origin,"kind":spec.kind,
             "argv":spec.argv,"cwd":spec.cwd,"stdin":spec.stdin,
-            "lifetime_ms":spec.lifetime.as_millis(),"idle_ms":spec.idle_timeout.as_millis()});
+            "lifetime_ms":spec.lifetime.as_millis(),"idle_ms":spec.idle_timeout.as_millis(),
+            "sandbox":spec.sandbox.receipt_meta()});
         let operation = match crate::operation_receipts::begin_background(
             journal,
             artifacts,

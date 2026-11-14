@@ -444,23 +444,32 @@ async fn select_effort(
     commit_provider(store, settings, session, client, events, p)
 }
 fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) -> Footer {
+    let base_permissions = if runtime.permissions() == ApprovalMode::FullAccess {
+        "full-access"
+    } else if runtime.allow_shell {
+        if runtime.permissions() == ApprovalMode::AutoEdit {
+            "auto-edit + shell"
+        } else {
+            "ask + shell"
+        }
+    } else if runtime.permissions() == ApprovalMode::AutoEdit {
+        "auto-edit"
+    } else {
+        "ask"
+    };
+    let permissions = if runtime.effective_sandbox.is_active() {
+        format!(
+            "{base_permissions} · {}",
+            runtime.effective_sandbox.short_badge()
+        )
+    } else {
+        base_permissions.into()
+    };
     Footer {
         model: session.provider.model.clone(),
         provider: session.provider.kind.to_string(),
         effort: session.provider.effort.to_string(),
-        permissions: if runtime.permissions() == ApprovalMode::FullAccess {
-            "full-access".into()
-        } else if runtime.allow_shell {
-            if runtime.permissions() == ApprovalMode::AutoEdit {
-                "auto-edit + shell".into()
-            } else {
-                "ask + shell".into()
-            }
-        } else if runtime.permissions() == ApprovalMode::AutoEdit {
-            "auto-edit".into()
-        } else {
-            "ask".into()
-        },
+        permissions,
         plan,
         context_chars: budget.request_used(&session.messages),
         context_limit: budget.limit,
@@ -482,7 +491,7 @@ fn status(
     memory_line: &str,
 ) {
     notice!(
-        "\nМодель       {} / {}\nEffort       {}\nРежим        {} · shell {}\nПапка        {}\nСессия       {}",
+        "\nМодель       {} / {}\nEffort       {}\nРежим        {} · shell {}\nПесочница    {}\nПапка        {}\nСессия       {}",
         session.provider.kind,
         ui::safe(&session.provider.model),
         session.provider.effort,
@@ -502,6 +511,7 @@ fn status(
         } else {
             "по подтверждению"
         },
+        runtime.effective_sandbox.status_label_ru(),
         session.root.display(),
         session.id
     );
@@ -1115,7 +1125,7 @@ fn help(registry: &crate::commands::CommandRegistry) {
         notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
     }
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -1211,6 +1221,177 @@ fn apply_permissions(
         }
     );
     Ok(())
+}
+
+fn sandbox_command(
+    args: &[&str],
+    rich: bool,
+    store: &ConfigStore,
+    session: &Session,
+    runtime: &mut Cli,
+    events: &Events,
+) -> Result<()> {
+    use crate::cli::Toggle;
+    use crate::sandbox::{
+        EffectiveSandboxPolicy, ProjectSandbox, SandboxMode, ensure_mode_supported, probe_support,
+    };
+
+    if crate::memory::is_eval_environment(runtime, store.root()) {
+        bail!("Управление песочницей отключено в изолированном режиме rcode eval");
+    }
+
+    match args {
+        ["status"] => {
+            let support = probe_support();
+            let saved = store.project_sandbox(&session.root)?;
+            let text = crate::sandbox_cli::render_status_text(
+                &session.root,
+                &support,
+                saved,
+                runtime.effective_sandbox,
+            );
+            notice!("\n{}", events.redact(&text));
+            Ok(())
+        }
+        [] => {
+            let support = probe_support();
+            let presets = [
+                ProjectSandbox {
+                    mode: SandboxMode::Off,
+                    network: false,
+                },
+                ProjectSandbox {
+                    mode: SandboxMode::WorkspaceWrite,
+                    network: false,
+                },
+                ProjectSandbox {
+                    mode: SandboxMode::WorkspaceWrite,
+                    network: true,
+                },
+                ProjectSandbox {
+                    mode: SandboxMode::ReadOnly,
+                    network: false,
+                },
+            ];
+            let choices = [
+                Choice {
+                    label: "off".into(),
+                    detail: "выключена: shell запускается с правами пользователя".into(),
+                    enabled: true,
+                },
+                Choice {
+                    label: "workspace-write".into(),
+                    detail: "запись только в проект и TMPDIR задания, сеть заблокирована".into(),
+                    enabled: support.available,
+                },
+                Choice {
+                    label: "workspace-write + network".into(),
+                    detail: "запись в проект и TMPDIR задания, разрешена только IP-сеть".into(),
+                    enabled: support.available,
+                },
+                Choice {
+                    label: "read-only".into(),
+                    detail: "проект только на чтение, запись только в TMPDIR задания, сеть заблокирована"
+                        .into(),
+                    enabled: support.available,
+                },
+            ];
+            let default_idx = match (
+                runtime.effective_sandbox.mode,
+                runtime.effective_sandbox.network,
+            ) {
+                (SandboxMode::Off, _) => 0,
+                (SandboxMode::WorkspaceWrite, false) => 1,
+                (SandboxMode::WorkspaceWrite, true) => 2,
+                (SandboxMode::ReadOnly, _) => 3,
+            };
+            let Some(idx) = choose(
+                "OS-песочница shell модели · выбор сохраняется для этого проекта",
+                &choices,
+                default_idx,
+                rich,
+            )?
+            else {
+                return Ok(());
+            };
+            let chosen = presets[idx];
+            ensure_mode_supported(chosen.mode)?;
+            store.save_project_sandbox(&session.root, chosen)?;
+            runtime.sandbox = Some(chosen.mode);
+            runtime.sandbox_network = Some(if chosen.network {
+                Toggle::On
+            } else {
+                Toggle::Off
+            });
+            runtime.effective_sandbox = EffectiveSandboxPolicy {
+                mode: chosen.mode,
+                network: if chosen.mode == SandboxMode::Off {
+                    false
+                } else {
+                    chosen.network
+                },
+            };
+            notice!(
+                "✓ OS-песочница: {} · сохранено для этого проекта",
+                runtime.effective_sandbox.status_label_ru()
+            );
+            Ok(())
+        }
+        [mode_raw @ ("off" | "workspace-write" | "read-only")] => {
+            let mode: SandboxMode = mode_raw.parse()?;
+            ensure_mode_supported(mode)?;
+            let mut saved = store.project_sandbox(&session.root)?;
+            saved.mode = mode;
+            let next_net_flag = if mode == SandboxMode::Off {
+                None
+            } else {
+                runtime.sandbox_network
+            };
+            let effective = EffectiveSandboxPolicy::resolve(saved, Some(mode), next_net_flag)?;
+            if effective.is_active() {
+                ensure_mode_supported(effective.mode)?;
+            }
+            store.save_project_sandbox(&session.root, saved)?;
+            runtime.sandbox = Some(mode);
+            runtime.sandbox_network = next_net_flag;
+            runtime.effective_sandbox = effective;
+            notice!(
+                "✓ OS-песочница: {} · сохранено для этого проекта",
+                runtime.effective_sandbox.status_label_ru()
+            );
+            Ok(())
+        }
+        ["network", state_raw @ ("on" | "off")] => {
+            let net = *state_raw == "on";
+            let mut saved = store.project_sandbox(&session.root)?;
+            saved.network = net;
+            let next_net_flag = if runtime.effective_sandbox.is_active() {
+                Some(if net { Toggle::On } else { Toggle::Off })
+            } else {
+                None
+            };
+            let effective = EffectiveSandboxPolicy::resolve(saved, runtime.sandbox, next_net_flag)?;
+            if effective.is_active() {
+                ensure_mode_supported(effective.mode)?;
+            }
+            store.save_project_sandbox(&session.root, saved)?;
+            runtime.sandbox_network = next_net_flag;
+            runtime.effective_sandbox = effective;
+            notice!(
+                "✓ Сеть песочницы проекта: {} · эффективная политика: {}",
+                if net {
+                    "разрешена (IPv4/IPv6)"
+                } else {
+                    "заблокирована"
+                },
+                runtime.effective_sandbox.status_label_ru()
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "Использование: /sandbox [status|off|workspace-write|read-only|network on|network off]"
+        ),
+    }
 }
 /// Discovery warnings, at most ten lines; shown again only when the set changes.
 fn skill_problems(problems: &[SkillProblem], events: &Events) {
@@ -1443,6 +1624,12 @@ pub(crate) async fn run(
         &session.provider.model,
         rich,
     );
+    if !rich && runtime.effective_sandbox.is_active() {
+        notice!(
+            "OS-песочница: {}",
+            runtime.effective_sandbox.status_label_ru()
+        );
+    }
     let restored_context = if cli.resume.is_some() {
         // Compact before hydration, then announce below the restored conversation.
         // An oversized protected task remains available for /compact or /new.
@@ -1594,7 +1781,15 @@ pub(crate) async fn run(
         let first_word = input.split_whitespace().next().unwrap_or_default();
         if !matches!(
             first_word,
-            "/new" | "/clear" | "/resume" | "/help" | "/status" | "/memory" | "/exit" | "/quit"
+            "/new"
+                | "/clear"
+                | "/resume"
+                | "/help"
+                | "/status"
+                | "/memory"
+                | "/sandbox"
+                | "/exit"
+                | "/quit"
         ) && let Err(error) = execution.activate()
         {
             events.emit("error", json!({"message":events.redact(&format!("{error:#}. Исполнение сессии недоступно. Введите /exit; после перезапуска восстановите сессию через /resume."))}));
@@ -1716,6 +1911,7 @@ pub(crate) async fn run(
                         apply_permissions(mode,store,session,&mut runtime,tools)?;
                     }Ok(())
                 },
+                "/sandbox"=>sandbox_command(&args,rich,store,session,&mut runtime,events),
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
                 "/status"=>{let rendered=skill_catalog(session,&skills);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&events.secret_snapshot()));status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
                 "/memory"=>memory_command(&args,&runtime,plan,store,session,client,events),

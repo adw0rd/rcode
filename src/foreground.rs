@@ -11,7 +11,7 @@ use crate::{
     state::Session,
     tools::Tools,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -46,6 +46,7 @@ pub(crate) fn prepare(root: &Path, args: &Value, origin: JobOrigin) -> Result<Jo
         lifetime: Duration::from_secs(seconds as u64),
         idle_timeout: Duration::from_secs(seconds as u64),
         stdin: false,
+        sandbox: crate::sandbox::PreparedSandbox::off(),
     })
 }
 
@@ -79,7 +80,11 @@ pub(crate) async fn wait(
     .context("Foreground deadline exceeded; cleanup remains unconfirmed")?
 }
 
-fn outcome(view: &JobSnapshot, delivery_cancelled: bool) -> ToolOutcome {
+fn outcome(
+    view: &JobSnapshot,
+    delivery_cancelled: bool,
+    sandbox: &crate::sandbox::SandboxReceiptMeta,
+) -> ToolOutcome {
     let reason = if delivery_cancelled {
         Some("worker_unavailable")
     } else if !view.cleanup_complete {
@@ -102,7 +107,8 @@ fn outcome(view: &JobSnapshot, delivery_cancelled: bool) -> ToolOutcome {
         "shell_changes_managed":false,"note":crate::tools::SHELL_NOTE,
         "termination":"process_group","cleanup_complete":view.cleanup_complete,
         "cleanup_warning":view.cleanup_warning,"output_truncated":view.output_truncated,
-        "redaction_incomplete":view.redaction_incomplete || delivery_cancelled,"utf8_lossy":view.utf8_lossy})
+        "redaction_incomplete":view.redaction_incomplete || delivery_cancelled,"utf8_lossy":view.utf8_lossy,
+        "sandbox":sandbox})
     .to_string();
     ToolOutcome {
         is_error: reason.is_some() || view.exit_code != Some(0) || view.signal.is_some(),
@@ -119,6 +125,7 @@ fn outcome(view: &JobSnapshot, delivery_cancelled: bool) -> ToolOutcome {
 fn complete(
     view: &JobSnapshot,
     worker: Option<&AgentRequest>,
+    sandbox: &crate::sandbox::SandboxReceiptMeta,
     save: impl FnOnce(ToolOutcome) -> Result<ToolOutcome>,
 ) -> Result<ToolOutcome> {
     if let Some(worker) = worker {
@@ -126,10 +133,11 @@ fn complete(
             save(outcome(
                 view,
                 !open || worker.reply.is_closed() || worker.cancel.is_cancelled(),
+                sandbox,
             ))
         })
     } else {
-        save(outcome(view, false))
+        save(outcome(view, false, sandbox))
     }
 }
 
@@ -149,9 +157,11 @@ impl Durable<'_> {
         args: &Value,
         worker: Option<&AgentRequest>,
         cancel: &CancellationToken,
+        turn_cancel: &CancellationToken,
+        authority: crate::sandbox::ExecutionAuthority,
     ) -> Result<ToolOutcome> {
         let owner = worker.map(|a| a.agent_id.as_str());
-        let spec = match prepare(
+        let mut spec = match prepare(
             self.tools.root(),
             args,
             JobOrigin {
@@ -169,12 +179,42 @@ impl Durable<'_> {
         if let Err(error) = self.jobs.check_start_capacity() {
             return Ok(ToolOutcome::error(format!("{error:#}")));
         }
-        if cancel.is_cancelled() {
+        if turn_cancel.is_cancelled() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "Задача отменена; shell не запускался",
             )
             .into());
+        }
+        if cancel.is_cancelled() {
+            return Ok(ToolOutcome::error(
+                "Задача отменена; действие не исполнялось",
+            ));
+        }
+        let sandbox = match crate::sandbox::PreparedSandbox::prepare(
+            authority.policy(),
+            self.tools.root(),
+            &self.tools.extra_directories(),
+            Some(self.store.root()),
+            &secrets,
+        ) {
+            Ok(sandbox) => sandbox,
+            Err(error) => return Ok(ToolOutcome::error(format!("{error:#}"))),
+        };
+        sandbox.apply_to_env(&mut spec.env);
+        let sandbox_meta = sandbox.receipt_meta();
+        spec.sandbox = sandbox;
+        if turn_cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Задача отменена; shell не запускался",
+            )
+            .into());
+        }
+        if cancel.is_cancelled() {
+            return Ok(ToolOutcome::error(
+                "Задача отменена; действие не исполнялось",
+            ));
         }
         let reservation = self.jobs.reserve_start()?;
         let id = reservation.id().to_owned();
@@ -183,7 +223,8 @@ impl Durable<'_> {
         self.tools.mark_shell_used()?;
         let intent = json!({"command_id":id,"arguments":args,"kind":spec.kind,
             "origin":spec.origin,"argv":spec.argv,"cwd":spec.cwd,"stdin":false,
-            "lifetime_ms":spec.lifetime.as_millis(),"idle_ms":spec.idle_timeout.as_millis()});
+            "lifetime_ms":spec.lifetime.as_millis(),"idle_ms":spec.idle_timeout.as_millis(),
+            "sandbox":sandbox_meta});
         let pending = crate::operation_receipts::begin(
             self.journal,
             &artifacts,
@@ -198,21 +239,37 @@ impl Durable<'_> {
         let _guard = CancelOnDrop(scope.clone());
         // Native admission has no suspension points between spawn and ownership.
         // On Err the enriched intent remains unknown; never retry or fall back.
+        let mut entered_start = false;
         let start = || {
-            ensure!(
-                !cancel.is_cancelled()
-                    && !worker.is_some_and(|a| a.reply.is_closed() || a.cancel.is_cancelled()),
-                "Worker или вызов отменён до запуска shell"
-            );
+            entered_start = true;
+            if turn_cancel.is_cancelled() {
+                return Err(
+                    crate::jobs::PreSpawnCancelled("Задача отменена; shell не запускался").into(),
+                );
+            }
+            if cancel.is_cancelled()
+                || worker.is_some_and(|a| a.reply.is_closed() || a.cancel.is_cancelled())
+            {
+                return Err(crate::jobs::PreSpawnCancelled(
+                    "Worker или вызов отменён до запуска shell",
+                )
+                .into());
+            }
             self.jobs
                 .start_reserved_now(reservation, spec, scope.clone())
         };
-        if let Some(worker) = worker {
+        let started = if let Some(worker) = worker {
             worker.admission.with_open(start)
         } else {
             start()
+        };
+        if let Err(error) = started {
+            return Err(classify_pre_spawn_start_error(
+                error,
+                !entered_start,
+                turn_cancel.is_cancelled(),
+            ));
         }
-        .context("Запуск shell не подтверждён; намерение сохранено без автоматического повтора")?;
         wait(self.jobs, owner, &id, worker, &scope).await?;
         self.events.refresh_keys(self.store)?;
         let secrets = self.events.secret_snapshot();
@@ -221,7 +278,7 @@ impl Durable<'_> {
         let result = self
             .jobs
             .publish_snapshot(&view, |current| {
-                complete(current, worker, |outcome| {
+                complete(current, worker, &sandbox_meta, |outcome| {
                     crate::operation_receipts::finish(
                         pending,
                         self.journal,
@@ -242,6 +299,26 @@ impl Durable<'_> {
         }
         Ok(result)
     }
+}
+
+fn classify_pre_spawn_start_error(
+    error: anyhow::Error,
+    rejected_before_start_closure: bool,
+    turn_cancelled: bool,
+) -> anyhow::Error {
+    let refused_before_spawn = rejected_before_start_closure
+        || error
+            .downcast_ref::<crate::jobs::PreSpawnCancelled>()
+            .is_some();
+    let cause = if refused_before_spawn && turn_cancelled {
+        anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Задача отменена; shell не запускался",
+        ))
+    } else {
+        error
+    };
+    cause.context("Запуск shell не подтверждён; намерение сохранено без автоматического повтора")
 }
 
 /// Public Tools convenience path outside an application SessionRuntime. The app
@@ -266,7 +343,8 @@ pub(crate) async fn standalone(
     let result: Result<ToolOutcome> = async {
         let started = jobs.start(spec, scope.clone()).await?;
         let view = wait(&jobs, None, &started.id, None, &scope).await?;
-        jobs.publish_snapshot(&view, |view| Ok(outcome(view, false)))
+        let off_meta = crate::sandbox::SandboxReceiptMeta::off();
+        jobs.publish_snapshot(&view, |view| Ok(outcome(view, false, &off_meta)))
             .await
     }
     .await;
@@ -361,7 +439,16 @@ mod tests {
                 session: &mut session,
                 store: &store,
             }
-            .run(&call, &json!({"command":command}), actor, &cancel)
+            .run(
+                &call,
+                &json!({"command":command}),
+                actor,
+                &cancel,
+                &cancel,
+                crate::sandbox::ExecutionAuthority::ModelTool(
+                    crate::sandbox::EffectiveSandboxPolicy::off(),
+                ),
+            )
             .await;
             if closed_before {
                 trigger.abort();
@@ -490,11 +577,172 @@ mod tests {
             &json!({"command":"printf unexpected > started"}),
             None,
             &cancel,
+            &cancel,
+            crate::sandbox::ExecutionAuthority::ModelTool(
+                crate::sandbox::EffectiveSandboxPolicy::off(),
+            ),
         )
         .await
         .unwrap_err();
         assert_eq!(crate::app::exit_code(&error), 130, "{error:#}");
         assert!(!root.join("started").exists());
+    }
+
+    #[tokio::test]
+    async fn worker_only_cancellation_vs_turn_cancellation_through_durable_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let store = ConfigStore::at(temp.path().join("state")).unwrap();
+        let mut session = Session::new(&root, ProviderSettings::new(ProviderKind::Custom)).unwrap();
+        session
+            .task_state
+            .host_followup("Validate worker vs turn cancellation")
+            .unwrap();
+        session.turn_index = 1;
+        session.save(&store).unwrap();
+        let mut tools = Tools::new(&root, &session.dir(&store).join("checkpoints")).unwrap();
+        tools.begin_turn().unwrap();
+        let events = Events::new(true);
+        let mut runtime = SessionRuntime::new(&session.dir(&store), &session.id, vec![]).unwrap();
+        let turn_cancel = CancellationToken::new();
+        let scope = runtime.begin_turn(1, &turn_cancel).unwrap();
+
+        // 1. Worker-only cancel BEFORE begin (`!turn_cancel.is_cancelled()`, `worker_cancel.is_cancelled()`)
+        //    returns a regular ToolOutcome error without aborting the turn or creating an Unknown intent.
+        {
+            let (artifacts, journal, jobs, _) = runtime.receipt_resources().unwrap();
+            let journal = journal.unwrap();
+            let worker_cancel = CancellationToken::new();
+            worker_cancel.cancel();
+            let (reply, _scoped, admission) = crate::agents::scoped_reply_for_test();
+            let worker = crate::agents::AgentRequest {
+                agent_id: "worker-timeout".into(),
+                name: "worker-timeout".into(),
+                role: crate::agents::AgentRole::Worker,
+                call: ToolCall::new("run_command", json!({"command":"printf bad > started"})),
+                cancel: worker_cancel.clone(),
+                reply,
+                admission,
+                transfers: Default::default(),
+            };
+            let outcome = Durable {
+                tools: &mut tools,
+                events: &events,
+                jobs,
+                journal,
+                artifacts,
+                session: &mut session,
+                store: &store,
+            }
+            .run(
+                &worker.call,
+                &json!({"command":"printf bad > started"}),
+                Some(&worker),
+                &worker_cancel,
+                &turn_cancel,
+                crate::sandbox::ExecutionAuthority::ModelTool(
+                    crate::sandbox::EffectiveSandboxPolicy::off(),
+                ),
+            )
+            .await
+            .expect("worker-only preflight cancel must not abort parent turn");
+            assert!(outcome.is_error);
+            assert!(journal.records(artifacts).unwrap().is_empty());
+        }
+
+        // 2. Closed worker reply AFTER begin while parent `turn_cancel` is active (NOT cancelled)
+        //    must return exit_code 2 (never misclassified as 130 turn interrupt).
+        {
+            let (artifacts, journal, jobs, _) = runtime.receipt_resources().unwrap();
+            let journal = journal.unwrap();
+            let worker_cancel = CancellationToken::new();
+            let (reply, scoped, admission) = crate::agents::scoped_reply_for_test();
+            drop(scoped);
+            let worker = crate::agents::AgentRequest {
+                agent_id: "worker-closed".into(),
+                name: "worker-closed".into(),
+                role: crate::agents::AgentRole::Worker,
+                call: ToolCall::new("run_command", json!({"command":"printf bad > started"})),
+                cancel: worker_cancel.clone(),
+                reply,
+                admission,
+                transfers: Default::default(),
+            };
+            let err = Durable {
+                tools: &mut tools,
+                events: &events,
+                jobs,
+                journal,
+                artifacts,
+                session: &mut session,
+                store: &store,
+            }
+            .run(
+                &worker.call,
+                &json!({"command":"printf bad > started"}),
+                Some(&worker),
+                &worker_cancel,
+                &turn_cancel,
+                crate::sandbox::ExecutionAuthority::ModelTool(
+                    crate::sandbox::EffectiveSandboxPolicy::off(),
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(crate::app::exit_code(&err), 2, "{err:#}");
+            assert!(!root.join("started").exists());
+        }
+
+        runtime
+            .finish_turn_saved(scope, true, &mut session, &store, &[])
+            .await
+            .unwrap();
+        runtime
+            .shutdown_saved(&mut session, &store, &[])
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn cancelled_turn_pre_spawn_errors_map_to_interrupt_130_without_masking_spawn_failures() {
+        // 1. Reply gate closed before `start` closure ran + turn cancelled -> 130.
+        let closed_err = anyhow::anyhow!("Worker reply closed before native action");
+        let interrupted = classify_pre_spawn_start_error(closed_err, true, true);
+        assert_eq!(crate::app::exit_code(&interrupted), 130, "{interrupted:#}");
+        assert!(format!("{interrupted:#}").contains("Запуск shell не подтверждён"));
+
+        // 2. Supervisor `PreSpawnCancelled("scope cancelled")` inside `start_reserved_now`
+        //    after `start` closure began + turn cancelled -> 130!
+        let supervisor_pre_spawn =
+            anyhow::Error::from(crate::jobs::PreSpawnCancelled("scope cancelled"));
+        let interrupted_sup = classify_pre_spawn_start_error(supervisor_pre_spawn, false, true);
+        assert_eq!(
+            crate::app::exit_code(&interrupted_sup),
+            130,
+            "{interrupted_sup:#}"
+        );
+
+        // 3. When the turn is NOT cancelled (isolated worker timeout), exit_code remains 2.
+        let worker_only = classify_pre_spawn_start_error(
+            anyhow::Error::from(crate::jobs::PreSpawnCancelled("scope cancelled")),
+            false,
+            false,
+        );
+        assert_eq!(crate::app::exit_code(&worker_only), 2, "{worker_only:#}");
+
+        // 4. Genuine supervisor/spawn failure (not `PreSpawnCancelled` and after entering `start`)
+        //    is NEVER masked even if `turn_cancelled` is true.
+        let real_spawn_err = classify_pre_spawn_start_error(
+            anyhow::anyhow!("four resource slots occupied"),
+            false,
+            true,
+        );
+        assert_eq!(
+            crate::app::exit_code(&real_spawn_err),
+            2,
+            "{real_spawn_err:#}"
+        );
     }
 
     #[tokio::test]
@@ -537,8 +785,11 @@ mod tests {
             transfers: Default::default(),
         };
         drop(receiver); // after confirmed EOF, before durable publication
+        let off_meta = crate::sandbox::SandboxReceiptMeta::off();
         let receipt = jobs
-            .publish_snapshot(&view, |current| complete(current, Some(&worker), Ok))
+            .publish_snapshot(&view, |current| {
+                complete(current, Some(&worker), &off_meta, Ok)
+            })
             .await
             .unwrap();
         assert!(receipt.is_error);

@@ -38,6 +38,7 @@ fn spec(session: &Session, command: &str) -> JobSpec {
         lifetime: Duration::from_secs(60),
         idle_timeout: Duration::from_secs(60),
         stdin: false,
+        sandbox: Default::default(),
     }
 }
 async fn start(
