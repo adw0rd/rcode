@@ -299,7 +299,7 @@ git commit -m "feat(eval): сохранять исходники кейсов"
 Run:
 
 ```bash
-RCODE_EVAL_DOCKER=/Users/colinfrl/.local/bin/docker \
+RCODE_EVAL_DOCKER="$HOME/.local/bin/docker" \
 RCODE_EVAL_SOCKET="$HOME/.orbstack/run/docker.sock" \
 RCODE_EVAL_IMAGE=sha256:98de9b6855a361f8caaca0b266ce4b1f5eeef5ce803857127a339296e513f57e \
 python3 tests/eval_host.py HostTests.test_persistent_snapshot_survives_case_and_matches_oracle
