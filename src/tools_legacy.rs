@@ -86,6 +86,7 @@ type PathBinding = Vec<FileIdentity>;
 
 struct ReadObservation {
     sha256: String,
+    stale: bool,
     #[cfg(unix)]
     identity: FileIdentity,
     #[cfg(unix)]
@@ -877,6 +878,7 @@ impl Tools {
                 (actor.map(str::to_owned), snapshot_key),
                 ReadObservation {
                     sha256: hash,
+                    stale: false,
                     identity: file.identity,
                     binding,
                 },
@@ -887,7 +889,10 @@ impl Tools {
             let (_, root, relative) = self.required_location(path, false)?;
             self.read_snapshots.insert(
                 (actor.map(str::to_owned), root.join(relative)),
-                ReadObservation { sha256: hash },
+                ReadObservation {
+                    sha256: hash,
+                    stale: false,
+                },
             );
         }
         Ok(outcome)
@@ -1102,16 +1107,33 @@ impl Tools {
                     Some(Value::String(s)) => Some(s.as_str()),
                     _ => bail!("expected_sha256 должен быть строкой"),
                 };
-                #[cfg(unix)]
-                if let (Some(observation), Some(file)) = (observation, before.as_ref()) {
+                let actual_sha256 = before.as_ref().map(|file| sha256(&file.bytes));
+                if let (Some(observation), Some(file), Some(actual)) =
+                    (observation, before.as_ref(), actual_sha256.as_deref())
+                {
+                    #[cfg(unix)]
                     ensure!(
-                        observation.identity == file.identity && observation.binding == binding,
+                        !observation.stale
+                            && observation.identity == file.identity
+                            && observation.binding == binding,
                         "Файл или каталог был заменён после чтения; перечитайте файл"
                     );
+                    #[cfg(not(unix))]
+                    {
+                        let _ = file;
+                        ensure!(
+                            !observation.stale,
+                            "Файл изменён после чтения; перечитайте файл"
+                        );
+                    }
+                    ensure!(
+                        observation.sha256 == actual,
+                        "Файл не прочитан в этом контексте или изменён после чтения, либо expected_sha256 неверен. Перечитайте файл через read_file и подготовьте правку по актуальному содержимому; не повторяйте прежнюю запись без проверки"
+                    );
                 }
-                match &before {
-                    Some(file) => ensure!(
-                        expected == Some(sha256(&file.bytes).as_str()),
+                match actual_sha256.as_deref() {
+                    Some(actual) => ensure!(
+                        expected == Some(actual),
                         "Файл не прочитан в этом контексте или изменён после чтения, либо expected_sha256 неверен. Перечитайте файл через read_file и подготовьте правку по актуальному содержимому; не повторяйте прежнюю запись без проверки"
                     ),
                     None => ensure!(
@@ -1269,14 +1291,15 @@ impl Tools {
             (Some(before), Some(hash), Some(observation)) => {
                 #[cfg(unix)]
                 {
-                    observation.sha256 == *hash
+                    !observation.stale
+                        && observation.sha256 == *hash
                         && observation.identity == before.identity
                         && observation.binding == prepared.binding
                 }
                 #[cfg(not(unix))]
                 {
                     let _ = before;
-                    observation.sha256 == *hash
+                    !observation.stale && observation.sha256 == *hash
                 }
             }
             _ => false,
@@ -1294,10 +1317,16 @@ impl Tools {
                     snapshot_key,
                     ReadObservation {
                         sha256: current_hash.expect("before hash present"),
+                        stale: false,
                         identity: before.identity,
                         binding: prepared.binding,
                     },
                 );
+            } else if name == "edit_file"
+                && !had_matching_observation
+                && let Some(observation) = self.read_snapshots.get_mut(&snapshot_key)
+            {
+                observation.stale = true;
             }
             #[cfg(not(unix))]
             if name == "write_file" {
@@ -1306,8 +1335,14 @@ impl Tools {
                     snapshot_key,
                     ReadObservation {
                         sha256: current_hash.expect("before hash present"),
+                        stale: false,
                     },
                 );
+            } else if name == "edit_file"
+                && !had_matching_observation
+                && let Some(observation) = self.read_snapshots.get_mut(&snapshot_key)
+            {
+                observation.stale = true;
             }
             return Ok(ToolOutcome::success(
                 "Содержимое уже совпадает; файл не изменён",
@@ -1410,12 +1445,18 @@ impl Tools {
                 return Err(error);
             }
         };
+        for (key, observation) in &mut self.read_snapshots {
+            if key.1 == absolute {
+                observation.stale = true;
+            }
+        }
         if record_observation && let Some(proof) = published {
             #[cfg(unix)]
             self.read_snapshots.insert(
                 snapshot_key,
                 ReadObservation {
                     sha256: after_hash.clone(),
+                    stale: false,
                     identity: proof.identity,
                     binding: prepared.binding.clone(),
                 },
@@ -1427,6 +1468,7 @@ impl Tools {
                     snapshot_key,
                     ReadObservation {
                         sha256: after_hash.clone(),
+                        stale: false,
                     },
                 );
             }
@@ -3729,6 +3771,96 @@ mod tests {
                 .unwrap();
             assert!(modify_hardlink.is_error);
         }
+
+        // Untouched file (no prior checkpoint): read -> in-place external modification ->
+        // explicit expected_sha256 matching new disk bytes must still be rejected.
+        f.file("in_place_legacy.py", "orig = 1\n");
+        assert!(
+            !f.tools
+                .execute_for(
+                    "read_file",
+                    &json!({"path": "in_place_legacy.py"}),
+                    &cancel,
+                    None
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        f.file("in_place_legacy.py", "tampered = 2\n");
+        let explicit_bypass = f
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({
+                    "path": "in_place_legacy.py",
+                    "content": "overwrite\n",
+                    "expected_sha256": hash(b"tampered = 2\n"),
+                }),
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            explicit_bypass.is_error,
+            "legacy tools must reject explicit expected_sha256 when read observation sha256 is stale"
+        );
+        assert_eq!(
+            fs::read(f.root.join("in_place_legacy.py")).unwrap(),
+            b"tampered = 2\n"
+        );
+
+        // No-op edit_file on a modified file without checkpoint marks observation irreversibly stale
+        // even if external bytes return to the originally read A on the same inode.
+        f.file("aba_legacy.py", "state = 'A'\n");
+        assert!(
+            !f.tools
+                .execute_for(
+                    "read_file",
+                    &json!({"path": "aba_legacy.py"}),
+                    &cancel,
+                    None
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        f.file("aba_legacy.py", "state = 'B'\n");
+        assert!(
+            !f.tools
+                .execute_for(
+                    "edit_file",
+                    &json!({
+                        "path": "aba_legacy.py",
+                        "old_text": "state = 'B'",
+                        "new_text": "state = 'B'",
+                    }),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error
+        );
+        f.file("aba_legacy.py", "state = 'A'\n");
+        assert!(
+            f.tools
+                .execute_for(
+                    "write_file",
+                    &json!({
+                        "path": "aba_legacy.py",
+                        "content": "overwrite\n",
+                        "expected_sha256": hash(b"state = 'A'\n"),
+                    }),
+                    &cancel,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_error,
+            "stale flag set by no-op edit_file must remain rejected until re-read"
+        );
     }
 
     #[test]

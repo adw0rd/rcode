@@ -433,6 +433,82 @@ async fn stale_observation_survives_edit_file_and_blocks_explicit_hash_bypass() 
         "stale observation must not be refreshed or erased by edit_file"
     );
     assert_eq!(fs::read(&path).unwrap(), post_edit_bytes);
+
+    // Untouched file without any prior WAL checkpoint: same-inode in-place modification
+    // after read_file must block explicit expected_sha256 bypass at prepare() directly
+    // (covers filesystems like ext4 when freed inodes are reused on atomic staging renames).
+    let same_inode_path = f.file("same_inode.py", b"initial = 1\ntarget = 2\n");
+    assert!(!f.read("same_inode.py").await.unwrap().is_error);
+    let in_place_inode = fs::metadata(&same_inode_path).unwrap().ino();
+    let in_place_bytes = b"in_place = 777\ntarget = 2\n";
+    fs::write(&same_inode_path, in_place_bytes).unwrap();
+    assert_eq!(
+        fs::metadata(&same_inode_path).unwrap().ino(),
+        in_place_inode
+    );
+    let bypass_same_inode = f
+        .call(ToolCall::new(
+            "write_file",
+            json!({
+                "path": "same_inode.py",
+                "content": "overwrite\n",
+                "expected_sha256": format!("{:x}", Sha256::digest(in_place_bytes)),
+            }),
+        ))
+        .await;
+    assert!(
+        rejected(&bypass_same_inode),
+        "explicit expected_sha256 must not bypass a stale read observation on an uncheckpointed file"
+    );
+    assert_eq!(fs::read(&same_inode_path).unwrap(), in_place_bytes);
+
+    // Irreversible `stale` flag on no-op edit_file without any WAL checkpoint:
+    // read(A) -> external in-place write(B) -> no-op edit_file(B -> B) -> external restore(A)
+    // on the same inode must still reject write_file until a fresh read_file.
+    let aba_path = f.file("aba_noop.py", b"state = 'A'\n");
+    let aba_inode = fs::metadata(&aba_path).unwrap().ino();
+    assert!(!f.read("aba_noop.py").await.unwrap().is_error);
+    fs::write(&aba_path, b"state = 'B'\n").unwrap();
+    assert_eq!(fs::metadata(&aba_path).unwrap().ino(), aba_inode);
+    let noop_on_stale = f
+        .call(ToolCall::new(
+            "edit_file",
+            json!({
+                "path": "aba_noop.py",
+                "old_text": "state = 'B'",
+                "new_text": "state = 'B'",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(!noop_on_stale.is_error, "{}", noop_on_stale.content);
+    fs::write(&aba_path, b"state = 'A'\n").unwrap();
+    assert_eq!(fs::metadata(&aba_path).unwrap().ino(), aba_inode);
+    assert!(
+        rejected(&f.write("aba_noop.py", "overwrite\n").await),
+        "no-op edit_file on modified file must mark observation irreversibly stale"
+    );
+    let aba_explicit = f
+        .call(ToolCall::new(
+            "write_file",
+            json!({
+                "path": "aba_noop.py",
+                "content": "overwrite\n",
+                "expected_sha256": format!("{:x}", Sha256::digest(b"state = 'A'\n")),
+            }),
+        ))
+        .await;
+    assert!(
+        rejected(&aba_explicit),
+        "explicit expected_sha256 must not bypass observation marked stale by no-op edit_file"
+    );
+    assert!(!f.read("aba_noop.py").await.unwrap().is_error);
+    assert!(
+        !f.write("aba_noop.py", "fresh = 1\n")
+            .await
+            .unwrap()
+            .is_error
+    );
 }
 
 #[tokio::test]
