@@ -1027,7 +1027,7 @@ def test_diagnostics_sidecar_matches_policy_and_survives_cleanup(self):
 Run:
 
 ```bash
-RCODE_EVAL_DOCKER=/Users/colinfrl/.local/bin/docker \
+RCODE_EVAL_DOCKER="$HOME/.local/bin/docker" \
 RCODE_EVAL_SOCKET="$HOME/.orbstack/run/docker.sock" \
 RCODE_EVAL_IMAGE=sha256:98de9b6855a361f8caaca0b266ce4b1f5eeef5ce803857127a339296e513f57e \
 python3 tests/eval_host.py
@@ -1084,14 +1084,14 @@ Run:
 ```bash
 git check-ignore -q artifacts/todo-eval
 mkdir -p artifacts/todo-eval/build-target
-/Users/colinfrl/.local/bin/docker run --rm --network=none --platform linux/arm64 \
+"$HOME/.local/bin/docker" run --rm --network=none --platform linux/arm64 \
   -v "$PWD:/src:ro" -v "$PWD/artifacts/todo-eval/build-target:/target" \
   -v "$HOME/.cargo:/cargo:ro" -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
   -w /src rust:1.88-slim cargo build --offline --release --locked --package rcode-cli --bin rcode
 cp artifacts/todo-eval/build-target/release/rcode artifacts/todo-eval/rcode-linux
 file artifacts/todo-eval/rcode-linux
 shasum -a 256 artifacts/todo-eval/rcode-linux
-/Users/colinfrl/.local/bin/docker run --rm --network=none --platform linux/arm64 \
+"$HOME/.local/bin/docker" run --rm --network=none --platform linux/arm64 \
   --entrypoint /agent/rcode -v "$PWD/artifacts/todo-eval/rcode-linux:/agent/rcode:ro" \
   sha256:98de9b6855a361f8caaca0b266ce4b1f5eeef5ce803857127a339296e513f57e --version
 ```
@@ -1103,7 +1103,7 @@ Expected: Linux ELF запускается и новый SHA-256 зафикси�
 Run с явными env:
 
 ```bash
-export RCODE_EVAL_DOCKER=/Users/colinfrl/.local/bin/docker
+export RCODE_EVAL_DOCKER="$HOME/.local/bin/docker"
 export RCODE_EVAL_SOCKET="$HOME/.orbstack/run/docker.sock"
 export RCODE_EVAL_IMAGE=sha256:98de9b6855a361f8caaca0b266ce4b1f5eeef5ce803857127a339296e513f57e
 python3 tests/eval_runtime.py
