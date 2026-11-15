@@ -2776,12 +2776,21 @@ impl ToolExecutor<'_> {
                 return Ok(ToolOutcome::error(format!("{error:#}")));
             }
         }
-        if write || (shell && !input) {
+        let mut prepared_write_preview: Option<(String, crate::tools::ApprovedWrite)> = None;
+        if write {
+            match self
+                .tools
+                .preview_write_for(name, args, actor.map(|r| r.agent_id.as_str()))
+            {
+                Ok(pair) => prepared_write_preview = Some(pair),
+                Err(error) => return Ok(ToolOutcome::error(format!("{error:#}"))),
+            }
+        } else if shell && !input {
             let validation = self
                 .tools
                 .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))
                 .and_then(|_| {
-                    if shell && !self.cli.shell_allowed() && ui::terminal() && !self.cli.json {
+                    if !self.cli.shell_allowed() && ui::terminal() && !self.cli.json {
                         ui::shell_preview(self.tools.root(), args).map(|_| ())
                     } else {
                         Ok(())
@@ -2845,8 +2854,9 @@ impl ToolExecutor<'_> {
                 ui::shell_preview_content(self.tools.root(), args)?
             } else {
                 ui::ApprovalPreview::plain(
-                    self.tools
-                        .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))?
+                    prepared_write_preview
+                        .as_ref()
+                        .map(|(diff, _)| diff.clone())
                         .unwrap_or_else(|| args.to_string()),
                 )
             };
@@ -2953,9 +2963,7 @@ impl ToolExecutor<'_> {
         }
         if write
             && self.cli.file_edits_allowed()
-            && let Ok(Some(preview)) =
-                self.tools
-                    .preview_for(name, args, actor.map(|r| r.agent_id.as_str()))
+            && let Some((preview, _)) = prepared_write_preview.as_ref()
         {
             self.events.emit("preview", json!({"name":name,"agent_id":actor.map(|request|request.agent_id.as_str()),"diff":preview.chars().take(16_000).collect::<String>()}));
         }
@@ -3054,7 +3062,13 @@ impl ToolExecutor<'_> {
             ToolOutcome::error("Задача отменена; действие не исполнялось")
         } else {
             self.tools
-                .execute_for(name, args, cancel, actor.map(|r| r.agent_id.as_str()))
+                .execute_for_approved(
+                    name,
+                    args,
+                    cancel,
+                    actor.map(|r| r.agent_id.as_str()),
+                    prepared_write_preview.as_ref().map(|(_, stamp)| stamp),
+                )
                 .await?
         };
         if let Some((pending, session, artifacts, store)) = durable {
@@ -3975,6 +3989,371 @@ pub(crate) async fn skill_turn(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn accept_steering_messages(
+    screen: Option<&crate::screen::Screen>,
+    client: &ProviderClient,
+    session: &mut Session,
+    store: &ConfigStore,
+    cli: &Cli,
+    plan: bool,
+    skills: &SkillCatalog,
+    memory: &MemorySnapshot,
+    artifacts: &crate::artifacts::ArtifactStore,
+    observations: Option<&std::sync::Arc<std::sync::Mutex<crate::final_review::EvidenceCollector>>>,
+    events: &Events,
+    cancel: &CancellationToken,
+    step: u32,
+) -> Result<usize> {
+    let Some(screen) = screen else {
+        return Ok(0);
+    };
+    if cli.json || step + 1 >= cli.max_steps {
+        return Ok(0);
+    }
+    let mut accepted = 0usize;
+    while let Some(raw) = screen.peek_steer_next() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        events.refresh_keys(store)?;
+        let clean_text = match events.redact_checked(raw.trim()) {
+            Ok(clean) => clean,
+            Err(_) => {
+                events.emit(
+                    "warning",
+                    json!({
+                        "message": "Уточнение в очереди отложено до конца хода: не удалось безопасно отредактировать секреты"
+                    }),
+                );
+                break;
+            }
+        };
+        if clean_text.is_empty() {
+            let _ = screen.pop_steer_front(&raw);
+            continue;
+        }
+        let mut next_task = session.task_state.clone();
+        if let Err(error) = persist_user_request(
+            artifacts,
+            &mut next_task,
+            &clean_text,
+            session.turn_index,
+            events,
+        ) {
+            events.emit(
+                "warning",
+                json!({
+                    "message": format!("Уточнение отложено до конца хода: {error:#}")
+                }),
+            );
+            break;
+        }
+        let mut candidate = session.clone();
+        candidate.task_state = next_task;
+        candidate.messages.push(Message::user(clean_text.clone()));
+        let candidate_budget = context_budget_with_memory(
+            client,
+            &candidate,
+            cli,
+            plan,
+            skills,
+            memory,
+            &events.secret_snapshot(),
+        );
+        let before = candidate.context_used(&candidate_budget);
+        let saved = match candidate.auto_compact_within(0, &candidate_budget) {
+            Ok(saved) => saved,
+            Err(_) => {
+                events.emit(
+                    "warning",
+                    json!({
+                        "message": "Уточнение отложено до конца хода: не помещается в бюджет контекста"
+                    }),
+                );
+                break;
+            }
+        };
+        if cancel.is_cancelled() {
+            break;
+        }
+        if let Err(save_err) = candidate.save(store) {
+            if let Ok(disk) = Session::load(store, &session.id, &session.root)
+                && serde_json::to_value(&disk).ok() == serde_json::to_value(&candidate).ok()
+            {
+                *session = disk;
+                let _ = screen.pop_steer_front(&raw);
+            }
+            return Err(save_err);
+        }
+        *session = candidate;
+        let _ = screen.pop_steer_front(&raw);
+        accepted += 1;
+        if saved > 0 {
+            ContextPreparation::Compacted {
+                before,
+                after: session.context_used(&candidate_budget),
+                saved,
+                tokens: candidate_budget.is_tokens(),
+            }
+            .report(events);
+        }
+        if let Some(collector) = observations {
+            collector
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_user_steering(step, &clean_text);
+        }
+        events.emit(
+            "user_steer",
+            json!({
+                "text": clean_text,
+                "step": step + 1,
+            }),
+        );
+        screen.context(candidate_budget.request_used(&session.messages));
+        if cancel.is_cancelled() {
+            break;
+        }
+    }
+    Ok(accepted)
+}
+
+struct BtwDisplayGuard<'a> {
+    events: &'a Events,
+    cancelled: bool,
+    finished: bool,
+}
+
+impl<'a> BtwDisplayGuard<'a> {
+    fn new(events: &'a Events) -> Self {
+        Self {
+            events,
+            cancelled: false,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, elapsed_secs: f64, input_tokens: u64, output_tokens: u64) {
+        self.finished = true;
+        self.events.emit(
+            "btw_done",
+            json!({
+                "elapsed_secs": elapsed_secs,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }),
+        );
+    }
+}
+
+impl Drop for BtwDisplayGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.events
+                .emit("btw_aborted", json!({ "cancelled": self.cancelled }));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn context_budget_for_btw(
+    client: &ProviderClient,
+    session: &Session,
+    cli: &Cli,
+    plan: bool,
+    skills: &SkillCatalog,
+    memory: &MemorySnapshot,
+    secrets: &[String],
+    system_prompt: &str,
+) -> ContextBudget {
+    if !client.is_local() {
+        let catalog =
+            skill_catalog(session, skills).map_or(0, |catalog| catalog.text.chars().count());
+        let ask_prompt_overhead = if cli.interactive {
+            crate::ask_user::PROMPT_GUIDANCE.chars().count()
+        } else {
+            0
+        };
+        let allow_write = executable_write_memory(cli, plan, memory);
+        let mem_prompt_overhead = if memory.policy.is_enabled() {
+            if !memory.notes.is_empty() {
+                memory
+                    .render_index_for(CatalogUnit::Chars, secrets, allow_write)
+                    .map_or(0, |r| r.text.chars().count())
+            } else if allow_write {
+                crate::memory::EMPTY_MEMORY_GUIDANCE.chars().count()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let task_prompt_overhead = if session.task_state.goal().is_empty() {
+            0
+        } else {
+            session
+                .task_state
+                .projection()
+                .map_or(0, |s| s.chars().count())
+                + 48
+        };
+        return ContextBudget::cloud_with_overhead(
+            catalog + ask_prompt_overhead + mem_prompt_overhead + task_prompt_overhead,
+        );
+    }
+    let overhead = crate::context::estimate_overhead(system_prompt, &[]);
+    client.context_budget(overhead)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn btw_question(
+    session: &mut Session,
+    store: &ConfigStore,
+    client: &mut ProviderClient,
+    events: &Events,
+    cli: &Cli,
+    plan: bool,
+    skills: &SkillCatalog,
+    memory: &MemorySnapshot,
+    question: &str,
+) -> Result<()> {
+    let trimmed = question.trim();
+    anyhow::ensure!(
+        !trimmed.is_empty(),
+        "Использование: /btw <вопрос> — быстрый вопрос по контексту без инструментов и без записи в историю"
+    );
+    anyhow::ensure!(
+        trimmed.len() <= 32_768 && !trimmed.contains('\0'),
+        "Вопрос /btw слишком длинный или содержит нулевой символ"
+    );
+    events.refresh_keys(store)?;
+    let clean_question = events.redact(trimmed);
+    let cancel = CancellationToken::new();
+    let _interrupt = TurnInterrupt::bind(cancel.clone())?;
+    if let Some(screen) = crate::screen::current() {
+        screen.bind_cancel(cancel.clone());
+    }
+    events.emit(
+        "btw_start",
+        json!({
+            "question": clean_question,
+            "provider": session.provider.kind.as_str(),
+            "model": session.provider.model,
+        }),
+    );
+    let mut display_guard = BtwDisplayGuard::new(events);
+    events.busy("Отвечаю на /btw · без инструментов и записи в историю");
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            display_guard.cancelled = true;
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "Запрос /btw отменён").into());
+        }
+        _ = local_app::refresh_context(client, events) => {}
+    }
+    let step_secrets = events.secret_snapshot();
+    let system_prompt =
+        system_prompt_with_memory(client, session, cli, plan, skills, memory, &step_secrets);
+    let btw_budget = context_budget_for_btw(
+        client,
+        session,
+        cli,
+        plan,
+        skills,
+        memory,
+        &step_secrets,
+        &system_prompt,
+    );
+    let side_prompt = format!(
+        "[Побочный вопрос оператора (/btw) — ответь кратко и по существу только обычным текстом на основе уже имеющегося контекста диалога. Инструменты в этом запросе отключены; не утверждай, что выполнял новые чтения, команды или правки файлов, и не выводи вызовы инструментов.]\n\nВопрос: {clean_question}"
+    );
+    let question_msg = Message::user(side_prompt);
+    let incoming = btw_budget.measure(&question_msg);
+    let history_messages = if session.context_used(&btw_budget).saturating_add(incoming)
+        <= btw_budget.history_limit()
+    {
+        session.messages.clone()
+    } else {
+        let mut ephemeral = session.clone();
+        ephemeral
+            .auto_compact_within(incoming, &btw_budget)
+            .context("Вопрос /btw не помещается в бюджет контекста даже после временного сжатия")?;
+        ephemeral.messages
+    };
+
+    let mut messages = vec![Message::text("system", system_prompt)];
+    messages.extend(history_messages);
+    messages.push(question_msg);
+    let definitions: Vec<crate::protocol::ToolDefinition> = Vec::new();
+
+    let mut guard = StreamGuard::new(&events.secret_snapshot())?;
+    events.busy("Отвечаю на /btw · без инструментов и записи в историю");
+    let mut emit = |chunk: &str| {
+        let clean = guard.push(chunk, false);
+        if !clean.is_empty() {
+            events.emit("text", json!({ "text": clean }));
+        }
+    };
+    let started = std::time::Instant::now();
+    let completion = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "Запрос /btw отменён").into()),
+        result = client.complete(&messages, &definitions, &mut emit) => result,
+    };
+    for secret in client.redaction_secrets() {
+        events.remember(secret);
+    }
+    let mut completion = match completion {
+        Ok(completion) => completion,
+        Err(error) => {
+            display_guard.cancelled = crate::app::exit_code(&error) == 130;
+            let _ = guard.abort();
+            return Err(error);
+        }
+    };
+    if client.is_local() {
+        client.observe_prompt_tokens(
+            crate::context::estimate_request(&messages, &definitions),
+            completion.usage.input_tokens,
+        );
+    }
+    session.last_usage = completion.usage.clone();
+    session.usage.input_tokens += completion.usage.input_tokens;
+    session.usage.output_tokens += completion.usage.output_tokens;
+    session.usage.cached_input_tokens += completion.usage.cached_input_tokens;
+
+    if let Err(error) = events.refresh_keys(store) {
+        let _ = guard.abort();
+        let _ = serde_json::to_value(&completion.usage).map(|v| events.emit("usage", v));
+        return Err(error);
+    }
+    let rest = guard.push("", true);
+    if !rest.is_empty() {
+        events.emit("text", json!({ "text": rest }));
+    }
+    completion.content = events.redact(&completion.content);
+    events.emit("usage", serde_json::to_value(&completion.usage)?);
+
+    if !session.messages.is_empty() || session.dir(store).join("session.json").is_file() {
+        session.save(store)?;
+    }
+
+    if !completion.tool_calls.is_empty() {
+        bail!("Модель вернула вызов инструмента в режиме /btw; действие не исполнялось");
+    }
+    if completion.refusal || completion.content.trim().is_empty() {
+        bail!("Модель вернула пустой или отклонённый ответ на /btw");
+    }
+
+    display_guard.finish(
+        started.elapsed().as_secs_f64(),
+        completion.usage.input_tokens,
+        completion.usage.output_tokens,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn turn(
     session: &mut Session,
     store: &ConfigStore,
@@ -4461,6 +4840,41 @@ async fn turn_inner(
                 );
             }
             if completion.tool_calls.is_empty() {
+                if !executor.denied && !cancel.is_cancelled() && step + 1 < cli.max_steps {
+                    let steered = accept_steering_messages(
+                        crate::screen::current().as_deref(),
+                        client,
+                        session,
+                        store,
+                        cli,
+                        plan,
+                        skills,
+                        &executor.memory,
+                        artifacts,
+                        observations.as_ref(),
+                        events,
+                        &cancel,
+                        step,
+                    )?;
+                    if cancel.is_cancelled() {
+                        if !review_mode.is_enabled() {
+                            events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                            return Ok(130);
+                        }
+                    } else if steered > 0 {
+                        repeated.clear();
+                        file_failures.reset();
+                        outside_failure_steps = 0;
+                        repeated_feedback = 0;
+                        recovery_used = false;
+                        executor.last_error = false;
+                        events.busy("Учитываю уточнение пользователя и продолжаю задачу");
+                        continue;
+                    }
+                } else if cancel.is_cancelled() && !review_mode.is_enabled() {
+                    events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                    return Ok(130);
+                }
                 if executor.last_error && !executor.denied && !plan && !recovery_used && step + 1 < cli.max_steps {
                     recovery_used = true;
                     let mut feedback = Message::user("[rcode runtime feedback, not a new user permission] The runtime recorded a tool error or nonzero exit status. This alone does not establish that the original task is incomplete. Evaluate it against the original user request and observed tool results, not an assistant completion claim or advisory plan status. If the error or nonzero status was expected under the original user request, complete relevant tool results are already available, and all requested work is complete, finish without further tool calls and accurately report the observed outcomes; when finishing without further tool calls, return the complete, self-contained final response to the user's request rather than replacing a prior draft with a brief status note. Do not repeat operations or audit receipt journals merely because this feedback appeared; respect any user restriction on extra tool calls. If the original request is incomplete after compaction, recover it from the TaskState request sources before deciding. Otherwise, if a genuine failure leaves the task incomplete, investigate it and try a reasonable alternative within the existing permissions. A missing executable under one name does not prove the dependency is absent: discover available names/versions with tools. For a creation task, create the actual configuration and source files, not only a directory or instructions. Respect denied approvals, ignored paths and file restrictions. Continue the original task if possible; if a real blocker remains, explain the incomplete result without claiming success.");
@@ -5390,6 +5804,40 @@ async fn turn_inner(
                 if cancel.is_cancelled() {
                     events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
                     return Ok(130);
+                }
+            }
+            if !executor.denied && !cancel.is_cancelled() && step + 1 < cli.max_steps {
+                let steered = accept_steering_messages(
+                    crate::screen::current().as_deref(),
+                    client,
+                    session,
+                    store,
+                    cli,
+                    plan,
+                    skills,
+                    &executor.memory,
+                    artifacts,
+                    observations.as_ref(),
+                    events,
+                    &cancel,
+                    step,
+                )?;
+                if cancel.is_cancelled() {
+                    events.emit("error",json!({"message":"Ход прерван; перед повтором проверьте файлы","exit_code":130}));
+                    return Ok(130);
+                }
+                if steered > 0 {
+                    repeated.clear();
+                    file_failures.reset();
+                    outside_failure_steps = 0;
+                    repeated_feedback = 0;
+                    recovery_used = false;
+                    executor.last_error = false;
+                    repeat_stop = None;
+                    repeated_stop = None;
+                    repeat_warning = None;
+                    repeated_warning = false;
+                    outside_path_failed = false;
                 }
             }
             let mut loop_reason: Option<String> = None;
@@ -10123,6 +10571,280 @@ mod tests {
             assert!(!serialized_session.contains(known_secret));
             assert!(serialized_session.contains("[REDACTED]"));
         }
+    }
+
+    #[test]
+    fn accept_steering_commits_plain_text_preserves_goal_and_stops_at_slash_or_cancel() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+        let settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
+        let mut session = Session::new(&root, settings.clone()).unwrap();
+        session.turn_index = 1;
+        crate::config::ensure_private_directory(&session.dir(&store)).unwrap();
+        let artifacts =
+            crate::artifacts::ArtifactStore::open(&session.dir(&store), &session.id).unwrap();
+        let events = Events::new(false);
+        events.remember("steer-secret-token".into());
+        let initial_goal = "Исходная цель задачи";
+        session.messages.push(Message::user(initial_goal));
+        persist_user_request(
+            &artifacts,
+            &mut session.task_state,
+            initial_goal,
+            session.turn_index,
+            &events,
+        )
+        .unwrap();
+        session.save(&store).unwrap();
+
+        let client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
+        let mut cli = default_cli();
+        cli.interactive = true;
+        let skills = SkillCatalog::empty();
+        let memory = MemorySnapshot::disabled();
+        let observations = crate::final_review::turn_collector(true);
+        let screen = crate::screen::Screen::test_screen();
+        screen.set_draft_for_test("неотправленный черновик");
+        screen.push_queued_for_test("Уточнение 1: обнови миграцию steer-secret-token");
+        screen.push_queued_for_test("Уточнение 2: сохрани обратную совместимость");
+        screen.push_queued_for_test("/status");
+        screen.push_queued_for_test("После слэш-команды");
+
+        let cancel = CancellationToken::new();
+        let count = accept_steering_messages(
+            Some(screen.as_ref()),
+            &client,
+            &mut session,
+            &store,
+            &cli,
+            false,
+            &skills,
+            &memory,
+            &artifacts,
+            observations.as_ref(),
+            &events,
+            &cancel,
+            0,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(
+            session.messages[1].content.as_deref(),
+            Some("Уточнение 1: обнови миграцию [REDACTED]")
+        );
+        assert_eq!(
+            session.messages[2].content.as_deref(),
+            Some("Уточнение 2: сохрани обратную совместимость")
+        );
+        let task_json = serde_json::to_value(&session.task_state).unwrap();
+        assert_eq!(task_json["goal"], initial_goal);
+        assert_eq!(
+            task_json["current_request"],
+            "Уточнение 2: сохрани обратную совместимость"
+        );
+        let obs_snap = observations.as_ref().unwrap().lock().unwrap().snapshot();
+        assert_eq!(obs_snap.clarifications.len(), 2);
+        assert_eq!(screen.peek_steer_next(), None);
+        assert_eq!(
+            screen.take_queue(),
+            vec![
+                "/status".to_owned(),
+                "После слэш-команды".to_owned(),
+                "неотправленный черновик".to_owned(),
+            ]
+        );
+        assert!(screen.take_queue().is_empty());
+
+        // Pre-cancelled token leaves queued steering untouched in Screen and Session.
+        screen.push_queued_for_test("Не должно уйти при отмене");
+        cancel.cancel();
+        let cancelled_count = accept_steering_messages(
+            Some(screen.as_ref()),
+            &client,
+            &mut session,
+            &store,
+            &cli,
+            false,
+            &skills,
+            &memory,
+            &artifacts,
+            observations.as_ref(),
+            &events,
+            &cancel,
+            1,
+        )
+        .unwrap();
+        assert_eq!(cancelled_count, 0);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(
+            screen.take_queue(),
+            vec!["Не должно уйти при отмене".to_owned()]
+        );
+
+        // External CAS conflict on session.json with identical message count must NOT pop steering.
+        let mut foreign = Session::load(&store, &session.id, &root).unwrap();
+        foreign
+            .messages
+            .push(Message::user("Внешняя запись с той же длиной 4"));
+        foreign.save(&store).unwrap();
+        screen.push_queued_for_test("Уточнение при конфликте CAS");
+        let conflict_cancel = CancellationToken::new();
+        let save_conflict = accept_steering_messages(
+            Some(screen.as_ref()),
+            &client,
+            &mut session,
+            &store,
+            &cli,
+            false,
+            &skills,
+            &memory,
+            &artifacts,
+            observations.as_ref(),
+            &events,
+            &conflict_cancel,
+            1,
+        );
+        assert!(save_conflict.is_err());
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(
+            screen.take_queue(),
+            vec!["Уточнение при конфликте CAS".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn btw_question_is_ephemeral_omits_tools_tracks_usage_and_rejects_tool_calls() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ConfigStore::at(base.path().join("state")).unwrap();
+
+        let replies = vec![
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Краткий ответ по контексту"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 41, "completion_tokens": 9}
+            }),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "Ответ поверх сохранённой сессии"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 6}
+            }),
+            json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "bad_btw_call",
+                        "type": "function",
+                        "function": {"name": "run_command", "arguments": "{\"command\":\"touch pwned\"}"}
+                    }]
+                }, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4}
+            }),
+        ];
+        let (url, server) = one_shot_http_server(replies).await;
+        let mut settings = crate::config::ProviderSettings::new(ProviderKind::Custom);
+        settings.base_url = Some(url);
+        let mut session = Session::new(&root, settings.clone()).unwrap();
+        let mut client = ProviderClient::new(settings, "fixture-key".into()).unwrap();
+        let events = Events::new(false);
+        let secret = "super-secret-btw-key";
+        events.remember(secret.into());
+        let mut cli = default_cli();
+        cli.interactive = true;
+        let skills = SkillCatalog::empty();
+        let memory = MemorySnapshot::disabled();
+
+        // 1) Brand-new unsaved session: does not create session.json or touch messages/turn_index.
+        btw_question(
+            &mut session,
+            &store,
+            &mut client,
+            &events,
+            &cli,
+            false,
+            &skills,
+            &memory,
+            &format!("Почему выбран этот подход ({secret})?"),
+        )
+        .await
+        .unwrap();
+        assert!(session.messages.is_empty());
+        assert_eq!(session.turn_index, 0);
+        assert!(session.task_state.goal().is_empty());
+        assert!(!session.dir(&store).join("session.json").exists());
+        assert_eq!(session.usage.input_tokens, 41);
+        assert_eq!(session.usage.output_tokens, 9);
+
+        // 2) Persisted session: updates usage on disk while keeping messages and turn_index intact.
+        session.messages.push(Message::user("Реальная история"));
+        session.turn_index = 1;
+        session.save(&store).unwrap();
+        btw_question(
+            &mut session,
+            &store,
+            &mut client,
+            &events,
+            &cli,
+            false,
+            &skills,
+            &memory,
+            "А что с таймаутами?",
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0].content.as_deref(),
+            Some("Реальная история")
+        );
+        assert_eq!(session.turn_index, 1);
+        assert_eq!(session.usage.input_tokens, 61);
+        assert_eq!(session.usage.output_tokens, 15);
+        let loaded = Session::load(&store, &session.id, &root).unwrap();
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.turn_index, 1);
+        assert_eq!(loaded.usage.input_tokens, 61);
+        assert_eq!(loaded.usage.output_tokens, 15);
+
+        // 3) Unexpected tool_calls rejected without execution, while still accounting usage.
+        let err = btw_question(
+            &mut session,
+            &store,
+            &mut client,
+            &events,
+            &cli,
+            false,
+            &skills,
+            &memory,
+            "Попробуй вызвать инструмент",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("/btw"), "{err:#}");
+        assert!(!root.join("pwned").exists());
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.usage.input_tokens, 73);
+        assert_eq!(session.usage.output_tokens, 19);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for req in &requests {
+            assert!(
+                req.get("tools").is_none(),
+                "btw request must never advertise tools: {req}"
+            );
+        }
+        let first_user = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(!first_user.contains(secret));
+        assert!(first_user.contains("[REDACTED]"));
+        let second_msgs = requests[1]["messages"].as_array().unwrap();
+        assert_eq!(second_msgs.len(), 3, "{second_msgs:#?}");
+        assert_eq!(second_msgs[1]["content"], "Реальная история");
     }
 }
 

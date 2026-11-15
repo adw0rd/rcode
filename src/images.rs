@@ -229,6 +229,28 @@ pub(crate) fn tokens(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     result
 }
 
+/// Pure syntactic check (zero filesystem I/O, safe under UI mutexes) detecting
+/// whether operator input may attach an image and therefore must go through
+/// inter-turn `user_message` + `vision` rather than mid-turn text steering.
+pub(crate) fn may_contain_image_attachment(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed
+        .strip_prefix("/attach")
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+    {
+        return true;
+    }
+    if image_path(trimmed) {
+        return true;
+    }
+    tokens(trimmed)
+        .into_iter()
+        .any(|(_, token)| image_path(&token))
+}
+
 /// Вызывается только на пользовательском вводе, никогда на ответе модели или tool output.
 pub fn user_message(input: &str, root: &Path) -> Result<Message> {
     let explicit = input

@@ -130,6 +130,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Переключить режим планирования",
     },
     CommandSpec {
+        name: "/btw",
+        description: "Быстрый вопрос по контексту без записи в историю",
+    },
+    CommandSpec {
         name: "/diff",
         description: "Показать изменения файлов",
     },

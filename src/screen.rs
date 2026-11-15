@@ -196,6 +196,26 @@ pub fn panel_height(height: u16) -> u16 {
         .max(1)
 }
 
+pub(crate) fn is_steerable_user_text(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('!') {
+        return false;
+    }
+    if trimmed.starts_with('/') {
+        let first_word = trimmed.split_whitespace().next().unwrap_or_default();
+        if first_word == "/attach" || !first_word[1..].contains(['/', '\\', '.']) {
+            return false;
+        }
+    }
+    if crate::images::may_contain_image_attachment(trimmed) {
+        return false;
+    }
+    true
+}
+
 impl Screen {
     fn new(footer: Footer) -> Arc<Self> {
         let (tx, rx) = mpsc::channel();
@@ -427,6 +447,38 @@ impl Screen {
             out.borrow_mut().extend(queued);
         });
         out.into_inner()
+    }
+    /// Возвращает копию первой готовой реплики из `queued` для mid-turn steering,
+    /// не трогая `draft` и не удаляя реплику до успешного сохранения в сессии.
+    /// Останавливается на активной панели, slash-командах, `!shell` и вложениях.
+    pub fn peek_steer_next(&self) -> Option<String> {
+        let out = std::cell::RefCell::new(None);
+        self.change(|s| {
+            if s.panel.is_some() {
+                return;
+            }
+            while s.queued.first().is_some_and(|item| item.trim().is_empty()) {
+                s.queued.remove(0);
+            }
+            if let Some(first) = s.queued.first()
+                && is_steerable_user_text(first)
+            {
+                *out.borrow_mut() = Some(first.clone());
+            }
+        });
+        out.into_inner()
+    }
+    /// Удаляет голову `queued` после успешного сохранения steering-реплики,
+    /// только если голова совпадает с зафиксированной строкой.
+    pub fn pop_steer_front(&self, expected: &str) -> bool {
+        let popped = std::cell::Cell::new(false);
+        self.change(|s| {
+            if s.queued.first().is_some_and(|head| head == expected) {
+                s.queued.remove(0);
+                popped.set(true);
+            }
+        });
+        popped.get()
     }
     pub fn bind_cancel(&self, token: CancellationToken) {
         self.change(|s| s.cancel = token);
@@ -718,6 +770,14 @@ impl Screen {
             output_tokens: 0,
             workspace: "project".into(),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn push_queued_for_test(&self, text: impl Into<String>) {
+        self.change(|s| s.queued.push(text.into()));
+    }
+    #[cfg(test)]
+    pub(crate) fn set_draft_for_test(&self, text: impl Into<String>) {
+        self.change(|s| s.draft = text.into());
     }
     #[cfg(test)]
     pub(crate) fn history_text(&self) -> String {
@@ -3027,5 +3087,53 @@ mod tests {
             "cursor=({cursor_row}, {cursor_col})"
         );
         assert!(custom_frame.rows[9].0.contains("Контекст"));
+    }
+
+    #[test]
+    fn steer_queue_preserves_draft_fifo_commands_and_image_attachments() {
+        assert!(is_steerable_user_text("уточни обработку ошибок"));
+        assert!(is_steerable_user_text(
+            "/Users/colinfrl/work/rcode/src/lib.rs проверь этот файл"
+        ));
+        assert!(!is_steerable_user_text("   \n\t "));
+        assert!(!is_steerable_user_text("!cargo test"));
+        assert!(!is_steerable_user_text("/compact"));
+        assert!(!is_steerable_user_text("/btw почему так?"));
+        assert!(!is_steerable_user_text("/rstack:review"));
+        assert!(!is_steerable_user_text("/attach screen.png"));
+        assert!(!is_steerable_user_text("./screen.png"));
+        assert!(!is_steerable_user_text(
+            "посмотри /Users/me/Desktop/shot.png пожалуйста"
+        ));
+
+        let screen = Screen::test_screen();
+        screen.set_draft_for_test("недопечатанный черновик");
+        screen.push_queued_for_test("   ");
+        screen.push_queued_for_test("первое уточнение");
+        screen.push_queued_for_test("/compact");
+        screen.push_queued_for_test("после команды");
+
+        // Leading whitespace is dropped; peek does not remove the item until pop_steer_front.
+        assert_eq!(
+            screen.peek_steer_next(),
+            Some("первое уточнение".to_owned())
+        );
+        assert_eq!(
+            screen.peek_steer_next(),
+            Some("первое уточнение".to_owned())
+        );
+        assert!(!screen.pop_steer_front("чужой текст"));
+        assert!(screen.pop_steer_front("первое уточнение"));
+
+        // Stops at /compact so FIFO order with "после команды" and unfinished draft is preserved!
+        assert_eq!(screen.peek_steer_next(), None);
+        assert_eq!(
+            screen.take_queue(),
+            vec![
+                "/compact".to_owned(),
+                "после команды".to_owned(),
+                "недопечатанный черновик".to_owned(),
+            ]
+        );
     }
 }

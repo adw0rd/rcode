@@ -104,6 +104,29 @@ struct Prepared {
     binding: PathBinding,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ApprovedWrite {
+    before_sha256: Option<String>,
+    after_sha256: String,
+    #[cfg(unix)]
+    before_identity: Option<FileIdentity>,
+    #[cfg(unix)]
+    binding: PathBinding,
+}
+
+impl Prepared {
+    fn approval_stamp(&self) -> ApprovedWrite {
+        ApprovedWrite {
+            before_sha256: self.before.as_ref().map(|s| sha256(&s.bytes)),
+            after_sha256: sha256(&self.after),
+            #[cfg(unix)]
+            before_identity: self.before.as_ref().map(|s| s.identity),
+            #[cfg(unix)]
+            binding: self.binding.clone(),
+        }
+    }
+}
+
 struct UndoPrepared<'a> {
     change: &'a Change,
     parent: Dir,
@@ -442,6 +465,44 @@ impl Tools {
         self.preview_for(name, args, None)
     }
 
+    fn format_write_preview(
+        &self,
+        name: &str,
+        args: &Value,
+        actor: Option<&str>,
+    ) -> Result<(String, ApprovedWrite)> {
+        let prepared = self.prepare(name, args, actor)?;
+        let stamp = prepared.approval_stamp();
+        let before = prepared
+            .before
+            .as_ref()
+            .map(|s| std::str::from_utf8(&s.bytes))
+            .transpose()?
+            .unwrap_or("");
+        let after = std::str::from_utf8(&prepared.after)?;
+        let diff = unified_diff(
+            &display_path(prepared.root.as_deref(), &prepared.path),
+            before,
+            after,
+        );
+        Ok((diff, stamp))
+    }
+
+    pub(crate) fn preview_write_for(
+        &self,
+        name: &str,
+        args: &Value,
+        actor: Option<&str>,
+    ) -> Result<(String, ApprovedWrite)> {
+        ensure!(
+            matches!(name, "write_file" | "edit_file"),
+            "Неизвестная файловая операция: {name}"
+        );
+        validate_args(name, args)?;
+        let args = self.workspace_args(name, args)?;
+        self.format_write_preview(name, args.as_ref(), actor)
+    }
+
     pub(crate) fn preview_for(
         &self,
         name: &str,
@@ -453,19 +514,8 @@ impl Tools {
         let args = args.as_ref();
         match name {
             "write_file" | "edit_file" => {
-                let prepared = self.prepare(name, args, actor)?;
-                let before = prepared
-                    .before
-                    .as_ref()
-                    .map(|s| std::str::from_utf8(&s.bytes))
-                    .transpose()?
-                    .unwrap_or("");
-                let after = std::str::from_utf8(&prepared.after)?;
-                Ok(Some(unified_diff(
-                    &display_path(prepared.root.as_deref(), &prepared.path),
-                    before,
-                    after,
-                )))
+                let (diff, _) = self.format_write_preview(name, args, actor)?;
+                Ok(Some(diff))
             }
             "run_command" => {
                 command_args(args)?;
@@ -548,6 +598,18 @@ impl Tools {
         cancel: &CancellationToken,
         actor: Option<&str>,
     ) -> Result<ToolOutcome> {
+        self.execute_for_approved(name, args, cancel, actor, None)
+            .await
+    }
+
+    pub(crate) async fn execute_for_approved(
+        &mut self,
+        name: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+        actor: Option<&str>,
+        approved: Option<&ApprovedWrite>,
+    ) -> Result<ToolOutcome> {
         let result = async {
             validate_args(name, args)?;
             check_cancel(cancel)?;
@@ -557,7 +619,7 @@ impl Tools {
                 "read_file" => self.read_file(args, cancel, actor),
                 "list_files" => self.list_files(args, cancel).await,
                 "search" => self.search(args, cancel).await,
-                "write_file" | "edit_file" => self.write(name, args, cancel, actor),
+                "write_file" | "edit_file" => self.write(name, args, cancel, actor, approved),
                 "run_command" => self.run_command(args, cancel).await,
                 _ => bail!("Неизвестный инструмент: {name}"),
             }
@@ -1148,42 +1210,8 @@ impl Tools {
                 let text = std::str::from_utf8(&file.bytes)?;
                 let old = string_arg(args, "old_text")?;
                 let new = string_arg(args, "new_text")?;
-                ensure!(!old.is_empty(), "old_text не должен быть пустым");
-                ensure!(
-                    old.len() <= MAX_FILE_BYTES && new.len() <= MAX_FILE_BYTES,
-                    "Слишком большой текст замены"
-                );
                 let all = bool_arg(args, "replace_all", false)?;
-                let count = text
-                    .match_indices(old)
-                    .take(if all { usize::MAX } else { 2 })
-                    .count();
-                ensure!(count > 0, "old_text не найден; перечитайте файл");
-                let overlapping = if !all {
-                    let first = text.find(old).unwrap();
-                    let next = first + text[first..].chars().next().unwrap().len_utf8();
-                    text[next..].contains(old)
-                } else {
-                    false
-                };
-                ensure!(
-                    !overlapping && (count == 1 || all),
-                    "old_text неоднозначен; уточните контекст или явно укажите replace_all=true"
-                );
-                let length = text
-                    .len()
-                    .checked_sub(count * old.len())
-                    .and_then(|n| {
-                        count
-                            .checked_mul(new.len())
-                            .and_then(|added| n.checked_add(added))
-                    })
-                    .context("Слишком большая замена")?;
-                ensure!(
-                    length <= MAX_FILE_BYTES,
-                    "Результат превышает лимит файла 1 MiB"
-                );
-                text.replace(old, new).into_bytes()
+                crate::text_edit::apply_edit_text(text, old, new, all, MAX_FILE_BYTES)?
             }
             _ => bail!("Неизвестная файловая операция"),
         };
@@ -1273,8 +1301,15 @@ impl Tools {
         args: &Value,
         cancel: &CancellationToken,
         actor: Option<&str>,
+        approved: Option<&ApprovedWrite>,
     ) -> Result<ToolOutcome> {
         let prepared = self.prepare(name, args, actor)?;
+        if let Some(expected) = approved {
+            ensure!(
+                prepared.approval_stamp() == *expected,
+                "Файл изменился после подготовки diff; перечитайте файл через read_file и повторите правку"
+            );
+        }
         check_cancel(cancel)?;
         let current_hash = prepared.before.as_ref().map(|s| sha256(&s.bytes));
         let absolute = prepared
@@ -3941,6 +3976,155 @@ mod tests {
             assert!(
                 hardlinked.is_none(),
                 "post-rename hardlink must withhold proof"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_two_stage_fallback_preserves_crlf_and_observation_chain() {
+        let mut f = Fixture::new();
+        fs::write(
+            f.root.join("service.rs"),
+            b"fn a() {\r\n    let x = 1;   \r\n}\r\n",
+        )
+        .unwrap();
+        assert!(
+            !f.call("read_file", json!({"path": "service.rs"}))
+                .await
+                .is_error
+        );
+
+        let first = f
+            .call(
+                "edit_file",
+                json!({
+                    "path": "service.rs",
+                    "old_text": "fn a() {\n    let x = 1;\n}",
+                    "new_text": "fn a() {\n    let x = 2;\n    let y = 3;\n}",
+                }),
+            )
+            .await;
+        assert!(!first.is_error, "{}", first.content);
+        assert_eq!(
+            fs::read(f.root.join("service.rs")).unwrap(),
+            b"fn a() {\r\n    let x = 2;\r\n    let y = 3;\r\n}\r\n"
+        );
+
+        let second = f
+            .call(
+                "edit_file",
+                json!({
+                    "path": "service.rs",
+                    "old_text": "    let y = 3;\n",
+                    "new_text": "    let y = 42;\n",
+                }),
+            )
+            .await;
+        assert!(!second.is_error, "{}", second.content);
+        assert_eq!(
+            fs::read(f.root.join("service.rs")).unwrap(),
+            b"fn a() {\r\n    let x = 2;\r\n    let y = 42;\r\n}\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_write_rejects_concurrent_modification_between_preview_and_execute() {
+        let mut f = Fixture::new();
+        let cancel = CancellationToken::new();
+
+        f.file("service.toml", "port = 8080\n");
+        let args_edit = json!({
+            "path": "service.toml",
+            "old_text": "port = 8080",
+            "new_text": "port = 9090",
+        });
+        let (preview, approved_edit) = f
+            .tools
+            .preview_write_for("edit_file", &args_edit, None)
+            .unwrap();
+        assert!(preview.contains("+++ b/service.toml"), "{preview}");
+        fs::write(
+            f.root.join("service.toml"),
+            "# operator comment\nport = 8080\n",
+        )
+        .unwrap();
+
+        let rejected_diff = f
+            .tools
+            .execute_for_approved("edit_file", &args_edit, &cancel, None, Some(&approved_edit))
+            .await
+            .unwrap();
+        assert!(rejected_diff.is_error, "{}", rejected_diff.content);
+        assert!(
+            rejected_diff
+                .content
+                .contains("Файл изменился после подготовки diff"),
+            "{}",
+            rejected_diff.content
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("service.toml")).unwrap(),
+            "# operator comment\nport = 8080\n"
+        );
+        assert!(f.tools.undo().unwrap().contains("Нет файловых правок"));
+
+        let args_new = json!({"path": "created.toml", "content": "agent = true\n"});
+        let (_, approved_new) = f
+            .tools
+            .preview_write_for("write_file", &args_new, None)
+            .unwrap();
+        assert!(approved_new.before_sha256.is_none());
+        fs::write(f.root.join("created.toml"), "operator = true\n").unwrap();
+
+        let rejected_new = f
+            .tools
+            .execute_for_approved("write_file", &args_new, &cancel, None, Some(&approved_new))
+            .await
+            .unwrap();
+        assert!(rejected_new.is_error, "{}", rejected_new.content);
+        assert_eq!(
+            fs::read_to_string(f.root.join("created.toml")).unwrap(),
+            "operator = true\n"
+        );
+
+        #[cfg(unix)]
+        {
+            f.file("config.toml", "port = 8080\n");
+            let args_inode = json!({
+                "path": "config.toml",
+                "old_text": "port = 8080",
+                "new_text": "port = 9090",
+            });
+            let (_, approved_inode) = f
+                .tools
+                .preview_write_for("edit_file", &args_inode, None)
+                .unwrap();
+            let replacement = f.root.join("config.toml.tmp");
+            fs::write(&replacement, "port = 8080\n").unwrap();
+            fs::rename(&replacement, f.root.join("config.toml")).unwrap();
+
+            let rejected_inode = f
+                .tools
+                .execute_for_approved(
+                    "edit_file",
+                    &args_inode,
+                    &cancel,
+                    None,
+                    Some(&approved_inode),
+                )
+                .await
+                .unwrap();
+            assert!(rejected_inode.is_error, "{}", rejected_inode.content);
+            assert!(
+                rejected_inode
+                    .content
+                    .contains("Файл изменился после подготовки diff"),
+                "{}",
+                rejected_inode.content
+            );
+            assert_eq!(
+                fs::read_to_string(f.root.join("config.toml")).unwrap(),
+                "port = 8080\n"
             );
         }
     }
