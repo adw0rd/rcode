@@ -210,10 +210,7 @@ pub(crate) fn is_steerable_user_text(raw: &str) -> bool {
             return false;
         }
     }
-    if crate::images::may_contain_image_attachment(trimmed) {
-        return false;
-    }
-    true
+    !crate::images::may_contain_image_attachment(trimmed)
 }
 
 impl Screen {
