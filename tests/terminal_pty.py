@@ -259,6 +259,8 @@ class Fixture(LoopbackHTTPServer):
         self.release_busy = threading.Event()
         self.detail_started = threading.Event()
         self.release_detail = threading.Event()
+        self.steer_started = threading.Event()
+        self.release_steer = threading.Event()
         super().__init__(("127.0.0.1", 0), Handler)
 
     def recorded(self):
@@ -337,6 +339,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if body["messages"][index]["role"] == "user"
                             and not body["messages"][index]["content"].startswith("[rcode runtime feedback")), None)
         loop_prompt = body["messages"][actual_user]["content"] if actual_user is not None else None
+        if "Почему выбран Rust для CLI?" in prompt:
+            assert not body.get("tools"), f"/btw request must never advertise tools: {body}"
+            self.reply({
+                "choices": [{"message": {"role": "assistant", "content": "BTW_EPHEMERAL_ANSWER"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 17, "completion_tokens": 6},
+            })
+            return
+        if any(m.get("role") == "user" and m.get("content") == "STEER_MULTI_STEP" for m in body["messages"]):
+            serialized = json.dumps(body["messages"], ensure_ascii=False)
+            assert "BTW_EPHEMERAL_ANSWER" not in serialized, f"/btw leaked into turn history: {serialized}"
+            assert "Почему выбран Rust для CLI?" not in serialized, f"/btw question leaked into turn history: {serialized}"
+            assert "/status" not in serialized, f"slash command leaked into model steering: {serialized}"
+            if prompt == "STEER_MULTI_STEP":
+                self.server.steer_started.set()
+                self.server.release_steer.wait(timeout=6)
+                self.reply({
+                    "choices": [{"message": {"role": "assistant", "content": None,
+                                "tool_calls": [{"id": "call_steer_list", "type": "function", "function": {
+                                    "name": "list_files",
+                                    "arguments": json.dumps({"path": "."})}}]},
+                                "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 19, "completion_tokens": 5},
+                })
+            else:
+                assert prompt == "STEER_REFINEMENT_TEXT", f"expected mid-turn steering prompt, got: {prompt!r}"
+                assert body["messages"][-2]["role"] == "tool", body["messages"][-3:]
+                self.reply({
+                    "choices": [{"message": {"role": "assistant", "content": "STEER_TURN_FINAL_DONE"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 24, "completion_tokens": 7},
+                })
+            return
         if loop_prompt in ("LOOP_ABORT", "LOOP_CONTINUE"):
             turn = body["messages"][actual_user + 1:]
             final_step = any(message["role"] == "assistant"
@@ -1414,6 +1449,39 @@ def main(binary):
             terminal.command("/sandbox off", "✓ OS-песочница: выключена")
             terminal.assert_footer("openrouter", "auto-edit")
 
+            phase("ephemeral /btw and mid-turn steering")
+            terminal.command("/btw", "Использование: /btw <вопрос>")
+            mark = terminal.mark()
+            terminal.send("/btw Почему выбран Rust для CLI?\r")
+            terminal.editor_after("BTW_EPHEMERAL_ANSWER", mark)
+            terminal.expect("◇ btw › Почему выбран Rust для CLI?", mark)
+            terminal.expect("вне истории сессии", mark)
+            terminal.assert_footer("openrouter", "auto-edit")
+
+            before_steer_session = load_json(session_path)
+            before_turn_index = before_steer_session["turn_index"]
+            mark = terminal.mark()
+            terminal.send("STEER_MULTI_STEP\r")
+            terminal.until(fixture.steer_started.is_set, "steer step 1 started")
+            terminal.until(terminal.busy_ready, "busy panel during steer step 1")
+            terminal.send("STEER_REFINEMENT_TEXT\r")
+            terminal.until(lambda: "в очереди: 1" in terminal.text(mark), "queued steering item")
+            terminal.send("/status\r")
+            terminal.until(lambda: "в очереди: 2" in terminal.text(mark), "queued slash item after steering")
+            fixture.release_steer.set()
+            terminal.editor_after("STEER_TURN_FINAL_DONE", mark)
+            terminal.expect("❯ STEER_REFINEMENT_TEXT", mark)
+            terminal.until(
+                lambda: "Режим        auto-edit" in terminal.text(mark) and terminal.editor_ready(),
+                "trailing /status executed automatically after steered turn",
+            )
+            after_steer_session = load_json(session_path)
+            assert after_steer_session["turn_index"] == before_turn_index + 1, (
+                f"mid-turn steering must stay in a single turn: {before_turn_index} -> {after_steer_session['turn_index']}"
+            )
+            assert after_steer_session["task_state"]["goal"] == before_steer_session["task_state"]["goal"], after_steer_session["task_state"]
+            assert after_steer_session["task_state"]["current_request"] == "STEER_REFINEMENT_TEXT", after_steer_session["task_state"]
+
             mark = terminal.mark()
             terminal.send(b"\x04")
             terminal.until(lambda: terminal.status is not None, "Ctrl+D exit")
@@ -1613,6 +1681,7 @@ def main(binary):
         fixture.release_agent.set()
         fixture.release_balance.set()
         fixture.release_detail.set()
+        fixture.release_steer.set()
         if terminal is not None:
             capture_path = os.environ.get("RCODE_PTY_DUMP_GRID")
             if capture_path:

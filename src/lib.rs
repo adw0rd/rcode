@@ -24,6 +24,7 @@ pub(crate) mod skill_tool;
 pub(crate) mod skills;
 pub(crate) mod skills_cli;
 pub mod state;
+pub(crate) mod text_edit;
 mod think;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod tools;

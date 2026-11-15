@@ -1125,7 +1125,7 @@ fn help(registry: &crate::commands::CommandRegistry) {
         notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
     }
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -1788,6 +1788,7 @@ pub(crate) async fn run(
                 | "/status"
                 | "/memory"
                 | "/sandbox"
+                | "/btw"
                 | "/exit"
                 | "/quit"
         ) && let Err(error) = execution.activate()
@@ -1913,6 +1914,14 @@ pub(crate) async fn run(
                 },
                 "/sandbox"=>sandbox_command(&args,rich,store,session,&mut runtime,events),
                 "/plan"=>{plan=match args.first().copied(){Some("on")=>true,Some("off")=>false,None=>!plan,_=>bail!("/plan [on|off]")};notice!("✓ Режим плана: {}",if plan{"включён"}else{"выключен"});Ok(())},
+                "/btw"=>{
+                    let rest=input.strip_prefix(command).unwrap_or_default();
+                    match crate::app::btw_question(session,store,client,events,&runtime,plan,&skills,&memory,rest).await {
+                        Ok(())=>Ok(()),
+                        Err(err) if crate::app::exit_code(&err)==130=>{notice!("Запрос /btw отменён.");Ok(())},
+                        Err(err)=>Err(err),
+                    }
+                },
                 "/status"=>{let rendered=skill_catalog(session,&skills);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&events.secret_snapshot()));status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
                 "/memory"=>memory_command(&args,&runtime,plan,store,session,client,events),
                 "/balance"=>{

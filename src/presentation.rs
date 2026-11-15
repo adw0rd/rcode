@@ -697,6 +697,36 @@ impl Human {
                     )
                 );
             }
+            "user_steer" => {
+                line!(
+                    "\n{} {}",
+                    tone("❯", "1;38;5;110", rich),
+                    ui::safe(data["text"].as_str().unwrap_or_default())
+                );
+            }
+            "btw_start" => {
+                line!(
+                    "\n{} {}",
+                    tone("◇ btw ›", "1;38;5;110", rich),
+                    ui::safe(data["question"].as_str().unwrap_or_default())
+                );
+            }
+            "btw_done" => {
+                let elapsed = data["elapsed_secs"].as_f64().unwrap_or_default();
+                let inp = number(data["input_tokens"].as_u64().unwrap_or_default());
+                let out = number(data["output_tokens"].as_u64().unwrap_or_default());
+                line!(
+                    "\n{}",
+                    tone(
+                        &format!(
+                            "── btw · {elapsed:.1}s · ↑{inp} ↓{out} токенов · вне истории сессии"
+                        ),
+                        "2",
+                        rich
+                    )
+                );
+            }
+            "btw_aborted" => {}
             _ => {}
         }
     }
