@@ -1646,6 +1646,7 @@ pub(crate) async fn run(
                 &initial_memory,
                 &events.secret_snapshot(),
             ),
+            events,
         )?)
     } else {
         None
@@ -1971,7 +1972,7 @@ pub(crate) async fn run(
                 "/cost"=>{cost(session);Ok(())},
                 "/diff"=>{notice!("{}",ui::safe(&tools.diff()?));Ok(())},
                 "/undo"=>{let text=tools.undo()?;notice!("{}",ui::safe(&text));let mut message=Message::user(format!("Пользователь выполнил /undo: {text}. Перечитай файлы перед изменениями."));message.provider_meta=Some(ProviderMeta{kind:"rcode_runtime".into(),data:json!({"undo":true})});session.messages.push(message);session.save(store)},
-                "/compact"=>{let saved=session.compact_within(&budget)?;session.save(store)?;notice!("✓ История сокращена на {saved} {}",budget.unit_label());Ok(())},
+                "/compact"=>{events.refresh_keys(store)?;let saved=session.compact_within_redacted(&budget,&events.secret_snapshot())?;session.save(store)?;notice!("✓ История сокращена на {saved} {}",budget.unit_label());Ok(())},
                 "/clear"|"/new"=>{
                     let mut next=Session::new(&session.root,session.provider.clone())?;
                     crate::config::ensure_private_directory(&next.dir(store))?;
@@ -2001,7 +2002,7 @@ pub(crate) async fn run(
                         let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
                         execution.reconcile_receipts(&mut restored)?;
                         restored.save(store)?;
-                        *session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        *session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()),events)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }else if let Some(id)=id{
                         // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
                         let mut restored=Session::load(store,&id,&session.root)?;
@@ -2011,7 +2012,7 @@ pub(crate) async fn run(
                         next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                         next_execution.reconcile_receipts(&mut restored)?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()))?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()),events)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _ if custom.is_some() => {

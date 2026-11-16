@@ -282,6 +282,8 @@ pub fn is_restricted_receipt(content: &str) -> bool {
         value["error"] == "denied"
             || value["error"] == "interrupted"
             || value["outcome"] == "unknown"
+            || value["status"] == "unknown"
+            || value["reason"] == "cleanup_unknown"
     })
 }
 
@@ -1382,5 +1384,21 @@ mod tests {
         assert!(value.get("next_line").is_none(), "{tiny}");
         assert_eq!(value["is_error"], true);
         assert_eq!(value["error"], "budget_exhausted");
+    }
+
+    #[test]
+    fn restricted_receipt_detects_unknown_status_and_cleanup_unknown_reason() {
+        assert!(is_restricted_receipt(r#"{"error":"denied"}"#));
+        assert!(is_restricted_receipt(r#"{"error":"interrupted"}"#));
+        assert!(is_restricted_receipt(r#"{"outcome":"unknown"}"#));
+        assert!(is_restricted_receipt(
+            r#"{"status":"unknown","command_id":"c1"}"#
+        ));
+        assert!(is_restricted_receipt(
+            r#"{"exit_code":0,"reason":"cleanup_unknown"}"#
+        ));
+        assert!(!is_restricted_receipt(
+            r#"{"exit_code":0,"stdout":"ok","status":"completed"}"#
+        ));
     }
 }
