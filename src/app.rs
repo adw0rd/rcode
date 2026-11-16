@@ -558,15 +558,20 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
         }
     }
     if cli.compact {
-        session.compact_within(&context_budget_with_memory(
-            &client,
-            &session,
-            cli,
-            cli.plan,
-            &skills,
-            &memory,
-            &events.secret_snapshot(),
-        ))?;
+        events.refresh_keys(&store)?;
+        let compact_secrets = events.secret_snapshot();
+        session.compact_within_redacted(
+            &context_budget_with_memory(
+                &client,
+                &session,
+                cli,
+                cli.plan,
+                &skills,
+                &memory,
+                &compact_secrets,
+            ),
+            &compact_secrets,
+        )?;
         session.save(&store)?;
     }
     let result = if let Some(Command::Exec { prompt }) = &cli.command {
@@ -1872,7 +1877,7 @@ async fn graceful_finish(
         }
     }
     session.save(store)?;
-    if !prepare_context(session, store, 0, &budget)?.report(events) {
+    if !prepare_context(session, store, 0, &budget, events)?.report(events) {
         return Ok(exit_code);
     }
     let mut messages = vec![Message::text(
@@ -2131,6 +2136,7 @@ impl ToolExecutor<'_> {
             // Close other pending calls only in this feasibility snapshot. No
             // synthetic receipt is persisted or used to authorize execution.
             candidate.repair_pending()?;
+            let plan_secrets = self.events.secret_snapshot();
             let budget = context_budget_with_memory(
                 client,
                 &candidate,
@@ -2138,10 +2144,10 @@ impl ToolExecutor<'_> {
                 self.plan,
                 self.skills,
                 &self.memory,
-                &self.events.secret_snapshot(),
+                &plan_secrets,
             );
             candidate
-                .auto_compact_within(0, &budget)
+                .auto_compact_within_redacted(0, &budget, &plan_secrets)
                 .context("План не помещается в бюджет модели; сократите его")?;
             session.task_state = candidate.task_state;
             if let Some(store) = self.store {
@@ -3824,7 +3830,7 @@ pub(crate) async fn user_shell(
             events.emit("shell_result",json!({"content":outcome.content,"is_error":outcome.is_error,"elapsed_secs":since.elapsed().as_secs_f64()}));
             // Manual commands consume no API tokens but their receipts share
             // the local context budget with the next model request.
-            prepare_context(session, store, 0, budget)?.report(events);
+            prepare_context(session, store, 0, budget, events)?.report(events);
         }
         Err(error) => {
             session.repair_pending()?;
@@ -3936,9 +3942,12 @@ pub(crate) fn prepare_context(
     store: &ConfigStore,
     incoming: usize,
     budget: &ContextBudget,
+    events: &Events,
 ) -> Result<ContextPreparation> {
+    events.refresh_keys(store)?;
+    let secrets = events.secret_snapshot();
     let before = session.context_used(budget);
-    let saved = match session.auto_compact_within(incoming, budget) {
+    let saved = match session.auto_compact_within_redacted(incoming, budget, &secrets) {
         Ok(saved) => saved,
         Err(error) => return Ok(ContextPreparation::Blocked(error.to_string())),
     };
@@ -4051,6 +4060,7 @@ fn accept_steering_messages(
         let mut candidate = session.clone();
         candidate.task_state = next_task;
         candidate.messages.push(Message::user(clean_text.clone()));
+        let steer_secrets = events.secret_snapshot();
         let candidate_budget = context_budget_with_memory(
             client,
             &candidate,
@@ -4058,10 +4068,14 @@ fn accept_steering_messages(
             plan,
             skills,
             memory,
-            &events.secret_snapshot(),
+            &steer_secrets,
         );
         let before = candidate.context_used(&candidate_budget);
-        let saved = match candidate.auto_compact_within(0, &candidate_budget) {
+        let saved = match candidate.auto_compact_within_redacted(
+            0,
+            &candidate_budget,
+            &steer_secrets,
+        ) {
             Ok(saved) => saved,
             Err(_) => {
                 events.emit(
@@ -4276,7 +4290,7 @@ pub(crate) async fn btw_question(
     } else {
         let mut ephemeral = session.clone();
         ephemeral
-            .auto_compact_within(incoming, &btw_budget)
+            .auto_compact_within_redacted(incoming, &btw_budget, &step_secrets)
             .context("Вопрос /btw не помещается в бюджет контекста даже после временного сжатия")?;
         ephemeral.messages
     };
@@ -4443,7 +4457,7 @@ async fn turn_inner(
         &events.secret_snapshot(),
     );
     let incoming = budget.measure(&message);
-    if !prepare_context(session, store, incoming, &budget)?.report(events) {
+    if !prepare_context(session, store, incoming, &budget, events)?.report(events) {
         return Ok(1);
     }
     crate::images::validate_limits(
@@ -4534,6 +4548,7 @@ async fn turn_inner(
     let mut candidate = session.clone();
     candidate.task_state = next_task;
     candidate.messages.push(message);
+    let turn_secrets = events.secret_snapshot();
     let candidate_budget = context_budget_for_turn_with_memory(
         client,
         &candidate,
@@ -4542,10 +4557,10 @@ async fn turn_inner(
         skills,
         preload_skill.is_some(),
         &initial_memory,
-        &events.secret_snapshot(),
+        &turn_secrets,
     );
     let before = candidate.context_used(&candidate_budget);
-    let saved = match candidate.auto_compact_within(0, &candidate_budget) {
+    let saved = match candidate.auto_compact_within_redacted(0, &candidate_budget, &turn_secrets) {
         Ok(saved) => saved,
         Err(error) => {
             events.emit("error",json!({"message":format!("Состояние задачи не помещается в контекст: {error:#}"),"exit_code":1}));
@@ -4726,7 +4741,7 @@ async fn turn_inner(
                 &executor.memory,
                 &step_secrets,
             );
-            if !prepare_context(session, store, 0, &budget)?.report(events) {
+            if !prepare_context(session, store, 0, &budget, events)?.report(events) {
                 return Ok(1);
             }
             let definitions = turn_definitions_with_memory_and_sandbox(
@@ -5287,7 +5302,7 @@ async fn turn_inner(
                                         &executor.memory,
                                         &events.secret_snapshot(),
                                     );
-                                    if !prepare_context(session, store, 0, &budget)?.report(events) {
+                                    if !prepare_context(session, store, 0, &budget, events)?.report(events) {
                                         save_repair_failure(
                                             session,
                                             store,
