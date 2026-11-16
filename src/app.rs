@@ -759,17 +759,17 @@ fn system_prompt_for(
         .mode
     {
         crate::sandbox::SandboxMode::Off => (
-            "If an external directory must first be created, use an authorized run_command for mkdir, then file tools for its files.",
+            "write_file creates subdirectories inside granted roots; use authorized run_command mkdir only for a new ungranted external root.",
             "Shell has the user's privileges and is not an OS sandbox; use file tools for edits inside the workspace where possible.",
             "A shell heredoc fallback for an external directory requires independent host authorization and must never bypass a denied directory grant.",
         ),
         crate::sandbox::SandboxMode::WorkspaceWrite => (
-            "If an approved external directory (--add-dir) must first have subdirectories created, use an authorized run_command within the active workspace-write OS sandbox, then file tools for its files.",
+            "write_file creates missing subdirectories inside the workspace or an approved external directory (--add-dir); creating directories outside approved roots is blocked by the workspace-write OS sandbox.",
             "Shell runs inside the host OS sandbox (workspace-write); use file tools for edits inside the workspace where possible.",
             "A shell heredoc fallback for an approved external directory requires independent host authorization, remains confined by the OS sandbox, and must never bypass a denied directory grant.",
         ),
         crate::sandbox::SandboxMode::ReadOnly => (
-            "In read-only OS sandbox mode, shell commands cannot create or modify directories outside the per-job TMPDIR; use file tools for authorized file writes.",
+            "In read-only OS sandbox mode, shell commands cannot create or modify directories outside the per-job TMPDIR; use file tools for authorized writes (write_file creates missing subdirectories inside granted roots).",
             "Shell runs inside the host read-only OS sandbox; use file tools for authorized edits.",
             "In read-only OS sandbox mode, shell commands cannot write to workspace or external directories; use file tools with host authorization and never bypass a denied directory grant.",
         ),
@@ -8961,6 +8961,10 @@ mod tests {
         };
         assert!(desc("read_file").contains("Не перечитывайте файл сразу после успешного"));
         assert!(desc("write_file").contains("перечитывать файл для проверки записи не нужно"));
+        assert!(
+            desc("write_file")
+                .contains("Недостающие подкаталоги внутри корня создаются автоматически")
+        );
         assert!(desc("edit_file").contains("перечитывать файл для проверки не нужно"));
         assert!(desc("edit_file").contains("Не включайте префиксы номеров строк"));
 
@@ -8979,6 +8983,7 @@ mod tests {
             prompt
                 .contains("do not re-read a file right after a successful write_file or edit_file")
         );
+        assert!(prompt.contains("write_file creates subdirectories"));
         assert!(prompt.contains("starts cold without your context"));
         assert!(prompt.contains("never when the user forbids delegation"));
         assert!(!prompt.contains("subagent"));

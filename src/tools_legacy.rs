@@ -102,6 +102,7 @@ struct Prepared {
     after: Vec<u8>,
     #[cfg(unix)]
     binding: PathBinding,
+    missing_dirs: Vec<OsString>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +113,7 @@ pub(crate) struct ApprovedWrite {
     before_identity: Option<FileIdentity>,
     #[cfg(unix)]
     binding: PathBinding,
+    missing_dirs: Vec<OsString>,
 }
 
 impl Prepared {
@@ -123,6 +125,7 @@ impl Prepared {
             before_identity: self.before.as_ref().map(|s| s.identity),
             #[cfg(unix)]
             binding: self.binding.clone(),
+            missing_dirs: self.missing_dirs.clone(),
         }
     }
 }
@@ -330,7 +333,14 @@ impl Tools {
         if let Some((dir, root, relative)) =
             self.location(path, matches!(name, "list_files" | "search"))?
         {
-            Policy::new(dir, root).check(&relative, name == "write_file")?;
+            Policy::new(dir, root).check(
+                &relative,
+                if name == "write_file" {
+                    MissingPolicy::AllowMissingSubtree
+                } else {
+                    MissingPolicy::Disallow
+                },
+            )?;
             return Ok(None);
         }
         safe_external_path(path, name == "write_file")?;
@@ -349,7 +359,14 @@ impl Tools {
         } else {
             Path::new(path.file_name().context("Требуется путь к файлу")?)
         };
-        Policy::new(&dir, &root).check(relative, name == "write_file")?;
+        Policy::new(&dir, &root).check(
+            relative,
+            if name == "write_file" {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         Ok(Some(root))
     }
 
@@ -412,7 +429,7 @@ impl Tools {
             ),
             (
                 "write_file",
-                "Атомарно записать UTF-8 файл в проекте или разрешённом host внешнем каталоге (относительный или абсолютный путь). Перед перезаписью существующего файла вызовите read_file: host сверяет снимок чтения. Обычно опускайте expected_sha256; явно передавайте только read_file.sha256 (не хеш артефакта), для нового файла опускайте. Для частичных правок берите edit_file; перечитывать файл для проверки записи не нужно. Родительский каталог должен существовать; доступно undo.",
+                "Атомарно записать UTF-8 файл в проекте или разрешённом host внешнем каталоге. Перед перезаписью вызовите read_file: host сверяет снимок чтения. Обычно опускайте expected_sha256 (явно — только read_file.sha256, не хеш артефакта; для нового файла опускайте). Для частичных правок — edit_file; перечитывать файл для проверки записи не нужно. Недостающие подкаталоги внутри корня создаются автоматически; доступно undo.",
                 json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string","description":"Необязательно: обычно опускайте после read_file. Явное значение — только sha256 самого файла из read_file, не хеш сохранённого ответа инструмента."}}),
                 vec!["path", "content"],
             ),
@@ -667,7 +684,7 @@ impl Tools {
         for change in &turn.entries {
             let dir = self.change_directory(change)?;
             let root = change.root.as_deref().unwrap_or(&self.root);
-            let path = Policy::new(&dir, root).check(&change.path, false)?;
+            let path = Policy::new(&dir, root).check(&change.path, MissingPolicy::Disallow)?;
             let displayed_path = display_path(change.root.as_deref(), &path);
             #[cfg(unix)]
             let (parent, name, binding) = bound_parent_handle(&dir, root, &path)?;
@@ -773,7 +790,8 @@ impl Tools {
             let path = display_path(root, relative);
             let current = self.change_directory(change).and_then(|dir| {
                 let root = change.root.as_deref().unwrap_or(&self.root);
-                let relative = Policy::new(&dir, root).check(relative, true)?;
+                let relative =
+                    Policy::new(&dir, root).check(relative, MissingPolicy::AllowMissingLeaf)?;
                 let (parent, name) = parent_handle(&dir, &relative)?;
                 snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)
             });
@@ -872,7 +890,14 @@ impl Tools {
     ) -> Result<Option<(Snapshot, PathBinding, PathBuf)>> {
         let (dir, root, path) = self.required_location(path, false)?;
         let (fresh_root, _) = checked_root(dir, root)?;
-        let path = Policy::new(&fresh_root, root).check(&path, allow_missing)?;
+        let path = Policy::new(&fresh_root, root).check(
+            &path,
+            if allow_missing {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         let (parent, name, binding) = bound_parent_handle(dir, root, &path)?;
         Ok(snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)?
             .map(|file| (file, binding, root.join(path))))
@@ -881,7 +906,14 @@ impl Tools {
     #[cfg(not(unix))]
     fn allowed_snapshot(&self, path: &Path, allow_missing: bool) -> Result<Option<Snapshot>> {
         let (dir, root, path) = self.required_location(path, false)?;
-        let path = Policy::new(dir, root).check(&path, allow_missing)?;
+        let path = Policy::new(dir, root).check(
+            &path,
+            if allow_missing {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         let (parent, name) = parent_handle(dir, &path)?;
         snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)
     }
@@ -1072,7 +1104,7 @@ impl Tools {
         let (dir, root, path) = self.required_location(Path::new(path), true)?;
         let external_root = (root != self.root).then_some(root);
         let mut policy = Policy::new(dir, root);
-        policy.check(&path, false)?;
+        policy.check(&path, MissingPolicy::Disallow)?;
         if dir.symlink_metadata(&path)?.is_file() {
             return Ok((vec![display_path(external_root, &path)], false));
         }
@@ -1100,7 +1132,7 @@ impl Tools {
                 let Ok(child) = normalized_path(&child, false) else {
                     continue;
                 };
-                if policy.check(&child, false).is_err() {
+                if policy.check(&child, MissingPolicy::Disallow).is_err() {
                     continue;
                 }
                 let file_type = entry.file_type()?;
@@ -1134,17 +1166,36 @@ impl Tools {
     fn prepare(&self, name: &str, args: &Value, actor: Option<&str>) -> Result<Prepared> {
         let (dir, root, path) =
             self.required_location(Path::new(string_arg(args, "path")?), false)?;
+        let policy_mode = if name == "write_file" {
+            MissingPolicy::AllowMissingSubtree
+        } else {
+            MissingPolicy::Disallow
+        };
         #[cfg(unix)]
         let (policy_root, _) = checked_root(dir, root)?;
         #[cfg(unix)]
-        let path = Policy::new(&policy_root, root).check(&path, name == "write_file")?;
+        let path = Policy::new(&policy_root, root).check(&path, policy_mode)?;
         #[cfg(not(unix))]
-        let path = Policy::new(dir, root).check(&path, name == "write_file")?;
+        let path = Policy::new(dir, root).check(&path, policy_mode)?;
         #[cfg(unix)]
-        let (parent, file_name, binding) = bound_parent_handle(dir, root, &path)?;
+        let (parent, file_name, binding, missing_dirs) = if name == "write_file" {
+            bound_write_parent_handle(dir, root, &path)?
+        } else {
+            let (parent, file_name, binding) = bound_parent_handle(dir, root, &path)?;
+            (parent, file_name, binding, Vec::new())
+        };
         #[cfg(not(unix))]
-        let (parent, file_name) = parent_handle(dir, &path)?;
-        let before = snapshot(&parent, Path::new(&file_name), MAX_FILE_BYTES)?;
+        let (parent, file_name, missing_dirs) = if name == "write_file" {
+            write_parent_handle(dir, &path)?
+        } else {
+            let (parent, file_name) = parent_handle(dir, &path)?;
+            (parent, file_name, Vec::new())
+        };
+        let before = if missing_dirs.is_empty() {
+            snapshot(&parent, Path::new(&file_name), MAX_FILE_BYTES)?
+        } else {
+            None
+        };
         if let Some(file) = &before {
             std::str::from_utf8(&file.bytes)
                 .context("Редактирование бинарного или не UTF-8 файла запрещено")?;
@@ -1225,6 +1276,7 @@ impl Tools {
             after,
             #[cfg(unix)]
             binding,
+            missing_dirs,
         })
     }
 
@@ -1239,7 +1291,14 @@ impl Tools {
                 .context("Разрешённый корень каталога заменён или отозван")?
         };
         let (fresh_root, _) = checked_root(retained, root_path)?;
-        Policy::new(&fresh_root, root_path).check(&prepared.path, prepared.before.is_none())?;
+        Policy::new(&fresh_root, root_path).check(
+            &prepared.path,
+            if prepared.before.is_none() {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         let (parent, name, binding) = bound_parent_handle(retained, root_path, &prepared.path)?;
         ensure!(
             binding == prepared.binding,
@@ -1273,7 +1332,8 @@ impl Tools {
     ) -> Result<Dir> {
         let root_path = change.root.as_deref().unwrap_or(&self.root);
         let retained = self.change_directory(change)?;
-        let path = Policy::new(&retained, root_path).check(&change.path, false)?;
+        let path =
+            Policy::new(&retained, root_path).check(&change.path, MissingPolicy::Disallow)?;
         let (parent, name, current_binding) = bound_parent_handle(&retained, root_path, &path)?;
         ensure!(
             current_binding == *binding,
@@ -1295,6 +1355,118 @@ impl Tools {
         Ok(parent)
     }
 
+    fn materialize_missing_dirs(&self, prepared: &mut Prepared) -> Result<()> {
+        if prepared.missing_dirs.is_empty() {
+            return Ok(());
+        }
+        let root_path = prepared.root.as_deref().unwrap_or(&self.root);
+        let retained = if root_path == self.root {
+            &self.dir
+        } else {
+            self.extra_dirs
+                .get(root_path)
+                .context("Разрешённый корень каталога заменён или отозван")?
+        };
+        #[cfg(unix)]
+        let (fresh_root, root_identity) = checked_root(retained, root_path)?;
+        #[cfg(unix)]
+        Policy::new(&fresh_root, root_path)
+            .check(&prepared.path, MissingPolicy::AllowMissingSubtree)?;
+        #[cfg(not(unix))]
+        let fresh_root = retained.try_clone()?;
+        #[cfg(not(unix))]
+        Policy::new(&fresh_root, root_path)
+            .check(&prepared.path, MissingPolicy::AllowMissingSubtree)?;
+
+        let all_parts = prepared
+            .path
+            .parent()
+            .map(|parent| {
+                parent
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(part) => Some(part.to_os_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        ensure!(
+            prepared.missing_dirs.len() <= all_parts.len(),
+            "Некорректный суффикс создаваемых каталогов"
+        );
+        let existing_len = all_parts.len() - prepared.missing_dirs.len();
+        ensure!(
+            all_parts[existing_len..] == prepared.missing_dirs[..],
+            "Суффикс создаваемых каталогов не совпадает с путём"
+        );
+        let mut current = fresh_root;
+        #[cfg(unix)]
+        let mut current_binding = vec![root_identity];
+        for part in &all_parts[..existing_len] {
+            current = open_child_directory(&current, part)?;
+            #[cfg(unix)]
+            current_binding.push(directory_identity(&current)?);
+        }
+        #[cfg(unix)]
+        ensure!(
+            current_binding == prepared.binding,
+            "Каталог в пути был заменён перед записью"
+        );
+        match current.symlink_metadata(&prepared.missing_dirs[0]) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => bail!("Каталог в пути появился перед записью"),
+            Err(error) => return Err(error.into()),
+        }
+        for part in &prepared.missing_dirs {
+            #[cfg(unix)]
+            {
+                use cap_std::fs::{DirBuilder, DirBuilderExt, MetadataExt as CapUnixMetadataExt};
+                let mut builder = DirBuilder::new();
+                builder.mode(0o777);
+                current.create_dir_with(part, &builder)?;
+                {
+                    let handle = current.open(".")?;
+                    handle.sync_all()?;
+                }
+                let child = open_child_directory(&current, part)?;
+                let named = current.symlink_metadata(part)?;
+                ensure!(
+                    named.is_dir() && !named.file_type().is_symlink(),
+                    "Созданный компонент пути не является обычным каталогом"
+                );
+                let child_id = directory_identity(&child)?;
+                ensure!(
+                    (FileIdentity {
+                        device: named.dev(),
+                        inode: named.ino(),
+                    }) == child_id,
+                    "Созданный каталог изменился во время открытия"
+                );
+                current_binding.push(child_id);
+                current = child;
+            }
+            #[cfg(not(unix))]
+            {
+                current.create_dir(part)?;
+                let child = open_child_directory(&current, part)?;
+                let named = current.symlink_metadata(part)?;
+                ensure!(
+                    named.is_dir() && !named.file_type().is_symlink(),
+                    "Созданный компонент пути не является обычным каталогом"
+                );
+                current = child;
+            }
+        }
+        prepared.parent = current;
+        #[cfg(unix)]
+        {
+            prepared.binding = current_binding;
+        }
+        prepared.missing_dirs.clear();
+        Ok(())
+    }
+
     fn write(
         &mut self,
         name: &str,
@@ -1303,7 +1475,7 @@ impl Tools {
         actor: Option<&str>,
         approved: Option<&ApprovedWrite>,
     ) -> Result<ToolOutcome> {
-        let prepared = self.prepare(name, args, actor)?;
+        let mut prepared = self.prepare(name, args, actor)?;
         if let Some(expected) = approved {
             ensure!(
                 prepared.approval_stamp() == *expected,
@@ -1446,6 +1618,7 @@ impl Tools {
             hook();
         }
         let result = check_cancel(cancel).and_then(|()| {
+            self.materialize_missing_dirs(&mut prepared)?;
             #[cfg(unix)]
             {
                 atomic_write_checked_proof(
@@ -1793,6 +1966,95 @@ fn checked_root(retained: &Dir, root: &Path) -> Result<(Dir, FileIdentity)> {
 }
 
 #[cfg(unix)]
+fn bound_write_parent_handle(
+    retained_root: &Dir,
+    root_path: &Path,
+    relative: &Path,
+) -> Result<(Dir, OsString, PathBinding, Vec<OsString>)> {
+    let (root, root_identity) = checked_root(retained_root, root_path)?;
+    let name = relative
+        .file_name()
+        .context("Требуется путь к файлу")?
+        .to_os_string();
+    let parent_path = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut parent = root;
+    let mut binding = vec![root_identity];
+    let mut missing_dirs = Vec::new();
+    for component in parent_path.components() {
+        let Component::Normal(part) = component else {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            bail!("Некорректный компонент пути")
+        };
+        if !missing_dirs.is_empty() {
+            missing_dirs.push(part.to_os_string());
+            continue;
+        }
+        match parent.symlink_metadata(part) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "Symlink в пути запрещён"
+                );
+                ensure!(metadata.is_dir(), "Компонент пути не является каталогом");
+                parent = open_child_directory(&parent, part)?;
+                binding.push(directory_identity(&parent)?);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_dirs.push(part.to_os_string());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok((parent, name, binding, missing_dirs))
+}
+
+#[cfg(not(unix))]
+fn write_parent_handle(root: &Dir, path: &Path) -> Result<(Dir, OsString, Vec<OsString>)> {
+    let name = path
+        .file_name()
+        .context("Требуется путь к файлу")?
+        .to_os_string();
+    let parent_path = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut parent = root.try_clone()?;
+    let mut missing_dirs = Vec::new();
+    for component in parent_path.components() {
+        let Component::Normal(part) = component else {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            bail!("Некорректный компонент пути")
+        };
+        if !missing_dirs.is_empty() {
+            missing_dirs.push(part.to_os_string());
+            continue;
+        }
+        match parent.symlink_metadata(part) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "Symlink в пути запрещён"
+                );
+                ensure!(metadata.is_dir(), "Компонент пути не является каталогом");
+                parent = open_child_directory(&parent, part)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_dirs.push(part.to_os_string());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok((parent, name, missing_dirs))
+}
+
+#[cfg(unix)]
 fn bound_parent_handle(
     retained_root: &Dir,
     root_path: &Path,
@@ -1884,6 +2146,13 @@ pub(crate) fn secret_component(name: &std::ffi::OsStr) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MissingPolicy {
+    Disallow,
+    AllowMissingLeaf,
+    AllowMissingSubtree,
+}
+
 struct Policy<'a> {
     dir: &'a Dir,
     root: &'a Path,
@@ -1897,13 +2166,48 @@ impl<'a> Policy<'a> {
             matchers: HashMap::new(),
         }
     }
-    fn load(&mut self, path: &Path, base: &Path) -> Result<()> {
+    fn load_from_dir(&mut self, dir: &Dir, path: &Path, name: &Path, base: &Path) -> Result<()> {
         if self.matchers.contains_key(path) {
             return Ok(());
         }
         let mut builder = GitignoreBuilder::new(self.root.join(base));
-        let text = match parent_handle(self.dir, path)
-            .and_then(|(parent, name)| snapshot(&parent, Path::new(&name), 256 * 1024))
+        let text = match snapshot(dir, name, 256 * 1024) {
+            Ok(Some(file)) => {
+                Some(String::from_utf8(file.bytes).context("Ignore-файл не является UTF-8")?)
+            }
+            Ok(None) => None,
+            Err(error)
+                if error.downcast_ref::<io::Error>().is_some_and(|e| {
+                    e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::NotADirectory
+                }) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.context("Не удалось безопасно прочитать ignore-файл")),
+        };
+        if let Some(text) = text {
+            ensure!(
+                text.lines().count() <= 10_000,
+                "Слишком много ignore-правил"
+            );
+            for line in text.lines() {
+                builder
+                    .add_line(Some(path.into()), line)
+                    .context("Некорректное ignore-правило")?;
+            }
+        }
+        self.matchers.insert(path.into(), builder.build()?);
+        Ok(())
+    }
+    fn load_root_exclude(&mut self) -> Result<()> {
+        let path = Path::new(".git/info/exclude");
+        if self.matchers.contains_key(path) {
+            return Ok(());
+        }
+        let mut builder = GitignoreBuilder::new(self.root);
+        let text = match open_child_directory(self.dir, std::ffi::OsStr::new(".git"))
+            .and_then(|git| open_child_directory(&git, std::ffi::OsStr::new("info")))
+            .and_then(|info| snapshot(&info, Path::new("exclude"), 256 * 1024))
         {
             Ok(Some(file)) => {
                 Some(String::from_utf8(file.bytes).context("Ignore-файл не является UTF-8")?)
@@ -1932,10 +2236,18 @@ impl<'a> Policy<'a> {
         self.matchers.insert(path.into(), builder.build()?);
         Ok(())
     }
-    fn check(&mut self, path: &Path, allow_missing: bool) -> Result<PathBuf> {
-        let path = normalized_path(path, true)?;
-        self.load(Path::new(".git/info/exclude"), Path::new("."))?;
-        self.load(Path::new(".gitignore"), Path::new("."))?;
+    fn check(&mut self, path: &Path, missing_policy: MissingPolicy) -> Result<PathBuf> {
+        let path = normalized_path(
+            path,
+            !matches!(missing_policy, MissingPolicy::AllowMissingSubtree),
+        )?;
+        self.load_root_exclude()?;
+        self.load_from_dir(
+            self.dir,
+            Path::new(".gitignore"),
+            Path::new(".gitignore"),
+            Path::new("."),
+        )?;
         let mut layers = vec![
             PathBuf::from(".git/info/exclude"),
             PathBuf::from(".gitignore"),
@@ -1945,37 +2257,51 @@ impl<'a> Policy<'a> {
             .components()
             .filter(|c| !matches!(c, Component::CurDir))
             .count();
+        let mut current_dir: Option<Dir> = Some(self.dir.try_clone()?);
         for (i, component) in path
             .components()
             .filter(|c| !matches!(c, Component::CurDir))
             .enumerate()
         {
+            let part = component.as_os_str();
             ensure!(
-                !secret_component(component.as_os_str()),
+                !secret_component(part),
                 "Доступ к секретным файлам и служебным каталогам запрещён"
             );
-            prefix.push(component.as_os_str());
-            let metadata = match self.dir.symlink_metadata(&prefix) {
-                Ok(metadata) => {
-                    ensure!(
-                        !metadata.file_type().is_symlink(),
-                        "Symlink недоступен файловым инструментам"
-                    );
-                    Some(metadata)
+            prefix.push(part);
+            let metadata = if let Some(dir) = current_dir.as_ref() {
+                match dir.symlink_metadata(part) {
+                    Ok(metadata) => {
+                        ensure!(
+                            !metadata.file_type().is_symlink(),
+                            "Symlink недоступен файловым инструментам"
+                        );
+                        Some(metadata)
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => match missing_policy {
+                        MissingPolicy::AllowMissingSubtree => {
+                            if i + 1 < count {
+                                current_dir = None;
+                            }
+                            None
+                        }
+                        MissingPolicy::AllowMissingLeaf if i + 1 == count => None,
+                        _ => return Err(error.into()),
+                    },
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        && allow_missing
-                        && i + 1 == count =>
-                {
-                    None
-                }
-                Err(error) => return Err(error.into()),
+            } else {
+                None
             };
-            let is_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+            let existing_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+            let match_as_dir = if i + 1 < count {
+                metadata.as_ref().is_none_or(|m| m.is_dir())
+            } else {
+                existing_dir
+            };
             let mut ignored = false;
             for layer in &layers {
-                let matched = self.matchers[layer].matched(self.root.join(&prefix), is_dir);
+                let matched = self.matchers[layer].matched(self.root.join(&prefix), match_as_dir);
                 if !matched.is_none() {
                     ignored = matched.is_ignore();
                 }
@@ -1985,13 +2311,16 @@ impl<'a> Policy<'a> {
                 "Путь исключён правилами Git ignore: {}",
                 prefix.display()
             );
-            if i + 1 < count {
-                ensure!(is_dir, "Компонент пути не является каталогом");
+            if i + 1 < count && metadata.is_some() {
+                ensure!(existing_dir, "Компонент пути не является каталогом");
             }
-            if is_dir {
+            if existing_dir {
+                let next_dir =
+                    open_child_directory(current_dir.as_ref().expect("parent dir open"), part)?;
                 let ignore_path = prefix.join(".gitignore");
-                self.load(&ignore_path, &prefix)?;
+                self.load_from_dir(&next_dir, &ignore_path, Path::new(".gitignore"), &prefix)?;
                 layers.push(ignore_path);
+                current_dir = Some(next_dir);
             }
         }
         Ok(path)
@@ -4127,5 +4456,56 @@ mod tests {
                 "port = 8080\n"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_missing_parents_after_approval_and_enforces_policies_in_legacy() {
+        let mut f = Fixture::new();
+        let cancel = CancellationToken::new();
+        f.file(".gitignore", "target/\n");
+
+        // 1) Read-only preview does not create directories, and ApprovedWrite catches missing_dirs race.
+        let args = json!({"path": "tests/api/test_crud.py", "content": "assert True\n"});
+        let (_, approved) = f
+            .tools
+            .preview_write_for("write_file", &args, None)
+            .unwrap();
+        assert!(!f.root.join("tests").exists());
+
+        fs::create_dir(f.root.join("tests")).unwrap();
+        let raced = f
+            .tools
+            .execute_for_approved("write_file", &args, &cancel, None, Some(&approved))
+            .await
+            .unwrap();
+        assert!(raced.is_error, "{}", raced.content);
+        assert!(!f.root.join("tests/api").exists());
+        fs::remove_dir(f.root.join("tests")).unwrap();
+
+        // 2) Gitignore trailing-slash directory rule and secret components are blocked before mkdir.
+        for bad in ["target/out.txt", "newdir/.env", "newdir/.git/HEAD", "."] {
+            let out = f
+                .call("write_file", json!({"path": bad, "content": "nope\n"}))
+                .await;
+            assert!(out.is_error, "{bad}: {}", out.content);
+        }
+        assert!(!f.root.join("target").exists());
+        assert!(!f.root.join("newdir").exists());
+
+        // 3) Approved write creates missing parents and file; legacy undo removes the file while
+        //    leaving directories in place (documented non-WAL contract).
+        let ok = f
+            .tools
+            .execute_for_approved("write_file", &args, &cancel, None, Some(&approved))
+            .await
+            .unwrap();
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(
+            fs::read_to_string(f.root.join("tests/api/test_crud.py")).unwrap(),
+            "assert True\n"
+        );
+        f.tools.undo().unwrap();
+        assert!(!f.root.join("tests/api/test_crud.py").exists());
+        assert!(f.root.join("tests/api").is_dir());
     }
 }
