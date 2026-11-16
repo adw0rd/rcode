@@ -153,6 +153,19 @@ struct Turn {
     shell_used: bool,
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
+fn parent_normal_component_count(path: &Path) -> usize {
+    path.parent().map_or(0, |parent| {
+        parent
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count()
+    })
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Change {
@@ -170,6 +183,8 @@ struct Change {
     after_identity: Option<crate::file_wal::Identity>,
     #[serde(default)]
     binding: Option<Vec<crate::file_wal::Identity>>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    created_parents: usize,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -198,6 +213,14 @@ struct FileIdentity {
 #[cfg(unix)]
 type PathBinding = Vec<FileIdentity>;
 
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CreatedDirRecord {
+    rel_dir: PathBuf,
+    parent_binding: PathBinding,
+    identity: FileIdentity,
+}
+
 struct ReadObservation {
     sha256: String,
     stale: bool,
@@ -216,6 +239,7 @@ struct Prepared {
     after: Vec<u8>,
     #[cfg(unix)]
     binding: PathBinding,
+    missing_dirs: Vec<OsString>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +250,7 @@ pub(crate) struct ApprovedWrite {
     before_identity: Option<FileIdentity>,
     #[cfg(unix)]
     binding: PathBinding,
+    missing_dirs: Vec<OsString>,
 }
 
 impl Prepared {
@@ -237,6 +262,7 @@ impl Prepared {
             before_identity: self.before.as_ref().map(|s| s.identity),
             #[cfg(unix)]
             binding: self.binding.clone(),
+            missing_dirs: self.missing_dirs.clone(),
         }
     }
 }
@@ -492,13 +518,19 @@ impl Tools {
                             "Некорректный mode в checkpoint"
                         );
                         if state.version == 3 && !change.after_sha256.is_empty() {
+                            let parent_depth = parent_normal_component_count(&change.path);
                             ensure!(
                                 change.after_identity.is_some()
                                     && change.after_mode.is_some_and(|mode| mode <= 0o7777)
                                     && change.binding.as_ref().is_some_and(|binding| {
-                                        !binding.is_empty() && binding.len() <= 66
+                                        binding.len() == 1 + parent_depth && binding.len() <= 66
                                     })
-                                    && change.before.is_some() == change.mode.is_some(),
+                                    && change.before.is_some() == change.mode.is_some()
+                                    && change.created_parents <= parent_depth
+                                    && (change.created_parents == 0
+                                        || (change.before.is_none()
+                                            && change.mode.is_none()
+                                            && !change.readonly)),
                                 "Checkpoint v2 не содержит подтверждённую identity файла"
                             );
                         }
@@ -570,9 +602,19 @@ impl Tools {
                                 && hash.bytes().all(|b| b.is_ascii_hexdigit())),
                         "Invalid WAL before hash"
                     );
+                    let candidate_parent_depth = parent_normal_component_count(&candidate.path);
                     ensure!(
-                        pending.before_binding.len() <= 66,
+                        pending.before_binding.len() == 1 + candidate_parent_depth
+                            && pending.before_binding.len() <= 66,
                         "WAL path binding exceeds limit"
+                    );
+                    ensure!(
+                        candidate.created_parents <= candidate_parent_depth
+                            && (candidate.created_parents == 0
+                                || (candidate.before.is_none()
+                                    && candidate.mode.is_none()
+                                    && !candidate.readonly)),
+                        "Invalid created_parents in WAL candidate"
                     );
                     ensure!(
                         !pending.before_binding.is_empty()
@@ -606,6 +648,7 @@ impl Tools {
                     if let Some(previous) = matching.first() {
                         ensure!(
                             candidate.before == previous.before
+                                && candidate.created_parents == previous.created_parents
                                 && pending.before_image.as_ref() == Some(&previous.after_image)
                                 && pending.before_sha256.as_ref() == Some(&previous.after_sha256)
                                 && pending.before_identity == previous.after_identity
@@ -616,7 +659,13 @@ impl Tools {
                     } else {
                         ensure!(
                             candidate.before.as_ref() == pending.before_image.as_ref()
-                                && candidate.mode == pending.before_mode,
+                                && candidate.mode == pending.before_mode
+                                && (candidate.created_parents == 0
+                                    || (pending.before_image.is_none()
+                                        && pending.before_sha256.is_none()
+                                        && pending.before_identity.is_none()
+                                        && pending.before_mode.is_none()
+                                        && !pending.before_readonly)),
                             "Initial-write WAL images do not match the original preimage"
                         );
                     }
@@ -917,7 +966,14 @@ impl Tools {
         if let Some((dir, root, relative)) =
             self.location(path, matches!(name, "list_files" | "search"))?
         {
-            Policy::new(dir, root).check(&relative, name == "write_file")?;
+            Policy::new(dir, root).check(
+                &relative,
+                if name == "write_file" {
+                    MissingPolicy::AllowMissingSubtree
+                } else {
+                    MissingPolicy::Disallow
+                },
+            )?;
             return Ok(None);
         }
         safe_external_path(path, name == "write_file")?;
@@ -936,7 +992,14 @@ impl Tools {
         } else {
             Path::new(path.file_name().context("Требуется путь к файлу")?)
         };
-        Policy::new(&dir, &root).check(relative, name == "write_file")?;
+        Policy::new(&dir, &root).check(
+            relative,
+            if name == "write_file" {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         Ok(Some(root))
     }
 
@@ -999,7 +1062,7 @@ impl Tools {
             ),
             (
                 "write_file",
-                "Атомарно записать UTF-8 файл в проекте или разрешённом host внешнем каталоге (относительный или абсолютный путь). Перед перезаписью существующего файла вызовите read_file: host сверяет снимок чтения. Обычно опускайте expected_sha256; явно передавайте только read_file.sha256 (не хеш артефакта), для нового файла опускайте. Для частичных правок берите edit_file; перечитывать файл для проверки записи не нужно. Родительский каталог должен существовать; доступно undo.",
+                "Атомарно записать UTF-8 файл в проекте или разрешённом host внешнем каталоге. Перед перезаписью вызовите read_file: host сверяет снимок чтения. Обычно опускайте expected_sha256 (явно — только read_file.sha256, не хеш артефакта; для нового файла опускайте). Для частичных правок — edit_file; перечитывать файл для проверки записи не нужно. Недостающие подкаталоги внутри корня создаются автоматически; доступно undo.",
                 json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string","description":"Необязательно: обычно опускайте после read_file. Явное значение — только sha256 самого файла из read_file, не хеш сохранённого ответа инструмента."}}),
                 vec!["path", "content"],
             ),
@@ -1339,7 +1402,7 @@ impl Tools {
             // A completed delete is already absent, and a completed restore
             // may have changed policy. Those entries are identity-checked
             // below and must not be run through policy again.
-            let path = Policy::new(&dir, root).check(&change.path, false)?;
+            let path = Policy::new(&dir, root).check(&change.path, MissingPolicy::Disallow)?;
             let displayed_path = display_path(change.root.as_deref(), &path);
             #[cfg(unix)]
             let (parent, name, binding) = bound_parent_handle(&dir, root, &path)?;
@@ -1470,7 +1533,8 @@ impl Tools {
                 let change = &turn.entries[entry_index];
                 let retained = self.change_directory(change)?;
                 let root = change.root.as_deref().unwrap_or(&self.root);
-                let path = Policy::new(&retained, root).check(&change.path, false)?;
+                let path =
+                    Policy::new(&retained, root).check(&change.path, MissingPolicy::Disallow)?;
                 let (parent, name, binding) = bound_parent_handle(&retained, root, &path)?;
                 ensure!(
                     binding == item.binding,
@@ -1603,7 +1667,8 @@ impl Tools {
             let path = display_path(root, relative);
             let current = self.change_directory(change).and_then(|dir| {
                 let root = change.root.clone().unwrap_or_else(|| self.root.clone());
-                let relative = Policy::new(&dir, &root).check(relative, true)?;
+                let relative =
+                    Policy::new(&dir, &root).check(relative, MissingPolicy::AllowMissingLeaf)?;
                 let (parent, name) = parent_handle(&dir, &relative)?;
                 snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)
             });
@@ -1805,13 +1870,149 @@ impl Tools {
             return Ok(false);
         }
         let parent_path = normalized_path(change.path.parent().unwrap_or(Path::new(".")), true)?;
+        let prior_orphans = self.checkpoints.orphan_stages.clone();
         self.checkpoints.orphan_stages.retain(|orphan| {
             !(orphan.root == root
                 && orphan.parent == parent_path
                 && orphan.stage.name == stage.name)
         });
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            self.checkpoints.orphan_stages = prior_orphans;
+            return Err(error);
+        }
         Ok(true)
+    }
+
+    #[cfg(unix)]
+    fn checkpoints_reference_dir(&self, root: &Path, rel_dir: &Path) -> bool {
+        if self.wal_poisoned
+            || self.checkpoints.pending_write.is_some()
+            || self.checkpoints.pending_undo.is_some()
+        {
+            return true;
+        }
+        let target_dir = root.join(rel_dir);
+        for turn in &self.checkpoints.turns {
+            for change in &turn.entries {
+                let change_full = change
+                    .root
+                    .as_deref()
+                    .unwrap_or(&self.root)
+                    .join(&change.path);
+                if change_full.starts_with(&target_dir) {
+                    return true;
+                }
+            }
+        }
+        for orphan in &self.checkpoints.orphan_stages {
+            let orphan_full =
+                if orphan.parent == Path::new(".") || orphan.parent.as_os_str().is_empty() {
+                    orphan.root.clone()
+                } else {
+                    orphan.root.join(&orphan.parent)
+                };
+            if orphan_full == target_dir || orphan_full.starts_with(&target_dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn cleanup_root_dir(&self, root_path: &Path) -> Result<(Dir, FileIdentity)> {
+        if root_path == self.root {
+            return checked_root(&self.dir, &self.root);
+        }
+        if let Some(retained) = self.extra_dirs.get(root_path) {
+            return checked_root(retained, root_path);
+        }
+        validate_external_root(root_path, &self.checkpoint_path)?;
+        safe_external_path(root_path, false)?;
+        ensure!(
+            std::fs::canonicalize(root_path)? == root_path,
+            "Корень checkpoint изменён"
+        );
+        let dir = open_external_directory(root_path)?;
+        let id = directory_identity(&dir)?;
+        Ok((dir, id))
+    }
+
+    #[cfg(unix)]
+    fn cleanup_created_dirs(&self, root_path: &Path, records: &[CreatedDirRecord]) {
+        use cap_std::fs::MetadataExt as CapUnixMetadataExt;
+        if self.wal_poisoned
+            || self.checkpoints.pending_write.is_some()
+            || self.checkpoints.pending_undo.is_some()
+        {
+            return;
+        }
+        for record in records.iter().rev() {
+            if self.checkpoints_reference_dir(root_path, &record.rel_dir) {
+                continue;
+            }
+            let Some(leaf) = record.rel_dir.file_name() else {
+                continue;
+            };
+            let Ok((mut parent, root_identity)) = self.cleanup_root_dir(root_path) else {
+                continue;
+            };
+            let mut actual_parent_binding = vec![root_identity];
+            let parent_rel = record
+                .rel_dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut walk_ok = true;
+            for component in parent_rel.components() {
+                match component {
+                    Component::CurDir => continue,
+                    Component::Normal(part) => {
+                        let Ok(next) = open_child_directory(&parent, part) else {
+                            walk_ok = false;
+                            break;
+                        };
+                        let Ok(next_id) = directory_identity(&next) else {
+                            walk_ok = false;
+                            break;
+                        };
+                        actual_parent_binding.push(next_id);
+                        parent = next;
+                    }
+                    _ => {
+                        walk_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !walk_ok || actual_parent_binding != record.parent_binding {
+                continue;
+            }
+            let Ok(named) = parent.symlink_metadata(leaf) else {
+                continue;
+            };
+            if !named.is_dir()
+                || named.file_type().is_symlink()
+                || (FileIdentity {
+                    device: named.dev(),
+                    inode: named.ino(),
+                }) != record.identity
+            {
+                continue;
+            }
+            let Ok(child) = open_child_directory(&parent, leaf) else {
+                continue;
+            };
+            let child_matches = directory_identity(&child).ok() == Some(record.identity);
+            drop(child);
+            if !child_matches {
+                continue;
+            }
+            if parent.remove_dir(leaf).is_ok()
+                && let Ok(handle) = parent.open(".")
+            {
+                let _ = handle.sync_all();
+            }
+        }
     }
 
     /// Startup may classify a write intent, but it never publishes or removes
@@ -1826,7 +2027,8 @@ impl Tools {
         let root_path = candidate.root.clone().unwrap_or_else(|| self.root.clone());
         let root = root_path.as_path();
         let dir = self.change_directory(candidate)?;
-        let path = Policy::new(&dir, root).check(&candidate.path, true)?;
+        let path =
+            Policy::new(&dir, root).check(&candidate.path, MissingPolicy::AllowMissingLeaf)?;
         let (parent, name, binding) = bound_parent_handle(&dir, root, &path)?;
         let binding: Vec<_> = binding
             .iter()
@@ -1949,7 +2151,7 @@ impl Tools {
     /// has not happened. The old checkpoint and a reference to the still
     /// untouched stage are made durable before returning control; on failure,
     /// the Prepared intent and stage remain available for reopen.
-    fn abort_unpublished_write(&mut self, prior: &Checkpoints) -> Result<()> {
+    fn abort_unpublished_write(&mut self, prior: &Checkpoints) -> Result<bool> {
         let pending_state = self.checkpoints.clone();
         let intent = pending_state
             .pending_write
@@ -1979,16 +2181,22 @@ impl Tools {
             self.checkpoints = pending_state;
             return Err(error);
         }
-        if let Some(stage) = cleanup_stage.as_ref() {
-            let proof = crate::workspace_stage::PayloadProof {
-                sha256: cleanup_candidate.after_sha256.clone(),
-                len: cleanup_candidate.after_image.image.len,
-                mode: cleanup_candidate.after_mode.unwrap_or(0o600),
-            };
-            let _ = self.cleanup_committed_stage(&cleanup_candidate, stage, Some(&proof));
-        }
+        let stage_cleanup_durable = match cleanup_stage.as_ref() {
+            Some(stage) => {
+                let proof = crate::workspace_stage::PayloadProof {
+                    sha256: cleanup_candidate.after_sha256.clone(),
+                    len: cleanup_candidate.after_image.image.len,
+                    mode: cleanup_candidate.after_mode.unwrap_or(0o600),
+                };
+                matches!(
+                    self.cleanup_committed_stage(&cleanup_candidate, stage, Some(&proof)),
+                    Ok(true)
+                )
+            }
+            None => true,
+        };
         self.gc_unreferenced_from(&pending_state);
-        Ok(())
+        Ok(stage_cleanup_durable)
     }
 
     fn reconcile_pending_undo(&mut self) -> Result<()> {
@@ -2178,7 +2386,14 @@ impl Tools {
             let path = if done {
                 change.path.clone()
             } else {
-                Policy::new(&dir, root).check(&change.path, allow_missing)?
+                Policy::new(&dir, root).check(
+                    &change.path,
+                    if allow_missing {
+                        MissingPolicy::AllowMissingLeaf
+                    } else {
+                        MissingPolicy::Disallow
+                    },
+                )?
             };
             let (parent, name, binding) = bound_parent_handle(&dir, root, &path)?;
             let current = snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)?;
@@ -2401,7 +2616,36 @@ impl Tools {
                         && previous.after_mode == change.mode
                     {
                         previous.after_identity = Some(identity);
-                        previous.binding = change.binding.clone();
+                        let expected_len = 1 + parent_normal_component_count(&previous.path);
+                        if let Some(new_binding) = &change.binding {
+                            let (updated_binding, shared_start) = if new_binding.len()
+                                >= expected_len
+                            {
+                                (
+                                    Some(new_binding[new_binding.len() - expected_len..].to_vec()),
+                                    0,
+                                )
+                            } else if let Some(prev_binding) = previous.binding.as_ref()
+                                && prev_binding.len() == expected_len
+                            {
+                                let prefix_len = expected_len - new_binding.len();
+                                let mut merged = prev_binding.clone();
+                                merged[prefix_len..].copy_from_slice(new_binding);
+                                (Some(merged), prefix_len)
+                            } else {
+                                (None, 0)
+                            };
+                            if let Some(updated) = updated_binding {
+                                let same_dirs = previous.binding.as_ref().is_some_and(|old| {
+                                    old.len() == expected_len
+                                        && old[shared_start..] == updated[shared_start..]
+                                });
+                                if !same_dirs {
+                                    previous.created_parents = 0;
+                                }
+                                previous.binding = Some(updated);
+                            }
+                        }
                     }
                     break;
                 }
@@ -2443,9 +2687,83 @@ impl Tools {
             }
         }
         self.gc_unreferenced_from(&recoverable);
+        #[cfg(unix)]
+        self.cleanup_turn_created_dirs(&turn.entries);
         #[cfg(all(test, unix))]
         self.wal_fault(WalFaultPoint::Finalized);
         Ok(format!("Отменены файловые правки: {count}. {SHELL_NOTE}"))
+    }
+
+    #[cfg(unix)]
+    fn cleanup_turn_created_dirs(&self, entries: &[Change]) {
+        let mut by_key: BTreeMap<(PathBuf, PathBuf), Option<CreatedDirRecord>> = BTreeMap::new();
+        for change in entries {
+            if change.created_parents == 0 {
+                continue;
+            }
+            let Some(saved_binding) = change.binding.as_ref() else {
+                continue;
+            };
+            let parts = change
+                .path
+                .parent()
+                .map(|p| {
+                    p.components()
+                        .filter_map(|c| match c {
+                            Component::Normal(part) => Some(part),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if saved_binding.len() != 1 + parts.len() || change.created_parents > parts.len() {
+                continue;
+            }
+            let full_binding = saved_binding
+                .iter()
+                .map(|id| FileIdentity {
+                    device: id.device,
+                    inode: id.inode,
+                })
+                .collect::<Vec<_>>();
+            let entry_root = change.root.clone().unwrap_or_else(|| self.root.clone());
+            let start_depth = parts.len() - change.created_parents + 1;
+            for depth in start_depth..=parts.len() {
+                let mut rel_dir = PathBuf::new();
+                for part in &parts[..depth] {
+                    rel_dir.push(part);
+                }
+                let record = CreatedDirRecord {
+                    rel_dir: rel_dir.clone(),
+                    parent_binding: full_binding[..depth].to_vec(),
+                    identity: full_binding[depth],
+                };
+                match by_key.entry((entry_root.clone(), rel_dir)) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(Some(record));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        if slot.get().as_ref() != Some(&record) {
+                            slot.insert(None);
+                        }
+                    }
+                }
+            }
+        }
+        let mut ordered = by_key
+            .into_iter()
+            .filter_map(|((root, _), record)| record.map(|r| (root, r)))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            left.1
+                .rel_dir
+                .components()
+                .count()
+                .cmp(&right.1.rel_dir.components().count())
+        });
+        for (root, record) in ordered.into_iter().rev() {
+            self.cleanup_created_dirs(&root, std::slice::from_ref(&record));
+        }
     }
 
     fn ensure_turn(&mut self) -> Result<usize> {
@@ -2463,7 +2781,14 @@ impl Tools {
     ) -> Result<Option<(Snapshot, PathBinding, PathBuf)>> {
         let (dir, root, path) = self.required_location(path, false)?;
         let (fresh_root, _) = checked_root(dir, root)?;
-        let path = Policy::new(&fresh_root, root).check(&path, allow_missing)?;
+        let path = Policy::new(&fresh_root, root).check(
+            &path,
+            if allow_missing {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         let (parent, name, binding) = bound_parent_handle(dir, root, &path)?;
         Ok(snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)?
             .map(|file| (file, binding, root.join(path))))
@@ -2472,7 +2797,14 @@ impl Tools {
     #[cfg(not(unix))]
     fn allowed_snapshot(&self, path: &Path, allow_missing: bool) -> Result<Option<Snapshot>> {
         let (dir, root, path) = self.required_location(path, false)?;
-        let path = Policy::new(dir, root).check(&path, allow_missing)?;
+        let path = Policy::new(dir, root).check(
+            &path,
+            if allow_missing {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         let (parent, name) = parent_handle(dir, &path)?;
         snapshot(&parent, Path::new(&name), MAX_FILE_BYTES)
     }
@@ -2663,7 +2995,7 @@ impl Tools {
         let (dir, root, path) = self.required_location(Path::new(path), true)?;
         let external_root = (root != self.root).then_some(root);
         let mut policy = Policy::new(dir, root);
-        policy.check(&path, false)?;
+        policy.check(&path, MissingPolicy::Disallow)?;
         if dir.symlink_metadata(&path)?.is_file() {
             return Ok((vec![display_path(external_root, &path)], false));
         }
@@ -2691,7 +3023,7 @@ impl Tools {
                 let Ok(child) = normalized_path(&child, false) else {
                     continue;
                 };
-                if policy.check(&child, false).is_err() {
+                if policy.check(&child, MissingPolicy::Disallow).is_err() {
                     continue;
                 }
                 let file_type = entry.file_type()?;
@@ -2725,17 +3057,36 @@ impl Tools {
     fn prepare(&self, name: &str, args: &Value, actor: Option<&str>) -> Result<Prepared> {
         let (dir, root, path) =
             self.required_location(Path::new(string_arg(args, "path")?), false)?;
+        let policy_mode = if name == "write_file" {
+            MissingPolicy::AllowMissingSubtree
+        } else {
+            MissingPolicy::Disallow
+        };
         #[cfg(unix)]
         let (policy_root, _) = checked_root(dir, root)?;
         #[cfg(unix)]
-        let path = Policy::new(&policy_root, root).check(&path, name == "write_file")?;
+        let path = Policy::new(&policy_root, root).check(&path, policy_mode)?;
         #[cfg(not(unix))]
-        let path = Policy::new(dir, root).check(&path, name == "write_file")?;
+        let path = Policy::new(dir, root).check(&path, policy_mode)?;
         #[cfg(unix)]
-        let (parent, file_name, binding) = bound_parent_handle(dir, root, &path)?;
+        let (parent, file_name, binding, missing_dirs) = if name == "write_file" {
+            bound_write_parent_handle(dir, root, &path)?
+        } else {
+            let (parent, file_name, binding) = bound_parent_handle(dir, root, &path)?;
+            (parent, file_name, binding, Vec::new())
+        };
         #[cfg(not(unix))]
-        let (parent, file_name) = parent_handle(dir, &path)?;
-        let before = snapshot(&parent, Path::new(&file_name), MAX_FILE_BYTES)?;
+        let (parent, file_name, missing_dirs) = if name == "write_file" {
+            write_parent_handle(dir, &path)?
+        } else {
+            let (parent, file_name) = parent_handle(dir, &path)?;
+            (parent, file_name, Vec::new())
+        };
+        let before = if missing_dirs.is_empty() {
+            snapshot(&parent, Path::new(&file_name), MAX_FILE_BYTES)?
+        } else {
+            None
+        };
         if let Some(file) = &before {
             std::str::from_utf8(&file.bytes)
                 .context("Редактирование бинарного или не UTF-8 файла запрещено")?;
@@ -2816,6 +3167,7 @@ impl Tools {
             after,
             #[cfg(unix)]
             binding,
+            missing_dirs,
         })
     }
 
@@ -2830,7 +3182,14 @@ impl Tools {
                 .context("Разрешённый корень каталога заменён или отозван")?
         };
         let (fresh_root, _) = checked_root(retained, root_path)?;
-        Policy::new(&fresh_root, root_path).check(&prepared.path, prepared.before.is_none())?;
+        Policy::new(&fresh_root, root_path).check(
+            &prepared.path,
+            if prepared.before.is_none() {
+                MissingPolicy::AllowMissingLeaf
+            } else {
+                MissingPolicy::Disallow
+            },
+        )?;
         let (parent, name, binding) = bound_parent_handle(retained, root_path, &prepared.path)?;
         ensure!(
             binding == prepared.binding,
@@ -2864,7 +3223,8 @@ impl Tools {
     ) -> Result<Dir> {
         let root_path = change.root.as_deref().unwrap_or(&self.root);
         let retained = self.change_directory(change)?;
-        let path = Policy::new(&retained, root_path).check(&change.path, false)?;
+        let path =
+            Policy::new(&retained, root_path).check(&change.path, MissingPolicy::Disallow)?;
         let (parent, name, current_binding) = bound_parent_handle(&retained, root_path, &path)?;
         ensure!(
             current_binding == *binding,
@@ -2881,6 +3241,220 @@ impl Tools {
             "Конфликт undo: файл изменён непосредственно перед отменой"
         );
         Ok(parent)
+    }
+
+    fn ensure_manifest_headroom(
+        &self,
+        prepared: &Prepared,
+        turn_index: usize,
+        existing: Option<&Change>,
+    ) -> Result<()> {
+        let parent_depth = parent_normal_component_count(&prepared.path);
+        let max_id = crate::file_wal::Identity {
+            device: u64::MAX,
+            inode: u64::MAX,
+        };
+        let max_binding = vec![max_id; 1 + parent_depth];
+        let max_stored = StoredImage {
+            image: crate::file_wal::ImageRef {
+                id: "ffffffff-ffff-4fff-bfff-ffffffffffff".to_owned(),
+                sha256: "f".repeat(64),
+                len: MAX_FILE_BYTES,
+            },
+            identity: max_id,
+        };
+        let max_stage = crate::workspace_stage::StageRef {
+            name: crate::workspace_stage::StageDirectory::plan_name(),
+            directory: Some(max_id),
+            guard: Some(max_id),
+            payload: Some(max_id),
+        };
+        let max_candidate = Change {
+            root: prepared.root.clone(),
+            path: prepared.path.clone(),
+            before: existing
+                .and_then(|c| c.before.clone())
+                .or_else(|| prepared.before.as_ref().map(|_| max_stored.clone())),
+            mode: Some(0o7777),
+            readonly: false,
+            after_sha256: "f".repeat(64),
+            after_image: max_stored.clone(),
+            after_mode: Some(0o7777),
+            after_identity: Some(max_id),
+            binding: Some(max_binding.clone()),
+            created_parents: existing.map_or(prepared.missing_dirs.len(), |c| c.created_parents),
+        };
+
+        let mut prepared_state = self.checkpoints.clone();
+        prepared_state.pending_write = Some(WriteIntent {
+            turn: turn_index,
+            candidate: max_candidate.clone(),
+            before_image: Some(max_stored.clone()),
+            before_sha256: Some("f".repeat(64)),
+            before_identity: Some(max_id),
+            before_mode: Some(0o7777),
+            before_readonly: false,
+            before_binding: max_binding.clone(),
+            stage: Some(max_stage.clone()),
+        });
+        ensure!(
+            serde_json::to_vec(&prepared_state)?.len() <= crate::file_wal::MAX_MANIFEST_BYTES,
+            "Превышен лимит WAL manifest (4 MiB)"
+        );
+
+        let mut committed_state = self.checkpoints.clone();
+        let primary_root = self.root.clone();
+        let full_target = prepared
+            .root
+            .as_deref()
+            .unwrap_or(&primary_root)
+            .join(&prepared.path);
+        if let Some(slot) = committed_state.turns[turn_index]
+            .entries
+            .iter_mut()
+            .find(|c| c.root.as_deref().unwrap_or(&primary_root).join(&c.path) == full_target)
+        {
+            *slot = max_candidate;
+        } else {
+            committed_state.turns[turn_index]
+                .entries
+                .push(max_candidate);
+        }
+        let orphan_root = prepared.root.clone().unwrap_or(primary_root);
+        let orphan_parent =
+            normalized_path(prepared.path.parent().unwrap_or(Path::new(".")), true)?;
+        committed_state.orphan_stages.push(OrphanStage {
+            root: orphan_root,
+            parent: orphan_parent,
+            stage: max_stage.clone(),
+            bytes: u64::MAX,
+            binding: max_binding,
+        });
+        let entries_len = committed_state.turns[turn_index].entries.len();
+        committed_state.pending_undo = Some(UndoIntent {
+            turn: turn_index,
+            order: (0..entries_len).collect(),
+            prepared: true,
+            entries: vec![
+                UndoProgress {
+                    stage: Some(max_stage),
+                    done: Some(UndoDone::Restored(max_id)),
+                };
+                entries_len
+            ],
+        });
+        ensure!(
+            serde_json::to_vec(&committed_state)?.len() <= crate::file_wal::MAX_MANIFEST_BYTES,
+            "Превышен лимит WAL manifest (4 MiB)"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn materialize_missing_dirs(&self, prepared: &mut Prepared) -> Result<Vec<CreatedDirRecord>> {
+        use cap_std::fs::{DirBuilder, DirBuilderExt, MetadataExt as CapUnixMetadataExt};
+        if prepared.missing_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root_path = prepared.root.as_deref().unwrap_or(&self.root);
+        let retained = if root_path == self.root {
+            &self.dir
+        } else {
+            self.extra_dirs
+                .get(root_path)
+                .context("Разрешённый корень каталога заменён или отозван")?
+        };
+        let (fresh_root, root_identity) = checked_root(retained, root_path)?;
+        Policy::new(&fresh_root, root_path)
+            .check(&prepared.path, MissingPolicy::AllowMissingSubtree)?;
+
+        let all_parts = prepared
+            .path
+            .parent()
+            .map(|parent| {
+                parent
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(part) => Some(part.to_os_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        ensure!(
+            prepared.missing_dirs.len() <= all_parts.len(),
+            "Некорректный суффикс создаваемых каталогов"
+        );
+        let existing_len = all_parts.len() - prepared.missing_dirs.len();
+        ensure!(
+            all_parts[existing_len..] == prepared.missing_dirs[..],
+            "Суффикс создаваемых каталогов не совпадает с путём"
+        );
+        let mut current = fresh_root;
+        let mut current_binding = vec![root_identity];
+        let mut rel_prefix = PathBuf::new();
+        for part in &all_parts[..existing_len] {
+            current = open_child_directory(&current, part)?;
+            current_binding.push(directory_identity(&current)?);
+            rel_prefix.push(part);
+        }
+        ensure!(
+            current_binding == prepared.binding,
+            "Каталог в пути был заменён перед записью"
+        );
+        match current.symlink_metadata(&prepared.missing_dirs[0]) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => bail!("Каталог в пути появился перед записью"),
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut created = Vec::with_capacity(prepared.missing_dirs.len());
+        for part in &prepared.missing_dirs {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o777);
+            let step = (|| -> Result<(Dir, FileIdentity)> {
+                current.create_dir_with(part, &builder)?;
+                {
+                    let handle = current.open(".")?;
+                    handle.sync_all()?;
+                }
+                let child = open_child_directory(&current, part)?;
+                let named = current.symlink_metadata(part)?;
+                ensure!(
+                    named.is_dir() && !named.file_type().is_symlink(),
+                    "Созданный компонент пути не является обычным каталогом"
+                );
+                let child_id = directory_identity(&child)?;
+                ensure!(
+                    (FileIdentity {
+                        device: named.dev(),
+                        inode: named.ino(),
+                    }) == child_id,
+                    "Созданный каталог изменился во время открытия"
+                );
+                Ok((child, child_id))
+            })();
+            match step {
+                Ok((child, child_id)) => {
+                    rel_prefix.push(part);
+                    created.push(CreatedDirRecord {
+                        rel_dir: rel_prefix.clone(),
+                        parent_binding: current_binding.clone(),
+                        identity: child_id,
+                    });
+                    current_binding.push(child_id);
+                    current = child;
+                }
+                Err(error) => {
+                    self.cleanup_created_dirs(root_path, &created);
+                    return Err(error);
+                }
+            }
+        }
+        prepared.parent = current;
+        prepared.binding = current_binding;
+        prepared.missing_dirs.clear();
+        Ok(created)
     }
 
     fn write(
@@ -2900,7 +3474,7 @@ impl Tools {
             self.checkpoints.pending_undo.is_none(),
             "Незавершённая WAL-группа отмены блокирует новые изменения"
         );
-        let prepared = self.prepare(name, args, actor)?;
+        let mut prepared = self.prepare(name, args, actor)?;
         if let Some(expected) = approved {
             ensure!(
                 prepared.approval_stamp() == *expected,
@@ -3011,6 +3585,38 @@ impl Tools {
             .iter()
             .find(|c| c.root.as_deref().unwrap_or(&primary_root).join(&c.path) == absolute)
             .cloned();
+        if let Some(change) = &existing {
+            ensure!(
+                current_hash.as_ref() == Some(&change.after_sha256),
+                "Конфликт: файл изменён вне файловых инструментов в этом ходе; исходные пользовательские правки сохранены"
+            );
+            let before = prepared
+                .before
+                .as_ref()
+                .context("Tracked file disappeared before write")?;
+            ensure!(
+                change
+                    .after_identity
+                    .is_some_and(|id| id.device == before.identity.device
+                        && id.inode == before.identity.inode),
+                "Conflict: tracked file identity changed outside file tools"
+            );
+            ensure!(
+                change.after_mode == permission_mode(&before.permissions),
+                "Conflict: tracked file mode changed outside file tools"
+            );
+            let saved_binding = change
+                .binding
+                .as_ref()
+                .context("Tracked file has no path identity")?;
+            ensure!(
+                saved_binding
+                    .iter()
+                    .map(|id| (id.device, id.inode))
+                    .eq(prepared.binding.iter().map(|id| (id.device, id.inode))),
+                "Conflict: tracked parent directory identity changed"
+            );
+        }
         let total_entries = self
             .checkpoints
             .turns
@@ -3066,6 +3672,7 @@ impl Tools {
                 <= crate::file_wal::MAX_STORE_BYTES,
             "WAL orphan budget reserves space for undoing the active turn"
         );
+        self.ensure_manifest_headroom(&prepared, turn_index, existing.as_ref())?;
         let before_snapshot = prepared.before.as_ref();
         let new_preimage_bytes = existing
             .is_none()
@@ -3102,37 +3709,26 @@ impl Tools {
         } else {
             None
         };
+        #[cfg(unix)]
+        let created_in_call = match self.materialize_missing_dirs(&mut prepared) {
+            Ok(records) => records,
+            Err(error) => {
+                let _ = self
+                    .blob_store
+                    .remove_verified_image(&after_image.image, after_image.identity);
+                if existing.is_none()
+                    && let Some(stored) = &before_image
+                {
+                    let _ = self
+                        .blob_store
+                        .remove_verified_image(&stored.image, stored.identity);
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(unix)]
+        let cleanup_root = prepared.root.clone().unwrap_or_else(|| self.root.clone());
         let mut candidate = if let Some(change) = existing {
-            ensure!(
-                current_hash.as_ref() == Some(&change.after_sha256),
-                "Конфликт: файл изменён вне файловых инструментов в этом ходе; исходные пользовательские правки сохранены"
-            );
-            let before = prepared
-                .before
-                .as_ref()
-                .context("Tracked file disappeared before write")?;
-            ensure!(
-                change
-                    .after_identity
-                    .is_some_and(|id| id.device == before.identity.device
-                        && id.inode == before.identity.inode),
-                "Conflict: tracked file identity changed outside file tools"
-            );
-            ensure!(
-                change.after_mode == permission_mode(&before.permissions),
-                "Conflict: tracked file mode changed outside file tools"
-            );
-            let saved_binding = change
-                .binding
-                .as_ref()
-                .context("Tracked file has no path identity")?;
-            ensure!(
-                saved_binding
-                    .iter()
-                    .map(|id| (id.device, id.inode))
-                    .eq(prepared.binding.iter().map(|id| (id.device, id.inode))),
-                "Conflict: tracked parent directory identity changed"
-            );
             change
         } else {
             Change {
@@ -3152,6 +3748,10 @@ impl Tools {
                 after_mode: None,
                 after_identity: None,
                 binding: None,
+                #[cfg(unix)]
+                created_parents: created_in_call.len(),
+                #[cfg(not(unix))]
+                created_parents: 0,
             }
         };
         candidate.after_sha256 = after_hash.clone();
@@ -3224,6 +3824,9 @@ impl Tools {
                 Ok(stage) => stage,
                 Err(error) => {
                     self.reconcile_pending_write()?;
+                    if !created_in_call.is_empty() {
+                        self.cleanup_created_dirs(&cleanup_root, &created_in_call);
+                    }
                     return Err(error);
                 }
             };
@@ -3258,13 +3861,19 @@ impl Tools {
                 hook();
             }
             if let Err(error) = check_cancel(cancel) {
-                self.abort_unpublished_write(&old_state)?;
+                let stage_cleaned = self.abort_unpublished_write(&old_state)?;
+                if stage_cleaned && !created_in_call.is_empty() {
+                    self.cleanup_created_dirs(&cleanup_root, &created_in_call);
+                }
                 return Err(error);
             }
             let target = match self.revalidate_prepared(&prepared) {
                 Ok(target) => target,
                 Err(error) => {
-                    self.abort_unpublished_write(&old_state)?;
+                    let stage_cleaned = self.abort_unpublished_write(&old_state)?;
+                    if stage_cleaned && !created_in_call.is_empty() {
+                        self.cleanup_created_dirs(&cleanup_root, &created_in_call);
+                    }
                     return Err(error);
                 }
             };
@@ -3691,6 +4300,95 @@ fn checked_root(retained: &Dir, root: &Path) -> Result<(Dir, FileIdentity)> {
 }
 
 #[cfg(unix)]
+fn bound_write_parent_handle(
+    retained_root: &Dir,
+    root_path: &Path,
+    relative: &Path,
+) -> Result<(Dir, OsString, PathBinding, Vec<OsString>)> {
+    let (root, root_identity) = checked_root(retained_root, root_path)?;
+    let name = relative
+        .file_name()
+        .context("Требуется путь к файлу")?
+        .to_os_string();
+    let parent_path = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut parent = root;
+    let mut binding = vec![root_identity];
+    let mut missing_dirs = Vec::new();
+    for component in parent_path.components() {
+        let Component::Normal(part) = component else {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            bail!("Некорректный компонент пути")
+        };
+        if !missing_dirs.is_empty() {
+            missing_dirs.push(part.to_os_string());
+            continue;
+        }
+        match parent.symlink_metadata(part) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "Symlink в пути запрещён"
+                );
+                ensure!(metadata.is_dir(), "Компонент пути не является каталогом");
+                parent = open_child_directory(&parent, part)?;
+                binding.push(directory_identity(&parent)?);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_dirs.push(part.to_os_string());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok((parent, name, binding, missing_dirs))
+}
+
+#[cfg(not(unix))]
+fn write_parent_handle(root: &Dir, path: &Path) -> Result<(Dir, OsString, Vec<OsString>)> {
+    let name = path
+        .file_name()
+        .context("Требуется путь к файлу")?
+        .to_os_string();
+    let parent_path = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut parent = root.try_clone()?;
+    let mut missing_dirs = Vec::new();
+    for component in parent_path.components() {
+        let Component::Normal(part) = component else {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            bail!("Некорректный компонент пути")
+        };
+        if !missing_dirs.is_empty() {
+            missing_dirs.push(part.to_os_string());
+            continue;
+        }
+        match parent.symlink_metadata(part) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "Symlink в пути запрещён"
+                );
+                ensure!(metadata.is_dir(), "Компонент пути не является каталогом");
+                parent = open_child_directory(&parent, part)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_dirs.push(part.to_os_string());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok((parent, name, missing_dirs))
+}
+
+#[cfg(unix)]
 fn bound_parent_handle(
     retained_root: &Dir,
     root_path: &Path,
@@ -3855,6 +4553,13 @@ pub(crate) fn secret_component(name: &std::ffi::OsStr) -> bool {
             .any(|suffix| name.ends_with(suffix))
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MissingPolicy {
+    Disallow,
+    AllowMissingLeaf,
+    AllowMissingSubtree,
+}
+
 struct Policy<'a> {
     dir: &'a Dir,
     root: &'a Path,
@@ -3868,13 +4573,48 @@ impl<'a> Policy<'a> {
             matchers: HashMap::new(),
         }
     }
-    fn load(&mut self, path: &Path, base: &Path) -> Result<()> {
+    fn load_from_dir(&mut self, dir: &Dir, path: &Path, name: &Path, base: &Path) -> Result<()> {
         if self.matchers.contains_key(path) {
             return Ok(());
         }
         let mut builder = GitignoreBuilder::new(self.root.join(base));
-        let text = match parent_handle(self.dir, path)
-            .and_then(|(parent, name)| snapshot(&parent, Path::new(&name), 256 * 1024))
+        let text = match snapshot(dir, name, 256 * 1024) {
+            Ok(Some(file)) => {
+                Some(String::from_utf8(file.bytes).context("Ignore-файл не является UTF-8")?)
+            }
+            Ok(None) => None,
+            Err(error)
+                if error.downcast_ref::<io::Error>().is_some_and(|e| {
+                    e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::NotADirectory
+                }) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.context("Не удалось безопасно прочитать ignore-файл")),
+        };
+        if let Some(text) = text {
+            ensure!(
+                text.lines().count() <= 10_000,
+                "Слишком много ignore-правил"
+            );
+            for line in text.lines() {
+                builder
+                    .add_line(Some(path.into()), line)
+                    .context("Некорректное ignore-правило")?;
+            }
+        }
+        self.matchers.insert(path.into(), builder.build()?);
+        Ok(())
+    }
+    fn load_root_exclude(&mut self) -> Result<()> {
+        let path = Path::new(".git/info/exclude");
+        if self.matchers.contains_key(path) {
+            return Ok(());
+        }
+        let mut builder = GitignoreBuilder::new(self.root);
+        let text = match open_child_directory(self.dir, std::ffi::OsStr::new(".git"))
+            .and_then(|git| open_child_directory(&git, std::ffi::OsStr::new("info")))
+            .and_then(|info| snapshot(&info, Path::new("exclude"), 256 * 1024))
         {
             Ok(Some(file)) => {
                 Some(String::from_utf8(file.bytes).context("Ignore-файл не является UTF-8")?)
@@ -3903,10 +4643,18 @@ impl<'a> Policy<'a> {
         self.matchers.insert(path.into(), builder.build()?);
         Ok(())
     }
-    fn check(&mut self, path: &Path, allow_missing: bool) -> Result<PathBuf> {
-        let path = normalized_path(path, true)?;
-        self.load(Path::new(".git/info/exclude"), Path::new("."))?;
-        self.load(Path::new(".gitignore"), Path::new("."))?;
+    fn check(&mut self, path: &Path, missing_policy: MissingPolicy) -> Result<PathBuf> {
+        let path = normalized_path(
+            path,
+            !matches!(missing_policy, MissingPolicy::AllowMissingSubtree),
+        )?;
+        self.load_root_exclude()?;
+        self.load_from_dir(
+            self.dir,
+            Path::new(".gitignore"),
+            Path::new(".gitignore"),
+            Path::new("."),
+        )?;
         let mut layers = vec![
             PathBuf::from(".git/info/exclude"),
             PathBuf::from(".gitignore"),
@@ -3916,37 +4664,51 @@ impl<'a> Policy<'a> {
             .components()
             .filter(|c| !matches!(c, Component::CurDir))
             .count();
+        let mut current_dir: Option<Dir> = Some(self.dir.try_clone()?);
         for (i, component) in path
             .components()
             .filter(|c| !matches!(c, Component::CurDir))
             .enumerate()
         {
+            let part = component.as_os_str();
             ensure!(
-                !secret_component(component.as_os_str()),
+                !secret_component(part),
                 "Доступ к секретным файлам и служебным каталогам запрещён"
             );
-            prefix.push(component.as_os_str());
-            let metadata = match self.dir.symlink_metadata(&prefix) {
-                Ok(metadata) => {
-                    ensure!(
-                        !metadata.file_type().is_symlink(),
-                        "Symlink недоступен файловым инструментам"
-                    );
-                    Some(metadata)
+            prefix.push(part);
+            let metadata = if let Some(dir) = current_dir.as_ref() {
+                match dir.symlink_metadata(part) {
+                    Ok(metadata) => {
+                        ensure!(
+                            !metadata.file_type().is_symlink(),
+                            "Symlink недоступен файловым инструментам"
+                        );
+                        Some(metadata)
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => match missing_policy {
+                        MissingPolicy::AllowMissingSubtree => {
+                            if i + 1 < count {
+                                current_dir = None;
+                            }
+                            None
+                        }
+                        MissingPolicy::AllowMissingLeaf if i + 1 == count => None,
+                        _ => return Err(error.into()),
+                    },
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        && allow_missing
-                        && i + 1 == count =>
-                {
-                    None
-                }
-                Err(error) => return Err(error.into()),
+            } else {
+                None
             };
-            let is_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+            let existing_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+            let match_as_dir = if i + 1 < count {
+                metadata.as_ref().is_none_or(|m| m.is_dir())
+            } else {
+                existing_dir
+            };
             let mut ignored = false;
             for layer in &layers {
-                let matched = self.matchers[layer].matched(self.root.join(&prefix), is_dir);
+                let matched = self.matchers[layer].matched(self.root.join(&prefix), match_as_dir);
                 if !matched.is_none() {
                     ignored = matched.is_ignore();
                 }
@@ -3956,13 +4718,16 @@ impl<'a> Policy<'a> {
                 "Путь исключён правилами Git ignore: {}",
                 prefix.display()
             );
-            if i + 1 < count {
-                ensure!(is_dir, "Компонент пути не является каталогом");
+            if i + 1 < count && metadata.is_some() {
+                ensure!(existing_dir, "Компонент пути не является каталогом");
             }
-            if is_dir {
+            if existing_dir {
+                let next_dir =
+                    open_child_directory(current_dir.as_ref().expect("parent dir open"), part)?;
                 let ignore_path = prefix.join(".gitignore");
-                self.load(&ignore_path, &prefix)?;
+                self.load_from_dir(&next_dir, &ignore_path, Path::new(".gitignore"), &prefix)?;
                 layers.push(ignore_path);
+                current_dir = Some(next_dir);
             }
         }
         Ok(path)
@@ -6471,6 +7236,668 @@ mod tests {
                 fs::read_to_string(f.root.join("config.toml")).unwrap(),
                 "port = 8080\n"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_missing_parents_only_after_approval_and_cleans_empty_dirs_on_undo()
+    {
+        let mut f = Fixture::new();
+        let cancel = CancellationToken::new();
+
+        // 1) preview_write_for is strictly side-effect free (simulating operator denial).
+        let nested_args = json!({
+            "path": "app/api/v1/main.py",
+            "content": "def health():\n    return {'ok': True}\n",
+        });
+        let (diff, approved) = f
+            .tools
+            .preview_write_for("write_file", &nested_args, None)
+            .unwrap();
+        assert!(diff.contains("+++ b/app/api/v1/main.py"), "{diff}");
+        assert!(!f.root.join("app").exists());
+
+        // 2) TOCTOU: if first missing dir appears before execute_for_approved, reject without mutating.
+        fs::create_dir(f.root.join("app")).unwrap();
+        let raced = f
+            .tools
+            .execute_for_approved("write_file", &nested_args, &cancel, None, Some(&approved))
+            .await
+            .unwrap();
+        assert!(raced.is_error, "{}", raced.content);
+        assert!(
+            raced
+                .content
+                .contains("Файл изменился после подготовки diff"),
+            "{}",
+            raced.content
+        );
+        assert!(!f.root.join("app/api").exists());
+        fs::remove_dir(f.root.join("app")).unwrap();
+
+        // 3) TOCTOU: replacing an existing ancestor inode before execute_for_approved is also rejected.
+        #[cfg(unix)]
+        {
+            fs::create_dir(f.root.join("existing")).unwrap();
+            let sub_args = json!({"path": "existing/sub/mod.py", "content": "x = 1\n"});
+            let (_, sub_approved) = f
+                .tools
+                .preview_write_for("write_file", &sub_args, None)
+                .unwrap();
+            fs::rename(f.root.join("existing"), f.root.join("existing_old")).unwrap();
+            fs::create_dir(f.root.join("existing")).unwrap();
+            let inode_raced = f
+                .tools
+                .execute_for_approved("write_file", &sub_args, &cancel, None, Some(&sub_approved))
+                .await
+                .unwrap();
+            assert!(inode_raced.is_error, "{}", inode_raced.content);
+            assert!(!f.root.join("existing/sub").exists());
+            fs::remove_dir(f.root.join("existing")).unwrap();
+            fs::remove_dir(f.root.join("existing_old")).unwrap();
+        }
+
+        // 4) Approved execution creates missing parents, records observation, and preserves
+        //    created_parents across a same-turn edit/overwrite; undo removes file + empty dirs.
+        let created = f
+            .tools
+            .execute_for_approved("write_file", &nested_args, &cancel, None, Some(&approved))
+            .await
+            .unwrap();
+        assert!(!created.is_error, "{}", created.content);
+        assert!(f.root.join("app/api/v1/main.py").is_file());
+
+        let edited = f
+            .call(
+                "edit_file",
+                json!({
+                    "path": "app/api/v1/main.py",
+                    "old_text": "return {'ok': True}",
+                    "new_text": "return {'status': 'ok'}",
+                }),
+            )
+            .await;
+        assert!(!edited.is_error, "{}", edited.content);
+        f.tools.undo().unwrap();
+        assert!(!f.root.join("app").exists());
+
+        // 5) Writing into an already-existing directory omits created_parents from manifest JSON.
+        f.tools.begin_turn().unwrap();
+        assert!(
+            !f.call(
+                "write_file",
+                json!({"path": "root_file.txt", "content": "hi\n"})
+            )
+            .await
+            .is_error
+        );
+        let raw_manifest = fs::read_to_string(f.state.join(CHECKPOINT_FILE)).unwrap();
+        assert!(
+            !raw_manifest.contains("created_parents"),
+            "created_parents=0 must be omitted: {raw_manifest}"
+        );
+        f.tools.undo().unwrap();
+
+        // 6) User-created file inside a created directory keeps the non-empty ancestors on undo.
+        f.tools.begin_turn().unwrap();
+        assert!(
+            !f.call(
+                "write_file",
+                json!({"path": "pkg/deep/leaf/gen.py", "content": "v = 1\n"}),
+            )
+            .await
+            .is_error
+        );
+        fs::write(f.root.join("pkg/deep/user_notes.md"), "keep me\n").unwrap();
+        f.tools.undo().unwrap();
+        assert!(!f.root.join("pkg/deep/leaf").exists());
+        assert_eq!(
+            fs::read_to_string(f.root.join("pkg/deep/user_notes.md")).unwrap(),
+            "keep me\n"
+        );
+
+        // 7) Earlier committed turn referencing a parent directory keeps that parent on partial undo.
+        f.tools.begin_turn().unwrap();
+        assert!(
+            !f.call(
+                "write_file",
+                json!({"path": "shared/first.txt", "content": "1\n"}),
+            )
+            .await
+            .is_error
+        );
+        f.tools.begin_turn().unwrap();
+        assert!(
+            !f.call(
+                "write_file",
+                json!({"path": "shared/sub/second.txt", "content": "2\n"}),
+            )
+            .await
+            .is_error
+        );
+        f.tools.undo().unwrap();
+        assert!(!f.root.join("shared/sub").exists());
+        assert!(f.root.join("shared/first.txt").is_file());
+        f.tools.undo().unwrap();
+        assert!(!f.root.join("shared").exists());
+    }
+
+    #[tokio::test]
+    async fn write_file_missing_parents_enforce_gitignore_secrets_symlinks_and_grant_boundaries() {
+        let mut f = Fixture::new();
+        f.file(".gitignore", "target/\nbuild/\n");
+        f.file("README.md", "hello\n");
+
+        // Directory-only gitignore rules (`target/`, `build/`) must block missing subtrees before mkdir.
+        for blocked in [
+            "target/out.txt",
+            "build/nested/artifact.json",
+            "newdir/.env",
+            "newdir/.git/config",
+            "newdir/secrets/key.txt",
+            "newdir/.rcode-wal-fake/x.txt",
+            "README.md/sub/file.txt",
+            ".",
+        ] {
+            let out = f
+                .call("write_file", json!({"path": blocked, "content": "bad\n"}))
+                .await;
+            assert!(out.is_error, "expected {blocked} to fail: {}", out.content);
+        }
+        assert!(!f.root.join("target").exists());
+        assert!(!f.root.join("build").exists());
+        assert!(!f.root.join("newdir").exists());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(f.state.as_path(), f.root.join("symdir")).unwrap();
+            let sym = f
+                .call(
+                    "write_file",
+                    json!({"path": "symdir/sub/escape.txt", "content": "no\n"}),
+                )
+                .await;
+            assert!(sym.is_error);
+            assert!(!f.state.join("sub").exists());
+        }
+
+        // edit_file and read_file still require existing directories.
+        assert!(
+            f.call(
+                "edit_file",
+                json!({"path": "missing/file.txt", "old_text": "a", "new_text": "b"}),
+            )
+            .await
+            .is_error
+        );
+        assert!(!f.root.join("missing").exists());
+
+        // External grant boundary: ungranted missing parent still fails; granted external root allows subdirs.
+        let ext_holder = tempfile::tempdir().unwrap();
+        let ext_root = fs::canonicalize(ext_holder.path()).unwrap();
+        let ungranted_nested = ext_root.join("ungranted_sub/file.txt");
+        assert!(
+            f.tools
+                .extra_directory_for(
+                    "write_file",
+                    &json!({"path": ungranted_nested, "content": "x\n"}),
+                )
+                .is_err()
+        );
+        assert!(!ext_root.join("ungranted_sub").exists());
+
+        f.tools.add_directory(&ext_root).unwrap();
+        let granted_nested = ext_root.join("created_ext/deep/file.txt");
+        assert_eq!(
+            f.tools
+                .extra_directory_for(
+                    "write_file",
+                    &json!({"path": granted_nested, "content": "x\n"}),
+                )
+                .unwrap(),
+            None
+        );
+        let ext_write = f
+            .call(
+                "write_file",
+                json!({"path": granted_nested, "content": "ext-ok\n"}),
+            )
+            .await;
+        assert!(!ext_write.is_error, "{}", ext_write.content);
+        assert_eq!(fs::read_to_string(&granted_nested).unwrap(), "ext-ok\n");
+        f.tools.undo().unwrap();
+        assert!(!ext_root.join("created_ext").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_missing_parents_preserve_wal_recovery_and_orphan_stage_invariants() {
+        // 1) Cancellation before publication cleans stage and newly created empty directories.
+        let mut f = Fixture::new();
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        f.tools.before_publication_hook = Some(Box::new(move || {
+            cancel_clone.cancel();
+        }));
+        let cancelled = f
+            .tools
+            .execute(
+                "write_file",
+                &json!({"path": "cancelled/sub/file.txt", "content": "data\n"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(cancelled.is_error);
+        assert!(!f.root.join("cancelled").exists());
+
+        // 2) Pre-write_manifest_atomic persist error inside cleanup_committed_stage restores
+        //    in-memory orphan_stages and preserves the created parent directory for reopen.
+        let mut f2 = Fixture::new();
+        assert!(
+            !f2.call(
+                "write_file",
+                json!({"path": "orphan_keep/sub/a.txt", "content": "ok\n"}),
+            )
+            .await
+            .is_error
+        );
+        let fake_stage = crate::workspace_stage::StageDirectory::plan_name();
+        let committed = f2.tools.checkpoints.turns[0].entries[0].clone();
+        let root_path = f2.tools.root().to_path_buf();
+        let parent_dir = Dir::open_ambient_dir(
+            f2.root.join("orphan_keep/sub"),
+            cap_std::ambient_authority(),
+        )
+        .unwrap();
+        let real_stage =
+            crate::workspace_stage::StageDirectory::create_empty(&parent_dir, &fake_stage)
+                .unwrap()
+                .reference();
+        drop(parent_dir);
+        f2.tools
+            .record_orphan_stage(
+                &root_path,
+                &committed.path,
+                &real_stage,
+                5,
+                committed.binding.as_deref().unwrap(),
+            )
+            .unwrap();
+        f2.tools.persist().unwrap();
+        // Widen state dir permissions so blob_store.check() fails BEFORE write_manifest_atomic
+        // without setting wal_poisoned!
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&f2.state, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cleanup_err = f2
+            .tools
+            .cleanup_committed_stage(&committed, &real_stage, None)
+            .unwrap_err();
+        assert!(
+            !f2.tools.wal_poisoned,
+            "precheck error must not poison WAL: {cleanup_err:#}"
+        );
+        assert_eq!(
+            f2.tools.checkpoints.orphan_stages.len(),
+            1,
+            "failed persist in cleanup_committed_stage must restore prior_orphans"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&f2.state, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Because orphan_stages still references orphan_keep/sub (even though physical stage was removed),
+        // undo removes a.txt but keeps orphan_keep/sub!
+        f2.tools.undo().unwrap();
+        assert!(!f2.root.join("orphan_keep/sub/a.txt").exists());
+        assert!(
+            f2.root.join("orphan_keep/sub").is_dir(),
+            "directory referenced by orphan_stages (even without physical stage) must be kept"
+        );
+        let root2 = f2.root.clone();
+        let state2 = f2.state.clone();
+        drop(f2.tools);
+        let _reopened2 = Tools::new(&root2, &state2).unwrap();
+
+        // 3) Post-rename persist failure (`ManifestAfterRenameBeforeDirSync` -> `wal_poisoned`)
+        //    preserves created directories so reopen + reconcile_pending_write succeeds.
+        let mut f3 = Fixture::new();
+        f3.tools.fail_store_after_wal_point(
+            WalFaultPoint::StageCreated { index: 0 },
+            crate::file_wal::StoreFaultPoint::ManifestAfterRenameBeforeDirSync,
+            libc::EIO,
+        );
+        let poisoned_res = f3
+            .tools
+            .execute(
+                "write_file",
+                &json!({"path": "poisoned/deep/file.txt", "content": "hello\n"}),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(poisoned_res.is_err());
+        assert!(f3.tools.wal_poisoned);
+        assert!(f3.root.join("poisoned/deep").is_dir());
+        let root3 = f3.root.clone();
+        let state3 = f3.state.clone();
+        drop(f3.tools);
+        let reopened3 = Tools::new(&root3, &state3).unwrap();
+        assert!(reopened3.checkpoints.pending_write.is_none());
+
+        // 4) Manifest headroom precheck with JSON-escaped `\u{0001}` path segments rejects BEFORE mkdir.
+        let mut f4 = Fixture::new();
+        f4.tools.begin_turn().unwrap();
+        let root_id = f4.tools.root_identity;
+        let canonical_root4 = f4.tools.root().to_path_buf();
+        let long_parent = PathBuf::from("\u{0001}".repeat(600));
+        let one_orphan = OrphanStage {
+            root: canonical_root4,
+            parent: long_parent,
+            stage: crate::workspace_stage::StageRef {
+                name: crate::workspace_stage::StageDirectory::plan_name(),
+                directory: Some(root_id),
+                guard: Some(root_id),
+                payload: Some(root_id),
+            },
+            bytes: 0,
+            binding: vec![root_id; 16],
+        };
+        let one_len = serde_json::to_vec(&one_orphan).unwrap().len() + 1;
+        let base_len = serde_json::to_vec(&f4.tools.checkpoints).unwrap().len();
+        let count = (crate::file_wal::MAX_MANIFEST_BYTES - 4_500 - base_len) / one_len;
+        for _ in 0..count {
+            let mut item = one_orphan.clone();
+            item.stage.name = crate::workspace_stage::StageDirectory::plan_name();
+            f4.tools.checkpoints.orphan_stages.push(item);
+        }
+        f4.tools.persist().unwrap();
+        let escaped_dir = format!("esc-{}", "\u{0001}".repeat(240));
+        let escaped_leaf = format!("{escaped_dir}/{}/f.txt", "\u{0001}".repeat(240));
+        let over_limit = f4
+            .call("write_file", json!({"path": escaped_leaf, "content": "x"}))
+            .await;
+        assert!(over_limit.is_error, "{}", over_limit.content);
+        assert!(
+            over_limit.content.contains("WAL manifest"),
+            "{}",
+            over_limit.content
+        );
+        assert!(
+            !f4.root.join(&escaped_dir).exists(),
+            "manifest overflow must be caught before creating any directory"
+        );
+
+        // 5) Same-turn external deletion of a tracked nested file + directory is rejected BEFORE mkdir.
+        let mut f5 = Fixture::new();
+        let first5 = f5
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({"path": "vanished/sub/file.txt", "content": "v1\n"}),
+                &CancellationToken::new(),
+                Some("worker-1"),
+            )
+            .await
+            .unwrap();
+        assert!(!first5.is_error, "{}", first5.content);
+        fs::remove_dir_all(f5.root.join("vanished")).unwrap();
+        let conflict5 = f5
+            .tools
+            .execute_for(
+                "write_file",
+                &json!({"path": "vanished/sub/file.txt", "content": "v2\n"}),
+                &CancellationToken::new(),
+                Some("worker-2"),
+            )
+            .await
+            .unwrap();
+        assert!(conflict5.is_error, "{}", conflict5.content);
+        assert!(
+            !f5.root.join("vanished").exists(),
+            "same-turn conflict check must reject before creating missing directories"
+        );
+
+        // 6) Cross-root checkpoints_reference_dir protects `/ext/narrow` + `created` when an orphan uses `/ext` + `narrow/created`.
+        let ext_base = tempfile::tempdir().unwrap();
+        let ext_wide = fs::canonicalize(ext_base.path()).unwrap();
+        let ext_narrow = ext_wide.join("narrow");
+        fs::create_dir_all(&ext_narrow).unwrap();
+        let mut f6 = Fixture::new();
+        f6.tools.add_directory(&ext_narrow).unwrap();
+        let ext_file = ext_narrow.join("created/leaf.txt");
+        let w6 = f6
+            .call(
+                "write_file",
+                json!({"path": ext_file.display().to_string(), "content": "ext\n"}),
+            )
+            .await;
+        assert!(!w6.is_error, "{}", w6.content);
+        f6.tools.checkpoints.orphan_stages.push(OrphanStage {
+            root: ext_wide.clone(),
+            parent: PathBuf::from("narrow/created"),
+            stage: crate::workspace_stage::StageRef {
+                name: crate::workspace_stage::StageDirectory::plan_name(),
+                directory: None,
+                guard: None,
+                payload: None,
+            },
+            bytes: 0,
+            binding: vec![f6.tools.root_identity; 3],
+        });
+        f6.tools.persist().unwrap();
+        assert!(
+            f6.tools
+                .checkpoints_reference_dir(&ext_narrow, Path::new("created")),
+            "cross-root orphan reference must block empty-dir removal"
+        );
+        f6.tools.undo().unwrap();
+        assert!(!ext_file.exists());
+        assert!(
+            ext_narrow.join("created").is_dir(),
+            "directory referenced by wider-root orphan_stages must remain on disk"
+        );
+
+        // 7) `write → widen grant → write → undo → reopen → undo` (and reverse wide → narrow) preserves binding length invariants.
+        let ext7_base = tempfile::tempdir().unwrap();
+        let ext7_wide = fs::canonicalize(ext7_base.path()).unwrap();
+        let ext7_narrow = ext7_wide.join("narrow");
+        fs::create_dir_all(&ext7_narrow).unwrap();
+        let mut f7 = Fixture::new();
+        f7.tools.add_directory(&ext7_narrow).unwrap();
+        let ext7_file = ext7_narrow.join("sub/f.txt");
+        let w7_1 = f7
+            .call(
+                "write_file",
+                json!({"path": ext7_file.display().to_string(), "content": "turn1\n"}),
+            )
+            .await;
+        assert!(!w7_1.is_error, "{}", w7_1.content);
+
+        f7.tools.begin_turn().unwrap();
+        f7.tools.add_directory(&ext7_wide).unwrap();
+        let r7 = f7
+            .call(
+                "read_file",
+                json!({"path": ext7_file.display().to_string()}),
+            )
+            .await;
+        assert!(!r7.is_error, "{}", r7.content);
+        let w7_2 = f7
+            .call(
+                "write_file",
+                json!({"path": ext7_file.display().to_string(), "content": "turn2\n"}),
+            )
+            .await;
+        assert!(!w7_2.is_error, "{}", w7_2.content);
+
+        f7.tools.undo().unwrap();
+        assert_eq!(fs::read_to_string(&ext7_file).unwrap(), "turn1\n");
+        let root7 = f7.root.clone();
+        let state7 = f7.state.clone();
+        drop(f7.tools);
+        let mut reopened7 = Tools::new(&root7, &state7).unwrap();
+        reopened7.undo().unwrap();
+        assert!(!ext7_file.exists());
+        assert!(!ext7_narrow.join("sub").exists());
+
+        // Reverse direction: wide grant in turn 1 -> reopen -> narrow grant in turn 2 -> undo -> reopen -> undo.
+        reopened7.begin_turn().unwrap();
+        reopened7.add_directory(&ext7_wide).unwrap();
+        let w7_wide = reopened7
+            .execute(
+                "write_file",
+                &json!({"path": ext7_file.display().to_string(), "content": "wide1\n"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!w7_wide.is_error, "{}", w7_wide.content);
+        drop(reopened7);
+
+        let mut reopened7_narrow = Tools::new(&root7, &state7).unwrap();
+        reopened7_narrow.begin_turn().unwrap();
+        reopened7_narrow.add_directory(&ext7_narrow).unwrap();
+        let r7_narrow = reopened7_narrow
+            .execute(
+                "read_file",
+                &json!({"path": ext7_file.display().to_string()}),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!r7_narrow.is_error, "{}", r7_narrow.content);
+        let w7_narrow = reopened7_narrow
+            .execute(
+                "write_file",
+                &json!({"path": ext7_file.display().to_string(), "content": "narrow2\n"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!w7_narrow.is_error, "{}", w7_narrow.content);
+        reopened7_narrow.undo().unwrap();
+        drop(reopened7_narrow);
+
+        let mut reopened7_final = Tools::new(&root7, &state7).unwrap();
+        reopened7_final.undo().unwrap();
+        assert!(!ext7_file.exists());
+        assert!(!ext7_narrow.join("sub").exists());
+
+        // 8) User replaces created directory `a` between turns: undo T2 + undo T1 removes `f` but preserves user's directory `a`.
+        let mut f8 = Fixture::new();
+        let w8_1 = f8
+            .call("write_file", json!({"path": "a/f.txt", "content": "v1\n"}))
+            .await;
+        assert!(!w8_1.is_error, "{}", w8_1.content);
+        fs::rename(f8.root.join("a"), f8.root.join("saved")).unwrap();
+        fs::create_dir(f8.root.join("a")).unwrap();
+        fs::copy(f8.root.join("saved/f.txt"), f8.root.join("a/f.txt")).unwrap();
+        let user_dir_ino = {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(f8.root.join("a")).unwrap().ino()
+        };
+
+        f8.tools.begin_turn().unwrap();
+        let r8 = f8.call("read_file", json!({"path": "a/f.txt"})).await;
+        assert!(!r8.is_error, "{}", r8.content);
+        let w8_2 = f8
+            .call("write_file", json!({"path": "a/f.txt", "content": "v2\n"}))
+            .await;
+        assert!(!w8_2.is_error, "{}", w8_2.content);
+
+        f8.tools.undo().unwrap();
+        assert_eq!(f8.tools.checkpoints.turns[0].entries[0].created_parents, 0);
+        f8.tools.undo().unwrap();
+        assert!(!f8.root.join("a/f.txt").exists());
+        assert!(
+            f8.root.join("a").is_dir(),
+            "user-recreated directory `a` must not be deleted by T1 undo"
+        );
+        let after_dir_ino = {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(f8.root.join("a")).unwrap().ino()
+        };
+        assert_eq!(after_dir_ino, user_dir_ino);
+        assert_eq!(
+            fs::read_to_string(f8.root.join("saved/f.txt")).unwrap(),
+            "v1\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deep_nested_mkdirs_and_undo_work_under_rlimit_nofile_64() {
+        const CHILD: &str = "RCODE_TEST_WAL_DEEP_MKDIR_LOW_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tools::tests::deep_nested_mkdirs_and_undo_work_under_rlimit_nofile_64")
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "low-FD deep mkdir child failed: {status}");
+            return;
+        }
+
+        let limit = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let mut fixture = Fixture::new();
+        // Max allowed normalized component count is 64 (63 nested dirs + 1 leaf file).
+        let deep_path = format!(
+            "{}/leaf.txt",
+            (0..63)
+                .map(|i| format!("d{i:02}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        let deep_out = fixture
+            .call(
+                "write_file",
+                json!({"path": deep_path, "content": "deep\n"}),
+            )
+            .await;
+        assert!(!deep_out.is_error, "{}", deep_out.content);
+
+        for index in 0..30 {
+            let p = format!("multi-{index:02}/a/b/c/file.txt");
+            let res = fixture
+                .call("write_file", json!({"path": p, "content": "ok\n"}))
+                .await;
+            assert!(!res.is_error, "{p}: {}", res.content);
+        }
+
+        // Also exercise unpublished abort cleanup under RLIMIT_NOFILE=64.
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        fixture.tools.before_publication_hook = Some(Box::new(move || {
+            cancel_clone.cancel();
+        }));
+        let aborted = fixture
+            .tools
+            .execute(
+                "write_file",
+                &json!({"path": "aborted/a/b/c/d/file.txt", "content": "x\n"}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert!(aborted.is_error);
+        assert!(!fixture.root.join("aborted").exists());
+
+        let root = fixture.root.clone();
+        let state = fixture.state.clone();
+        drop(fixture.tools);
+        let mut reopened = Tools::new(&root, &state).unwrap();
+        reopened.undo().unwrap();
+        assert!(!root.join("d00").exists());
+        for index in 0..30 {
+            assert!(!root.join(format!("multi-{index:02}")).exists());
         }
     }
 }
