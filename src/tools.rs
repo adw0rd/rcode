@@ -1068,7 +1068,7 @@ impl Tools {
             ),
             (
                 "edit_file",
-                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого host внешнего каталога (внешний путь — абсолютный). Не включайте префиксы номеров строк N\\t из read_file. Совпадение единственное, кроме replace_all=true. Успешный ответ подтверждает выполнение правки; перечитывать файл для проверки не нужно. Доступно undo.",
+                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого внешнего каталога. Не включайте префиксы номеров строк N\\t из read_file; для крупных перезаписей берите write_file после read_file. Совпадение единственное, кроме replace_all=true; перечитывать файл для проверки не нужно. Доступно undo.",
                 json!({"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}),
                 vec!["path", "old_text", "new_text"],
             ),
@@ -3153,7 +3153,27 @@ impl Tools {
                 let old = string_arg(args, "old_text")?;
                 let new = string_arg(args, "new_text")?;
                 let all = bool_arg(args, "replace_all", false)?;
-                crate::text_edit::apply_edit_text(text, old, new, all, MAX_FILE_BYTES)?
+                let snapshot_is_fresh = || {
+                    self.read_snapshots
+                        .get(&(actor.map(str::to_owned), root.join(&path)))
+                        .is_some_and(|obs| {
+                            #[cfg(unix)]
+                            let valid = !obs.stale
+                                && obs.identity == file.identity
+                                && obs.binding == binding;
+                            #[cfg(not(unix))]
+                            let valid = !obs.stale;
+                            valid && obs.sha256 == sha256(&file.bytes)
+                        })
+                };
+                crate::text_edit::apply_edit_text_with_context(
+                    text,
+                    old,
+                    new,
+                    all,
+                    MAX_FILE_BYTES,
+                    snapshot_is_fresh,
+                )?
             }
             _ => bail!("Неизвестная файловая операция"),
         };
@@ -7899,6 +7919,85 @@ mod tests {
         for index in 0..30 {
             assert!(!root.join(format!("multi-{index:02}")).exists());
         }
+    }
+
+    #[tokio::test]
+    async fn edit_file_miss_recovery_hint_tracks_fresh_actor_snapshot() {
+        let mut f = Fixture::new();
+        let initial = (1..=20)
+            .map(|i| format!("line_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(f.root.join("big.py"), &initial).unwrap();
+        let broad_miss = (1..=14)
+            .map(|i| format!("missing_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 1) Before reading: does NOT claim snapshot is fresh.
+        let unread = f
+            .call(
+                "edit_file",
+                json!({"path": "big.py", "old_text": broad_miss, "new_text": "x = 1"}),
+            )
+            .await;
+        assert!(unread.is_error);
+        assert!(
+            unread
+                .content
+                .contains("прочитайте файл через read_file и перезапишите через write_file"),
+            "{}",
+            unread.content
+        );
+        assert!(
+            !unread.content.contains("уже актуален"),
+            "{}",
+            unread.content
+        );
+
+        // 2) After read_file by main actor: claims snapshot is fresh -> immediate write_file succeeds!
+        let r = f.call("read_file", json!({"path": "big.py"})).await;
+        assert!(!r.is_error, "{}", r.content);
+        let fresh = f
+            .call(
+                "edit_file",
+                json!({"path": "big.py", "old_text": broad_miss, "new_text": "x = 1"}),
+            )
+            .await;
+        assert!(fresh.is_error);
+        assert!(
+            fresh
+                .content
+                .contains("снимок файла в текущем ходе уже актуален"),
+            "{}",
+            fresh.content
+        );
+
+        // Another actor (`worker-1`) does NOT share main's snapshot.
+        let other_actor = f
+            .tools
+            .execute_for(
+                "edit_file",
+                &json!({"path": "big.py", "old_text": broad_miss, "new_text": "x = 1"}),
+                &CancellationToken::new(),
+                Some("worker-1"),
+            )
+            .await
+            .unwrap();
+        assert!(other_actor.is_error);
+        assert!(!other_actor.content.contains("уже актуален"));
+
+        // External modification invalidates freshness for main too.
+        fs::write(f.root.join("big.py"), format!("{initial}extra = 99\n")).unwrap();
+        let mutated = f
+            .call(
+                "edit_file",
+                json!({"path": "big.py", "old_text": broad_miss, "new_text": "x = 1"}),
+            )
+            .await;
+        assert!(mutated.is_error);
+        assert!(!mutated.content.contains("уже актуален"));
     }
 }
 
