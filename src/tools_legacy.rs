@@ -435,7 +435,7 @@ impl Tools {
             ),
             (
                 "edit_file",
-                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого host внешнего каталога (внешний путь — абсолютный). Не включайте префиксы номеров строк N\\t из read_file. Совпадение единственное, кроме replace_all=true. Успешный ответ подтверждает выполнение правки; перечитывать файл для проверки не нужно. Доступно undo.",
+                "Заменить точное непустое old_text в UTF-8 файле проекта или разрешённого внешнего каталога. Не включайте префиксы номеров строк N\\t из read_file; для крупных перезаписей берите write_file после read_file. Совпадение единственное, кроме replace_all=true; перечитывать файл для проверки не нужно. Доступно undo.",
                 json!({"path":{"type":"string"},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}),
                 vec!["path", "old_text", "new_text"],
             ),
@@ -1262,7 +1262,27 @@ impl Tools {
                 let old = string_arg(args, "old_text")?;
                 let new = string_arg(args, "new_text")?;
                 let all = bool_arg(args, "replace_all", false)?;
-                crate::text_edit::apply_edit_text(text, old, new, all, MAX_FILE_BYTES)?
+                let snapshot_is_fresh = || {
+                    self.read_snapshots
+                        .get(&(actor.map(str::to_owned), root.join(&path)))
+                        .is_some_and(|obs| {
+                            #[cfg(unix)]
+                            let valid = !obs.stale
+                                && obs.identity == file.identity
+                                && obs.binding == binding;
+                            #[cfg(not(unix))]
+                            let valid = !obs.stale;
+                            valid && obs.sha256 == sha256(&file.bytes)
+                        })
+                };
+                crate::text_edit::apply_edit_text_with_context(
+                    text,
+                    old,
+                    new,
+                    all,
+                    MAX_FILE_BYTES,
+                    snapshot_is_fresh,
+                )?
             }
             _ => bail!("Неизвестная файловая операция"),
         };
@@ -4507,5 +4527,47 @@ mod tests {
         f.tools.undo().unwrap();
         assert!(!f.root.join("tests/api/test_crud.py").exists());
         assert!(f.root.join("tests/api").is_dir());
+    }
+
+    #[tokio::test]
+    async fn edit_file_miss_recovery_hint_tracks_fresh_actor_snapshot_in_legacy() {
+        let mut f = Fixture::new();
+        let initial = (1..=20)
+            .map(|i| format!("line_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(f.root.join("big.py"), &initial).unwrap();
+        let broad_miss = (1..=14)
+            .map(|i| format!("missing_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let unread = f
+            .call(
+                "edit_file",
+                json!({"path": "big.py", "old_text": broad_miss, "new_text": "x = 1"}),
+            )
+            .await;
+        assert!(unread.is_error);
+        assert!(!unread.content.contains("уже актуален"));
+
+        assert!(
+            !f.call("read_file", json!({"path": "big.py"}))
+                .await
+                .is_error
+        );
+        let fresh = f
+            .call(
+                "edit_file",
+                json!({"path": "big.py", "old_text": broad_miss, "new_text": "x = 1"}),
+            )
+            .await;
+        assert!(fresh.is_error);
+        assert!(
+            fresh
+                .content
+                .contains("снимок файла в текущем ходе уже актуален")
+        );
     }
 }

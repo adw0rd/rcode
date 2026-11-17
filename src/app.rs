@@ -1310,40 +1310,78 @@ fn pause_serve_reply_for_test(call_id: &str, outcome: &ToolOutcome) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileFailureAction {
+    Reset,
+    Continue,
+    Warn,
+    Stop,
+}
+
+fn canonical_file_error_kind(content: &str) -> &str {
+    if content.starts_with("old_text не найден") {
+        "old_text не найден"
+    } else if content.starts_with("old_text неоднозначен") {
+        "old_text неоднозначен"
+    } else {
+        content
+    }
+}
+
 #[derive(Default)]
 struct FileFailureLoop {
     last: Option<(String, String, String)>,
     repeats: u8,
+    path_target: Option<(String, String)>,
+    path_repeats: u8,
 }
 
 impl FileFailureLoop {
     fn reset(&mut self) {
         self.last = None;
         self.repeats = 0;
+        self.path_target = None;
+        self.path_repeats = 0;
     }
 
-    fn observe(&mut self, call: &ToolCall, outcome: &ToolOutcome) -> Option<u8> {
+    fn observe(&mut self, call: &ToolCall, outcome: &ToolOutcome) -> Option<FileFailureAction> {
         let name = call.function.name.as_str();
         if !outcome.is_error && matches!(name, "write_file" | "edit_file" | "run_command") {
-            self.last = None;
-            self.repeats = 0;
-            return Some(0);
+            self.reset();
+            return Some(FileFailureAction::Reset);
         }
         if !outcome.is_error || !matches!(name, "write_file" | "edit_file") {
             return None;
         }
         let args: Value = serde_json::from_str(&call.function.arguments).ok()?;
         let path = args.get("path")?.as_str()?;
-        // Compare the operation, target and error, not generated content: models
-        // can vary a few characters while repeating exactly the same failure.
-        let key = (name.to_owned(), path.to_owned(), outcome.content.clone());
+        // Compare the operation, target and canonical error class, not dynamic
+        // line diagnostics or generated content: models can vary old_text size
+        // or alternate errors on the same path without making real progress.
+        let target = (name.to_owned(), path.to_owned());
+        self.path_repeats = if self.path_target.as_ref() == Some(&target) {
+            self.path_repeats.saturating_add(1)
+        } else {
+            1
+        };
+        self.path_target = Some(target);
+
+        let kind = canonical_file_error_kind(&outcome.content).to_owned();
+        let key = (name.to_owned(), path.to_owned(), kind);
         self.repeats = if self.last.as_ref() == Some(&key) {
             self.repeats.saturating_add(1)
         } else {
             1
         };
         self.last = Some(key);
-        Some(self.repeats)
+
+        if self.repeats >= 4 || self.path_repeats >= 6 {
+            Some(FileFailureAction::Stop)
+        } else if self.repeats == 2 || (self.repeats < 2 && self.path_repeats == 3) {
+            Some(FileFailureAction::Warn)
+        } else {
+            Some(FileFailureAction::Continue)
+        }
     }
 }
 
@@ -5779,14 +5817,19 @@ async fn turn_inner(
                 outside_path_failed |= outcome.is_error && serde_json::from_str::<Value>(&outcome.content)
                     .is_ok_and(|error| error["error"] == "outside_workspace");
                 made_progress |= !outcome.is_error;
-                if let Some(repeats) = file_failures.observe(call, &outcome) {
-                    if repeats == 0 {
-                        repeat_warning = None;
-                        repeat_stop = None;
-                    } else if repeats == 2 {
-                        repeat_warning = Some(format!("[rcode runtime feedback, not a new user permission] {name} has repeated the same file error twice without a successful write. Successful reads alone do not resolve it. Diagnose the actual tool error and change the failing arguments: after read_file omit expected_sha256 to use the host's unchanged read snapshot, or copy its exact sha256; edit_file requires unique exact old_text without line numbers. Do not retry the same invalid write or bypass file restrictions and approvals. Error: {}", outcome.content));
-                    } else if repeats >= 4 {
-                        repeat_stop = Some(format!("Повторяется ошибка записи: {name} четыре раза вернул одну и ту же ошибку без успешной записи. Ход остановлен; результат не подтверждён. Причина: {} Продолжите новым запросом после устранения причины.", outcome.content));
+                if let Some(action) = file_failures.observe(call, &outcome) {
+                    match action {
+                        FileFailureAction::Reset => {
+                            repeat_warning = None;
+                            repeat_stop = None;
+                        }
+                        FileFailureAction::Warn => {
+                            repeat_warning = Some(format!("[rcode runtime feedback, not a new user permission] {name} has repeated file errors on this target without a successful write. Successful reads alone do not resolve it. Diagnose the actual tool error and change strategy: after read_file omit expected_sha256 to use the host's unchanged read snapshot, or copy its exact sha256; for edit_file pass a short unique 3-8 line old_text without N\\t line numbers, or if replacing a large block / rewriting the file switch to write_file after read_file (omitting expected_sha256; skip read_file only if the tool error explicitly confirms the host snapshot is already fresh). Do not retry another large failing edit_file or bypass file restrictions and approvals. Error: {}", outcome.content));
+                        }
+                        FileFailureAction::Stop => {
+                            repeat_stop = Some(format!("Повторяется ошибка записи: {name} неоднократно вернул ошибку на том же пути без успешной записи. Ход остановлен; результат не подтверждён. Причина: {} Продолжите новым запросом после устранения причины.", outcome.content));
+                        }
+                        FileFailureAction::Continue => {}
                     }
                 }
                 match repeated.observe(call, &outcome) {
@@ -7491,12 +7534,20 @@ mod tests {
     #[test]
     fn file_failure_counter_keeps_reads_but_resets_on_successful_writes() {
         let mut failures = FileFailureLoop::default();
-        let failed = ToolOutcome::error("old_text не найден; перечитайте файл");
+        let failed_v1 = ToolOutcome::error(
+            "old_text не найден (файл: 120 стр., old_text: 45 стр.); прочитайте нужный диапазон",
+        );
+        let failed_v2 = ToolOutcome::error(
+            "old_text не найден (файл: 120 стр., old_text: 38 стр., расхождение на 85-й строке); прочитайте нужный диапазон",
+        );
         let edit = ToolCall::new(
             "edit_file",
             json!({"path":"a.txt","old_text":"missing","new_text":"change"}),
         );
-        assert_eq!(failures.observe(&edit, &failed), Some(1));
+        assert_eq!(
+            failures.observe(&edit, &failed_v1),
+            Some(FileFailureAction::Continue)
+        );
         assert_eq!(
             failures.observe(
                 &ToolCall::new("read_file", json!({"path":"a.txt"})),
@@ -7504,17 +7555,58 @@ mod tests {
             ),
             None
         );
-        assert_eq!(failures.observe(&edit, &failed), Some(2));
+        // Varying diagnostic line counts still count as the same `old_text не найден` loop.
+        assert_eq!(
+            failures.observe(&edit, &failed_v2),
+            Some(FileFailureAction::Warn)
+        );
+        assert_eq!(
+            failures.observe(&edit, &failed_v1),
+            Some(FileFailureAction::Continue)
+        );
+        assert_eq!(
+            failures.observe(&edit, &failed_v2),
+            Some(FileFailureAction::Stop)
+        );
         assert_eq!(
             failures.observe(&edit, &ToolOutcome::success("written")),
-            Some(0)
+            Some(FileFailureAction::Reset)
         );
-        assert_eq!(failures.observe(&edit, &failed), Some(1));
+        assert_eq!(
+            failures.observe(&edit, &failed_v1),
+            Some(FileFailureAction::Continue)
+        );
         let other = ToolCall::new(
             "edit_file",
             json!({"path":"b.txt","old_text":"missing","new_text":"change"}),
         );
-        assert_eq!(failures.observe(&other, &failed), Some(1));
+        assert_eq!(
+            failures.observe(&other, &failed_v1),
+            Some(FileFailureAction::Continue)
+        );
+
+        // Alternating different errors on the same `(name, path)` also triggers Warn at 3 and Stop at 6.
+        let amb = ToolOutcome::error("old_text неоднозначен (совпадения на строках 2, 9)");
+        assert_eq!(
+            failures.observe(&other, &amb),
+            Some(FileFailureAction::Continue)
+        );
+        assert_eq!(
+            failures.observe(&other, &failed_v1),
+            Some(FileFailureAction::Warn)
+        );
+        assert_eq!(
+            failures.observe(&other, &amb),
+            Some(FileFailureAction::Continue)
+        );
+        assert_eq!(
+            failures.observe(&other, &failed_v2),
+            Some(FileFailureAction::Continue)
+        );
+        assert_eq!(
+            failures.observe(&other, &amb),
+            Some(FileFailureAction::Stop)
+        );
     }
 
     #[test]

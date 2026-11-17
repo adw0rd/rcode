@@ -2,10 +2,6 @@ use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
 use std::ops::Range;
 
-const AMBIGUOUS_MSG: &str =
-    "old_text неоднозначен; уточните контекст или явно укажите replace_all=true";
-const NOT_FOUND_MSG: &str = "old_text не найден; перечитайте файл";
-
 #[derive(Clone, Copy, Debug)]
 struct FileLine<'a> {
     start: usize,
@@ -14,12 +10,32 @@ struct FileLine<'a> {
     trimmed: &'a str,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MissLocation {
+    None,
+    MissingFinalNewline {
+        start_line: usize,
+        matched_lines: usize,
+    },
+    Prefix {
+        start_line: usize,
+        matched_lines: usize,
+        pat_len: usize,
+        mismatch_line: Option<usize>,
+    },
+    Anchor {
+        old_line_1based: usize,
+        file_line_1based: usize,
+    },
+}
+
 /// Applies `edit_file` replacement in two stages:
 /// - Stage 1: Exact byte match (preserving legacy `str::replace` behavior verbatim).
 /// - Stage 2a: When exact match finds 0 occurrences, CRLF <-> LF normalized pass
 ///   preserving horizontal whitespace.
 /// - Stage 2b: Full-line pass ignoring per-line trailing `' '` / `'\t'` and CRLF <-> LF
 ///   in `O(|text| + |old|)` time via KMP over interned line IDs.
+#[cfg(test)]
 pub(crate) fn apply_edit_text(
     text: &str,
     old: &str,
@@ -27,6 +43,20 @@ pub(crate) fn apply_edit_text(
     replace_all: bool,
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
+    apply_edit_text_with_context(text, old, new, replace_all, max_bytes, || false)
+}
+
+pub(crate) fn apply_edit_text_with_context<F>(
+    text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    max_bytes: usize,
+    snapshot_is_fresh: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce() -> bool,
+{
     ensure!(!old.is_empty(), "old_text не должен быть пустым");
     ensure!(
         old.len() <= max_bytes && new.len() <= max_bytes,
@@ -34,27 +64,34 @@ pub(crate) fn apply_edit_text(
     );
 
     // Stage 1: exact byte match.
-    let exact_count = text
-        .match_indices(old)
-        .take(if replace_all { usize::MAX } else { 2 })
-        .count();
-    if exact_count > 0 {
-        let overlapping = if !replace_all {
-            let first = text.find(old).expect("exact_count > 0");
+    let exact_count = if replace_all {
+        text.match_indices(old).count()
+    } else {
+        let sample: Vec<usize> = text.match_indices(old).take(4).map(|(i, _)| i).collect();
+        if !sample.is_empty() {
+            let first = sample[0];
             let next = first
                 + text[first..]
                     .chars()
                     .next()
                     .expect("non-empty old")
                     .len_utf8();
-            text[next..].contains(old)
-        } else {
-            false
-        };
-        ensure!(
-            !overlapping && (exact_count == 1 || replace_all),
-            "{AMBIGUOUS_MSG}"
-        );
+            let overlapping = sample.len() == 1 && text[next..].contains(old);
+            if overlapping || sample.len() > 1 {
+                bail!(
+                    "{}",
+                    format_ambiguous_message(
+                        text,
+                        &sample[..sample.len().min(3)],
+                        sample.len() > 3,
+                        overlapping,
+                    )
+                );
+            }
+        }
+        sample.len()
+    };
+    if exact_count > 0 {
         let length = text
             .len()
             .checked_sub(exact_count * old.len())
@@ -73,21 +110,29 @@ pub(crate) fn apply_edit_text(
     let old_lf = old.replace("\r\n", "\n");
     debug_assert!(!old_lf.is_empty());
 
-    let stage2a_count = norm
-        .match_indices(&old_lf)
-        .take(if replace_all { usize::MAX } else { 2 })
-        .count();
-    if stage2a_count > 0 {
-        if !replace_all {
-            let first = norm.find(&old_lf).expect("stage2a_count > 0");
+    if !replace_all {
+        let sample: Vec<usize> = norm
+            .match_indices(&old_lf)
+            .take(4)
+            .map(|(i, _)| i)
+            .collect();
+        if !sample.is_empty() {
+            let first = sample[0];
             let next = first
                 + norm[first..]
                     .chars()
                     .next()
                     .expect("non-empty old_lf")
                     .len_utf8();
-            let overlapping = norm[next..].contains(&old_lf);
-            ensure!(!overlapping && stage2a_count == 1, "{AMBIGUOUS_MSG}");
+            let overlapping = sample.len() == 1 && norm[next..].contains(&old_lf);
+            if overlapping || sample.len() > 1 {
+                let orig_offsets: Vec<usize> =
+                    sample.iter().take(3).map(|&i| norm_to_orig[i]).collect();
+                bail!(
+                    "{}",
+                    format_ambiguous_message(text, &orig_offsets, sample.len() > 3, overlapping)
+                );
+            }
             let orig_range = norm_to_orig[first]..norm_to_orig[first + old_lf.len()];
             return replace_ranges_preserving_eol(
                 text,
@@ -96,18 +141,25 @@ pub(crate) fn apply_edit_text(
                 max_bytes,
             );
         }
+    } else {
         let ranges: Vec<Range<usize>> = norm
             .match_indices(&old_lf)
             .map(|(start, _)| norm_to_orig[start]..norm_to_orig[start + old_lf.len()])
             .collect();
-        return replace_ranges_preserving_eol(text, &ranges, new, max_bytes);
+        if !ranges.is_empty() {
+            return replace_ranges_preserving_eol(text, &ranges, new, max_bytes);
+        }
     }
 
     // Stage 2b: full-line match ignoring per-line trailing ' ' / '\t' and CRLF <-> LF.
     if text.is_empty() || !old_lf.bytes().any(|b| b != b' ' && b != b'\t') {
-        bail!("{NOT_FOUND_MSG}");
+        bail!(
+            "{}",
+            format_not_found_message(text, old, &old_lf, MissLocation::None, snapshot_is_fresh())
+        );
     }
 
+    let file_line_count = text.lines().count();
     let file_lines = split_file_lines(text);
     let (trailing_newline, body) = match old_lf.strip_suffix('\n') {
         Some(stripped) => (true, stripped),
@@ -118,8 +170,11 @@ pub(crate) fn apply_edit_text(
         .map(|line| line.trim_end_matches([' ', '\t']))
         .collect();
     let pat_len = old_lines.len();
-    if pat_len == 0 || file_lines.len() < pat_len {
-        bail!("{NOT_FOUND_MSG}");
+    if pat_len == 0 {
+        bail!(
+            "{}",
+            format_not_found_message(text, old, &old_lf, MissLocation::None, snapshot_is_fresh())
+        );
     }
 
     let mut intern: HashMap<&str, u32> = HashMap::with_capacity(pat_len);
@@ -140,7 +195,10 @@ pub(crate) fn apply_edit_text(
         .collect();
 
     let pi = kmp_prefix(&pat_ids);
+    let min_meaningful_len = min_meaningful_prefix_len(&old_lines);
     let mut candidates: Vec<Range<usize>> = Vec::new();
+    let mut best_prefix: Option<(usize, usize)> = None;
+    let mut missing_eof_newline_start: Option<usize> = None;
     let mut matched = 0usize;
     for (idx, &tid) in text_ids.iter().enumerate() {
         while matched > 0 && pat_ids[matched] != tid {
@@ -148,6 +206,16 @@ pub(crate) fn apply_edit_text(
         }
         if pat_ids[matched] == tid {
             matched += 1;
+            if idx < file_line_count
+                && matched < pat_len
+                && best_prefix.is_none_or(|(best_len, _)| matched > best_len)
+                && min_meaningful_len.is_some_and(|min_len| matched >= min_len)
+            {
+                let start_idx = idx + 1 - matched;
+                if start_idx < file_line_count {
+                    best_prefix = Some((matched, start_idx));
+                }
+            }
             if matched == pat_len {
                 let start_line = idx + 1 - pat_len;
                 let end_line = idx;
@@ -156,6 +224,9 @@ pub(crate) fn apply_edit_text(
                 if trailing_newline
                     && file_lines[end_line].full_end == file_lines[end_line].content_end
                 {
+                    if end_line < file_line_count && missing_eof_newline_start.is_none() {
+                        missing_eof_newline_start = Some(start_line + 1);
+                    }
                     continue;
                 }
                 let orig_start = file_lines[start_line].start;
@@ -166,8 +237,8 @@ pub(crate) fn apply_edit_text(
                 };
                 if orig_end > orig_start {
                     candidates.push(orig_start..orig_end);
-                    if !replace_all && candidates.len() > 1 {
-                        bail!("{AMBIGUOUS_MSG}");
+                    if !replace_all && candidates.len() >= 4 {
+                        break;
                     }
                 }
             }
@@ -175,10 +246,35 @@ pub(crate) fn apply_edit_text(
     }
 
     if candidates.is_empty() {
-        bail!("{NOT_FOUND_MSG}");
+        let location = if let Some(start_line) = missing_eof_newline_start {
+            MissLocation::MissingFinalNewline {
+                start_line,
+                matched_lines: pat_len,
+            }
+        } else if let Some((matched_lines, start_idx)) = best_prefix {
+            let mismatch = start_idx + matched_lines + 1;
+            MissLocation::Prefix {
+                start_line: start_idx + 1,
+                matched_lines,
+                pat_len,
+                mismatch_line: (mismatch <= file_line_count).then_some(mismatch),
+            }
+        } else {
+            find_anchor_line(&old_lines, &pat_ids, &text_ids[..file_line_count])
+        };
+        bail!(
+            "{}",
+            format_not_found_message(text, old, &old_lf, location, snapshot_is_fresh())
+        );
     }
     if !replace_all {
-        ensure!(candidates.len() == 1, "{AMBIGUOUS_MSG}");
+        if candidates.len() > 1 {
+            let orig_offsets: Vec<usize> = candidates.iter().take(3).map(|r| r.start).collect();
+            bail!(
+                "{}",
+                format_ambiguous_message(text, &orig_offsets, candidates.len() > 3, false)
+            );
+        }
         return replace_ranges_preserving_eol(text, &candidates, new, max_bytes);
     }
 
@@ -191,6 +287,247 @@ pub(crate) fn apply_edit_text(
         }
     }
     replace_ranges_preserving_eol(text, &selected, new, max_bytes)
+}
+
+fn min_meaningful_prefix_len(old_lines: &[&str]) -> Option<usize> {
+    let first_alnum4 = old_lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim();
+            trimmed.chars().count() >= 4 && trimmed.chars().any(char::is_alphanumeric)
+        })
+        .map(|idx| idx + 1);
+    let first_two_nonempty = (old_lines.len() >= 2)
+        .then(|| {
+            old_lines
+                .iter()
+                .position(|line| !line.trim().is_empty())
+                .map(|idx| (idx + 1).max(2))
+        })
+        .flatten();
+    match (first_alnum4, first_two_nonempty) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_anchor_line(old_lines: &[&str], pat_ids: &[u32], text_ids: &[u32]) -> MissLocation {
+    let mut id_hits = [(0u32, 0usize); 16];
+    for (idx, &tid) in text_ids.iter().enumerate() {
+        let slot = tid as usize;
+        if slot < id_hits.len() {
+            if id_hits[slot].0 == 0 {
+                id_hits[slot].1 = idx;
+            }
+            id_hits[slot].0 = id_hits[slot].0.saturating_add(1);
+        }
+    }
+    for (k, (&line, &pid)) in old_lines.iter().zip(pat_ids.iter()).enumerate() {
+        let slot = pid as usize;
+        if slot >= id_hits.len() {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.chars().count() >= 8
+            && trimmed.chars().any(char::is_alphanumeric)
+            && (1..=3).contains(&id_hits[slot].0)
+        {
+            return MissLocation::Anchor {
+                old_line_1based: k + 1,
+                file_line_1based: id_hits[slot].1 + 1,
+            };
+        }
+    }
+    MissLocation::None
+}
+
+fn looks_like_numbered_read_output(old_lf: &str) -> bool {
+    let mut iter = old_lf.lines().peekable();
+    let Some(first_line) = iter.next() else {
+        return false;
+    };
+    let has_multiple = iter.peek().is_some();
+    let mut prev_num: Option<u32> = None;
+    let mut saw_tab = false;
+    let mut parsed_any = false;
+    for line in std::iter::once(first_line).chain(iter) {
+        if !has_multiple && line.trim().is_empty() {
+            return false;
+        }
+        let trimmed_spaces = line.trim_start_matches(' ');
+        if !matches!(trimmed_spaces.as_bytes().first(), Some(b'1'..=b'9')) {
+            return false;
+        }
+        let digit_len = trimmed_spaces
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if !(1..=7).contains(&digit_len) {
+            return false;
+        }
+        let Ok(num) = trimmed_spaces[..digit_len].parse::<u32>() else {
+            return false;
+        };
+        let rest = &trimmed_spaces[digit_len..];
+        if rest.starts_with('\t') {
+            saw_tab = true;
+        } else if !(rest.is_empty() && has_multiple) {
+            return false;
+        }
+        if let Some(prev) = prev_num
+            && num != prev.saturating_add(1)
+        {
+            return false;
+        }
+        prev_num = Some(num);
+        parsed_any = true;
+    }
+    parsed_any && saw_tab
+}
+
+fn offsets_to_1based_lines(text: &str, sorted_offsets: &[usize]) -> Vec<usize> {
+    if sorted_offsets.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(sorted_offsets.len());
+    let mut cursor = 0usize;
+    let mut line = 1usize;
+    for &target in sorted_offsets {
+        let clamped = target.min(bytes.len());
+        while cursor < clamped {
+            if bytes[cursor] == b'\n' {
+                line += 1;
+            }
+            cursor += 1;
+        }
+        if out.last().copied() != Some(line) {
+            out.push(line);
+        }
+    }
+    out
+}
+
+fn format_ambiguous_message(
+    text: &str,
+    byte_offsets: &[usize],
+    has_more: bool,
+    overlapping: bool,
+) -> String {
+    let lines = offsets_to_1based_lines(text, byte_offsets);
+    if overlapping {
+        let line = lines.first().copied().unwrap_or(1);
+        return format!(
+            "old_text неоднозначен (перекрывающиеся вхождения на {line}-й строке); расширьте old_text соседним контекстом или явно укажите replace_all=true"
+        );
+    }
+    if lines.len() <= 1 && !has_more {
+        let line = lines.first().copied().unwrap_or(1);
+        return format!(
+            "old_text неоднозначен (несколько совпадений на {line}-й строке); уточните контекст или явно укажите replace_all=true"
+        );
+    }
+    let joined = lines
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if has_more { " и др." } else { "" };
+    format!(
+        "old_text неоднозначен (совпадения на строках {joined}{suffix}); включите соседние строки для уникальности или явно укажите replace_all=true"
+    )
+}
+
+fn format_not_found_message(
+    text: &str,
+    old: &str,
+    old_lf: &str,
+    location: MissLocation,
+    snapshot_fresh: bool,
+) -> String {
+    let file_line_count = text.lines().count();
+    let old_line_count = old_lf.lines().count().max(1);
+    if text.is_empty() {
+        return if snapshot_fresh {
+            format!(
+                "old_text не найден (файл пуст: 0 стр., old_text: {old_line_count} стр.); снимок файла уже актуален — запишите содержимое через write_file без expected_sha256"
+            )
+        } else {
+            format!(
+                "old_text не найден (файл пуст: 0 стр., old_text: {old_line_count} стр.); прочитайте файл через read_file и запишите содержимое через write_file без expected_sha256"
+            )
+        };
+    }
+
+    let numbered = looks_like_numbered_read_output(old_lf);
+    let mut details = vec![format!(
+        "файл: {file_line_count} стр., old_text: {old_line_count} стр."
+    )];
+    if numbered {
+        details.push("в old_text обнаружены префиксы номеров строк N\\t из read_file".to_owned());
+    }
+    match location {
+        MissLocation::None => {}
+        MissLocation::MissingFinalNewline {
+            start_line,
+            matched_lines,
+        } => {
+            details.push(format!(
+                "совпали все {matched_lines} стр. с {start_line}-й строки, но в конце файла нет завершающего перевода строки"
+            ));
+        }
+        MissLocation::Prefix {
+            start_line,
+            matched_lines,
+            pat_len,
+            mismatch_line: Some(mismatch),
+        } => {
+            details.push(format!(
+                "совпали первые {matched_lines} из {pat_len} стр. с {start_line}-й строки, расхождение на {mismatch}-й строке"
+            ));
+        }
+        MissLocation::Prefix {
+            start_line,
+            matched_lines,
+            pat_len,
+            mismatch_line: None,
+        } => {
+            details.push(format!(
+                "совпали первые {matched_lines} из {pat_len} стр. с {start_line}-й строки до конца файла"
+            ));
+        }
+        MissLocation::Anchor {
+            old_line_1based,
+            file_line_1based,
+        } => {
+            details.push(format!(
+                "ориентир: строка {old_line_1based} old_text найдена на {file_line_1based}-й строке файла"
+            ));
+        }
+    }
+
+    let is_broad = old_line_count >= 12
+        || old.len() >= 600
+        || (old_line_count >= 6 && old_line_count * 2 >= file_line_count);
+    let guidance = if numbered {
+        if is_broad && snapshot_fresh {
+            "уберите префиксы N\\t из old_text (передайте 3–8 строк контекста) или для крупной замены сразу вызовите write_file без expected_sha256"
+        } else if is_broad {
+            "уберите префиксы N\\t из old_text и передайте короткий контекст (3–8 строк), либо для крупной замены прочитайте файл через read_file и перезапишите через write_file без expected_sha256"
+        } else {
+            "уберите префиксы N\\t из old_text и передайте чистый уникальный фрагмент файла"
+        }
+    } else if is_broad && snapshot_fresh {
+        "снимок файла в текущем ходе уже актуален: для крупной замены сразу вызовите write_file без expected_sha256, либо прочитайте нужный диапазон через read_file(start_line, max_lines) и передайте короткий уникальный old_text (3–8 строк)"
+    } else if is_broad {
+        "для точечной правки прочитайте нужный диапазон через read_file(start_line, max_lines) и передайте короткий уникальный old_text (3–8 строк), либо для крупной замены прочитайте файл через read_file и перезапишите через write_file без expected_sha256"
+    } else {
+        "перечитайте нужный диапазон через read_file(start_line, max_lines) и передайте точный уникальный фрагмент без префиксов N\\t"
+    };
+
+    format!("old_text не найден ({}); {guidance}", details.join(", "))
 }
 
 fn normalize_crlf_with_map(text: &str) -> (String, Vec<usize>) {
@@ -533,6 +870,183 @@ mod tests {
         assert_eq!(
             String::from_utf8(out_multi).unwrap(),
             "x\r\ny\r\n--\nx\ny\n"
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_line_counts_partial_prefix_anchor_and_numbered_prefixes_without_echoing_file_text()
+     {
+        let secret_marker = "SUPER_SECRET_SENTINEL_DO_NOT_ECHO_991";
+
+        // 1) Empty file with stale/missing snapshot vs fresh snapshot.
+        let empty_stale = apply_edit_text_with_context("", "x = 1", "x = 2", false, MAX, || false)
+            .unwrap_err()
+            .to_string();
+        assert!(empty_stale.starts_with("old_text не найден"));
+        assert!(empty_stale.contains("файл пуст: 0 стр."));
+        assert!(empty_stale.contains("прочитайте файл через read_file"));
+
+        let empty_fresh = apply_edit_text_with_context("", "x = 1", "x = 2", false, MAX, || true)
+            .unwrap_err()
+            .to_string();
+        assert!(empty_fresh.contains("снимок файла уже актуален"));
+        assert!(empty_fresh.contains("write_file без expected_sha256"));
+
+        // 2) Partial KMP prefix match reports exact 1-based start and divergence lines without leaking text.
+        let mut lines = Vec::new();
+        for idx in 1..=20 {
+            lines.push(format!("def func_{idx}(): return {idx} # {secret_marker}"));
+        }
+        let file = format!("{}\n", lines.join("\n"));
+        let partial_old = format!(
+            "{}\n{}\n{}\ndef wrong_line(): return 999\n{}",
+            lines[9], lines[10], lines[11], lines[13]
+        );
+        let err_partial = apply_edit_text(&file, &partial_old, "pass", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(err_partial.starts_with("old_text не найден"));
+        assert!(
+            err_partial.contains("файл: 20 стр., old_text: 5 стр."),
+            "{err_partial}"
+        );
+        assert!(
+            err_partial
+                .contains("совпали первые 3 из 5 стр. с 10-й строки, расхождение на 13-й строке"),
+            "{err_partial}"
+        );
+        assert!(!err_partial.contains(secret_marker));
+        assert!(!err_partial.contains("wrong_line"));
+
+        // 3) Prefix matching to EOF when old_text overruns the end of file.
+        let overrun_old = format!("{}\n{}\nextra_after_eof = 1", lines[18], lines[19]);
+        let err_eof = apply_edit_text(&file, &overrun_old, "pass", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_eof.contains("совпали первые 2 из 3 стр. с 19-й строки до конца файла"),
+            "{err_eof}"
+        );
+
+        // 4) Missing final newline at EOF vs synthetic EOF sentinel when file already ends with '\n'.
+        let no_eof_nl = "alpha_line\nbeta_line";
+        let err_nl = apply_edit_text(no_eof_nl, "alpha_line\nbeta_line\n", "x\n", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_nl.contains(
+                "совпали все 2 стр. с 1-й строки, но в конце файла нет завершающего перевода строки"
+            ),
+            "{err_nl}"
+        );
+        let err_synth = apply_edit_text("alpha\n", "alpha\n\n", "x\n", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err_synth.contains("нет завершающего перевода строки"),
+            "{err_synth}"
+        );
+        assert!(
+            err_synth.contains("совпали первые 1 из 2 стр. с 1-й строки до конца файла"),
+            "{err_synth}"
+        );
+        let err_two_punct = apply_edit_text("{} \n)\nactual\n", "{}\n)\nmissing", "x", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_two_punct
+                .contains("совпали первые 2 из 3 стр. с 1-й строки, расхождение на 3-й строке"),
+            "{err_two_punct}"
+        );
+
+        // 5) Anchor fallback when line 1 of old_text diverges.
+        let anchor_old = format!("def outdated_header():\n{}\n{}", lines[14], lines[15]);
+        let err_anchor = apply_edit_text(&file, &anchor_old, "pass", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_anchor.contains("ориентир: строка 2 old_text найдена на 15-й строке файла"),
+            "{err_anchor}"
+        );
+        assert!(!err_anchor.contains(secret_marker));
+
+        // 6) Broad old_text (>= 12 lines) distinguishes fresh vs stale read_snapshots.
+        let broad_old = (0..14)
+            .map(|i| format!("missing_line_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let broad_stale =
+            apply_edit_text_with_context(&file, &broad_old, "x", false, MAX, || false)
+                .unwrap_err()
+                .to_string();
+        assert!(broad_stale.contains("3–8 строк"));
+        assert!(
+            broad_stale.contains("прочитайте файл через read_file и перезапишите через write_file")
+        );
+
+        let broad_fresh = apply_edit_text_with_context(&file, &broad_old, "x", false, MAX, || true)
+            .unwrap_err()
+            .to_string();
+        assert!(broad_fresh.contains("снимок файла в текущем ходе уже актуален"));
+        assert!(broad_fresh.contains("сразу вызовите write_file без expected_sha256"));
+
+        // 7) Accidental `N\t` prefixes from `read_file` vs non-sequential TSV data.
+        let numbered_old = "10\tdef func_10():\n11\n12\tdef func_12():";
+        let err_num = apply_edit_text(&file, numbered_old, "pass", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_num.contains("префиксы номеров строк N\\t из read_file"),
+            "{err_num}"
+        );
+
+        let tsv_old = "1\tapple\n1\tbanana";
+        let err_tsv = apply_edit_text(&file, tsv_old, "pass", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err_tsv.contains("префиксы номеров строк N\\t из read_file"),
+            "{err_tsv}"
+        );
+        let leading_zero_old = "01\talpha\n02\tbeta";
+        let err_zero = apply_edit_text(&file, leading_zero_old, "pass", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err_zero.contains("префиксы номеров строк N\\t из read_file"),
+            "{err_zero}"
+        );
+        let broad_numbered = (1..=12)
+            .map(|i| format!("{i}\tmissing_{i} = {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err_broad_num =
+            apply_edit_text_with_context(&file, &broad_numbered, "pass", false, MAX, || false)
+                .unwrap_err()
+                .to_string();
+        assert!(err_broad_num.contains("3–8 строк"), "{err_broad_num}");
+        assert!(
+            err_broad_num
+                .contains("прочитайте файл через read_file и перезапишите через write_file"),
+            "{err_broad_num}"
+        );
+
+        // 8) Ambiguous match reports exact 1-based line numbers and `и др.` when > 3 matches.
+        let dup_file = "header\nreturn 404\nmid\nreturn 404\nfooter\n";
+        let err_dup = apply_edit_text(dup_file, "return 404", "return 400", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(err_dup.starts_with("old_text неоднозначен"));
+        assert!(err_dup.contains("совпадения на строках 2, 4"), "{err_dup}");
+        assert!(err_dup.contains("replace_all=true"));
+
+        let many_dup = "x = 1\ny\nx = 1\ny\nx = 1\ny\nx = 1\n";
+        let err_many = apply_edit_text(many_dup, "x = 1", "x = 2", false, MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_many.contains("совпадения на строках 1, 3, 5 и др."),
+            "{err_many}"
         );
     }
 }
