@@ -190,10 +190,18 @@ fn commit_provider(
     session.save(store)?;
     *client = next;
     if session.provider.kind == ProviderKind::Local {
+        let thinking = crate::local::ThinkingMode::from_option(
+            session
+                .provider
+                .local
+                .as_ref()
+                .and_then(|local| local.thinking),
+        );
         notice!(
-            "✓ local · профиль {} / {}",
+            "✓ local · профиль {} / {} · thinking {}",
             ui::safe(local_app::profile_name(&session.provider)),
-            ui::safe(&session.provider.model)
+            ui::safe(&session.provider.model),
+            thinking
         );
     } else {
         notice!(
@@ -382,6 +390,17 @@ async fn select_effort(
     events: &mut Events,
     models: &mut Vec<ModelInfo>,
 ) -> Result<()> {
+    if session.provider.kind == ProviderKind::Local {
+        if args.is_empty() || args == ["auto"] {
+            notice!(
+                "Для локальных моделей effort всегда auto. Управлять шаблонными рассуждениями (<think>) можно командой /thinking [auto|on|off]."
+            );
+            return Ok(());
+        }
+        bail!(
+            "Для local effort не настраивается (всегда auto); используйте /thinking [auto|on|off]"
+        );
+    }
     if models.is_empty() {
         let Some(fetched) = catalog(client, events).await? else {
             return Ok(());
@@ -443,6 +462,81 @@ async fn select_effort(
     p.effort = effort;
     commit_provider(store, settings, session, client, events, p)
 }
+fn select_thinking(
+    args: &[&str],
+    rich: bool,
+    store: &ConfigStore,
+    settings: &mut Settings,
+    session: &mut Session,
+    client: &mut ProviderClient,
+    events: &mut Events,
+) -> Result<()> {
+    if session.provider.kind != ProviderKind::Local {
+        bail!(
+            "Команда /thinking доступна только для провайдера local; для облачных провайдеров используйте /effort"
+        );
+    }
+    if args.len() > 1 {
+        bail!("Использование: /thinking [auto|on|off]");
+    }
+    local_app::check_current(store, &session.provider)?;
+    let runtime = session
+        .provider
+        .local
+        .as_ref()
+        .map_or(crate::local::LocalRuntime::OpenAi, |local| local.runtime);
+    if runtime == crate::local::LocalRuntime::Ollama && args.is_empty() {
+        notice!(
+            "Для Ollama rcode не передаёт управление thinking; настройте модель на сервере (режим: auto)."
+        );
+        return Ok(());
+    }
+    let options = crate::local::ThinkingMode::all();
+    let current_mode = crate::local::ThinkingMode::from_option(
+        session
+            .provider
+            .local
+            .as_ref()
+            .and_then(|local| local.thinking),
+    );
+    let mode = if let Some(value) = args.first() {
+        value.parse::<crate::local::ThinkingMode>()?
+    } else {
+        let choices = options
+            .iter()
+            .map(|mode| Choice {
+                label: mode.to_string(),
+                detail: match mode {
+                    crate::local::ThinkingMode::Auto => {
+                        "настройки сервера и шаблона по умолчанию; параметр не отправляется"
+                    }
+                    crate::local::ThinkingMode::On => {
+                        "явно включить рассуждения (enable_thinking = true) и скрывать блок <think>"
+                    }
+                    crate::local::ThinkingMode::Off => {
+                        "явно отключить рассуждения (enable_thinking = false)"
+                    }
+                }
+                .into(),
+                enabled: true,
+            })
+            .collect::<Vec<_>>();
+        let current = options
+            .iter()
+            .position(|mode| *mode == current_mode)
+            .unwrap_or_default();
+        let Some(index) = choose("Режим рассуждений · thinking", &choices, current, rich)?
+        else {
+            return Ok(());
+        };
+        options[index]
+    };
+    let mut next = session.provider.clone();
+    if let Some(local) = next.local.as_mut() {
+        local.thinking = mode.into_option();
+    }
+    commit_provider(store, settings, session, client, events, next)
+}
 fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) -> Footer {
     let base_permissions = if runtime.permissions() == ApprovalMode::FullAccess {
         "full-access"
@@ -465,10 +559,24 @@ fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) 
     } else {
         base_permissions.into()
     };
+    let effort = if session.provider.kind == ProviderKind::Local {
+        match session
+            .provider
+            .local
+            .as_ref()
+            .and_then(|local| local.thinking)
+        {
+            Some(true) => "thinking:on".into(),
+            Some(false) => "thinking:off".into(),
+            None => "auto".into(),
+        }
+    } else {
+        session.provider.effort.to_string()
+    };
     Footer {
         model: session.provider.model.clone(),
         provider: session.provider.kind.to_string(),
-        effort: session.provider.effort.to_string(),
+        effort,
         permissions,
         plan,
         context_chars: budget.request_used(&session.messages),
@@ -516,10 +624,18 @@ fn status(
         session.id
     );
     if session.provider.kind == ProviderKind::Local {
+        let thinking = crate::local::ThinkingMode::from_option(
+            session
+                .provider
+                .local
+                .as_ref()
+                .and_then(|local| local.thinking),
+        );
         notice!(
-            "Профиль      local · {} @{}",
+            "Профиль      local · {} @{} · thinking {}",
             ui::safe(local_app::profile_name(&session.provider)),
-            ui::safe(session.provider.base_url.as_deref().unwrap_or_default())
+            ui::safe(session.provider.base_url.as_deref().unwrap_or_default()),
+            thinking
         );
     }
     context(session, models, budget, skills, memory_line);
@@ -1125,7 +1241,7 @@ fn help(registry: &crate::commands::CommandRegistry) {
         notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
     }
     notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень] · /thinking [auto|on|off]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
     );
 }
 
@@ -1878,6 +1994,7 @@ pub(crate) async fn run(
                 "/model"|"/models"=>select_model(&args,false,rich,store,settings,session,client,events,&mut models).await,
                 "/provider"=>select_model(&args,true,rich,store,settings,session,client,events,&mut models).await,
                 "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
+                "/thinking"=>select_thinking(&args,rich,store,settings,session,client,events),
                 "/review-model"=>review_model_command(&args,store,settings,runtime.final_review_mode()),
                 "/final-review"=>{
                     match args.as_slice() {

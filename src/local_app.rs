@@ -151,6 +151,7 @@ pub(crate) fn doctor_fields(
             "context_tokens": budget.context_tokens,
             "context_source": budget.source.as_str(),
             "input_budget_tokens": budget.limit,
+            "thinking": local.thinking,
         }),
         usable,
     )

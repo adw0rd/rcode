@@ -169,16 +169,40 @@ def main(binary):
                 terminal.until(terminal.editor_ready, "composer after the local answer")
                 terminal.assert_footer("model-b", "local")
                 assert token_footer(terminal), f"footer must count tokens:\n{terminal.dump()}"
+                terminal.send("/thinking\r")
+                terminal.until(lambda: any("Режим рассуждений · thinking" in row for row in terminal.grid.rows()),
+                               "thinking picker for local profile")
+                terminal.send("\x1b[B\x1b[B\r")
+                terminal.until(terminal.editor_ready, "composer after choosing thinking off")
+                terminal.assert_footer("model-b", "local", "thinking:off")
+                for narrow_cols in (80, 60):
+                    terminal.resize(narrow_cols, 24)
+                    terminal.assert_footer("РАБОТА", "ask")
+                    assert " · thinking:off" not in terminal.grid.rows()[-2] or not terminal.grid.rows()[-2].startswith(" · "), (
+                        f"dangling separator at {narrow_cols} cols:\n{terminal.dump()}"
+                    )
+                terminal.resize(140, 28)
+                terminal.assert_footer("model-b", "local", "thinking:off")
+                terminal.send("ещё\r")
+                terminal.until(lambda: len([r for r in fixture.requests if r[0] == "POST"]) == 2,
+                               "second POST with thinking off")
+                terminal.until(terminal.editor_ready, "composer after second local answer")
+                terminal.send("/thinking auto\r")
+                terminal.until(terminal.editor_ready, "composer after resetting thinking to auto")
+                terminal.assert_footer("model-b", "local", "auto")
                 terminal.send("/exit\r")
                 terminal.finished()
             finally:
                 terminal.close()
             saved = json.loads((home / "config.json").read_text())
             assert saved["active"] == "local" and saved["local"]["active"] == "beta", saved
+            assert "thinking" not in saved["local"]["profiles"]["beta"]["local"], saved
             assert "local" not in saved["providers"], saved
             posts = [r for r in fixture.requests if r[0] == "POST"]
-            assert len(posts) == 1 and json.loads(posts[0][3])["model"] == "model-b", posts
-            assert "reasoning_effort" not in posts[0][3]
+            assert len(posts) == 2 and json.loads(posts[0][3])["model"] == "model-b", posts
+            assert "chat_template_kwargs" not in json.loads(posts[0][3])
+            assert json.loads(posts[1][3])["chat_template_kwargs"] == {"enable_thinking": False}, posts[1][3]
+            assert "reasoning_effort" not in posts[0][3] and "reasoning_effort" not in posts[1][3]
             assert all(r[2] is None for r in fixture.requests), fixture.requests
             assert all(CLOUD not in r[3] for r in fixture.requests)
 
@@ -281,6 +305,10 @@ def main(binary):
                     terminal.expect(error, mark)
                     terminal.until(terminal.editor_ready, f"composer after {error}")
                     assert "Ключ" not in terminal.text(mark), terminal.text(mark)
+                    mark = terminal.mark()
+                    terminal.send("/thinking off\r")
+                    terminal.expect(error, mark)
+                    terminal.until(terminal.editor_ready, f"composer after /thinking {error}")
                     assert fixture.requests == [], fixture.requests
                     assert not (home / "credentials.json").exists()
                 terminal.send("/exit\r")

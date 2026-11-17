@@ -82,6 +82,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Настроить глубину рассуждений",
     },
     CommandSpec {
+        name: "/thinking",
+        description: "Режим рассуждений локальной модели (auto, on, off)",
+    },
+    CommandSpec {
         name: "/permissions",
         description: "Настроить разрешения инструментов",
     },

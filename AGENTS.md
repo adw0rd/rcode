@@ -70,7 +70,7 @@
 - Ключ разрешается только через `credential_for` по снимку endpoint сессии. Привязка строгая по литералу адреса (`localhost` = `127.0.0.1`; `::1` и `127.0.0.2` — другие серверы). Клиент local: без прокси и redirect, `localhost` закреплён за 127.0.0.1 без IPv6 fallback. Не переносите профиль из снимка сессии в настройки, если адрес профиля изменился (`local_app::check_commit`).
 - Одна генерация на loopback-порт для всех профилей, клонов и новых клиентов. Permit берётся только внутри `ProviderClient::complete` и освобождается при drop/отмене; инструменты исполняются без permit.
 - Бюджет local — оценочные токены (контекст минус ответ и резерв, вместе с system prompt и tools); облако — прежние символы. Метаданные `/props` и `/api/ps` читаются только с коротким дедлайном, не чаще двух раз на клиент; сервер не перенастраивается. Не добавляйте эвристик «тихого» усечения и пробных генераций.
-- reasoning local не выводится, не сохраняется и не отправляется обратно. Effort для local всегда `auto`; `chat_template_kwargs.enable_thinking` — только по явному `--thinking`.
+- reasoning local не выводится, не сохраняется и не отправляется обратно. Effort для local всегда `auto`; явный выбор `thinking` (`--thinking auto|on|off` в `local add/use`, сессии/exec/doctor и `/thinking` в интерактиве) отправляется только при `on`/`off`: `chat_template_kwargs.enable_thinking` для всех поддерживаемых runtime и дополнительно верхнеуровневый `enable_thinking` для `LocalRuntime::Mlx` (`mlx_vlm.server` игнорирует `chat_template_kwargs`); при `auto` (`None`) оба поля опускаются, для `Ollama` явный `thinking` запрещён.
 - Проверка: `cargo test --test local_cli --test local_wire --test local_profiles_contract --test local_pty`. Это fixtures, не живой сервер.
 
 ## Скиллы и команды

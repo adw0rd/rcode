@@ -10,6 +10,9 @@ use crate::{
 use anyhow::Result;
 use serde_json::json;
 pub(crate) async fn run(command: &EvalCommand, cli: &Cli, events: &Events) -> Result<i32> {
+    if cli.thinking.is_some() && !matches!(command, EvalCommand::Run(_)) {
+        anyhow::bail!("Флаг --thinking не используется в rcode eval validate и compare");
+    }
     match command {
         EvalCommand::Validate { suite } => {
             let data = manifest::validate(suite)?;

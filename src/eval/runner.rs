@@ -251,6 +251,7 @@ pub(super) async fn run(args: &EvalRun, cli: &Cli, events: &Events) -> Result<i3
         cli.model.is_none()
             && cli.base_url.is_none()
             && cli.effort.is_none()
+            && cli.thinking.is_none()
             && cli.folder_id.is_none()
             && cli.ca_file.is_none()
             && cli.resume.is_none()

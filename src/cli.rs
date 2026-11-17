@@ -1,6 +1,6 @@
 pub use crate::config::ApprovalMode;
 use crate::config::{Effort, ProviderKind};
-use crate::local::LocalRuntime;
+use crate::local::{LocalRuntime, ThinkingMode};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -38,6 +38,13 @@ pub struct Cli {
         help = "Глубина рассуждений: auto, low, medium, high и уровни модели"
     )]
     pub effort: Option<Effort>,
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        help = "Режим рассуждений для local: auto, on или off"
+    )]
+    pub thinking: Option<ThinkingMode>,
     #[arg(long, global = true, help = "Простой интерфейс без панелей и анимации")]
     pub plain: bool,
     #[arg(long, global = true)]
@@ -506,12 +513,6 @@ pub enum LocalCommand {
         max_output_tokens: Option<u32>,
         #[arg(long, help = "Модель и сервер принимают изображения")]
         vision: bool,
-        #[arg(
-            long,
-            value_enum,
-            help = "Явно передавать chat_template_kwargs.enable_thinking"
-        )]
-        thinking: Option<Toggle>,
         #[arg(long, help = "Прочитать ключ сервера из stdin")]
         api_key_stdin: bool,
         #[arg(long, help = "Сделать профиль активным")]
@@ -519,7 +520,7 @@ pub enum LocalCommand {
         #[arg(long, help = "Заменить существующий профиль")]
         force: bool,
     },
-    #[command(about = "Сделать профиль активным; --model меняет его модель")]
+    #[command(about = "Сделать профиль активным; --model и --thinking меняют его настройки")]
     Use { name: String },
     #[command(about = "Сохранить ключ из stdin (--stdin) или удалить его (--delete)")]
     Key {
@@ -744,5 +745,38 @@ mod agent_timeout_cli_tests {
             Some(super::Command::ReviewModel { command: super::ReviewModelCommand::Set { model } })
                 if model == "review/model"
         ));
+    }
+
+    #[test]
+    fn thinking_flag_parses_globally_across_session_exec_and_local_commands() {
+        use crate::local::ThinkingMode;
+        for (args, expected) in [
+            (vec!["rcode", "--thinking", "off"], ThinkingMode::Off),
+            (
+                vec!["rcode", "exec", "--thinking", "on", "task"],
+                ThinkingMode::On,
+            ),
+            (
+                vec![
+                    "rcode",
+                    "local",
+                    "add",
+                    "mlx",
+                    "--base-url",
+                    "http://127.0.0.1:8080/v1",
+                    "--thinking",
+                    "auto",
+                ],
+                ThinkingMode::Auto,
+            ),
+            (
+                vec!["rcode", "local", "use", "mlx", "--thinking", "off"],
+                ThinkingMode::Off,
+            ),
+        ] {
+            let parsed = Cli::try_parse_from(&args).unwrap();
+            assert_eq!(parsed.thinking, Some(expected), "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["rcode", "--thinking", "high"]).is_err());
     }
 }

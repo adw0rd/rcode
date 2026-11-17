@@ -6,7 +6,7 @@ use crate::config::{ProviderKind, ProviderSettings};
 use anyhow::{Result, bail};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, net::IpAddr};
+use std::{collections::BTreeMap, fmt, net::IpAddr, str::FromStr};
 
 pub const DEFAULT_CONTEXT_TOKENS: u32 = 32_768;
 pub const MIN_CONTEXT_TOKENS: u32 = 2048;
@@ -78,6 +78,61 @@ impl fmt::Display for LocalRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ThinkingMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl ThinkingMode {
+    pub const fn all() -> [Self; 3] {
+        [Self::Auto, Self::On, Self::Off]
+    }
+
+    pub const fn from_option(thinking: Option<bool>) -> Self {
+        match thinking {
+            None => Self::Auto,
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+        }
+    }
+
+    pub const fn into_option(self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::On => Some(true),
+            Self::Off => Some(false),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl fmt::Display for ThinkingMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ThinkingMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::all()
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+            .ok_or_else(|| anyhow::anyhow!("Неизвестный режим thinking: доступны auto, on, off"))
+    }
+}
+
 const fn default_context_tokens() -> u32 {
     DEFAULT_CONTEXT_TOKENS
 }
@@ -94,7 +149,8 @@ pub struct LocalSettings {
     pub vision: bool,
     #[serde(default)]
     pub key_required: bool,
-    /// Explicit `chat_template_kwargs.enable_thinking`; omitted when unset.
+    /// Explicit thinking toggle (`chat_template_kwargs.enable_thinking`, plus
+    /// top-level `enable_thinking` on MLX); omitted when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
 }
@@ -338,5 +394,25 @@ mod tests {
         assert!(LocalRuntime::Ollama.stream_usage());
         assert!(!LocalRuntime::Mlx.stream_usage());
         assert!(!LocalRuntime::OpenAi.stream_usage());
+    }
+
+    #[test]
+    fn thinking_mode_roundtrips_with_option_and_cli_names() {
+        for (mode, name, raw) in [
+            (ThinkingMode::Auto, "auto", None),
+            (ThinkingMode::On, "on", Some(true)),
+            (ThinkingMode::Off, "off", Some(false)),
+        ] {
+            assert_eq!(mode.as_str(), name);
+            assert_eq!(mode.to_string(), name);
+            assert_eq!(mode.into_option(), raw);
+            assert_eq!(ThinkingMode::from_option(raw), mode);
+            assert_eq!(name.parse::<ThinkingMode>().unwrap(), mode);
+            assert_eq!(
+                <ThinkingMode as clap::ValueEnum>::from_str(name, false).unwrap(),
+                mode
+            );
+        }
+        assert!("invalid".parse::<ThinkingMode>().is_err());
     }
 }

@@ -287,6 +287,27 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     if let Some(Command::Local { command }) = &cli.command {
         return crate::local_cli::run(command, cli, &store, events).await;
     }
+    if cli.thinking.is_some()
+        && matches!(
+            cli.command,
+            Some(
+                Command::Skills { .. }
+                    | Command::Commands { .. }
+                    | Command::Memory { .. }
+                    | Command::Sandbox { .. }
+                    | Command::Websearch { .. }
+                    | Command::ReviewModel { .. }
+                    | Command::Connect { .. }
+                    | Command::Sessions
+                    | Command::Balance
+                    | Command::Models
+            )
+        )
+    {
+        bail!(
+            "Флаг --thinking применим только при запуске local-сессии, rcode exec, rcode doctor или rcode local add/use"
+        );
+    }
     if let Some(Command::Skills { command }) = &cli.command {
         return crate::skills_cli::run(command, cli, &store, events).await;
     }
@@ -399,6 +420,24 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     if let Some(ca) = &cli.ca_file {
         session.provider.ca_file = Some(ca.clone());
     }
+    let apply_thinking = |provider: &mut crate::config::ProviderSettings| -> Result<()> {
+        if let Some(thinking) = cli.thinking {
+            if provider.kind != ProviderKind::Local {
+                bail!(
+                    "Флаг --thinking применим только к провайдеру local; для облачных провайдеров используйте --effort"
+                );
+            }
+            if let Some(local) = provider.local.as_mut() {
+                local.thinking = thinking.into_option();
+            }
+        }
+        Ok(())
+    };
+    let wizard_eligible =
+        cli.command.is_none() && ui::terminal() && requested.is_none() && cli.resume.is_none();
+    if session.provider.kind == ProviderKind::Local || !wizard_eligible || store.exists() {
+        apply_thinking(&mut session.provider)?;
+    }
     if let Some(Command::Doctor { check: false }) = cli.command {
         let valid = session.provider.validate();
         let shell_desc = if cli.effective_sandbox.is_active() {
@@ -438,10 +477,7 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
     }
     let mut credential = store.credential_for(&session.provider)?;
     if (!store.exists() || credential.is_missing() || session.provider.validate().is_err())
-        && cli.command.is_none()
-        && ui::terminal()
-        && requested.is_none()
-        && cli.resume.is_none()
+        && wizard_eligible
     {
         session.provider = ui::connect(
             &store,
@@ -451,8 +487,10 @@ async fn dispatch(cli: &Cli, events: &mut Events) -> Result<i32> {
             cli.ca_file.as_deref(),
         )
         .await?;
+        apply_thinking(&mut session.provider)?;
         credential = store.credential_for(&session.provider)?;
     }
+    apply_thinking(&mut session.provider)?;
     let missing = format!(
         "Нет ключа {}. Выполните rcode connect {} или задайте переменную окружения",
         session.provider.kind, session.provider.kind

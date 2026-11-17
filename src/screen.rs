@@ -1204,6 +1204,47 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 fn num(n: u64) -> String {
     crate::presentation::number(n)
 }
+fn compact_permission(permission: &str) -> String {
+    permission
+        .replace("sandbox: workspace-write+net", "sb:rw+net")
+        .replace("sandbox: workspace-write", "sb:rw")
+        .replace("sandbox: read-only+net", "sb:ro+net")
+        .replace("sandbox: read-only", "sb:ro")
+        .replace("sandbox: off", "sb:off")
+        .replace("auto-edit + shell", "auto-edit+sh")
+        .replace("ask + shell", "ask+sh")
+}
+fn required_status_width(footer: &Footer) -> usize {
+    let mode = if footer.plan {
+        "ПЛАН"
+    } else {
+        "РАБОТА"
+    };
+    UnicodeWidthStr::width(format!("{} · {} · {mode}", footer.effort, footer.permissions).as_str())
+}
+fn clip_tail(path: &str, max_width: usize) -> Option<String> {
+    if UnicodeWidthStr::width(path) <= max_width {
+        return Some(path.to_owned());
+    }
+    if max_width < 4 {
+        return None;
+    }
+    let mut kept = Vec::new();
+    let mut used = 1;
+    for g in path.graphemes(true).rev() {
+        let w = UnicodeWidthStr::width(g);
+        if used + w > max_width {
+            break;
+        }
+        used += w;
+        kept.push(g);
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    kept.reverse();
+    Some(format!("…{}", kept.concat()))
+}
 fn status(
     footer: &Footer,
     balance: &str,
@@ -1217,24 +1258,62 @@ fn status(
     } else {
         "РАБОТА"
     };
-    let tail = format!(
-        " · {} · {} · {}",
+    let full_tail = format!(
+        " · {} · {} · {} · {mode}",
         footer.provider, footer.effort, permission
     );
-    let model = clip(
-        &flat(&footer.model),
-        first_width.saturating_sub(UnicodeWidthStr::width(tail.as_str()) + mode.len() + 3),
+    let full_tail_width = UnicodeWidthStr::width(full_tail.as_str());
+    let flat_model = flat(&footer.model);
+    let narrow_tail = format!(" · {} · {} · {mode}", footer.effort, permission);
+    let narrow_tail_width = UnicodeWidthStr::width(narrow_tail.as_str());
+    let compact_effort = match footer.effort.as_str() {
+        "thinking:on" => "on",
+        "thinking:off" => "off",
+        other => other,
+    };
+    let short_permission = compact_permission(permission);
+    let full_without_model = format!(
+        "{} · {} · {permission} · {mode}",
+        footer.provider, footer.effort
     );
-    let first = if first_width >= 54 {
-        format!("{model}{tail} · {mode}")
-    } else {
+    let no_model = format!("{} · {} · {mode}", footer.effort, permission);
+    let compact_no_model = format!("{compact_effort} · {permission} · {mode}");
+    let compact_perm_with_effort = format!("{compact_effort} · {short_permission} · {mode}");
+    let perm_and_mode = format!("{permission} · {mode}");
+    let compact_perm_and_mode = format!("{short_permission} · {mode}");
+    let mode_tail = format!(" · {mode}");
+    let mode_tail_width = UnicodeWidthStr::width(mode_tail.as_str());
+    let first = if first_width >= 54 && full_tail_width < first_width {
+        let clipped = clip(&flat_model, first_width - full_tail_width);
+        if clipped.is_empty() {
+            full_without_model
+        } else {
+            format!("{clipped}{full_tail}")
+        }
+    } else if narrow_tail_width < first_width
+        && !clip(&flat_model, first_width - narrow_tail_width).is_empty()
+    {
         format!(
-            "{} · {} · {} · {}",
-            clip(&flat(&footer.model), first_width.saturating_sub(24)),
-            footer.effort,
-            permission,
-            mode
+            "{}{narrow_tail}",
+            clip(&flat_model, first_width - narrow_tail_width)
         )
+    } else if UnicodeWidthStr::width(no_model.as_str()) <= first_width {
+        no_model
+    } else if UnicodeWidthStr::width(compact_no_model.as_str()) <= first_width {
+        compact_no_model
+    } else if UnicodeWidthStr::width(compact_perm_with_effort.as_str()) <= first_width {
+        compact_perm_with_effort
+    } else if UnicodeWidthStr::width(perm_and_mode.as_str()) <= first_width {
+        perm_and_mode
+    } else if UnicodeWidthStr::width(compact_perm_and_mode.as_str()) <= first_width {
+        compact_perm_and_mode
+    } else if mode_tail_width < first_width {
+        format!(
+            "{}{mode_tail}",
+            clip(&short_permission, first_width - mode_tail_width)
+        )
+    } else {
+        mode.into()
     };
     let percent = footer.context_percent();
     let filled = (percent.min(100) / 10).min(10);
@@ -1446,29 +1525,23 @@ fn compose(s: &State, width: u16, height: u16) -> Frame {
         );
     }
     // Правая часть статус-строки: путь проекта (хвостом — видно, над чем
-    // работаем) и версия; при узкой ширине остаётся только версия.
+    // работаем) и версия; путь уступает место обязательным индикаторам слева.
     let version = if width >= 54 {
         let brand = format!("rcode {}", env!("CARGO_PKG_VERSION"));
-        let path = s.footer.workspace.trim();
+        let brand_width = UnicodeWidthStr::width(brand.as_str());
+        let path = flat(s.footer.workspace.trim());
         if path.is_empty() {
             brand
         } else {
-            let max_right = (width / 2).clamp(20, 64);
-            let budget = max_right
-                .saturating_sub(UnicodeWidthStr::width(brand.as_str()))
-                .saturating_sub(3);
-            let mut shown: String = path
-                .chars()
-                .rev()
-                .take(budget)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            if UnicodeWidthStr::width(path) > budget {
-                shown.insert(0, '…');
+            let max_first_width = width.saturating_sub(brand_width + 2);
+            let reserved_left = required_status_width(&s.footer).min(max_first_width);
+            let available_right = width.saturating_sub(reserved_left + 2);
+            let max_right = available_right.min((width / 2).clamp(20, 64));
+            let budget = max_right.saturating_sub(brand_width + 3);
+            match clip_tail(&path, budget) {
+                Some(shown) => format!("{shown} · {brand}"),
+                None => brand,
             }
-            format!("{shown} · {brand}")
         }
     } else {
         format!("v{}", env!("CARGO_PKG_VERSION"))
@@ -2303,6 +2376,71 @@ mod tests {
         let local = status(&footer, "", 120, 0, 120)[1].0.clone();
         assert!(local.contains("25% ~5.0k/20.0k ток."), "{local}");
         assert!(status(&footer, "", 60, 0, 60)[1].0.contains("~ток."));
+    }
+
+    #[test]
+    fn narrow_footer_preserves_thinking_permissions_and_mode_without_clipping() {
+        let screen = Screen::test_screen();
+        {
+            let mut state = screen.state.lock().unwrap();
+            state.footer = Footer {
+                model: "Qwen3.8-27B-MLX-8bit".into(),
+                provider: "local".into(),
+                effort: "thinking:off".into(),
+                permissions: "ask".into(),
+                plan: false,
+                context_chars: 5_000,
+                context_limit: 32_768,
+                context_tokens: true,
+                input_tokens: 100,
+                output_tokens: 20,
+                workspace: "/Users/operator/very/long/nested/workspace/path/project".into(),
+            };
+        }
+        for cols in [60u16, 80, 140] {
+            for plan in [false, true] {
+                let expected_mode = if plan { "ПЛАН" } else { "РАБОТА" };
+                for (effort, short_effort) in [
+                    ("auto", "auto"),
+                    ("thinking:on", "on"),
+                    ("thinking:off", "off"),
+                ] {
+                    for (perms, short_perms) in [
+                        ("ask", "ask"),
+                        ("full-access", "full-access"),
+                        ("auto-edit + shell", "auto-edit+sh"),
+                        ("ask · sandbox: workspace-write", "ask · sb:rw"),
+                        (
+                            "auto-edit + shell · sandbox: workspace-write+net",
+                            "auto-edit+sh · sb:rw+net",
+                        ),
+                    ] {
+                        let mut state = screen.state.lock().unwrap();
+                        state.footer.plan = plan;
+                        state.footer.effort = effort.into();
+                        state.footer.permissions = perms.into();
+                        let frame = compose(&state, cols, 24);
+                        let line = &frame.rows[22].0;
+                        let has_perms = line.contains(&format!(" · {perms} · {expected_mode} "))
+                            || line.contains(&format!(" · {short_perms} · {expected_mode} "));
+                        assert!(
+                            has_perms,
+                            "cols={cols} plan={plan} effort={effort} perms={perms} clipped: {line:?}"
+                        );
+                        let has_effort = line.contains(effort)
+                            || line.starts_with(&format!("{short_effort} · "));
+                        assert!(
+                            has_effort,
+                            "cols={cols} plan={plan} effort={effort} perms={perms} lost effort: {line:?}"
+                        );
+                        assert!(
+                            !line.starts_with(" · "),
+                            "cols={cols} dangling separator: {line:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
