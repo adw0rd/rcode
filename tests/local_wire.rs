@@ -145,20 +145,49 @@ async fn stream_options_and_thinking_follow_runtime_and_explicit_choice() {
         (LocalRuntime::Mlx, false),
         (LocalRuntime::OpenAi, false),
     ] {
+        // Default (`thinking = None` / `auto`): neither field is sent on any runtime.
         let server = Server::start(|_, _| text_reply("ok"));
-        let mut settings = profile(&server.base(), runtime);
-        if runtime != LocalRuntime::Ollama {
-            settings.local.as_mut().unwrap().thinking = Some(false);
-        }
-        let mut client = ProviderClient::connect(settings, None).unwrap();
+        let mut client = ProviderClient::connect(profile(&server.base(), runtime), None).unwrap();
         complete(&mut client, &[]).await.0.unwrap();
         let body = server.generations()[0].json();
         assert_eq!(body.get("stream_options").is_some(), usage, "{runtime}");
-        if runtime != LocalRuntime::Ollama {
-            assert_eq!(
-                body["chat_template_kwargs"]["enable_thinking"], false,
-                "{runtime}"
+        assert!(body.get("chat_template_kwargs").is_none(), "{runtime}");
+        assert!(body.get("enable_thinking").is_none(), "{runtime}");
+
+        if runtime == LocalRuntime::Ollama {
+            let mut invalid = profile(&server.base(), runtime);
+            invalid.local.as_mut().unwrap().thinking = Some(false);
+            assert!(
+                ProviderClient::connect(invalid, None).is_err(),
+                "Ollama must reject explicit thinking before network"
             );
+            assert_eq!(server.generations().len(), 1);
+            continue;
+        }
+
+        for explicit in [false, true] {
+            let server = Server::start(|_, _| text_reply("ok"));
+            let mut settings = profile(&server.base(), runtime);
+            settings.local.as_mut().unwrap().thinking = Some(explicit);
+            let mut client = ProviderClient::connect(settings, None).unwrap();
+            complete(&mut client, &[]).await.0.unwrap();
+            let body = server.generations()[0].json();
+            assert_eq!(body.get("stream_options").is_some(), usage, "{runtime}");
+            assert_eq!(
+                body["chat_template_kwargs"]["enable_thinking"], explicit,
+                "{runtime} {explicit}"
+            );
+            if runtime == LocalRuntime::Mlx {
+                assert_eq!(
+                    body["enable_thinking"], explicit,
+                    "MLX top-level {explicit}"
+                );
+            } else {
+                assert!(
+                    body.get("enable_thinking").is_none(),
+                    "{runtime} must not send top-level enable_thinking"
+                );
+            }
         }
     }
 }

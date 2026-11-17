@@ -1051,3 +1051,212 @@ fn new_profile_never_inherits_an_orphan_key_of_its_name() {
         "the orphan key is deleted when the name is created again"
     );
 }
+
+#[test]
+fn local_thinking_control_covers_use_list_doctor_and_cli_override() {
+    let home = Home::new();
+    let mlx = local_server("qwen-mlx", "MLX_OK");
+    let ollama = local_server("qwen-ollama", "OLLAMA_OK");
+    let project = home.project("project");
+
+    // `ollama` + `--thinking` fails closed before even probing `/v1/models`.
+    let bad_ollama = home.run(
+        &[
+            "local",
+            "add",
+            "ollama-box",
+            "--base-url",
+            &ollama.base(),
+            "--runtime",
+            "ollama",
+            "--thinking",
+            "on",
+        ],
+        None,
+    );
+    assert!(!bad_ollama.status.success(), "{}", text(&bad_ollama));
+    assert!(
+        ollama.requests().is_empty(),
+        "invalid ollama thinking must fail before /v1/models"
+    );
+
+    home.add("ollama-box", &ollama.base(), "ollama", "qwen-ollama", &[]);
+    assert!(
+        !home
+            .run(&["local", "use", "ollama-box", "--thinking", "off"], None)
+            .status
+            .success()
+    );
+    assert!(
+        !home
+            .run(&["local", "list", "--thinking", "off"], None)
+            .status
+            .success()
+    );
+
+    home.add("mlx", &mlx.base(), "mlx", "qwen-mlx", &["--activate"]);
+    let plain_list = text(&home.ok(&["local", "list"], None));
+    assert!(
+        plain_list.contains("mlx") && plain_list.contains("thinking: auto"),
+        "{plain_list}"
+    );
+    let doctor_auto = home.ok(&["doctor", "--json", "--profile", "mlx"], None);
+    assert!(of_type(&events(&doctor_auto), "doctor")[0]["thinking"].is_null());
+
+    // `local use --thinking off` persists `false` in the profile and sends both MLX fields.
+    let used_off = text(&home.ok(&["local", "use", "mlx", "--thinking", "off"], None));
+    assert!(used_off.contains("thinking: off"), "{used_off}");
+    let listed = home.ok(&["local", "list", "--json"], None);
+    let mlx_row = of_type(&events(&listed), "local_profile")
+        .into_iter()
+        .find(|row| row["profile"] == "mlx")
+        .unwrap()
+        .clone();
+    assert_eq!(mlx_row["thinking"], false);
+
+    let doctor_off = home.ok(&["doctor", "--json", "--profile", "mlx"], None);
+    assert_eq!(
+        of_type(&events(&doctor_off), "doctor")[0]["thinking"],
+        false
+    );
+
+    assert!(
+        home.exec(&project, &["--profile", "mlx"], "первый")
+            .status
+            .success()
+    );
+    let first = mlx.generations()[0].json();
+    assert_eq!(first["enable_thinking"], false);
+    assert_eq!(first["chat_template_kwargs"]["enable_thinking"], false);
+
+    // One-off CLI `--thinking on` and `--thinking auto` override the run without mutating config.json.
+    assert!(
+        home.exec(
+            &project,
+            &["--profile", "mlx", "--thinking", "on"],
+            "второй"
+        )
+        .status
+        .success()
+    );
+    let second = mlx.generations()[1].json();
+    assert_eq!(second["enable_thinking"], true);
+    assert_eq!(second["chat_template_kwargs"]["enable_thinking"], true);
+
+    assert!(
+        home.exec(
+            &project,
+            &["--profile", "mlx", "--thinking", "auto"],
+            "третий"
+        )
+        .status
+        .success()
+    );
+    let third = mlx.generations()[2].json();
+    assert!(third.get("enable_thinking").is_none());
+    assert!(third.get("chat_template_kwargs").is_none());
+
+    // `--resume latest` keeps the snapshot's thinking (`auto` from turn 3), and
+    // `--resume latest --thinking on` overrides it without mutating `config.json`.
+    assert!(
+        home.exec(&project, &["--resume", "latest"], "четвёртый")
+            .status
+            .success()
+    );
+    let fourth = mlx.generations()[3].json();
+    assert!(fourth.get("enable_thinking").is_none());
+    assert!(fourth.get("chat_template_kwargs").is_none());
+
+    assert!(
+        home.exec(
+            &project,
+            &["--resume", "latest", "--thinking", "on"],
+            "пятый"
+        )
+        .status
+        .success()
+    );
+    let fifth = mlx.generations()[4].json();
+    assert_eq!(fifth["enable_thinking"], true);
+    assert_eq!(fifth["chat_template_kwargs"]["enable_thinking"], true);
+
+    // `doctor` reflects CLI `--thinking` override without mutating `config.json`.
+    let doctor_override = home.ok(
+        &["doctor", "--json", "--profile", "mlx", "--thinking", "on"],
+        None,
+    );
+    assert_eq!(
+        of_type(&events(&doctor_override), "doctor")[0]["thinking"],
+        true
+    );
+
+    // Saved profile on disk is still `false` until `local use --thinking auto` resets it.
+    let still_off = home.ok(&["local", "list", "--json"], None);
+    let mlx_row = of_type(&events(&still_off), "local_profile")
+        .into_iter()
+        .find(|row| row["profile"] == "mlx")
+        .unwrap()
+        .clone();
+    assert_eq!(mlx_row["thinking"], false);
+
+    let reset_auto = text(&home.ok(&["local", "use", "mlx", "--thinking", "auto"], None));
+    assert!(reset_auto.contains("thinking: auto"), "{reset_auto}");
+    let after_reset = home.ok(&["local", "list", "--json"], None);
+    let mlx_row = of_type(&events(&after_reset), "local_profile")
+        .into_iter()
+        .find(|row| row["profile"] == "mlx")
+        .unwrap()
+        .clone();
+    assert!(mlx_row["thinking"].is_null());
+
+    // Non-applicable subcommands and cloud providers reject `--thinking` before network.
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("evals/todo-api/manifest.json")
+        .to_string_lossy()
+        .into_owned();
+    for rejected in [
+        vec!["sessions", "--thinking", "off"],
+        vec!["models", "--profile", "mlx", "--thinking", "off"],
+        vec![
+            "eval",
+            "validate",
+            "--suite",
+            manifest_path.as_str(),
+            "--thinking",
+            "off",
+        ],
+    ] {
+        assert!(!home.run(&rejected, None).status.success(), "{rejected:?}");
+    }
+    let cloud = local_server("cloud-m", "CLOUD");
+    std::fs::write(
+        home.state.join("config.json"),
+        json!({"version":1,"active":"custom","providers":{"custom":{"kind":"custom","model":"cloud-m","base_url":cloud.base()}}}).to_string(),
+    )
+    .unwrap();
+    for rejected in [
+        vec![
+            "exec",
+            "--json",
+            "-C",
+            project.to_str().unwrap(),
+            "--provider",
+            "custom",
+            "--thinking",
+            "off",
+            "не отправится",
+        ],
+        vec![
+            "doctor",
+            "--json",
+            "--provider",
+            "custom",
+            "--thinking",
+            "off",
+        ],
+    ] {
+        assert!(!home.run(&rejected, None).status.success(), "{rejected:?}");
+    }
+    assert!(cloud.requests().is_empty());
+    no_cloud_key(&mlx);
+}

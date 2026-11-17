@@ -2,9 +2,11 @@
 //! never printed; profile output reports only whether a key is stored.
 use crate::{
     app::Events,
-    cli::{Cli, LocalCommand, Toggle},
+    cli::{Cli, LocalCommand},
     config::{ConfigStore, ProviderSettings, Settings},
-    local::{LocalRuntime, endpoint_identity, profile_settings, validate_local_endpoint},
+    local::{
+        LocalRuntime, ThinkingMode, endpoint_identity, profile_settings, validate_local_endpoint,
+    },
     local_runtime::{self, Candidate},
     protocol::{FailureKind, ProviderFailure},
     provider::ProviderClient,
@@ -22,6 +24,16 @@ pub async fn run(
 ) -> Result<i32> {
     if cli.profile.is_some() {
         bail!("Для rcode local укажите имя профиля аргументом, а не --profile");
+    }
+    if cli.effort.is_some() {
+        bail!("Для local глубина effort не настраивается; используйте --thinking auto|on|off");
+    }
+    if cli.thinking.is_some()
+        && !matches!(command, LocalCommand::Add { .. } | LocalCommand::Use { .. })
+    {
+        bail!(
+            "Флаг --thinking применяется в rcode local add и rcode local use, а также при запуске сессии или rcode exec"
+        );
     }
     let mut settings = store.load()?;
     match command {
@@ -48,7 +60,6 @@ pub async fn run(
             context_tokens,
             max_output_tokens,
             vision,
-            thinking,
             api_key_stdin,
             activate,
             force,
@@ -96,7 +107,7 @@ pub async fn run(
                     local.context_tokens = *tokens;
                 }
                 local.vision = *vision;
-                local.thinking = thinking.map(|toggle| toggle == Toggle::On);
+                local.thinking = cli.thinking.and_then(ThinkingMode::into_option);
                 local.key_required = key.is_some() || kept_key;
             }
             profile.ca_file = cli.ca_file.clone();
@@ -105,6 +116,7 @@ pub async fn run(
             } else if let Some(local) = &profile.local {
                 profile.max_output_tokens = profile.max_output_tokens.min(local.context_tokens / 4);
             }
+            crate::local::validate(&profile)?;
             if profile.model.is_empty() {
                 profile.model = first_model(&profile, key.clone()).await?;
                 if !cli.json {
@@ -149,13 +161,18 @@ pub async fn run(
                 .get(name)
                 .cloned()
                 .with_context(|| format!("Профиль local «{name}» не найден: rcode local list"))?;
-            if cli.base_url.is_some() {
+            if cli.base_url.is_some() || cli.ca_file.is_some() || cli.folder_id.is_some() {
                 bail!(
                     "Адрес профиля меняется командой rcode local add {name} --base-url URL --force"
                 );
             }
             if let Some(model) = &cli.model {
                 profile.model = model.clone();
+            }
+            if let Some(thinking) = cli.thinking
+                && let Some(local) = profile.local.as_mut()
+            {
+                local.thinking = thinking.into_option();
             }
             profile.validate()?;
             settings.remember_provider(&profile);
@@ -335,8 +352,13 @@ fn profile_row(
 }
 
 fn plain_row(row: &Value) -> String {
+    let thinking = match row["thinking"].as_bool() {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "auto",
+    };
     format!(
-        "{}{}  {}  {}  {}  ключ: {}  ctx {}",
+        "{}{}  {}  {}  {}  ключ: {}  ctx {}  thinking: {}",
         if row["active"] == true { "* " } else { "  " },
         row["profile"].as_str().unwrap_or_default(),
         row["runtime"].as_str().unwrap_or_default(),
@@ -347,6 +369,7 @@ fn plain_row(row: &Value) -> String {
         } else {
             "нет"
         },
-        row["context_tokens"]
+        row["context_tokens"],
+        thinking,
     )
 }

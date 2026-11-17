@@ -34,14 +34,14 @@ rcode doctor --check --provider gigachat
 rcode local discover [--json]
 rcode local add ИМЯ --base-url http://127.0.0.1:ПОРТ/v1 [--runtime ollama|llamacpp|mlx|lmstudio|openai]
                 [--model ID] [--context-tokens N] [--max-output-tokens N] [--vision]
-                [--thinking on|off] [--api-key-stdin] [--activate] [--force]
+                [--thinking auto|on|off] [--api-key-stdin] [--activate] [--force]
 rcode local list [--json]
-rcode local use ИМЯ [--model ID]
+rcode local use ИМЯ [--model ID] [--thinking auto|on|off]
 rcode local key ИМЯ (--stdin | --delete)
 rcode local remove ИМЯ
 rcode models --profile ИМЯ
 rcode doctor [--check] --profile ИМЯ
-rcode exec --profile ИМЯ 'запрос'
+rcode exec --profile ИМЯ [--thinking auto|on|off] 'запрос'
 ```
 
 `--profile` подразумевает `--provider local`; вместе с другим `--provider` это ошибка. Без `--model` команда `add` берёт первую чат-модель из `/models` сервера. `discover` проверяет только 127.0.0.1:11434, :8080 и :1234 с коротким таймаутом. В интерактиве `/provider` → `local` открывает список профилей, поиск серверов и ввод адреса вручную; `/model` показывает модели сервера активного профиля.
@@ -52,7 +52,7 @@ rcode exec --profile ИМЯ 'запрос'
 
 В одном процессе rcode одновременно идёт одна генерация на порт сервера, включая субагентов и разные профили одного сервера. Два отдельно запущенных rcode эту очередь не делят и могут генерировать на одном сервере параллельно. Отмена освобождает очередь rcode; сервер может ещё доделывать прерванный ответ.
 
-Рассуждения модели в полях `reasoning_content` и `reasoning`, а также ведущий блок `<think>` не показываются, не сохраняются и не отправляются обратно. Если шаблон модели сам открывает `<think>` и в ответ приходит только закрывающий `</think>`, без `--thinking` rcode распознаёт его лишь в первых 1024 байтах ответа и только для MLX и `openai`; более длинное рассуждение такой модели будет показано и сохранено как ответ. Для моделей, которые думают всегда (например, `*-Thinking`), укажите `--thinking on`: rcode дождётся `</think>` (если тега нет, ответ появится целиком в конце, без потерь) и передаст серверу `chat_template_kwargs.enable_thinking`. `--thinking off` передаёт `false`. Этот параметр учитывается, только если сервер и шаблон модели его поддерживают; для Ollama `--thinking` не принимается. Effort для local всегда `auto`.
+Рассуждения модели в полях `reasoning_content` и `reasoning`, а также ведущий блок `<think>` не показываются, не сохраняются и не отправляются обратно. Если шаблон модели сам открывает `<think>` и в ответ приходит только закрывающий `</think>`, в режиме `auto` (по умолчанию) rcode распознаёт его лишь в первых 1024 байтах ответа и только для MLX и `openai`; более длинное рассуждение такой модели будет показано и сохранено как ответ. Управлять режимом можно в профиле (`rcode local add … --thinking auto|on|off`, `rcode local use ИМЯ --thinking auto|on|off`), в интерактиве (`/thinking [auto|on|off]`) или разово на запуск (`rcode --profile ИМЯ --thinking off`, `rcode exec --profile ИМЯ --thinking off '…'`, без перезаписи `config.json`). При `on` rcode ждёт `</think>` до конца ответа (если тега нет, ответ появится целиком в конце, без потерь) и передаёт `true`; при `off` передаёт `false`; при `auto` не отправляет параметр. Для `llamacpp`, `lmstudio` и `openai` отправляется `chat_template_kwargs.enable_thinking`, а для `mlx` — одновременно верхнеуровневый `enable_thinking` (для `mlx_vlm.server`) и `chat_template_kwargs.enable_thinking` (для `mlx_lm`-совместимых серверов). Параметр учитывается, только если сервер и шаблон модели его поддерживают; для Ollama `--thinking` не принимается. Effort для local всегда `auto`.
 
 Вызов инструментов зависит от модели и сервера. Если сервер вернул вызов инструмента текстом или отклонил `tools`, rcode покажет ошибку и не будет повторять запрос без инструментов; для llama.cpp запускайте сервер с `--jinja`. Изображения отправляются только профилям с `--vision`. Баланс для local не применяется.
 

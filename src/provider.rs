@@ -90,8 +90,15 @@ impl ProviderClient {
                 .map_err(|error| protocol(&error.to_string()))?;
         }
         let base = checked_url(settings.base_url.as_deref().unwrap_or(default))?;
-        if is_local && settings.local.is_none() {
-            return Err(protocol("Профиль local повреждён: нет параметров local"));
+        if is_local {
+            let Some(local) = settings.local.as_ref() else {
+                return Err(protocol("Профиль local повреждён: нет параметров local"));
+            };
+            if local.thinking.is_some() && local.runtime == crate::local::LocalRuntime::Ollama {
+                return Err(protocol(
+                    "Для ollama rcode не передаёт управление thinking; настройте модель на сервере",
+                ));
+            }
         }
         let credential = if is_local {
             credential.filter(|key| !key.trim().is_empty())
@@ -589,6 +596,11 @@ impl ProviderClient {
             // Effort is never sent to a local server; thinking only by explicit choice.
             if let Some(thinking) = local.thinking {
                 body["chat_template_kwargs"] = json!({"enable_thinking":thinking});
+                // `mlx_vlm.server` reads top-level `enable_thinking` and ignores
+                // `chat_template_kwargs`; `mlx_lm`-compatible servers read `chat_template_kwargs`.
+                if local.runtime == crate::local::LocalRuntime::Mlx {
+                    body["enable_thinking"] = json!(thinking);
+                }
             }
             if self.settings.stream && local.runtime.stream_usage() {
                 body["stream_options"] = json!({"include_usage":true});
@@ -1449,7 +1461,7 @@ impl Accumulator {
         let rest = filter
             .finish(&mut self.completion.reasoning)
             .map_err(|_| {
-                protocol("Модель не закрыла блок рассуждений <think>, ответа нет. Увеличьте max_output_tokens профиля или отключите рассуждения на сервере (rcode local add … --thinking off, если сервер это поддерживает)")
+                protocol("Модель не закрыла блок рассуждений <think>, ответа нет. Увеличьте max_output_tokens профиля или отключите рассуждения (rcode local use ИМЯ --thinking off, если сервер это поддерживает)")
             })?;
         self.completion.content.push_str(&rest);
         if streaming && !rest.is_empty() {

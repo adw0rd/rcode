@@ -44,8 +44,13 @@ fn profile_detail(profile: &ProviderSettings, store: &ConfigStore) -> String {
         _ if local.is_some_and(|local| local.key_required) => "нужен ключ",
         _ => "без ключа",
     };
+    let thinking = match local.and_then(|local| local.thinking) {
+        Some(true) => " · thinking on",
+        Some(false) => " · thinking off",
+        None => "",
+    };
     format!(
-        "профиль {name} · {} · {address} · {key}{}",
+        "профиль {name} · {} · {address} · {key}{}{thinking}",
         local.map_or("", |local| local.runtime.as_str()),
         if profile.model.is_empty() {
             String::new()
