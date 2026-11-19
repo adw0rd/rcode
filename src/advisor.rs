@@ -3890,7 +3890,13 @@ mod tests {
             )
             .unwrap();
         wait_events.note_artifact_id(&art_meta.id);
+        #[cfg(unix)]
         let saved_art_text = art_store.verify_output(&art_meta).unwrap();
+        #[cfg(not(unix))]
+        let saved_art_text = art_store
+            .read_bytes(None, &art_meta.id, 0, 65536)
+            .unwrap()
+            .content;
         let saved_art_val: serde_json::Value = serde_json::from_str(&saved_art_text).unwrap();
         assert_eq!(saved_art_val["role"], "worker");
         assert_eq!(saved_art_val["status"], "failed");
@@ -4335,7 +4341,13 @@ mod tests {
                 ],
             )
             .unwrap();
+        #[cfg(unix)]
         let job_text = art_store.verify_output(&job_art).unwrap();
+        #[cfg(not(unix))]
+        let job_text = art_store
+            .read_bytes(None, &job_art.id, 0, 65536)
+            .unwrap()
+            .content;
         let job_json: serde_json::Value = serde_json::from_str(&job_text).unwrap();
         assert_eq!(job_json["delivery"], "delivered");
         assert_eq!(job_json["status"], "running");
@@ -4542,52 +4554,55 @@ mod tests {
 
         // 6) `capture_required` on `command_lifetime` `CommandManifestV1` preserves exact bytes
         //    even when `"cleanup_complete"`, `"exited"`, and `"managed"` are active secrets!
-        let manifest_raw = serde_json::json!({
-            "version": 1,
-            "command_id": "33333333-3333-4333-8333-333333333333",
-            "origin": {
-                "actor": null,
-                "turn": 1,
-                "tool": "command_output",
-                "call_id": "33333333-3333-4333-8333-333333333333"
-            },
-            "terminal": {
-                "cleanup_complete": true,
-                "credential_epoch": 0,
-                "exit_code": 0,
-                "id": "33333333-3333-4333-8333-333333333333",
-                "kind": "managed",
-                "status": "exited"
-            },
-            "stdout": [],
-            "stderr": []
-        });
-        // Re-parse through `job_manifest::try_redact_manifest` to match struct field order:
-        let (canonical_manifest, _) =
-            crate::job_manifest::try_redact_manifest(&manifest_raw.to_string(), &[])
-                .unwrap()
-                .unwrap();
-        let manifest_meta = art_store
-            .capture_required(
-                crate::artifacts::ArtifactOrigin {
-                    actor: None,
-                    turn: 6,
-                    tool: "command_lifetime".into(),
-                    call_id: "call_life_1".into(),
+        #[cfg(unix)]
+        {
+            let manifest_raw = serde_json::json!({
+                "version": 1,
+                "command_id": "33333333-3333-4333-8333-333333333333",
+                "origin": {
+                    "actor": null,
+                    "turn": 1,
+                    "tool": "command_output",
+                    "call_id": "33333333-3333-4333-8333-333333333333"
                 },
-                &canonical_manifest,
-                &[
-                    "cleanup_complete".into(),
-                    "exited".into(),
-                    "managed".into(),
-                    "command_lifetime".into(),
-                ],
-            )
-            .unwrap();
-        assert_eq!(
-            art_store.verify_required(&manifest_meta).unwrap(),
-            canonical_manifest
-        );
+                "terminal": {
+                    "cleanup_complete": true,
+                    "credential_epoch": 0,
+                    "exit_code": 0,
+                    "id": "33333333-3333-4333-8333-333333333333",
+                    "kind": "managed",
+                    "status": "exited"
+                },
+                "stdout": [],
+                "stderr": []
+            });
+            // Re-parse through `job_manifest::try_redact_manifest` to match struct field order:
+            let (canonical_manifest, _) =
+                crate::job_manifest::try_redact_manifest(&manifest_raw.to_string(), &[])
+                    .unwrap()
+                    .unwrap();
+            let manifest_meta = art_store
+                .capture_required(
+                    crate::artifacts::ArtifactOrigin {
+                        actor: None,
+                        turn: 6,
+                        tool: "command_lifetime".into(),
+                        call_id: "call_life_1".into(),
+                    },
+                    &canonical_manifest,
+                    &[
+                        "cleanup_complete".into(),
+                        "exited".into(),
+                        "managed".into(),
+                        "command_lifetime".into(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(
+                art_store.verify_required(&manifest_meta).unwrap(),
+                canonical_manifest
+            );
+        }
 
         // 7) `build_packet` skips `rcode_runtime` synthetic prompts for both `fallback_goal` and recent window!
         let mut rt_sess =
