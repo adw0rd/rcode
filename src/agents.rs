@@ -25,6 +25,16 @@ pub enum AgentRole {
     Worker,
 }
 
+impl AgentRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Explorer => "explorer",
+            Self::Reviewer => "reviewer",
+            Self::Worker => "worker",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -50,11 +60,23 @@ pub struct AgentRecord {
     pub name: String,
     pub task: String,
     pub role: AgentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_profile: Option<String>,
     pub status: AgentStatus,
     pub result: String,
     pub usage: Usage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transferred_commands: Vec<TransferredCommand>,
+}
+
+pub struct PreparedRoute {
+    pub client: ProviderClient,
+    pub system_prompt: String,
+    pub provider_settings: crate::config::ProviderSettings,
 }
 
 /// Serializes reply closure with synchronous native admission and publication.
@@ -203,6 +225,7 @@ pub struct AgentRequest {
     pub reply: oneshot::Sender<ToolOutcome>,
     pub admission: ReplyAdmission,
     pub(crate) transfers: Arc<Mutex<Vec<TransferredCommand>>>,
+    pub(crate) artifact_fit: Option<(crate::context::ContextBudget, usize)>,
 }
 impl AgentRequest {
     pub(crate) fn record_transfer(&self, transfer: TransferredCommand) -> anyhow::Result<()> {
@@ -231,6 +254,13 @@ struct Worker {
     id: String,
     record: Arc<Mutex<AgentRecord>>,
     stats: Arc<Mutex<UsageStats>>,
+    partial_usage: crate::provider::PartialCallState,
+    routed_provider: Option<crate::config::ProviderSettings>,
+    routed_client: Option<ProviderClient>,
+    routed_accounted: Usage,
+    routed_accounted_completions: u32,
+    routed_accounted_priced_completions: u32,
+    routed_accounted_priced_usd: f64,
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
     collected: bool,
@@ -241,6 +271,8 @@ struct Worker {
 struct UsageStats {
     usage: Usage,
     completions: u32,
+    priced_completions: u32,
+    priced_usd_sum: f64,
 }
 
 impl UsageStats {
@@ -251,6 +283,10 @@ impl UsageStats {
             .usage
             .cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        if let Some(step_cost) = usage.cost_usd {
+            self.priced_completions += 1;
+            self.priced_usd_sum += step_cost;
+        }
         self.usage.cost_usd = if self.completions == 0 {
             usage.cost_usd
         } else {
@@ -275,6 +311,9 @@ pub struct AgentPool {
     workers: Vec<Worker>,
     accounted: Usage,
     secrets: Arc<Mutex<Vec<String>>>,
+    verified_pages: Option<crate::app::SharedVerifiedPages>,
+    verified_excerpts: Option<crate::app::SharedVerifiedExcerpts>,
+    artifact_store_ctx: Option<(std::path::PathBuf, String)>,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +323,8 @@ struct SpawnArgs {
     name: Option<String>,
     #[serde(default)]
     role: AgentRole,
+    #[serde(default)]
+    route: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -296,24 +337,71 @@ struct IdArgs {
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
+use crate::redaction::merge_secret_variants;
+
 impl AgentPool {
-    pub fn set_secrets(&mut self, mut secrets: Vec<String>) {
-        secrets.retain(|secret| !secret.is_empty());
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
+    pub fn set_secrets(&mut self, secrets: Vec<String>) {
+        self.merge_secrets(&secrets);
+        self.redact_records();
+    }
+
+    pub(crate) fn redact_records(&self) {
+        let merged = self.secret_snapshot();
         for worker in &self.workers {
             let mut record = worker
                 .record
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            record.name = redact(&record.name, &secrets);
-            record.task = redact(&record.task, &secrets);
-            record.result = redact(&record.result, &secrets);
+            record.name = redact(&record.name, &merged);
+            record.task = redact(&record.task, &merged);
+            record.result = redact(&record.result, &merged);
+            if let Some(model) = &mut record.model {
+                *model = redact(model, &merged);
+            }
+            if let Some(profile) = &mut record.local_profile {
+                *profile = redact(profile, &merged);
+            }
         }
-        *self
+    }
+
+    pub fn merge_secrets(&self, extra: &[String]) {
+        let mut guard = self
             .secrets
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = secrets;
+            .unwrap_or_else(|error| error.into_inner());
+        crate::redaction::merge_secret_variants(&mut guard, extra);
+    }
+
+    pub fn secret_snapshot(&self) -> Vec<String> {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn bind_shared_secrets(&mut self, shared: Arc<Mutex<Vec<String>>>) {
+        let existing = self.secret_snapshot();
+        self.secrets = shared;
+        if !existing.is_empty() {
+            let mut guard = self
+                .secrets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            crate::redaction::merge_secret_variants(&mut guard, &existing);
+        }
+    }
+    pub(crate) fn bind_verified_pages(&mut self, pages: crate::app::SharedVerifiedPages) {
+        self.verified_pages = Some(pages);
+    }
+    pub(crate) fn bind_verified_excerpts(&mut self, excerpts: crate::app::SharedVerifiedExcerpts) {
+        self.verified_excerpts = Some(excerpts);
+    }
+    pub(crate) fn bind_artifact_store_context(
+        &mut self,
+        session_dir: std::path::PathBuf,
+        session_id: String,
+    ) {
+        self.artifact_store_ctx = Some((session_dir, session_id));
     }
     /// Host-owned wall-clock limit, configured before any worker is spawned.
     pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -345,15 +433,40 @@ impl AgentPool {
                 workers: Vec::new(),
                 accounted: Usage::default(),
                 secrets: Arc::new(Mutex::new(Vec::new())),
+                verified_pages: None,
+                verified_excerpts: None,
+                artifact_store_ctx: None,
             },
             receiver,
         )
     }
 
     pub fn definitions() -> Vec<ToolDefinition> {
+        Self::definitions_for(true)
+    }
+
+    pub fn definitions_for(allow_route: bool) -> Vec<ToolDefinition> {
+        let spawn_props = if allow_route {
+            json!({
+                "task":{"type":"string","minLength":1,"maxLength":MAX_TASK_CHARS},
+                "name":{"type":"string","minLength":1,"maxLength":80},
+                "role":{"type":"string","enum":["explorer","reviewer","worker"],"default":"explorer"},
+                "route":{"type":"string","minLength":1,"maxLength":256}
+            })
+        } else {
+            json!({
+                "task":{"type":"string","minLength":1,"maxLength":MAX_TASK_CHARS},
+                "name":{"type":"string","minLength":1,"maxLength":80},
+                "role":{"type":"string","enum":["explorer","reviewer","worker"],"default":"explorer"}
+            })
+        };
+        let spawn_desc = if allow_route {
+            "Запустить субагента на текущем provider/model (или на route по явному запросу пользователя) для параллельных подзадач. Не вызывайте для простых или последовательных шагов (холодный контекст, на local общая очередь) и никогда при запрете субагентов. Explorer/reviewer только читают; worker меняет файлы и команды (до 3 сразу, 6 за ход; сбор — wait_agent)."
+        } else {
+            "Запустить субагента на текущем provider/model для параллельных подзадач. Не вызывайте для простых или последовательных шагов (холодный контекст, на local общая очередь) и никогда при запрете субагентов. Explorer/reviewer только читают; worker меняет файлы и команды (до 3 сразу, 6 за ход; сбор — wait_agent)."
+        };
         [
-            ("spawn_agent", "Запустить субагента на текущем provider/model для параллельных или изолированных подзадач. Не вызывайте для простых или последовательных шагов (холодный контекст, на local общая очередь) и никогда при запрете субагентов в запросе. Explorer и reviewer только читают; worker меняет файлы и запускает команды с общими разрешениями (до 3 сразу, 6 за ход; сбор через wait_agent).",
-             json!({"task":{"type":"string","minLength":1,"maxLength":MAX_TASK_CHARS},"name":{"type":"string","minLength":1,"maxLength":80},"role":{"type":"string","enum":["explorer","reviewer","worker"],"default":"explorer"}}), vec!["task"]),
+            ("spawn_agent", spawn_desc, spawn_props, vec!["task"]),
             ("wait_agent", "Дождаться субагента и получить его результат и реальный usage. Повторный вызов возвращает сохранённый результат без нового API-запроса.",
              json!({"agent_id":{"type":"string"}}), vec!["agent_id"]),
             ("list_agents", "Показать состояния субагентов текущего хода. Для сбора результата используйте wait_agent.",json!({}),vec![]),
@@ -372,13 +485,83 @@ impl AgentPool {
         )
     }
 
+    /// Parses `spawn_agent` arguments and returns any requested custom `route`
+    /// after validating basic argument bounds.
+    pub fn parse_spawn_route(
+        args: &Value,
+    ) -> Result<Option<(String, AgentRole, Option<String>)>, String> {
+        let parsed: SpawnArgs = serde_json::from_value(args.clone()).map_err(|_| {
+            "spawn_agent: нужны task, необязательные name, role (explorer, reviewer, worker) и route; лишние поля запрещены"
+                .to_owned()
+        })?;
+        if parsed.task.trim().is_empty() || parsed.task.chars().count() > MAX_TASK_CHARS {
+            return Err("Задача субагента должна содержать от 1 до 16000 символов".into());
+        }
+        if parsed.name.as_ref().is_some_and(|name| {
+            name.trim().is_empty()
+                || name.chars().count() > 80
+                || name.chars().any(char::is_control)
+        }) {
+            return Err("Имя субагента: от 1 до 80 символов без управляющих символов".into());
+        }
+        let Some(route) = parsed.route else {
+            return Ok(None);
+        };
+        let trimmed = route.trim().to_owned();
+        if trimmed.is_empty()
+            || trimmed.chars().count() > 256
+            || trimmed.chars().any(char::is_control)
+        {
+            return Err(
+                "route в spawn_agent: от 1 до 256 символов без управляющих символов".into(),
+            );
+        }
+        Ok(Some((trimmed, parsed.role, parsed.name)))
+    }
+
+    pub async fn precheck_spawn(&mut self) -> Result<(), String> {
+        self.refresh().await;
+        if self.cancel.is_cancelled() {
+            return Err("Ход отменён; новые субагенты не запускаются".into());
+        }
+        if self.workers.len() >= MAX_SPAWNED {
+            return Err("Лимит: не более 6 субагентов за один ход".into());
+        }
+        if self
+            .records()
+            .iter()
+            .filter(|record| record.status == AgentStatus::Running)
+            .count()
+            >= MAX_RUNNING
+        {
+            return Err(
+                "Лимит: не более 3 субагентов одновременно; дождитесь результата или отмените задачу"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn execute_spawn_on(&mut self, args: &Value, prepared: PreparedRoute) -> ToolOutcome {
+        self.refresh().await;
+        match serde_json::from_value::<SpawnArgs>(args.clone()) {
+            Ok(parsed) => self.spawn_with_route(parsed, Some(prepared)),
+            Err(_) => ToolOutcome::error(
+                "spawn_agent: нужны task, необязательные name, role (explorer, reviewer, worker) и route; лишние поля запрещены",
+            ),
+        }
+    }
+
     pub async fn execute(&mut self, name: &str, args: &Value) -> ToolOutcome {
         self.refresh().await;
         match name {
             "spawn_agent" => match serde_json::from_value::<SpawnArgs>(args.clone()) {
-                Ok(args) => self.spawn(args),
+                Ok(parsed) if parsed.route.is_some() => ToolOutcome::error(
+                    "spawn_agent: альтернативный route недоступен в этом контексте",
+                ),
+                Ok(parsed) => self.spawn_with_route(parsed, None),
                 Err(_) => ToolOutcome::error(
-                    "spawn_agent: нужны task, необязательные name и role (explorer, reviewer, worker); лишние поля запрещены",
+                    "spawn_agent: нужны task, необязательные name, role (explorer, reviewer, worker) и route; лишние поля запрещены",
                 ),
             },
             "wait_agent" | "close_agent" => {
@@ -423,12 +606,17 @@ impl AgentPool {
         }
     }
 
-    fn spawn(&mut self, mut args: SpawnArgs) -> ToolOutcome {
-        let secrets = self
-            .secrets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+    fn spawn_with_route(
+        &mut self,
+        mut args: SpawnArgs,
+        prepared: Option<PreparedRoute>,
+    ) -> ToolOutcome {
+        if let Some(prep) = &prepared {
+            self.merge_secrets(&prep.client.redaction_secrets());
+        } else {
+            self.merge_secrets(&self.client.redaction_secrets());
+        }
+        let secrets = self.secret_snapshot();
         args.task = redact(&args.task, &secrets);
         args.name = args.name.map(|name| redact(&name, &secrets));
         if self.cancel.is_cancelled() {
@@ -460,15 +648,39 @@ impl AgentPool {
                 "Лимит: не более 3 субагентов одновременно; дождитесь результата или отмените задачу",
             );
         }
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = match mint_clean_actor_id(&secrets) {
+            Ok(id) => id,
+            Err(msg) => return ToolOutcome::error(msg),
+        };
         let name = args
             .name
             .unwrap_or_else(|| format!("agent-{}", self.workers.len() + 1));
+        let (mut worker_client, worker_prompt, routed_meta) = match prepared {
+            Some(prep) => (
+                prep.client,
+                prep.system_prompt,
+                Some(prep.provider_settings),
+            ),
+            None => (self.client.clone(), self.system_prompt.clone(), None),
+        };
+        let partial_usage = worker_client.isolate_partial_usage();
+        let effective_meta = routed_meta
+            .as_ref()
+            .unwrap_or_else(|| worker_client.settings());
+        let record_provider = Some(effective_meta.kind.as_str().to_owned());
+        let record_model = Some(redact(&effective_meta.model, &secrets));
+        let record_profile = effective_meta
+            .local
+            .as_ref()
+            .map(|l| redact(&l.profile, &secrets));
         let record = Arc::new(Mutex::new(AgentRecord {
             id: id.clone(),
             name: name.clone(),
             task: args.task.clone(),
             role: args.role,
+            provider: record_provider.clone(),
+            model: record_model.clone(),
+            local_profile: record_profile,
             status: AgentStatus::Running,
             result: String::new(),
             usage: Usage::default(),
@@ -477,13 +689,14 @@ impl AgentPool {
         let stats = Arc::new(Mutex::new(UsageStats::default()));
         let cancel = self.cancel.child_token();
         let transfers = Arc::new(Mutex::new(Vec::new()));
+        let routed_client = routed_meta.is_some().then(|| worker_client.clone());
         let task = WorkerTask {
             id: id.clone(),
             name: name.clone(),
             task: args.task,
             role: args.role,
-            system_prompt: self.system_prompt.clone(),
-            client: self.client.clone(),
+            system_prompt: worker_prompt,
+            client: worker_client,
             requests: self.requests.clone(),
             cancel: cancel.clone(),
             max_steps: self.max_steps,
@@ -491,9 +704,14 @@ impl AgentPool {
             sandbox: self.sandbox,
             stats: stats.clone(),
             secrets: self.secrets.clone(),
+            verified_pages: self.verified_pages.clone(),
+            verified_excerpts: self.verified_excerpts.clone(),
+            artifact_store_ctx: self.artifact_store_ctx.clone(),
             transfers: transfers.clone(),
         };
         let shared = record.clone();
+        let stats_for_spawn = stats.clone();
+        let partial_for_spawn = partial_usage.clone();
         let worker_timeout = self.timeout;
         let handle = tokio::spawn(async move {
             let cancel = task.cancel.clone();
@@ -507,6 +725,13 @@ impl AgentPool {
                     Err(_)=>(AgentStatus::Failed,format!("Истёк общий лимит времени субагента ({} секунд)", worker_timeout.as_secs())),
                 },
             };
+            let (partial_u, partial_responded) = partial_for_spawn.take();
+            if partial_u.is_some() || partial_responded {
+                stats_for_spawn
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .add(&partial_u.unwrap_or_default());
+            }
             cancel.cancel();
             let secrets = secrets
                 .lock()
@@ -520,12 +745,30 @@ impl AgentPool {
             id: id.clone(),
             record,
             stats,
+            partial_usage,
+            routed_provider: routed_meta,
+            routed_client,
+            routed_accounted: Usage::default(),
+            routed_accounted_completions: 0,
+            routed_accounted_priced_completions: 0,
+            routed_accounted_priced_usd: 0.0,
             cancel,
             handle: Some(handle),
             collected: false,
             transfers,
         });
-        ToolOutcome::success(json!({"agent_id":id,"name":name,"role":args.role,"status":"running","message":"Используйте wait_agent, чтобы собрать результат"}).to_string())
+        let mut resp = json!({
+            "agent_id": id,
+            "name": name,
+            "role": args.role,
+            "status": "running",
+            "message": "Используйте wait_agent, чтобы собрать результат"
+        });
+        if let (Some(prov), Some(mdl)) = (record_provider, record_model) {
+            resp["provider"] = json!(prov);
+            resp["model"] = json!(mdl);
+        }
+        ToolOutcome::success(resp.to_string())
     }
 
     async fn refresh(&mut self) {
@@ -562,6 +805,14 @@ impl AgentPool {
         };
         if let Some(result) = joined {
             worker.handle = None;
+            let (partial_u, partial_responded) = worker.partial_usage.take();
+            if partial_u.is_some() || partial_responded {
+                worker
+                    .stats
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .add(&partial_u.unwrap_or_default());
+            }
             if result.is_err() {
                 let mut record = worker
                     .record
@@ -652,6 +903,71 @@ impl AgentPool {
         delta
     }
 
+    pub fn take_routed_usage(&mut self) -> Vec<(crate::config::ProviderSettings, Usage, u32, u32)> {
+        let mut out = Vec::new();
+        for worker in &mut self.workers {
+            let Some(provider) = &worker.routed_provider else {
+                continue;
+            };
+            let stats = worker
+                .stats
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let new_completions = stats
+                .completions
+                .saturating_sub(worker.routed_accounted_completions);
+            if new_completions == 0 {
+                continue;
+            }
+            let new_priced = stats
+                .priced_completions
+                .saturating_sub(worker.routed_accounted_priced_completions);
+            let delta_cost = (new_priced > 0)
+                .then_some((stats.priced_usd_sum - worker.routed_accounted_priced_usd).max(0.0));
+            let delta = Usage {
+                input_tokens: stats
+                    .usage
+                    .input_tokens
+                    .saturating_sub(worker.routed_accounted.input_tokens),
+                output_tokens: stats
+                    .usage
+                    .output_tokens
+                    .saturating_sub(worker.routed_accounted.output_tokens),
+                cached_input_tokens: stats
+                    .usage
+                    .cached_input_tokens
+                    .saturating_sub(worker.routed_accounted.cached_input_tokens),
+                cost_usd: delta_cost,
+            };
+            worker.routed_accounted = stats.usage.clone();
+            worker.routed_accounted_completions = stats.completions;
+            worker.routed_accounted_priced_completions = stats.priced_completions;
+            worker.routed_accounted_priced_usd = stats.priced_usd_sum;
+            out.push((provider.clone(), delta, new_completions, new_priced));
+        }
+        out
+    }
+
+    pub(crate) fn routed_local_budgets(
+        &self,
+    ) -> Vec<(crate::model_route::RouteIdentity, (Option<u32>, f64))> {
+        let mut out = Vec::new();
+        for worker in &self.workers {
+            if let (Some(provider), Some(client)) = (&worker.routed_provider, &worker.routed_client)
+                && let Some(snapshot) = client.local_budget_snapshot()
+            {
+                out.push((
+                    crate::model_route::RouteIdentity::with_ca_sha256(
+                        provider,
+                        client.ca_bundle_sha256_hex(),
+                    ),
+                    snapshot,
+                ));
+            }
+        }
+        out
+    }
+
     pub fn records(&self) -> Vec<AgentRecord> {
         self.workers.iter().map(snapshot).collect()
     }
@@ -694,8 +1010,36 @@ fn bounded(text: &str, limit: usize) -> String {
 }
 
 fn redact(text: &str, secrets: &[String]) -> String {
-    crate::redaction::redact_text(text, secrets)
-        .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
+    if secrets.is_empty() {
+        return text.to_owned();
+    }
+    type CachedDict = (
+        crate::app::SecretGen,
+        Option<std::result::Result<std::sync::Arc<crate::redaction::SecretDictionary>, ()>>,
+    );
+    std::thread_local! {
+        static WORKER_DICT_CACHE: std::cell::RefCell<CachedDict> =
+            const { std::cell::RefCell::new(([0u8; 32], None)) };
+    }
+    let gen_id = crate::app::compute_secret_gen(secrets);
+    let dict_res = WORKER_DICT_CACHE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.0 == gen_id
+            && let Some(ref cached) = guard.1
+        {
+            return cached.clone();
+        }
+        let compiled = crate::redaction::SecretDictionary::new(secrets)
+            .map(std::sync::Arc::new)
+            .map_err(|_| ());
+        *guard = (gen_id, Some(compiled.clone()));
+        compiled
+    });
+    match dict_res {
+        Ok(dict) => crate::redaction::redact_text_idempotent_with(&dict, text)
+            .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into()),
+        Err(()) => "[rcode: текст скрыт из-за ошибки redaction]".into(),
+    }
 }
 
 fn redact_value(value: &mut Value, secrets: &[String]) {
@@ -717,40 +1061,722 @@ fn redact_value(value: &mut Value, secrets: &[String]) {
     }
 }
 
-fn redact_payload(text: &str, secrets: &[String]) -> String {
+fn redact_value_strings(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => *text = redact(text, secrets),
+        Value::Array(values) => {
+            for value in values {
+                redact_value_strings(value, secrets);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_value_strings(value, secrets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_against_schema(value: &mut Value, schema: Option<&Value>, secrets: &[String]) {
+    match value {
+        Value::String(text) => {
+            let is_schema_enum = schema
+                .and_then(|sc| sc.get("enum"))
+                .and_then(Value::as_array)
+                .is_some_and(|variants| variants.iter().any(|v| v.as_str() == Some(text.as_str())));
+            if !is_schema_enum {
+                *text = redact(text, secrets);
+            }
+        }
+        Value::Array(items) => {
+            let item_schema = schema.and_then(|s| s.get("items"));
+            for item in items {
+                redact_against_schema(item, item_schema, secrets);
+            }
+        }
+        Value::Object(map) => {
+            let props = schema
+                .and_then(|s| s.get("properties"))
+                .and_then(Value::as_object);
+            let old = std::mem::take(map);
+            for (key, mut child) in old {
+                if let Some(prop_schema) = props.and_then(|p| p.get(&key)) {
+                    redact_against_schema(&mut child, Some(prop_schema), secrets);
+                    map.insert(key, child);
+                } else {
+                    redact_value(&mut child, secrets);
+                    map.insert(redact(&key, secrets), child);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn is_agent_receipt_key(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "agent_id"
+            | "agents"
+            | "name"
+            | "task"
+            | "role"
+            | "provider"
+            | "model"
+            | "local_profile"
+            | "status"
+            | "result"
+            | "usage"
+            | "transferred_commands"
+            | "message"
+            | "error"
+            | "command_id"
+            | "handoff_operation_id"
+            | "lifetime_operation_id"
+            | "ownership_epoch"
+            | "input_tokens"
+            | "output_tokens"
+            | "cached_input_tokens"
+            | "cost_usd"
+            | "is_error"
+            | "artifact_id"
+            | "artifact_bytes"
+            | "artifact_truncated"
+            | "text"
+            | "preview"
+            | "hint"
+            | "omitted_bytes"
+            | "worker_receipts"
+            | "version"
+            | "available"
+            | "goal_verified"
+            | "scope"
+            | "selection"
+            | "observations"
+            | "omitted_operations"
+            | "pending_operations"
+            | "unavailable_operations"
+            | "truncated"
+            | "unavailable_reason"
+            | "semantics"
+            | "operation_id"
+            | "tool"
+            | "revision"
+            | "operation_outcome"
+            | "terminal"
+            | "output"
+            | "payload_unavailable"
+            | "stdout_truncated"
+            | "stdout_preview"
+            | "fields"
+            | "input_id"
+            | "cleanup_complete"
+            | "delivery_cancelled"
+            | "output_truncated"
+            | "redaction_incomplete"
+            | "exit_code"
+            | "signal"
+            | "delivery"
+            | "written"
+            | "total"
+            | "inputs"
+            | "inputs_truncated"
+    )
+}
+
+pub(crate) fn is_agent_receipt_enum_value(key: &str, val: &str) -> bool {
+    match key {
+        "role" => matches!(val, "explorer" | "reviewer" | "worker"),
+        "status" => matches!(
+            val,
+            "running"
+                | "completed"
+                | "failed"
+                | "cancelled"
+                | "interrupted"
+                | "exited"
+                | "stopped"
+                | "timed_out"
+                | "unknown"
+        ),
+        "provider" => matches!(
+            val,
+            "yandex" | "gigachat" | "openrouter" | "custom" | "local"
+        ),
+        "error" => matches!(
+            val,
+            "eval_disabled" | "invalid_route" | "denied" | "stale_route"
+        ),
+        "tool" => crate::app::is_known_builtin_tool_name(val),
+        "scope" => val == "worker_turn",
+        "selection" => val == "last_8_committed_by_admission",
+        "operation_outcome" => matches!(
+            val,
+            "succeeded" | "failed" | "cancelled" | "interrupted" | "unknown" | "completed"
+        ),
+        "delivery" => matches!(
+            val,
+            "accepted" | "delivered" | "rejected" | "cancelled" | "io_error"
+        ),
+        "unavailable_reason" => matches!(
+            val,
+            "journal_unavailable"
+                | "summary_unavailable"
+                | "secret_refresh_unavailable"
+                | "summary_over_limit"
+        ),
+        "payload_unavailable" => matches!(
+            val,
+            "manifest_not_expanded"
+                | "output_over_limit_or_truncated"
+                | "native_receipt_unavailable"
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn redact_agent_tool_value<F, A>(
+    value: &mut Value,
+    redact_str: &mut F,
+    is_verified_artifact: &A,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&str) -> anyhow::Result<String>,
+    A: Fn(&str) -> bool,
+{
+    redact_agent_tool_value_inner(value, redact_str, is_verified_artifact, true)
+}
+
+fn redact_agent_tool_value_inner<F, A>(
+    value: &mut Value,
+    redact_str: &mut F,
+    is_verified_artifact: &A,
+    is_root: bool,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&str) -> anyhow::Result<String>,
+    A: Fn(&str) -> bool,
+{
+    match value {
+        Value::String(s) => {
+            *s = redact_str(s)?;
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_agent_tool_value_inner(item, redact_str, is_verified_artifact, false)?;
+            }
+        }
+        Value::Object(map) => {
+            let old = std::mem::take(map);
+            for (key, mut child) in old {
+                let clean_key = if is_agent_receipt_key(&key) {
+                    key.clone()
+                } else {
+                    redact_str(&key)?
+                };
+                let preserve_val = match child.as_str() {
+                    Some(s) if is_root && key == "artifact_id" && is_verified_artifact(s) => true,
+                    Some(s) if is_agent_receipt_enum_value(&key, s) => true,
+                    _ => false,
+                };
+                if !preserve_val {
+                    redact_agent_tool_value_inner(
+                        &mut child,
+                        redact_str,
+                        is_verified_artifact,
+                        false,
+                    )?;
+                }
+                map.insert(clean_key, child);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_receipt_artifact_ids(
+    value: &Value,
+    known_artifact_ids: &mut std::collections::HashSet<String>,
+) {
+    let Some(map) = value.as_object() else {
+        return;
+    };
+    if let Some(id) = map.get("artifact_id").and_then(Value::as_str)
+        && crate::artifacts::is_canonical_artifact_id(id)
+    {
+        known_artifact_ids.insert(id.to_owned());
+    }
+    if let Some(id) = map
+        .get("meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("id"))
+        .and_then(Value::as_str)
+        && crate::artifacts::is_canonical_artifact_id(id)
+    {
+        known_artifact_ids.insert(id.to_owned());
+    }
+}
+
+fn is_static_receipt_key(key: &str) -> bool {
+    matches!(
+        key,
+        "artifact_id"
+            | "artifact_bytes"
+            | "artifact_truncated"
+            | "meta"
+            | "version"
+            | "id"
+            | "session_id"
+            | "origin"
+            | "sha256"
+            | "actor"
+            | "turn"
+            | "tool"
+            | "call_id"
+            | "content"
+            | "offset"
+            | "bytes"
+            | "next_offset"
+            | "total_bytes"
+            | "start_line"
+            | "end_line"
+            | "next_line"
+            | "total_lines"
+            | "truncated"
+            | "matches"
+            | "error"
+            | "message"
+            | "hint"
+    )
+}
+
+fn redact_value_preserving_artifacts(
+    value: &mut Value,
+    secrets: &[String],
+    known_artifact_ids: &std::collections::HashSet<String>,
+) {
+    match value {
+        Value::String(text) => *text = redact(text, secrets),
+        Value::Array(items) => {
+            for item in items {
+                redact_value_preserving_artifacts(item, secrets, known_artifact_ids);
+            }
+        }
+        Value::Object(items) => {
+            let old = std::mem::take(items);
+            for (key, mut item) in old {
+                if ((key == "artifact_id" || key == "id")
+                    && item
+                        .as_str()
+                        .is_some_and(|id| known_artifact_ids.contains(id)))
+                    || (key == "tool"
+                        && item
+                            .as_str()
+                            .is_some_and(crate::app::is_known_builtin_tool_name))
+                {
+                    items.insert(key, item);
+                } else {
+                    redact_value_preserving_artifacts(&mut item, secrets, known_artifact_ids);
+                    let clean_key = if is_static_receipt_key(&key) {
+                        key
+                    } else {
+                        redact(&key, secrets)
+                    };
+                    items.insert(clean_key, item);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_receipt_payload(
+    text: &str,
+    secrets: &[String],
+    known_artifact_ids: &std::collections::HashSet<String>,
+) -> String {
     if let Ok(mut value) = serde_json::from_str::<Value>(text) {
-        redact_value(&mut value, secrets);
+        redact_value_preserving_artifacts(&mut value, secrets, known_artifact_ids);
         value.to_string()
     } else {
         redact(text, secrets)
     }
 }
 
-fn redact_call(call: &mut ToolCall, secrets: &[String]) {
-    if redact(&call.id, secrets) != call.id || call.id.len() > 256 {
-        call.id = format!("call_{}", uuid::Uuid::new_v4().simple());
+fn redact_tool_arguments(
+    tool_name: &str,
+    definitions: &[ToolDefinition],
+    text: &str,
+    secrets: &[String],
+    known_artifact_ids: &std::collections::HashSet<String>,
+) -> String {
+    if let Ok(mut value) = serde_json::from_str::<Value>(text) {
+        let preserved_artifact_id = (tool_name == "read_tool_output")
+            .then(|| {
+                value
+                    .get("artifact_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+            .filter(|id| known_artifact_ids.contains(id));
+        let schema = definitions
+            .iter()
+            .find(|d| d.name == tool_name)
+            .map(|d| &d.parameters);
+        redact_against_schema(&mut value, schema, secrets);
+        if let (Some(id), Some(obj)) = (preserved_artifact_id, value.as_object_mut()) {
+            obj.insert("artifact_id".into(), Value::String(id));
+        }
+        value.to_string()
+    } else {
+        redact(text, secrets)
     }
-    call.kind = redact(&call.kind, secrets);
-    call.function.name = redact(&call.function.name, secrets);
-    call.function.arguments = redact_payload(&call.function.arguments, secrets);
 }
 
-fn redact_message(message: &mut Message, secrets: &[String]) {
-    if let Some(content) = &mut message.content {
-        *content = redact(content, secrets);
-    }
-    if let Some(name) = &mut message.name {
-        *name = redact(name, secrets);
-    }
-    if let Some(id) = &mut message.tool_call_id {
-        *id = redact(id, secrets);
-    }
-    for call in &mut message.tool_calls {
-        redact_call(call, secrets);
-    }
-    if let Some(meta) = &mut message.provider_meta {
+fn redact_provider_meta(meta: &mut ProviderMeta, secrets: &[String]) {
+    if !matches!(
+        meta.kind.as_str(),
+        "gigachat" | "rcode_skill_preload" | "rcode_runtime"
+    ) {
         meta.kind = redact(&meta.kind, secrets);
-        redact_value(&mut meta.data, secrets);
+    }
+    match &mut meta.data {
+        Value::Object(map) => {
+            let old = std::mem::take(map);
+            for (key, mut child) in old {
+                if matches!(key.as_str(), "functions_state_id" | "subagent_final_step") {
+                    redact_value_strings(&mut child, secrets);
+                    map.insert(key, child);
+                } else {
+                    redact_value(&mut child, secrets);
+                    map.insert(redact(&key, secrets), child);
+                }
+            }
+        }
+        other => redact_value(other, secrets),
+    }
+}
+
+pub(crate) fn mint_clean_actor_id(secrets: &[String]) -> std::result::Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let initial = uuid::Uuid::new_v4().to_string();
+    if secrets.is_empty()
+        || crate::redaction::redact_text(&initial, secrets).is_ok_and(|c| c == initial)
+    {
+        return Ok(initial);
+    }
+    const ALPHABETS: [&[u8; 16]; 4] = [
+        b"0123456789abcdef",
+        b"ghijklmnopqrstuv",
+        b"wxyzABCDEFGHIJKL",
+        b"MNOPQRSTUVWXYZ_-",
+    ];
+    static ACTOR_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = ACTOR_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seed = uuid::Uuid::new_v4();
+    for (alpha_idx, alpha) in ALPHABETS.iter().enumerate() {
+        for round in 0u32..8 {
+            let mut hasher = Sha256::new();
+            hasher.update(seed.as_bytes());
+            hasher.update(seq.to_le_bytes());
+            hasher.update([alpha_idx as u8]);
+            hasher.update(round.to_le_bytes());
+            let digest = hasher.finalize();
+            let candidate: String = digest[..16]
+                .iter()
+                .flat_map(|b| {
+                    [
+                        char::from(alpha[(b >> 4) as usize]),
+                        char::from(alpha[(b & 0x0f) as usize]),
+                    ]
+                })
+                .collect();
+            if crate::redaction::redact_text(&candidate, secrets)
+                .is_ok_and(|clean| clean == candidate)
+            {
+                return Ok(candidate);
+            }
+        }
+    }
+    let safe_ascii: Vec<u8> = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-"
+        .iter()
+        .copied()
+        .filter(|&b| {
+            let s = String::from(char::from(b));
+            crate::redaction::redact_text(&s, secrets).is_ok_and(|c| c == s)
+        })
+        .collect();
+    if safe_ascii.len() >= 2 {
+        for round in 0u32..16 {
+            let mut hasher = Sha256::new();
+            hasher.update(seed.as_bytes());
+            hasher.update(seq.to_le_bytes());
+            hasher.update(b"actor");
+            hasher.update(round.to_le_bytes());
+            let digest = hasher.finalize();
+            let candidate: String = digest[..24]
+                .iter()
+                .map(|b| char::from(safe_ascii[(*b as usize) % safe_ascii.len()]))
+                .collect();
+            if crate::redaction::redact_text(&candidate, secrets)
+                .is_ok_and(|clean| clean == candidate)
+            {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(String::from(
+        "Не удалось сгенерировать идентификатор субагента без совпадения с активными секретами",
+    ))
+}
+
+pub(crate) fn mint_clean_call_id(secrets: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHABETS: [&[u8; 16]; 4] = [
+        b"0123456789abcdef",
+        b"ghijklmnopqrstuv",
+        b"wxyzABCDEFGHIJKL",
+        b"MNOPQRSTUVWXYZ_-",
+    ];
+    let seed = uuid::Uuid::new_v4();
+    for (alpha_idx, alpha) in ALPHABETS.iter().enumerate() {
+        for round in 0u32..8 {
+            let mut hasher = Sha256::new();
+            hasher.update(seed.as_bytes());
+            hasher.update([alpha_idx as u8]);
+            hasher.update(round.to_le_bytes());
+            let digest = hasher.finalize();
+            let candidate: String = digest[..16]
+                .iter()
+                .flat_map(|b| {
+                    [
+                        char::from(alpha[(b >> 4) as usize]),
+                        char::from(alpha[(b & 0x0f) as usize]),
+                    ]
+                })
+                .collect();
+            if crate::redaction::redact_text(&candidate, secrets)
+                .is_ok_and(|clean| clean == candidate)
+            {
+                return candidate;
+            }
+        }
+    }
+    // Exhaustive fallback if all 4 disjoint 16-symbol alphabets matched 1-char test secrets:
+    // scan all 94 printable ASCII bytes (`0x21..=0x7e`) plus non-ASCII letters (`α..=ω`) and
+    // include a monotonic sequence counter so consecutive calls never collide even if all
+    // characters are individually masked.
+    static CALL_ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = CALL_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let safe_chars: Vec<char> = (0x21u8..=0x7eu8)
+        .map(char::from)
+        .chain('\u{03b1}'..='\u{03c9}')
+        .chain('\u{4e00}'..='\u{9fff}')
+        .filter(|&ch| {
+            let s = ch.to_string();
+            crate::redaction::redact_text(&s, secrets).is_ok_and(|c| c == s)
+        })
+        .take(16)
+        .collect();
+    if safe_chars.len() >= 2 {
+        for round in 0u32..16 {
+            let mut hasher = Sha256::new();
+            hasher.update(seed.as_bytes());
+            hasher.update(seq.to_le_bytes());
+            hasher.update(round.to_le_bytes());
+            let digest = hasher.finalize();
+            let candidate: String = digest[..24]
+                .iter()
+                .map(|b| safe_chars[(*b as usize) % safe_chars.len()])
+                .collect();
+            if crate::redaction::redact_text(&candidate, secrets)
+                .is_ok_and(|clean| clean == candidate)
+            {
+                return candidate;
+            }
+        }
+    }
+    format!("[REDACTED]_{seq}")
+}
+
+fn redact_call_with_map(
+    call: &mut ToolCall,
+    definitions: &[ToolDefinition],
+    secrets: &[String],
+    remapped_ids: &mut std::collections::HashMap<String, String>,
+    known_artifact_ids: &std::collections::HashSet<String>,
+) {
+    if call.id.is_empty() {
+        call.id = mint_clean_call_id(secrets);
+    } else if let Some(mapped) = remapped_ids.get(call.id.as_str()) {
+        call.id = mapped.clone();
+    } else if redact(&call.id, secrets) != call.id || call.id.len() > 256 {
+        let clean = mint_clean_call_id(secrets);
+        remapped_ids.insert(call.id.clone(), clean.clone());
+        call.id = clean;
+    }
+    if call.kind != "function" {
+        call.kind = redact(&call.kind, secrets);
+    }
+    if !definitions.iter().any(|d| d.name == call.function.name) {
+        call.function.name = redact(&call.function.name, secrets);
+    }
+    call.function.arguments = redact_tool_arguments(
+        &call.function.name,
+        definitions,
+        &call.function.arguments,
+        secrets,
+        known_artifact_ids,
+    );
+}
+
+#[cfg(test)]
+fn redact_call(call: &mut ToolCall, definitions: &[ToolDefinition], secrets: &[String]) {
+    let mut remapped = std::collections::HashMap::new();
+    let known = std::collections::HashSet::new();
+    redact_call_with_map(call, definitions, secrets, &mut remapped, &known);
+}
+
+fn redact_verified_page_envelope(
+    text: &str,
+    secrets: &[String],
+    known_artifact_ids: &std::collections::HashSet<String>,
+) -> String {
+    if let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(text) {
+        let verified_body = map.remove("content");
+        let mut envelope = Value::Object(map);
+        redact_value_preserving_artifacts(&mut envelope, secrets, known_artifact_ids);
+        if let (Some(body), Some(obj)) = (verified_body, envelope.as_object_mut()) {
+            obj.insert("content".into(), body);
+        }
+        envelope.to_string()
+    } else {
+        redact(text, secrets)
+    }
+}
+
+#[cfg(test)]
+fn redact_messages(
+    messages: &mut [Message],
+    definitions: &[ToolDefinition],
+    secrets: &[String],
+    known_artifact_ids: &std::collections::HashSet<String>,
+    verified_pages: Option<&crate::app::SharedVerifiedPages>,
+) {
+    redact_messages_with_excerpts(
+        messages,
+        definitions,
+        secrets,
+        known_artifact_ids,
+        verified_pages,
+        None,
+        None,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn redact_messages_with_excerpts(
+    messages: &mut [Message],
+    definitions: &[ToolDefinition],
+    secrets: &[String],
+    known_artifact_ids: &std::collections::HashSet<String>,
+    verified_pages: Option<&crate::app::SharedVerifiedPages>,
+    verified_excerpts: Option<&crate::app::SharedVerifiedExcerpts>,
+    worker_id: Option<&str>,
+    artifact_store_ctx: Option<&(std::path::PathBuf, String)>,
+) {
+    let mut remapped_ids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for message in messages {
+        let is_tool_role = message.role == "tool";
+        let tool_name_ref = message.name.as_deref();
+        if let Some(content) = &mut message.content {
+            *content = if is_tool_role && tool_name_ref == Some("read_tool_output") {
+                let is_pure_err = serde_json::from_str::<Value>(content)
+                    .ok()
+                    .and_then(|v| {
+                        let obj = v.as_object()?;
+                        (obj.get("error").is_some() && obj.get("content").is_none()).then_some(())
+                    })
+                    .is_some();
+                if is_pure_err {
+                    redact_receipt_payload(content, secrets, known_artifact_ids)
+                } else if let Some(pages) = verified_pages
+                    && crate::app::check_worker_artifact_page_valid(pages, secrets, content)
+                {
+                    redact_verified_page_envelope(content, secrets, known_artifact_ids)
+                } else {
+                    serde_json::json!({
+                        "error": "artifact_read_failed",
+                        "message": "Страница артефакта устарела после обновления ключей; перечитайте её через read_tool_output"
+                    })
+                    .to_string()
+                }
+            } else if is_tool_role
+                && tool_name_ref.is_some_and(crate::artifacts::is_job_receipt_tool)
+            {
+                let refreshed = crate::app::refresh_worker_truncated_excerpt(
+                    content,
+                    secrets,
+                    verified_excerpts,
+                    worker_id,
+                    artifact_store_ctx,
+                );
+                if let Ok(mut parsed_job) = serde_json::from_str::<Value>(&refreshed)
+                    && parsed_job.is_object()
+                {
+                    let _ = crate::artifacts::redact_job_receipt_value(&mut parsed_job, &mut |s| {
+                        Ok(redact(s, secrets))
+                    });
+                    parsed_job.to_string()
+                } else {
+                    redact_receipt_payload(&refreshed, secrets, known_artifact_ids)
+                }
+            } else if is_tool_role {
+                let refreshed = crate::app::refresh_worker_truncated_excerpt(
+                    content,
+                    secrets,
+                    verified_excerpts,
+                    worker_id,
+                    artifact_store_ctx,
+                );
+                redact_receipt_payload(&refreshed, secrets, known_artifact_ids)
+            } else {
+                redact(content, secrets)
+            };
+        }
+        if let Some(name) = &mut message.name
+            && !definitions.iter().any(|d| d.name == *name)
+        {
+            *name = redact(name, secrets);
+        }
+        if let Some(id) = &mut message.tool_call_id {
+            if id.is_empty() {
+                *id = mint_clean_call_id(secrets);
+            } else if let Some(mapped) = remapped_ids.get(id.as_str()) {
+                *id = mapped.clone();
+            } else if redact(id, secrets) != *id || id.len() > 256 {
+                let clean = mint_clean_call_id(secrets);
+                remapped_ids.insert(id.clone(), clean.clone());
+                *id = clean;
+            }
+        }
+        for call in &mut message.tool_calls {
+            redact_call_with_map(
+                call,
+                definitions,
+                secrets,
+                &mut remapped_ids,
+                known_artifact_ids,
+            );
+        }
+        if let Some(meta) = &mut message.provider_meta {
+            redact_provider_meta(meta, secrets);
+        }
     }
 }
 
@@ -768,6 +1794,9 @@ struct WorkerTask {
     sandbox: crate::sandbox::EffectiveSandboxPolicy,
     stats: Arc<Mutex<UsageStats>>,
     secrets: Arc<Mutex<Vec<String>>>,
+    verified_pages: Option<crate::app::SharedVerifiedPages>,
+    verified_excerpts: Option<crate::app::SharedVerifiedExcerpts>,
+    artifact_store_ctx: Option<(std::path::PathBuf, String)>,
     transfers: Arc<Mutex<Vec<TransferredCommand>>>,
 }
 
@@ -834,6 +1863,8 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
     let mut denied = false;
     let mut last_error: Option<String> = None;
     let mut recovery_used = false;
+    let mut known_artifact_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for step in 0..task.max_steps {
         let step_definitions: &[ToolDefinition] = if step > 0
             && step + 1 == task.max_steps
@@ -852,38 +1883,102 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
         } else {
             &definitions
         };
+        {
+            let extra = task.client.redaction_secrets();
+            let mut guard = task
+                .secrets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            merge_secret_variants(&mut guard, &extra);
+        }
         let secrets = task
             .secrets
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        for message in &mut messages {
-            redact_message(message, &secrets);
-        }
+        redact_messages_with_excerpts(
+            &mut messages,
+            &definitions,
+            &secrets,
+            &known_artifact_ids,
+            task.verified_pages.as_ref(),
+            task.verified_excerpts.as_ref(),
+            Some(&task.id),
+            task.artifact_store_ctx.as_ref(),
+        );
         if let Some(error) = context_overflow(&task.client, &messages, step_definitions) {
             return Err(error);
         }
-        let mut completion = task
+        let call_result = task
             .client
             .complete(&messages, step_definitions, &mut |_| {})
-            .await
-            .map_err(|error| format!("{error:#}"))?;
+            .await;
+        // Merge any OAuth token minted during `complete()` BEFORE touching error or content!
+        {
+            let extra = task.client.redaction_secrets();
+            let mut guard = task
+                .secrets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            merge_secret_variants(&mut guard, &extra);
+        }
+        let secrets = task
+            .secrets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let (partial_usage, chat_responded) = task.client.take_partial_call();
+        let mut completion = match call_result {
+            Ok(completion) => completion,
+            Err(error) => {
+                let err_usage = error
+                    .downcast_ref::<crate::protocol::ProviderFailure>()
+                    .and_then(|pf| pf.usage.clone())
+                    .or(partial_usage);
+                if let Some(usage) = err_usage {
+                    task.stats
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .add(&usage);
+                } else if chat_responded {
+                    task.stats
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .add(&Usage::default());
+                }
+                return Err(redact(&format!("{error:#}"), &secrets));
+            }
+        };
         task.stats
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .add(&completion.usage);
-        let secrets = task
-            .secrets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+        if task.client.is_local() {
+            task.client.observe_prompt_tokens(
+                crate::context::estimate_request(&messages, step_definitions),
+                completion.usage.input_tokens,
+            );
+            if step == 0 {
+                tokio::select! {
+                    biased;
+                    _ = task.cancel.cancelled() => {}
+                    _ = task.client.refresh_local_context() => {}
+                }
+            }
+        }
         completion.content = redact(&completion.content, &secrets);
+        let mut step_remapped_ids = std::collections::HashMap::new();
         for call in &mut completion.tool_calls {
-            redact_call(call, &secrets);
+            redact_call_with_map(
+                call,
+                &definitions,
+                &secrets,
+                &mut step_remapped_ids,
+                &known_artifact_ids,
+            );
         }
         if let Some(meta) = &mut completion.provider_meta {
-            meta.kind = redact(&meta.kind, &secrets);
-            redact_value(&mut meta.data, &secrets);
+            redact_provider_meta(meta, &secrets);
         }
         if completion.tool_calls.is_empty() {
             let result = bounded(&completion.content, MAX_RESULT_CHARS);
@@ -941,6 +2036,29 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
                     receiver: Some(receiver),
                     admission: admission.clone(),
                 };
+                let artifact_fit = (call.function.name == "read_tool_output").then(|| {
+                    let used_chars = context_size(&messages);
+                    let char_headroom = MAX_CONTEXT_CHARS
+                        .saturating_sub(used_chars)
+                        .saturating_sub(1024)
+                        / 2;
+                    let worker_budget = task
+                        .client
+                        .context_budget(crate::context::estimate_tools(&definitions));
+                    if worker_budget.is_tokens() {
+                        let remaining_tokens = worker_budget
+                            .limit
+                            .saturating_sub(worker_budget.request_used(&messages))
+                            .saturating_sub(64);
+                        let char_token_cap = char_headroom / 3;
+                        let limit = remaining_tokens
+                            .min(char_token_cap)
+                            .min(worker_budget.receipt_limit().unwrap_or(usize::MAX));
+                        (worker_budget, limit)
+                    } else {
+                        (worker_budget, char_headroom)
+                    }
+                });
                 let request = AgentRequest {
                     agent_id: task.id.clone(),
                     name: redact(&task.name, &secrets),
@@ -950,22 +2068,79 @@ async fn run_worker(mut task: WorkerTask) -> Result<String, String> {
                     reply,
                     admission,
                     transfers: task.transfers.clone(),
+                    artifact_fit,
                 };
                 task.requests
                     .send(request)
                     .await
                     .map_err(|_| "Broker основного агента недоступен".to_owned())?;
-                receiver
+                let broker_outcome = receiver
                     .receive()
                     .await
-                    .map_err(|_| "Broker завершился без результата инструмента".to_owned())?
+                    .map_err(|_| "Broker завершился без результата инструмента".to_owned())?;
+                if let Ok(parsed) = serde_json::from_str::<Value>(&broker_outcome.content) {
+                    collect_receipt_artifact_ids(&parsed, &mut known_artifact_ids);
+                }
+                broker_outcome
             };
             let secrets = task
                 .secrets
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .clone();
-            outcome.content = redact_payload(&outcome.content, &secrets);
+            outcome.content = if call.function.name == "read_tool_output" {
+                if let Some(ref pages) = task.verified_pages {
+                    if outcome.is_error {
+                        redact_receipt_payload(&outcome.content, &secrets, &known_artifact_ids)
+                    } else if crate::app::check_worker_artifact_page_valid(
+                        pages,
+                        &secrets,
+                        &outcome.content,
+                    ) {
+                        redact_verified_page_envelope(
+                            &outcome.content,
+                            &secrets,
+                            &known_artifact_ids,
+                        )
+                    } else {
+                        outcome.is_error = true;
+                        serde_json::json!({
+                            "error": "artifact_read_failed",
+                            "message": "Страница артефакта устарела после обновления ключей; перечитайте её через read_tool_output"
+                        })
+                        .to_string()
+                    }
+                } else {
+                    redact_receipt_payload(&outcome.content, &secrets, &known_artifact_ids)
+                }
+            } else if crate::artifacts::is_job_receipt_tool(&call.function.name) {
+                let refreshed = crate::app::refresh_worker_truncated_excerpt(
+                    &outcome.content,
+                    &secrets,
+                    task.verified_excerpts.as_ref(),
+                    Some(&task.id),
+                    task.artifact_store_ctx.as_ref(),
+                );
+                if let Ok(mut parsed_job) = serde_json::from_str::<Value>(&refreshed)
+                    && parsed_job.is_object()
+                {
+                    let _ = crate::artifacts::redact_job_receipt_value(&mut parsed_job, &mut |s| {
+                        Ok(redact(s, &secrets))
+                    });
+                    parsed_job.to_string()
+                } else {
+                    redact_receipt_payload(&refreshed, &secrets, &known_artifact_ids)
+                }
+            } else {
+                let refreshed = crate::app::refresh_worker_truncated_excerpt(
+                    &outcome.content,
+                    &secrets,
+                    task.verified_excerpts.as_ref(),
+                    Some(&task.id),
+                    task.artifact_store_ctx.as_ref(),
+                );
+                redact_receipt_payload(&refreshed, &secrets, &known_artifact_ids)
+            };
             if outcome.is_error
                 && serde_json::from_str::<Value>(&outcome.content)
                     .ok()
@@ -2094,5 +3269,187 @@ mod tests {
         )
         .unwrap();
         assert!(context_overflow(&cloud, &large, &definitions).is_none());
+    }
+
+    #[test]
+    fn worker_redaction_preserves_gigachat_functions_state_id_and_tool_schema_keys() {
+        let secrets = vec![
+            "id".to_string(),
+            "path".to_string(),
+            "real-secret-token".to_string(),
+        ];
+        let definitions = Tools::definitions();
+
+        let mut meta = ProviderMeta {
+            kind: "gigachat".into(),
+            data: json!({
+                "functions_state_id": "state-with-real-secret-token",
+                "secret_id_key": "value"
+            }),
+        };
+        redact_provider_meta(&mut meta, &secrets);
+        assert_eq!(meta.kind, "gigachat");
+        assert_eq!(meta.data["functions_state_id"], "state-with-[REDACTED]");
+        assert!(meta.data.get("secret_id_key").is_none());
+
+        let mut call = ToolCall::new(
+            "read_file",
+            json!({"path": "src/lib.rs", "extra_id": "real-secret-token"}),
+        );
+        call.id = "safe_call_1".into();
+        redact_call(&mut call, &definitions, &secrets);
+        assert_eq!(call.kind, "function");
+        assert_eq!(call.function.name, "read_file");
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap();
+        assert_eq!(args["path"], "src/lib.rs");
+        assert!(!call.function.arguments.contains("real-secret-token"));
+
+        // Short secret `"call"` must NEVER break correlation between `assistant.tool_calls[].id`
+        // and `tool.tool_call_id` across multi-step worker history redaction!
+        let call_secrets = vec!["call".to_string()];
+        let mut call_with_prefix = ToolCall::new("read_file", json!({"path": "a.rs"}));
+        call_with_prefix.id = "call_123".into();
+        let mut step_map = std::collections::HashMap::new();
+        let empty_known = std::collections::HashSet::new();
+        redact_call_with_map(
+            &mut call_with_prefix,
+            &definitions,
+            &call_secrets,
+            &mut step_map,
+            &empty_known,
+        );
+        assert!(
+            !call_with_prefix.id.contains("call"),
+            "{}",
+            call_with_prefix.id
+        );
+        let mut history = vec![
+            Message::assistant(&crate::protocol::Completion {
+                tool_calls: vec![call_with_prefix.clone()],
+                ..crate::protocol::Completion::default()
+            }),
+            Message::tool(&call_with_prefix, "ok"),
+        ];
+        redact_messages(
+            &mut history,
+            &definitions,
+            &call_secrets,
+            &empty_known,
+            None,
+        );
+        assert_eq!(
+            Some(history[0].tool_calls[0].id.as_str()),
+            history[1].tool_call_id.as_deref()
+        );
+
+        // Worker `read_tool_output` ONLY preserves broker-issued `artifact_id`s recorded in
+        // `known_artifact_ids` (even when `"4"` and `"-"` are secrets), while redacting any
+        // unissued UUIDv4 secret in `read_tool_output`!
+        let defs_with_art: Vec<ToolDefinition> = definitions
+            .iter()
+            .cloned()
+            .chain(std::iter::once(crate::artifact_tool::definition()))
+            .collect();
+        let uuid_secret = "12345678-1234-4234-8234-123456789abc".to_owned();
+        let issued_id = "550e8400-e29b-41d4-a716-446655440000".to_owned();
+        let art_test_secrets = vec![uuid_secret.clone(), "4".into(), "-".into()];
+        let mut known_set = std::collections::HashSet::new();
+        let raw_broker_receipt = json!({
+            "artifact_id": issued_id,
+            "summary": format!("contains {uuid_secret}")
+        })
+        .to_string();
+        collect_receipt_artifact_ids(
+            &serde_json::from_str::<Value>(&raw_broker_receipt).unwrap(),
+            &mut known_set,
+        );
+        assert!(known_set.contains(&issued_id));
+        let redacted_receipt =
+            redact_receipt_payload(&raw_broker_receipt, &art_test_secrets, &known_set);
+        let receipt_json: Value = serde_json::from_str(&redacted_receipt).unwrap();
+        assert_eq!(receipt_json["artifact_id"], issued_id);
+        assert!(!redacted_receipt.contains(&uuid_secret));
+
+        let unissued_args = redact_tool_arguments(
+            "read_tool_output",
+            &defs_with_art,
+            &json!({"artifact_id": uuid_secret}).to_string(),
+            &art_test_secrets,
+            &known_set,
+        );
+        assert!(
+            !unissued_args.contains("12345678"),
+            "unissued UUIDv4 secret must be redacted: {unissued_args}"
+        );
+
+        let issued_args = redact_tool_arguments(
+            "read_tool_output",
+            &defs_with_art,
+            &json!({"artifact_id": issued_id}).to_string(),
+            &art_test_secrets,
+            &known_set,
+        );
+        let issued_json: Value = serde_json::from_str(&issued_args).unwrap();
+        assert_eq!(issued_json["artifact_id"], issued_id);
+
+        // Even when `"4"`, `"k"`, and `"K"` are all secrets simultaneously, `mint_clean_call_id`
+        // produces a verified clean ID without leaking any of them!
+        let nibble_secrets = vec!["4".into(), "k".into(), "K".into()];
+        let minted = mint_clean_call_id(&nibble_secrets);
+        assert_eq!(
+            crate::redaction::redact_text(&minted, &nibble_secrets).unwrap(),
+            minted
+        );
+
+        // Exhausting all 67 ASCII characters of `A-Za-z0-9_-.:~` as 1-char secrets still produces
+        // distinct, redaction-clean IDs for consecutive tool calls!
+        let all_67: Vec<String> =
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-.:~"
+                .chars()
+                .map(|c| c.to_string())
+                .collect();
+        let id_a = mint_clean_call_id(&all_67);
+        let id_b = mint_clean_call_id(&all_67);
+        assert_ne!(id_a, id_b);
+        assert_eq!(crate::redaction::redact_text(&id_a, &all_67).unwrap(), id_a);
+        assert_eq!(crate::redaction::redact_text(&id_b, &all_67).unwrap(), id_b);
+
+        // `mint_clean_actor_id` avoids `"4"` and `"-"` while staying `[A-Za-z0-9_-]`,
+        // AND `ArtifactStore::capture` preserves `origin.tool == "advisor"` + canonical field order
+        // even when `"visor"` is an active secret!
+        let actor_secrets = vec!["4".into(), "-".into(), "visor".into()];
+        let actor_id = mint_clean_actor_id(&actor_secrets).unwrap();
+        assert!(
+            actor_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
+        assert_eq!(
+            crate::redaction::redact_text(&actor_id, &actor_secrets).unwrap(),
+            actor_id
+        );
+
+        let art_dir = tempfile::tempdir().unwrap();
+        let art_store = crate::artifacts::ArtifactStore::open(art_dir.path(), &actor_id).unwrap();
+        let adv_receipt =
+            crate::advisor::typed_receipt("advice", None, Some(2), "Long guidance text", None);
+        let meta = art_store
+            .capture(
+                crate::artifacts::ArtifactOrigin {
+                    actor: None,
+                    turn: 1,
+                    tool: crate::advisor::TOOL_NAME.into(),
+                    call_id: "c_1".into(),
+                },
+                &adv_receipt,
+                &actor_secrets,
+            )
+            .unwrap();
+        assert_eq!(meta.origin.tool, crate::advisor::TOOL_NAME);
+        let previewed = crate::operation_receipts::preview(&adv_receipt, &meta, false);
+        assert!(
+            previewed.starts_with(r#"{"advisory":true,"status":"advice""#),
+            "{previewed}"
+        );
     }
 }

@@ -109,6 +109,13 @@ pub struct Cli {
         help = "Включить финальное ревью с одним ограниченным проходом исправления и проверки"
     )]
     pub final_review_repair: bool,
+    #[arg(
+        long,
+        global = true,
+        value_name = "МАРШРУТ",
+        help = "Модель-советник на этот запуск (например gigachat, openrouter:MODEL или off)"
+    )]
+    pub advisor: Option<String>,
     #[arg(long, global=true, default_value_t=32, value_parser=clap::value_parser!(u32).range(1..=256), help="Предел запросов к модели за один ход (1–256); новый запрос начинает новый ход")]
     pub max_steps: u32,
     #[arg(
@@ -127,6 +134,16 @@ pub struct Cli {
     pub(crate) interactive: bool,
     #[arg(skip)]
     pub(crate) effective_sandbox: crate::sandbox::EffectiveSandboxPolicy,
+    #[arg(skip)]
+    pub(crate) advisor_override: crate::advisor::AdvisorRuntimeOverride,
+    #[arg(skip)]
+    pub(crate) effective_advisor: Option<crate::advisor::EffectiveAdvisor>,
+    #[arg(skip)]
+    pub(crate) advisor_unavailable_reason: Option<String>,
+    #[arg(skip)]
+    pub(crate) published_routes: Vec<crate::model_route::ConfiguredRouteSummary>,
+    #[arg(skip)]
+    pub(crate) in_eval: bool,
 }
 impl Cli {
     pub fn permissions(&self) -> ApprovalMode {
@@ -175,6 +192,63 @@ impl Cli {
         self.final_review = mode == crate::final_review::FinalReviewMode::OneShot;
         self.final_review_repair = mode == crate::final_review::FinalReviewMode::Repair;
     }
+
+    pub(crate) fn refresh_routing(
+        &mut self,
+        store: &crate::config::ConfigStore,
+        settings: &crate::config::Settings,
+        current_provider: &crate::config::ProviderSettings,
+        events: &crate::app::Events,
+    ) -> anyhow::Result<()> {
+        if self.in_eval {
+            self.effective_advisor = None;
+            self.advisor_unavailable_reason = None;
+            self.published_routes.clear();
+            return Ok(());
+        }
+        self.published_routes =
+            crate::model_route::published_routes(store, settings, current_provider);
+        match crate::advisor::resolve_effective(store, settings, &self.advisor_override, false) {
+            Ok(effective) => {
+                self.effective_advisor = effective;
+                self.advisor_unavailable_reason = None;
+            }
+            Err(error) => {
+                if matches!(
+                    self.advisor_override,
+                    crate::advisor::AdvisorRuntimeOverride::Selected { .. }
+                ) {
+                    return Err(error);
+                }
+                let reason = events.redact(&format!("{error:#}"));
+                events.emit(
+                    "warning",
+                    serde_json::json!({
+                        "message": format!(
+                            "Сохранённый маршрут /advisor недоступен и временно отключён: {reason}; настройте заново через /advisor или rcode advisor off"
+                        )
+                    }),
+                );
+                self.effective_advisor = None;
+                self.advisor_unavailable_reason = Some(reason);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_routing_soft(
+        &mut self,
+        store: &crate::config::ConfigStore,
+        settings: &crate::config::Settings,
+        current_provider: &crate::config::ProviderSettings,
+        events: &crate::app::Events,
+    ) {
+        if let Err(error) = self.refresh_routing(store, settings, current_provider, events) {
+            let reason = events.redact(&format!("{error:#}"));
+            self.effective_advisor = None;
+            self.advisor_unavailable_reason = Some(reason);
+        }
+    }
 }
 #[derive(Debug, Subcommand, Clone)]
 pub enum Command {
@@ -200,6 +274,11 @@ pub enum Command {
     ReviewModel {
         #[command(subcommand)]
         command: ReviewModelCommand,
+    },
+    #[command(about = "Настроить модель-советника /advisor (без сетевого запроса)")]
+    Advisor {
+        #[command(subcommand)]
+        command: Option<AdvisorCommand>,
     },
     #[command(about = "Проверить настройки; --check проверяет доступ к API")]
     Doctor {
@@ -395,6 +474,19 @@ pub enum ReviewModelCommand {
     Set {
         #[arg(long)]
         model: String,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum AdvisorCommand {
+    #[command(about = "Показать сохранённый маршрут советника (/advisor)")]
+    Status,
+    #[command(about = "Выключить советника по умолчанию")]
+    Off,
+    #[command(about = "Сохранить модель-советника (без сетевого запроса)")]
+    Set {
+        #[arg(value_name = "СЕЛЕКТОР")]
+        selector: Option<String>,
     },
 }
 

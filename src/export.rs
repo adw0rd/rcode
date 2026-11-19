@@ -14,10 +14,41 @@ const LEGACY_TOOLS_PREFIX: &str =
     "[Результаты завершённых инструментов сокращены командой /compact: ";
 const LEGACY_TOOLS_SUFFIX: &str = ". Перед изменениями перечитай файлы.]";
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write(
     session: &Session,
     argument: &str,
     redact: impl Fn(&str) -> String,
+) -> Result<PathBuf> {
+    write_with_tool_sanitizer(session, argument, &redact, |_tool_name, raw| {
+        if let Ok(serde_json::Value::Object(mut map)) =
+            serde_json::from_str::<serde_json::Value>(raw)
+        {
+            let sliced = crate::app::extract_sliced_rcode_truncated_fields(&map);
+            if !sliced.is_empty() {
+                for field in &sliced {
+                    if map.contains_key(field) {
+                        map.insert(
+                            field.clone(),
+                            serde_json::Value::String(
+                                "[rcode: сокращённый фрагмент опущен при экспорте; полный вывод в артефакте сессии]"
+                                    .into(),
+                            ),
+                        );
+                    }
+                }
+                return redact(&serde_json::Value::Object(map).to_string());
+            }
+        }
+        redact(raw)
+    })
+}
+
+pub(crate) fn write_with_tool_sanitizer(
+    session: &Session,
+    argument: &str,
+    redact: impl Fn(&str) -> String,
+    sanitize_tool: impl Fn(&str, &str) -> String,
 ) -> Result<PathBuf> {
     let argument = argument.trim();
     ensure!(
@@ -67,7 +98,7 @@ pub(crate) fn write(
     }
     // Redact the complete document, including model labels, tool names and JSON
     // escapes, immediately before writing. Do not serialize provider metadata.
-    let text = redact(&render(session, &redact));
+    let text = redact(&render(session, &redact, &sanitize_tool));
     let mut temporary = tempfile::Builder::new()
         .prefix(".rcode-export-")
         .tempfile_in(&parent)
@@ -144,7 +175,11 @@ fn ensure_absent(path: &Path) -> Result<()> {
     }
 }
 
-fn render(session: &Session, redact: impl Fn(&str) -> String) -> String {
+fn render(
+    session: &Session,
+    redact: impl Fn(&str) -> String,
+    sanitize_tool: impl Fn(&str, &str) -> String,
+) -> String {
     let clean = |text: &str| redact(text).replace(&session.id, "[ID сессии скрыт]");
     // Older Session::compact stored its local summary as the first assistant
     // message. Match only that exact shape, preserving ordinary quoted text.
@@ -251,10 +286,10 @@ fn render(session: &Session, redact: impl Fn(&str) -> String) -> String {
                 ));
                 // is_error is not retained in Message: preserve errors/denials
                 // verbatim without guessing whether arbitrary text is success.
-                json_or_text(
-                    &mut output,
-                    &clean(message.content.as_deref().unwrap_or_default()),
-                );
+                let sanitized_tool =
+                    sanitize_tool(name, message.content.as_deref().unwrap_or_default())
+                        .replace(&session.id, "[ID сессии скрыт]");
+                json_or_text(&mut output, &clean(&sanitized_tool));
                 count += 1;
             }
             _ => {}
@@ -291,6 +326,56 @@ fn render(session: &Session, redact: impl Fn(&str) -> String) -> String {
                     "Доработка основной моделью: {} · проверка: {}\n\n",
                     label(&clean(repair_status)),
                     label(&clean(verification))
+                ));
+            }
+        }
+    }
+    let omitted_adv = session
+        .effective_advisor_calls()
+        .saturating_sub(session.advisor_calls.len() as u64);
+    if !session.advisor_calls.is_empty() || omitted_adv > 0 {
+        output.push_str("\n## Советы модели (/advisor)\n\n");
+        if omitted_adv > 0 {
+            output.push_str(&format!(
+                "_В истории сессии хранятся последние {} записей; более ранних обращений опущено: {}._\n\n",
+                session.advisor_calls.len(),
+                omitted_adv,
+            ));
+        }
+        for call in &session.advisor_calls {
+            let route = match &call.local_profile {
+                Some(profile) => format!(
+                    "local:{} / {}",
+                    label(&clean(profile)),
+                    label(&clean(&call.model))
+                ),
+                None => format!(
+                    "{} / {}",
+                    label(&clean(&call.provider)),
+                    label(&clean(&call.model))
+                ),
+            };
+            output.push_str(&format!(
+                "### Ход {} · {} · {}\n\n",
+                call.turn_index,
+                route,
+                label(&clean(&call.status)),
+            ));
+            if let Some(focus) = &call.focus {
+                output.push_str(&format!("Запрос: {}\n\n", label(&clean(focus))));
+            }
+            if let Some(rendered_guidance) =
+                crate::advisor::render_export_guidance(call, |s| clean(s))
+            {
+                quoted(&mut output, &rendered_guidance);
+            }
+            if let Some(message) = &call.message {
+                quoted(&mut output, &clean(message));
+            }
+            if let Some(usage) = &call.usage {
+                output.push_str(&format!(
+                    "Токены советника: ↑{} входных · ↓{} выходных\n\n",
+                    usage.input_tokens, usage.output_tokens
                 ));
             }
         }
@@ -365,7 +450,7 @@ mod tests {
     }
 
     fn render(session: &Session) -> String {
-        super::render(session, str::to_owned)
+        super::render(session, str::to_owned, |_, raw| raw.to_owned())
     }
 
     #[test]

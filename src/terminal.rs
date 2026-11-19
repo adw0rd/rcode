@@ -74,6 +74,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Выбрать модель отдельного финального ревью",
     },
     CommandSpec {
+        name: "/advisor",
+        description: "Модель-советник (паттерн Executor + Advisor)",
+    },
+    CommandSpec {
         name: "/final-review",
         description: "Включить или выключить финальное ревью для этого запуска",
     },

@@ -573,10 +573,11 @@ pub(crate) fn setup(store: &ConfigStore) -> Result<Option<Config>> {
             settings.folder_id = Some(folder.to_owned());
         }
     }
-    let mut loaded: Settings = store.load()?;
-    prepare_provider_selection(store, &mut loaded.websearch, provider)?;
-    loaded.websearch = settings;
-    store.save(&loaded)?;
+    store.update_settings(|loaded| {
+        prepare_provider_selection(store, &mut loaded.websearch, provider)?;
+        loaded.websearch = settings;
+        Ok(())
+    })?;
     save_key(store, provider, &key)?;
     println!("✓ Поиск настроен: {}", provider.label());
     resolve(store)
@@ -629,9 +630,9 @@ pub async fn run(
             let Some(provider) = Provider::parse(name) else {
                 anyhow::bail!("Провайдер не распознан: yandex, brave или tavily");
             };
-            let mut settings: Settings = store.load()?;
-            prepare_provider_selection(store, &mut settings.websearch, provider)?;
-            store.save(&settings)?;
+            store.update_settings(|settings| {
+                prepare_provider_selection(store, &mut settings.websearch, provider)
+            })?;
             events.emit(
                 "websearch",
                 json!({"version": 1, "provider": provider.as_str()}),
@@ -682,9 +683,10 @@ pub async fn run(
         WebsearchCommand::Clear => {
             model_shell_guard()?;
             clear_keys(store)?;
-            let mut settings: Settings = store.load()?;
-            settings.websearch = WebSearchSettings::default();
-            store.save(&settings)?;
+            store.update_settings(|settings| {
+                settings.websearch = WebSearchSettings::default();
+                Ok(())
+            })?;
             events.emit(
                 "websearch",
                 json!({"version": 1, "provider": null, "key": false}),
@@ -734,27 +736,19 @@ pub(crate) fn unconfigured_receipt(
         {
             Ok(Some(index)) if index < all.len() => {
                 let provider = all[index];
-                match store.load().and_then(|mut settings: Settings| {
-                    prepare_provider_selection(store, &mut settings.websearch, provider)?;
-                    Ok(settings)
+                match store.update_settings(|settings| {
+                    prepare_provider_selection(store, &mut settings.websearch, provider)
                 }) {
-                    Ok(settings) => match store.save(&settings) {
-                        Ok(()) => {
-                            crate::screen::notice(format!(
-                                "✓ Провайдер поиска: {}. Ключ ещё не задан: наберите /websearch или выполните rcode websearch key (скрытый ввод)",
-                                provider.label()
-                            ));
-                            events_notice(
-                                events,
-                                &format!("выбран провайдер поиска {}", provider.as_str()),
-                            );
-                        }
-                        Err(error) => {
-                            return ToolOutcome::error(
-                                json!({"error": "setup_failed", "message": crate::ui::safe(&format!("{error:#}"))}).to_string(),
-                            );
-                        }
-                    },
+                    Ok(_) => {
+                        crate::screen::notice(format!(
+                            "✓ Провайдер поиска: {}. Ключ ещё не задан: наберите /websearch или выполните rcode websearch key (скрытый ввод)",
+                            provider.label()
+                        ));
+                        events_notice(
+                            events,
+                            &format!("выбран провайдер поиска {}", provider.as_str()),
+                        );
+                    }
                     Err(error) => {
                         return ToolOutcome::error(
                             json!({"error": "setup_failed", "message": crate::ui::safe(&format!("{error:#}"))}).to_string(),
@@ -842,8 +836,11 @@ pub(crate) async fn choose(
     };
     if selected == all.len() {
         clear_keys(store)?;
-        settings.websearch = WebSearchSettings::default();
-        store.save(settings)?;
+        let updated = store.update_settings(|current| {
+            current.websearch = WebSearchSettings::default();
+            Ok(())
+        })?;
+        *settings = updated;
         events.emit(
             "websearch",
             json!({"version": 1, "provider": null, "key": false}),
@@ -854,8 +851,10 @@ pub(crate) async fn choose(
     let provider = all[selected];
     let key = ui::password(&format!("API-ключ {} (ввод скрыт): ", provider.label()))?;
     let key = key.trim();
-    prepare_provider_selection(store, &mut settings.websearch, provider)?;
-    store.save(settings)?;
+    let updated = store.update_settings(|current| {
+        prepare_provider_selection(store, &mut current.websearch, provider)
+    })?;
+    *settings = updated;
     if key.chars().count() < MIN_KEY_CHARS {
         notice!("! Ключ короче {MIN_KEY_CHARS} символов; новый ключ не сохранён");
     } else {

@@ -17,7 +17,6 @@ use reqwest::{
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
-    net::IpAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -45,12 +44,49 @@ pub struct ProviderClient {
     auth_url: Option<Url>,
     /// `None` only for a local profile without a key: no Authorization header.
     credential: Option<String>,
-    token: Option<AccessToken>,
+    token: Arc<Mutex<Option<AccessToken>>>,
+    token_refresh: Arc<tokio::sync::Mutex<()>>,
     generation_slots: Arc<Semaphore>,
+    loopback_gate: Option<Arc<crate::local_runtime::PortGate>>,
+    _local_port_lease: Option<Arc<crate::local_runtime::LocalPortLease>>,
     image_uploads: Arc<tokio::sync::Mutex<BTreeMap<String, String>>>,
     credits_forbidden: Arc<AtomicBool>,
     /// Local servers only: pinned loopback client and state shared by clones.
     local: Option<LocalConnection>,
+    /// SHA-256 digest of the loaded custom PEM CA bundle (if `settings.ca_file` was set).
+    ca_bundle_sha256: Option<[u8; 32]>,
+    /// Optional shared host secret pool updated the instant an OAuth token is minted.
+    secret_sink: Option<Arc<Mutex<Vec<String>>>>,
+    /// Per-instance partial usage slot surviving mid-SSE cancellation or timeout.
+    last_stream_usage: PerCallUsage,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PartialCallState {
+    pub(crate) usage: Arc<Mutex<Option<Usage>>>,
+    pub(crate) chat_responded: Arc<AtomicBool>,
+}
+
+impl PartialCallState {
+    pub(crate) fn clear(&self) {
+        *lock(&self.usage) = None;
+        self.chat_responded.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn take(&self) -> (Option<Usage>, bool) {
+        let u = lock(&self.usage).take();
+        let responded = self.chat_responded.swap(false, Ordering::AcqRel);
+        (u, responded)
+    }
+}
+
+#[derive(Default)]
+struct PerCallUsage(PartialCallState);
+
+impl Clone for PerCallUsage {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Clone)]
@@ -145,9 +181,26 @@ impl ProviderClient {
         let mut builder = client_builder();
         let mut loopback_builder = client_builder().no_proxy();
         let mut local_builder = is_local.then(local_client_builder);
+        let mut ca_bundle_sha256: Option<[u8; 32]> = None;
         if let Some(path) = &settings.ca_file {
-            let pem = std::fs::read(path)
-                .map_err(|_| fail(FailureKind::Transport, None, "Не удалось прочитать CA-файл"))?;
+            if !path.is_absolute() {
+                return Err(fail(
+                    FailureKind::Protocol,
+                    None,
+                    "Путь ca_file в конфигурации или сессии должен быть абсолютным; пересохраните подключение с --ca-file",
+                ));
+            }
+            let pem = crate::model_route::read_regular_ca_bytes(path).ok_or_else(|| {
+                fail(
+                    FailureKind::Transport,
+                    None,
+                    "Не удалось прочитать CA-файл (ожидается обычный файл до 4 МиБ)",
+                )
+            })?;
+            {
+                use sha2::{Digest, Sha256};
+                ca_bundle_sha256 = Some(Sha256::digest(&pem).into());
+            }
             let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
                 fail(
                     FailureKind::Transport,
@@ -198,6 +251,13 @@ impl ProviderClient {
                 4
             }))
         };
+        let (loopback_gate, _local_port_lease) =
+            if is_local || crate::model_route::is_loopback_route(&settings) {
+                let (gate, lease) = crate::local_runtime::port_gate(&base, is_local);
+                (Some(gate), lease)
+            } else {
+                (None, None)
+            };
         Ok(Self {
             settings,
             client,
@@ -206,16 +266,141 @@ impl ProviderClient {
             base,
             auth_url,
             credential,
-            token: None,
+            token: Default::default(),
+            token_refresh: Default::default(),
             generation_slots,
+            loopback_gate,
+            _local_port_lease,
             image_uploads: Default::default(),
             credits_forbidden: Default::default(),
             local,
+            ca_bundle_sha256,
+            secret_sink: None,
+            last_stream_usage: Default::default(),
         })
+    }
+
+    pub(crate) fn take_partial_usage(&self) -> Option<Usage> {
+        self.last_stream_usage.0.take().0
+    }
+
+    pub(crate) fn take_partial_call(&self) -> (Option<Usage>, bool) {
+        self.last_stream_usage.0.take()
+    }
+
+    pub(crate) fn isolate_partial_usage(&mut self) -> PartialCallState {
+        let shared = PartialCallState::default();
+        self.last_stream_usage = PerCallUsage(shared.clone());
+        shared
+    }
+
+    pub(crate) fn bind_secret_sink(&mut self, sink: Arc<Mutex<Vec<String>>>) {
+        self.secret_sink = Some(sink);
+    }
+
+    pub(crate) fn ca_bundle_sha256_hex(&self) -> Option<String> {
+        self.ca_bundle_sha256
+            .map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    pub(crate) fn ca_bundle_matches_disk(&self) -> bool {
+        let Some(ref path) = self.settings.ca_file else {
+            return self.ca_bundle_sha256.is_none();
+        };
+        let Some(pem) = crate::model_route::read_regular_ca_bytes(path) else {
+            return false;
+        };
+        use sha2::{Digest, Sha256};
+        let current: [u8; 32] = Sha256::digest(&pem).into();
+        self.ca_bundle_sha256 == Some(current)
+    }
+
+    pub(crate) fn share_oauth_state_from(&mut self, peer: &Self) -> bool {
+        let same_ca = self
+            .settings
+            .ca_file
+            .as_ref()
+            .is_none_or(|p| p.is_absolute())
+            && peer
+                .settings
+                .ca_file
+                .as_ref()
+                .is_none_or(|p| p.is_absolute())
+            && self
+                .settings
+                .ca_file
+                .as_deref()
+                .map(crate::model_route::normalize_ca_path)
+                == peer
+                    .settings
+                    .ca_file
+                    .as_deref()
+                    .map(crate::model_route::normalize_ca_path);
+        if self.settings.kind == ProviderKind::GigaChat
+            && peer.settings.kind == ProviderKind::GigaChat
+            && self.credential == peer.credential
+            && self.auth_url == peer.auth_url
+            && self.settings.scope == peer.settings.scope
+            && same_ca
+            && self.ca_bundle_sha256 == peer.ca_bundle_sha256
+        {
+            self.token = peer.token.clone();
+            self.token_refresh = peer.token_refresh.clone();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Shares the generation concurrency semaphore (and OAuth token state when credentials match)
+    /// across multiple routed cloud models targeting the exact same connection. For identical
+    /// local loopback routes, propagates already-probed `runtime_context` and `calibration`.
+    pub(crate) fn share_connection_state_from(&mut self, peer: &Self) {
+        if !self.is_local() && !peer.is_local() {
+            self.generation_slots = peer.generation_slots.clone();
+        } else if let (Some(self_local), Some(peer_local)) = (&self.local, &peer.local)
+            && crate::model_route::RouteIdentity::same_as(&self.settings, &peer.settings)
+        {
+            if !Arc::ptr_eq(&self_local.runtime_context, &peer_local.runtime_context) {
+                let peer_ctx = { *lock(&peer_local.runtime_context) };
+                if let Some(ctx) = peer_ctx {
+                    let mut dst = lock(&self_local.runtime_context);
+                    *dst = Some(dst.map_or(ctx, |cur| cur.min(ctx)));
+                }
+            }
+            if !Arc::ptr_eq(&self_local.calibration, &peer_local.calibration) {
+                let peer_cal = { *lock(&peer_local.calibration) };
+                let mut dst_cal = lock(&self_local.calibration);
+                if peer_cal > *dst_cal {
+                    *dst_cal = peer_cal;
+                }
+            }
+        }
+        let _ = self.share_oauth_state_from(peer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_generation_slots_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation_slots, &other.generation_slots)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_oauth_cache_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.token, &other.token)
+            && Arc::ptr_eq(&self.token_refresh, &other.token_refresh)
     }
 
     pub fn settings(&self) -> &ProviderSettings {
         &self.settings
+    }
+
+    pub(crate) fn credential_matches(&self, candidate: Option<&str>) -> bool {
+        let normalized = if self.is_local() {
+            candidate.filter(|key| !key.trim().is_empty())
+        } else {
+            candidate
+        };
+        self.credential.as_deref() == normalized
     }
 
     /// Host-only redaction values for this client; never serialize or send to tools.
@@ -224,7 +409,7 @@ impl ProviderClient {
         if let Some(credential) = &self.credential {
             values.push(credential.clone());
         }
-        if let Some(token) = &self.token {
+        if let Some(token) = &*lock(&self.token) {
             values.push(token.value.clone());
         }
         values
@@ -264,6 +449,37 @@ impl ProviderClient {
 
     pub fn is_local(&self) -> bool {
         self.local.is_some()
+    }
+
+    pub(crate) fn local_budget_snapshot(&self) -> Option<(Option<u32>, f64)> {
+        let local = self.local.as_ref()?;
+        let known_ctx = *local
+            .runtime_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cal = *local.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        Some((known_ctx, cal))
+    }
+
+    pub(crate) fn restore_local_budget_snapshot(&self, (known_ctx, cal): (Option<u32>, f64)) {
+        if let Some(dst) = &self.local {
+            if let Some(ctx) = known_ctx {
+                let mut guard = dst
+                    .runtime_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = Some(guard.map_or(ctx, |existing| existing.min(ctx)));
+            }
+            let mut cal_guard = dst.calibration.lock().unwrap_or_else(|e| e.into_inner());
+            *cal_guard = cal_guard.max(cal);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copy_local_budget_from(&self, source: &Self) {
+        if let Some(snapshot) = source.local_budget_snapshot() {
+            self.restore_local_budget_snapshot(snapshot);
+        }
     }
 
     /// Reads the server context before the first request and once more after
@@ -403,6 +619,7 @@ impl ProviderClient {
         tools: &[ToolDefinition],
         emit: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Completion> {
+        self.last_stream_usage.0.clear();
         // Clones share the allowance. Keep it through the complete SSE/JSON body,
         // including retries; reading only headers does not finish a generation.
         let slot = match self.generation_slots.clone().try_acquire_owned() {
@@ -421,11 +638,40 @@ impl ProviderClient {
             }
         };
         let _slot = slot.map_err(|_| transport("Очередь модельных запросов закрыта"))?;
+        #[allow(dead_code)]
+        enum LoopbackHold {
+            Exclusive(tokio::sync::OwnedRwLockWriteGuard<()>),
+            Shared(tokio::sync::OwnedRwLockReadGuard<()>),
+        }
+        let _loopback_hold = if let Some(gate) = &self.loopback_gate {
+            if self.is_local() || gate.has_local() {
+                let guard = match gate.lock.clone().try_write_owned() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        let screen = crate::screen::current().filter(|_| self.is_local());
+                        if let Some(screen) = &screen {
+                            screen.busy("Жду локальную модель: занята другим запросом");
+                        }
+                        let g = gate.lock.clone().write_owned().await;
+                        if let Some(screen) = &screen {
+                            screen.busy("Локальная модель отвечает");
+                        }
+                        g
+                    }
+                };
+                Some(LoopbackHold::Exclusive(guard))
+            } else {
+                Some(LoopbackHold::Shared(gate.lock.clone().read_owned().await))
+            }
+        } else {
+            None
+        };
         let uploaded = self.prepare_images(messages).await?;
         let body = self.completion_body(messages, tools, &uploaded)?;
         let response = self
             .authorized_request(Method::POST, "chat/completions", Some(&body))
             .await?;
+        let http_status = response.status().as_u16();
         let local = self.is_local();
         let is_sse = response
             .headers()
@@ -437,41 +683,81 @@ impl ProviderClient {
                     .is_some_and(|h| h.trim() == "text/event-stream")
             });
         let giga = self.settings.kind == ProviderKind::GigaChat;
-        if is_sse {
-            let completion = read_sse(response, self.idle(), &self.settings, emit).await?;
-            validate_tool_output(&completion, tools, local)?;
-            Ok(completion)
-        } else {
-            let value = read_json(response, self.idle()).await?;
-            let mut accumulator = Accumulator::new(&self.settings);
-            accumulator.json_completion(&value, giga)?;
-            accumulator.flush_reasoning(false, &mut |_| {})?;
-            let completion = accumulator.finish()?;
-            validate_tool_output(&completion, tools, local)?;
-            if !completion.content.is_empty() {
-                emit(&completion.content);
+        let parsed: Result<Completion> = if is_sse {
+            async {
+                let completion = read_sse(
+                    response,
+                    self.idle(),
+                    &self.settings,
+                    Some(&self.last_stream_usage.0.usage),
+                    emit,
+                )
+                .await?;
+                validate_tool_output(&completion, tools, local)
+                    .map_err(|err| attach_completion_usage(&completion, err))?;
+                self.last_stream_usage.0.clear();
+                Ok(completion)
             }
-            Ok(completion)
-        }
+            .await
+        } else {
+            async {
+                let value = read_json(response, self.idle()).await?;
+                let mut accumulator =
+                    Accumulator::with_sink(&self.settings, Some(&self.last_stream_usage.0.usage));
+                if let Err(err) = accumulator.json_completion(&value, giga) {
+                    return Err(accumulator.attach_usage(err));
+                }
+                accumulator.check_terminal_error()?;
+                if let Err(err) = accumulator.flush_reasoning(false, &mut |_| {}) {
+                    return Err(accumulator.attach_usage(err));
+                }
+                let completion = accumulator.finish()?;
+                validate_tool_output(&completion, tools, local)
+                    .map_err(|err| attach_completion_usage(&completion, err))?;
+                if !completion.content.is_empty() {
+                    emit(&completion.content);
+                }
+                self.last_stream_usage.0.clear();
+                Ok(completion)
+            }
+            .await
+        };
+        parsed.map_err(|err| match err.downcast::<ProviderFailure>() {
+            Ok(mut pf) => {
+                pf.status.get_or_insert(http_status);
+                pf.into()
+            }
+            Err(other) => other,
+        })
     }
 
     pub async fn models(&mut self) -> Result<Vec<ModelInfo>> {
+        Ok(self.models_with_origin().await?.0)
+    }
+
+    /// Returns `(models, verified_by_endpoint)` where `verified_by_endpoint` is `true`
+    /// only when `GET /models` actually returned a `200 OK` JSON catalog (and `false`
+    /// when `404/405` fell back to the configured model ID).
+    pub(crate) async fn models_with_origin(&mut self) -> Result<(Vec<ModelInfo>, bool)> {
         let response = match self.authorized_request(Method::GET, "models", None).await {
             Ok(response) => response,
             Err(error)
                 if error
                     .downcast_ref::<ProviderFailure>()
-                    .is_some_and(|e| matches!(e.status, Some(404 | 405))) =>
+                    .is_some_and(|e| !e.from_oauth && matches!(e.status, Some(404 | 405))) =>
             {
-                return Ok(vec![ModelInfo {
-                    id: self.model()?,
-                    name: format!(
-                        "{} (из конфигурации; список API недоступен)",
-                        self.settings.model
-                    ),
-                    supports_tools: None,
-                    ..ModelInfo::default()
-                }]);
+                return Ok((
+                    vec![ModelInfo {
+                        id: self.model()?,
+                        name: format!(
+                            "{} (из конфигурации; список API недоступен)",
+                            self.settings.model
+                        ),
+                        supports_tools: None,
+                        ..ModelInfo::default()
+                    }],
+                    false,
+                ));
             }
             Err(error) => return Err(error),
         };
@@ -481,7 +767,7 @@ impl ProviderClient {
             .and_then(Value::as_array)
             .ok_or_else(|| protocol("API моделей не вернул массив data"))?;
         let local = self.is_local();
-        models
+        let parsed: Vec<ModelInfo> = models
             .iter()
             .filter(|model| {
                 // Local servers also list embedding models; they cannot run an agent.
@@ -540,7 +826,8 @@ impl ProviderClient {
                     supports_images,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((parsed, true))
     }
 
     fn idle(&self) -> Duration {
@@ -738,25 +1025,14 @@ impl ProviderClient {
             );
         }
         let giga = self.settings.kind == ProviderKind::GigaChat;
-        if giga
-            && self
-                .token
-                .as_ref()
-                .is_none_or(|t| t.expires_at_secs <= epoch_seconds().saturating_add(60))
-        {
-            self.refresh_token().await?;
-        }
         for auth_attempt in 0..=1 {
+            let mut used_giga_token: Option<String> = None;
             let authorization = if self.is_local() {
                 self.credential.as_ref().map(|key| format!("Bearer {key}"))
             } else if giga {
-                Some(format!(
-                    "Bearer {}",
-                    self.token
-                        .as_ref()
-                        .ok_or_else(|| protocol("Отсутствует OAuth-токен"))?
-                        .value
-                ))
+                let current_token = self.obtain_gigachat_token().await?;
+                used_giga_token = Some(current_token.clone());
+                Some(format!("Bearer {current_token}"))
             } else if self.settings.kind == ProviderKind::Yandex {
                 let key = self.cloud_key();
                 Some(
@@ -795,16 +1071,23 @@ impl ProviderClient {
             let request = request
                 .build()
                 .map_err(|_| protocol("Не удалось сформировать HTTP-запрос"))?;
-            let response = self
-                .send_with_retry(
-                    request,
-                    method == Method::POST && path == "chat/completions",
-                )
-                .await?;
+            let is_chat_completion = method == Method::POST && path == "chat/completions";
+            let response = self.send_with_retry(request, is_chat_completion).await?;
+            if is_chat_completion {
+                self.last_stream_usage
+                    .0
+                    .chat_responded
+                    .store(true, Ordering::Release);
+            }
             if giga && response.status() == reqwest::StatusCode::UNAUTHORIZED && auth_attempt == 0 {
                 drop(response);
-                self.token = None;
-                self.refresh_token().await?;
+                let _refresh_guard = self.token_refresh.lock().await;
+                let current_valid = self.valid_cached_token();
+                if current_valid.is_none() || current_valid.as_deref() == used_giga_token.as_deref()
+                {
+                    *lock(&self.token) = None;
+                    let _ = self.refresh_token().await?;
+                }
                 continue;
             }
             return self.check_status(response).await;
@@ -812,12 +1095,30 @@ impl ProviderClient {
         unreachable!("bounded authorization loop always returns")
     }
 
+    async fn obtain_gigachat_token(&self) -> Result<String> {
+        if let Some(tok) = self.valid_cached_token() {
+            return Ok(tok);
+        }
+        let _refresh_guard = self.token_refresh.lock().await;
+        if let Some(tok) = self.valid_cached_token() {
+            return Ok(tok);
+        }
+        self.refresh_token().await
+    }
+
+    fn valid_cached_token(&self) -> Option<String> {
+        lock(&self.token)
+            .as_ref()
+            .filter(|t| t.expires_at_secs > epoch_seconds().saturating_add(60))
+            .map(|t| t.value.clone())
+    }
+
     /// Cloud providers always carry a key (enforced in `connect`).
     fn cloud_key(&self) -> &str {
         self.credential.as_deref().unwrap_or_default()
     }
 
-    async fn refresh_token(&mut self) -> Result<()> {
+    async fn refresh_token(&self) -> Result<String> {
         let key = self.cloud_key();
         let key = key.strip_prefix("Basic ").unwrap_or(key);
         let request = self
@@ -840,13 +1141,25 @@ impl ProviderClient {
             .build()
             .map_err(|_| protocol("Не удалось сформировать OAuth-запрос"))?;
         let response = self.send_with_retry(request, false).await?;
-        let response = self.check_status(response).await?;
+        let response = self.check_status(response).await.map_err(|err| {
+            match err.downcast::<ProviderFailure>() {
+                Ok(mut pf) => {
+                    pf.from_oauth = true;
+                    pf.into()
+                }
+                Err(other) => other,
+            }
+        })?;
         let value = read_json(response, self.idle()).await?;
         let token = value
             .get("access_token")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| protocol("OAuth-ответ не содержит access_token"))?;
+        if let Some(sink) = &self.secret_sink {
+            let mut secrets = sink.lock().unwrap_or_else(|e| e.into_inner());
+            crate::redaction::push_secret_variants(&mut secrets, token);
+        }
         sensitive_header(&format!("Bearer {token}"))?;
         let expires_at = value
             .get("expires_at")
@@ -865,11 +1178,12 @@ impl ProviderClient {
                 "OAuth-сервер вернул истёкший токен",
             ));
         }
-        self.token = Some(AccessToken {
-            value: token.into(),
+        let owned = token.to_owned();
+        *lock(&self.token) = Some(AccessToken {
+            value: owned.clone(),
             expires_at_secs,
         });
-        Ok(())
+        Ok(owned)
     }
 
     async fn send_with_retry(&self, request: Request, generation: bool) -> Result<Response> {
@@ -918,6 +1232,12 @@ impl ProviderClient {
                         "Ошибка HTTP-транспорта API"
                     })
                 })?;
+            if generation {
+                self.last_stream_usage
+                    .0
+                    .chat_responded
+                    .store(true, Ordering::Release);
+            }
             if matches!(response.status().as_u16(), 429 | 502 | 503) && attempt < MAX_RETRIES {
                 // Only the status/headers have been inspected; no response body was consumed.
                 let wait = response
@@ -947,6 +1267,18 @@ impl ProviderClient {
                 FailureKind::Protocol,
                 Some(code),
                 "API вернул перенаправление; укажите конечный HTTPS endpoint",
+            ));
+        }
+        if matches!(code, 401 | 403) {
+            if self.is_local()
+                && let Some((kind, message)) = self.local_failure(code, "")
+            {
+                return Err(fail(kind, Some(code), &format!("{message} (HTTP {code})")));
+            }
+            return Err(fail(
+                FailureKind::Auth,
+                Some(code),
+                &format!("API отклонил авторизацию; проверьте ключ, scope и права (HTTP {code})"),
             ));
         }
         // Inspect for known context errors, but never include an upstream body (which can echo prompts or secrets).
@@ -1227,13 +1559,8 @@ fn checked_url(value: &str) -> Result<Url> {
     Ok(url)
 }
 fn is_loopback(url: &Url) -> bool {
-    url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    })
+    url.host_str()
+        .is_some_and(crate::model_route::is_loopback_or_v4_mapped_host)
 }
 fn endpoint(base: &Url, path: &str) -> Url {
     let mut url = base.clone();
@@ -1262,8 +1589,31 @@ fn fail(kind: FailureKind, status: Option<u16>, message: &str) -> anyhow::Error 
         kind,
         status,
         message: message.into(),
+        usage: None,
+        from_oauth: false,
     }
     .into()
+}
+fn completion_reported_usage(completion: &Completion) -> Option<Usage> {
+    (completion.usage_reported
+        || completion.usage.input_tokens > 0
+        || completion.usage.output_tokens > 0
+        || completion.usage.cost_usd.is_some())
+    .then(|| completion.usage.clone())
+}
+fn attach_completion_usage(completion: &Completion, err: anyhow::Error) -> anyhow::Error {
+    let Some(usage) = completion_reported_usage(completion) else {
+        return err;
+    };
+    match err.downcast::<ProviderFailure>() {
+        Ok(mut pf) => {
+            if pf.usage.is_none() {
+                pf.usage = Some(usage);
+            }
+            pf.into()
+        }
+        Err(other) => other,
+    }
 }
 fn protocol(message: &str) -> anyhow::Error {
     fail(FailureKind::Protocol, None, message)
@@ -1342,14 +1692,16 @@ fn giga_messages(messages: &[Message], uploaded: &BTreeMap<String, String>) -> R
                 output.push(assistant);
                 let result = matching[0];
                 let result_text = result.content.as_deref().unwrap_or("");
-                let parsed = serde_json::from_str::<Value>(result_text)
-                    .unwrap_or_else(|_| json!(result_text));
-                let object = if parsed.is_object() {
-                    parsed
-                } else {
-                    json!({"result":parsed})
+                let content_json = match serde_json::from_str::<Value>(result_text) {
+                    Ok(Value::Object(map)) => {
+                        crate::context::serialize_receipt_map(&call.function.name, &map)
+                    }
+                    Ok(other) => json!({"result": other}).to_string(),
+                    Err(_) => json!({"result": result_text}).to_string(),
                 };
-                output.push(json!({"role":"function","name":call.function.name,"content":object.to_string()}));
+                output.push(
+                    json!({"role":"function","name":call.function.name,"content":content_json}),
+                );
             }
             index += count + 1;
         } else {
@@ -1422,13 +1774,15 @@ async fn read_json(response: Response, idle: Duration) -> Result<Value> {
 }
 
 #[derive(Default)]
-struct Accumulator {
+struct Accumulator<'a> {
     completion: Completion,
     calls: BTreeMap<u64, PartialCall>,
     terminal: bool,
+    terminal_error: Option<&'static str>,
     yandex_name_ids: bool,
     /// Local servers only: reasoning fields and a leading `<think>` block are hidden.
     think: Option<crate::think::ThinkFilter>,
+    usage_sink: Option<&'a Mutex<Option<Usage>>>,
 }
 #[derive(Default)]
 struct PartialCall {
@@ -1437,8 +1791,11 @@ struct PartialCall {
     arguments: String,
     kind: String,
 }
-impl Accumulator {
-    fn new(settings: &ProviderSettings) -> Self {
+impl<'a> Accumulator<'a> {
+    fn with_sink(
+        settings: &ProviderSettings,
+        usage_sink: Option<&'a Mutex<Option<Usage>>>,
+    ) -> Self {
         Self {
             yandex_name_ids: settings.kind == ProviderKind::Yandex,
             think: settings
@@ -1446,8 +1803,18 @@ impl Accumulator {
                 .as_ref()
                 .filter(|_| settings.kind == ProviderKind::Local)
                 .map(|local| crate::think::ThinkFilter::for_local(local.runtime, local.thinking)),
+            usage_sink,
             ..Self::default()
         }
+    }
+    fn attach_usage(&self, err: anyhow::Error) -> anyhow::Error {
+        attach_completion_usage(&self.completion, err)
+    }
+    fn check_terminal_error(&self) -> Result<()> {
+        if let Some(msg) = self.terminal_error {
+            return Err(self.attach_usage(protocol(msg)));
+        }
+        Ok(())
     }
     /// Emits text held back while deciding about a leading `<think>` block.
     fn flush_reasoning(
@@ -1485,21 +1852,6 @@ impl Accumulator {
         Ok(())
     }
     fn common(&mut self, value: &Value) -> Result<()> {
-        if value.get("error").is_some_and(|error| !error.is_null()) {
-            let code = value["error"]["code"]
-                .as_u64()
-                .and_then(|s| u16::try_from(s).ok());
-            let kind = match code {
-                Some(401 | 403) => FailureKind::Auth,
-                Some(429) => FailureKind::RateLimit,
-                _ => FailureKind::Protocol,
-            };
-            return Err(fail(
-                kind,
-                code,
-                "API сообщил об ошибке генерации; ответ не завершён",
-            ));
-        }
         if let Some(model) = value.get("model").and_then(Value::as_str) {
             self.completion.model = Some(model.into());
         }
@@ -1529,6 +1881,26 @@ impl Accumulator {
             // The final-review UI reports usage only when both authoritative
             // token counts were present and valid; partial objects are unknown.
             self.completion.usage_reported = input_tokens.is_some() && output_tokens.is_some();
+            if let Some(sink) = self.usage_sink
+                && let Some(reported) = completion_reported_usage(&self.completion)
+            {
+                *lock(sink) = Some(reported);
+            }
+        }
+        if value.get("error").is_some_and(|error| !error.is_null()) {
+            let code = value["error"]["code"]
+                .as_u64()
+                .and_then(|s| u16::try_from(s).ok());
+            let kind = match code {
+                Some(401 | 403) => FailureKind::Auth,
+                Some(429) => FailureKind::RateLimit,
+                _ => FailureKind::Protocol,
+            };
+            return Err(self.attach_usage(fail(
+                kind,
+                code,
+                "API сообщил об ошибке генерации; ответ не завершён",
+            )));
         }
         Ok(())
     }
@@ -1673,15 +2045,15 @@ impl Accumulator {
     }
     fn finish_reason(&mut self, choice: &Value) -> Result<()> {
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if self.terminal && self.completion.finish_reason != reason {
+                return Err(self.attach_usage(protocol("Противоречивый finish_reason в SSE")));
+            }
             if !matches!(reason, "stop" | "tool_calls" | "function_call") {
-                return Err(protocol(if reason == "length" {
+                self.terminal_error = Some(if reason == "length" {
                     "Ответ модели обрезан лимитом токенов; увеличьте max_output_tokens"
                 } else {
                     "Модель не завершила ответ (фильтрация или ошибка генерации)"
-                }));
-            }
-            if self.terminal && self.completion.finish_reason != reason {
-                return Err(protocol("Противоречивый finish_reason в SSE"));
+                });
             }
             self.completion.finish_reason = reason.into();
             self.terminal = true;
@@ -1689,21 +2061,26 @@ impl Accumulator {
         Ok(())
     }
     fn finish(mut self) -> Result<Completion> {
+        self.check_terminal_error()?;
         if !self.terminal {
-            return Err(protocol(
+            return Err(self.attach_usage(protocol(
                 "Ответ API оборвался до finish_reason; инструменты не исполнены",
-            ));
+            )));
         }
         let mut ids = HashSet::new();
-        for (_, partial) in self.calls {
+        for (_, partial) in std::mem::take(&mut self.calls) {
             if partial.name.is_empty() || (!partial.kind.is_empty() && partial.kind != "function") {
-                return Err(protocol("Неполное описание вызова инструмента"));
+                return Err(self.attach_usage(protocol("Неполное описание вызова инструмента")));
             }
             let arguments: Value = serde_json::from_str(&partial.arguments).map_err(|_| {
-                protocol("Аргументы инструмента содержат неполный или некорректный JSON")
+                self.attach_usage(protocol(
+                    "Аргументы инструмента содержат неполный или некорректный JSON",
+                ))
             })?;
             if !arguments.is_object() {
-                return Err(protocol("Аргументы инструмента должны быть JSON-объектом"));
+                return Err(
+                    self.attach_usage(protocol("Аргументы инструмента должны быть JSON-объектом"))
+                );
             }
             // Some Yandex models use the function name as a non-unique ID.
             // Distinct structured indexes remain distinct calls; only their
@@ -1715,7 +2092,9 @@ impl Accumulator {
                     partial.id
                 };
             if !ids.insert(id.clone()) {
-                return Err(protocol("Повторный идентификатор вызова инструмента"));
+                return Err(
+                    self.attach_usage(protocol("Повторный идентификатор вызова инструмента"))
+                );
             }
             self.completion.tool_calls.push(ToolCall {
                 id,
@@ -1731,7 +2110,9 @@ impl Accumulator {
             "tool_calls" | "function_call"
         ) && self.completion.tool_calls.is_empty()
         {
-            return Err(protocol("Модель завершила вызов функции без её аргументов"));
+            return Err(
+                self.attach_usage(protocol("Модель завершила вызов функции без её аргументов"))
+            );
         }
         Ok(self.completion)
     }
@@ -1741,6 +2122,7 @@ async fn read_sse(
     response: Response,
     idle: Duration,
     settings: &ProviderSettings,
+    usage_sink: Option<&Mutex<Option<Usage>>>,
     emit: &mut (dyn FnMut(&str) + Send),
 ) -> Result<Completion> {
     let kind = settings.kind;
@@ -1755,16 +2137,19 @@ async fn read_sse(
     let mut data = String::new();
     let mut bytes = 0usize;
     let giga = kind == ProviderKind::GigaChat;
-    let mut accumulator = Accumulator::new(settings);
+    let mut accumulator = Accumulator::with_sink(settings, usage_sink);
     while let Some(chunk) = tokio::time::timeout(idle, stream.next())
         .await
-        .map_err(|_| idle_timeout(idle))?
+        .map_err(|_| accumulator.attach_usage(idle_timeout(idle)))?
     {
-        let chunk = chunk
-            .map_err(|_| transport("SSE-соединение оборвалось; частичный ответ не сохранён"))?;
+        let chunk = chunk.map_err(|_| {
+            accumulator.attach_usage(transport(
+                "SSE-соединение оборвалось; частичный ответ не сохранён",
+            ))
+        })?;
         bytes = bytes.saturating_add(chunk.len());
         if bytes > MAX_BODY {
-            return Err(protocol("Ответ API превышает лимит 8 MiB"));
+            return Err(accumulator.attach_usage(protocol("Ответ API превышает лимит 8 MiB")));
         }
         pending.extend_from_slice(&chunk);
         let mut consumed = 0;
@@ -1774,17 +2159,24 @@ async fn read_sse(
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
             }
-            let line = std::str::from_utf8(line)
-                .map_err(|_| protocol("SSE содержит некорректный UTF-8"))?;
+            let line = std::str::from_utf8(line).map_err(|_| {
+                accumulator.attach_usage(protocol("SSE содержит некорректный UTF-8"))
+            })?;
             if line.is_empty() {
                 if !data.is_empty() {
                     if data.trim() == "[DONE]" {
-                        accumulator.flush_reasoning(true, emit)?;
+                        accumulator.check_terminal_error()?;
+                        if let Err(err) = accumulator.flush_reasoning(true, emit) {
+                            return Err(accumulator.attach_usage(err));
+                        }
                         return accumulator.finish();
                     }
-                    let value: Value = serde_json::from_str(&data)
-                        .map_err(|_| protocol("SSE содержит некорректный JSON"))?;
-                    accumulator.stream_event(&value, giga, emit)?;
+                    let value: Value = serde_json::from_str(&data).map_err(|_| {
+                        accumulator.attach_usage(protocol("SSE содержит некорректный JSON"))
+                    })?;
+                    if let Err(err) = accumulator.stream_event(&value, giga, emit) {
+                        return Err(accumulator.attach_usage(err));
+                    }
                     data.clear();
                 }
             } else if let Some(value) = line.strip_prefix("data:") {
@@ -1797,7 +2189,52 @@ async fn read_sse(
         }
         pending.drain(..consumed);
     }
-    Err(protocol(
+    accumulator.check_terminal_error()?;
+    Err(accumulator.attach_usage(protocol(
         "SSE оборвался до [DONE]; частичный ответ не сохранён, инструменты не исполнены",
-    ))
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_local_budget_transfers_calibration_without_runtime_context() {
+        let mlx = ProviderSettings {
+            kind: ProviderKind::Local,
+            model: "mlx-community/Qwen3.8-27B".into(),
+            base_url: Some("http://127.0.0.1:8080/v1".into()),
+            local: Some(crate::local::LocalSettings {
+                profile: "mlx".into(),
+                runtime: crate::local::LocalRuntime::Mlx,
+                context_tokens: 8192,
+                vision: false,
+                key_required: false,
+                thinking: None,
+            }),
+            ..ProviderSettings::new(ProviderKind::Local)
+        };
+        let parent = ProviderClient::connect(mlx.clone(), None).unwrap();
+        let child = ProviderClient::connect(mlx, None).unwrap();
+        let sample = [Message::user("x".repeat(400))];
+        let before = child.context_budget(0).request_used(&sample);
+
+        parent.observe_prompt_tokens(100, 180);
+        child.copy_local_budget_from(&parent);
+
+        let after = child.context_budget(0).request_used(&sample);
+        assert!(
+            after > before,
+            "expected calibrated usage > {before}, got {after}"
+        );
+
+        // Session-level sync must remain strictly monotone even when synced against an uncalibrated client.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = crate::state::Session::new(tmp.path(), parent.settings.clone()).unwrap();
+        session.sync_local_client_budget(&parent.settings, &parent);
+        let stale = ProviderClient::connect(parent.settings.clone(), None).unwrap();
+        session.sync_local_client_budget(&parent.settings, &stale);
+        assert_eq!(stale.context_budget(0).request_used(&sample), after);
+    }
 }

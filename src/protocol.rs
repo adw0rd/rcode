@@ -172,6 +172,8 @@ pub struct ProviderFailure {
     pub kind: FailureKind,
     pub status: Option<u16>,
     pub message: String,
+    pub usage: Option<Usage>,
+    pub from_oauth: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

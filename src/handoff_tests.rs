@@ -78,6 +78,7 @@ async fn fault_case(mode: u8) -> Result<()> {
         reply,
         admission: Default::default(),
         transfers: Default::default(),
+        artifact_fit: None,
     };
     let parent_token = scope.cancellation();
     let parent_id = scope.identity();

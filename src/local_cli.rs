@@ -84,6 +84,18 @@ pub async fn run(
             if let Some(key) = &key {
                 crate::local_app::remember_key(events, key);
             }
+            let extra_secrets: Vec<String> = key.iter().cloned().collect();
+            let mut precheck =
+                profile_settings(name, &base_url, runtime.unwrap_or(LocalRuntime::OpenAi), "");
+            precheck.ca_file = cli
+                .ca_file
+                .as_deref()
+                .map(crate::model_route::normalize_ca_path);
+            crate::model_route::ensure_connection_free_of_secrets(
+                store,
+                &precheck,
+                &extra_secrets,
+            )?;
             let runtime = match runtime {
                 Some(runtime) => *runtime,
                 None => guess_runtime(&url, &base_url).await,
@@ -110,74 +122,88 @@ pub async fn run(
                 local.thinking = cli.thinking.and_then(ThinkingMode::into_option);
                 local.key_required = key.is_some() || kept_key;
             }
-            profile.ca_file = cli.ca_file.clone();
+            profile.ca_file = cli
+                .ca_file
+                .as_deref()
+                .map(crate::model_route::normalize_ca_path);
             if let Some(tokens) = max_output_tokens {
                 profile.max_output_tokens = *tokens;
             } else if let Some(local) = &profile.local {
                 profile.max_output_tokens = profile.max_output_tokens.min(local.context_tokens / 4);
             }
             crate::local::validate(&profile)?;
-            if profile.model.is_empty() {
-                profile.model = first_model(&profile, key.clone()).await?;
-                if !cli.json {
-                    println!("Модель из /models сервера: {}", ui::safe(&profile.model));
-                }
+            let auto_selected_model = profile.model.is_empty();
+            if auto_selected_model {
+                profile.model = first_model(store, &profile, key.clone()).await?;
             }
             profile.validate()?;
-            settings
-                .local
-                .profiles
-                .insert(name.clone(), profile.clone());
-            if *activate {
-                settings.remember_provider(&profile);
-            } else if settings.local.active.is_none() {
-                settings.local.active = Some(name.clone());
+            crate::model_route::ensure_route_free_of_secrets(store, &profile, &extra_secrets)?;
+            if auto_selected_model && !cli.json {
+                println!("Модель из /models сервера: {}", ui::safe(&profile.model));
             }
-            // A key belongs to the address it was entered for: a new profile
-            // never inherits a key left under its name, a moved one loses it.
-            // Deleted before the profile is saved, so it never coexists with it.
-            if !kept_key {
-                store.delete_local_credential(name)?;
-            }
-            store.save(&settings)?;
-            if let Some(key) = &key {
-                store.save_local_credential(name, key)?;
-            }
-            let row = profile_row(store, &settings, name, &profile);
+            let (committed_settings, committed_moved) = store
+                .commit_local_profile_add_with_secrets(
+                    name,
+                    *force,
+                    *activate,
+                    false,
+                    profile,
+                    key.as_deref(),
+                    || events.secret_snapshot(),
+                )?;
+            settings = committed_settings;
+            let saved_profile = settings.local.profiles[name].clone();
+            let row = profile_row(store, &settings, name, &saved_profile);
             if cli.json {
                 events.emit("local_profile", row);
             } else {
                 println!("✓ Профиль сохранён: {}", plain_row(&row));
-                if moved && key.is_none() {
+                if (moved || committed_moved) && key.is_none() {
                     println!("Адрес изменился: ключ прежнего адреса удалён.");
                 }
             }
             Ok(0)
         }
         LocalCommand::Use { name } => {
-            let mut profile = settings
-                .local
-                .profiles
-                .get(name)
-                .cloned()
+            let profile = crate::model_route::configured_local_profile(&settings, name)?
                 .with_context(|| format!("Профиль local «{name}» не найден: rcode local list"))?;
             if cli.base_url.is_some() || cli.ca_file.is_some() || cli.folder_id.is_some() {
                 bail!(
                     "Адрес профиля меняется командой rcode local add {name} --base-url URL --force"
                 );
             }
-            if let Some(model) = &cli.model {
-                profile.model = model.clone();
-            }
-            if let Some(thinking) = cli.thinking
-                && let Some(local) = profile.local.as_mut()
-            {
-                local.thinking = thinking.into_option();
-            }
-            profile.validate()?;
-            settings.remember_provider(&profile);
-            store.save(&settings)?;
-            let row = profile_row(store, &settings, name, &profile);
+            let _ = events.refresh_keys(store);
+            let mut saved_profile = profile;
+            settings = store.update_settings_with_credentials(|current, providers_creds| {
+                let live_extra = events.secret_snapshot();
+                let route_dict = crate::model_route::build_route_secret_dictionary_from_raw(
+                    providers_creds.values().cloned(),
+                    &live_extra,
+                )?;
+                let mut p = crate::model_route::configured_local_profile(current, name)?
+                    .with_context(|| {
+                        let safe_name = match route_dict.as_ref() {
+                            Some(dict) => crate::redaction::redact_text_idempotent_with(dict, name)
+                                .unwrap_or_else(|_| "[скрыто]".into()),
+                            None => name.to_owned(),
+                        };
+                        format!("Профиль local «{safe_name}» не найден: rcode local list")
+                    })?;
+                if let Some(model) = &cli.model {
+                    p.model = model.clone();
+                }
+                if let Some(thinking) = cli.thinking
+                    && let Some(local) = p.local.as_mut()
+                {
+                    local.thinking = thinking.into_option();
+                }
+                p.validate()?;
+                crate::model_route::check_route_against_secret_dictionary(route_dict.as_ref(), &p)?;
+                current.remember_provider(&p);
+                saved_profile = p;
+                Ok(())
+            })?;
+            let row = profile_row(store, &settings, name, &saved_profile);
             if cli.json {
                 events.emit("local_profile", row);
             } else {
@@ -190,9 +216,20 @@ pub async fn run(
             stdin: _,
             delete,
         } => {
-            if !settings.local.profiles.contains_key(name) {
-                bail!("Профиль local «{name}» не найден: rcode local list");
-            }
+            let expected_profile =
+                settings
+                    .local
+                    .profiles
+                    .get(name)
+                    .cloned()
+                    .with_context(|| {
+                        let safe_name = crate::model_route::redact_route_display_field(
+                            store,
+                            &events.secret_snapshot(),
+                            name,
+                        );
+                        format!("Профиль local «{safe_name}» не найден: rcode local list")
+                    })?;
             if *delete {
                 // The profile still expects a key: requests stop before the
                 // network until a new key is stored or the profile is re-added.
@@ -200,27 +237,29 @@ pub async fn run(
             } else {
                 let key = read_key()?;
                 crate::local_app::remember_key(events, &key);
-                store.save_local_credential(name, &key)?;
-                if let Some(local) = settings
-                    .local
-                    .profiles
-                    .get_mut(name)
-                    .and_then(|profile| profile.local.as_mut())
-                    .filter(|local| !local.key_required)
-                {
-                    local.key_required = true;
-                    store.save(&settings)?;
-                }
+                let _ = events.refresh_keys(store);
+                crate::model_route::ensure_route_free_of_secrets(
+                    store,
+                    &expected_profile,
+                    &events.secret_snapshot(),
+                )?;
+                let _ = store.commit_local_profile_key(&expected_profile, name, &key)?;
             }
+            let _ = events.refresh_keys(store);
+            let clean_name = crate::model_route::redact_route_display_field(
+                store,
+                &events.secret_snapshot(),
+                name,
+            );
             let message = if *delete {
-                format!("Ключ профиля {name} удалён")
+                format!("Ключ профиля {clean_name} удалён")
             } else {
-                format!("Ключ профиля {name} сохранён")
+                format!("Ключ профиля {clean_name} сохранён")
             };
             if cli.json {
                 events.emit(
                     "local_key",
-                    json!({"profile":name,"key":if *delete {"none"} else {"stored"}}),
+                    json!({"profile":clean_name,"key":if *delete {"none"} else {"stored"}}),
                 );
             } else {
                 println!("✓ {message}");
@@ -287,14 +326,36 @@ async fn guess_runtime(url: &reqwest::Url, base_url: &str) -> LocalRuntime {
     }
 }
 
-async fn first_model(profile: &ProviderSettings, key: Option<String>) -> Result<String> {
+async fn first_model(
+    store: &ConfigStore,
+    profile: &ProviderSettings,
+    key: Option<String>,
+) -> Result<String> {
+    let mut initial_extra = Vec::new();
+    if let Some(ref k) = key {
+        crate::redaction::push_secret_variants(&mut initial_extra, k);
+    }
+    crate::model_route::ensure_connection_free_of_secrets(store, profile, &initial_extra)?;
     let mut client = ProviderClient::connect(profile.clone(), key.clone())?;
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(initial_extra));
+    client.bind_secret_sink(std::sync::Arc::clone(&sink));
     let models = tokio::time::timeout(std::time::Duration::from_secs(10), client.models())
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("Локальный сервер не ответил за 10 секунд")));
     match models {
-        Ok(models) if !models.is_empty() => Ok(models[0].id.clone()),
-        Ok(_) => bail!("Сервер не сообщил ни одной модели; укажите --model ID"),
+        Ok(models) => {
+            let mut extra = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for s in client.redaction_secrets() {
+                crate::redaction::push_secret_variants(&mut extra, &s);
+            }
+            let dict = crate::model_route::build_route_secret_dictionary(store, &extra)?;
+            let clean = crate::local_ui::filter_local_models_preserving_order(models, dict.as_ref());
+            if let Some(first) = clean.first() {
+                Ok(first.id.clone())
+            } else {
+                bail!("Сервер не сообщил ни одной допустимой модели; укажите --model ID")
+            }
+        }
         Err(error)
             if key.is_none()
                 && error
@@ -330,15 +391,30 @@ fn profile_row(
     name: &str,
     profile: &ProviderSettings,
 ) -> Value {
+    let dict_res = crate::model_route::build_route_secret_dictionary(store, &[]);
+    let redact_field = |text: &str| -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        match &dict_res {
+            Ok(None) => text.to_owned(),
+            Ok(Some(d)) => crate::redaction::redact_text_idempotent_with(d, text)
+                .unwrap_or_else(|_| "[скрыто]".into()),
+            Err(_) => "[скрыто]".into(),
+        }
+    };
     let local = profile
         .local
         .clone()
         .unwrap_or_else(crate::local::draft_settings);
+    let clean_name = redact_field(name);
+    let clean_base_url = profile.base_url.as_deref().map(&redact_field);
+    let clean_model = redact_field(&profile.model);
     json!({
-        "profile": name,
+        "profile": clean_name,
         "runtime": local.runtime,
-        "base_url": profile.base_url,
-        "model": profile.model,
+        "base_url": clean_base_url,
+        "model": clean_model,
         "active": settings.local.active.as_deref() == Some(name),
         "default_provider": settings.active == crate::config::ProviderKind::Local
             && settings.local.active.as_deref() == Some(name),

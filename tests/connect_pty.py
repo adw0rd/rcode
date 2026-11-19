@@ -252,6 +252,41 @@ def main(binary):
                 terminal.finished()
             finally:
                 terminal.close()
+
+            # Changing custom base_url must NOT send the previous endpoint's saved key.
+            fixture.requests.clear()
+            home_rebind = root / "custom-rebind"
+            home_rebind.mkdir(mode=0o700)
+            (home_rebind / "config.json").write_text(json.dumps({
+                "version": 1, "active": "custom", "providers": {"custom": {
+                    "kind": "custom", "model": "GigaChat", "base_url": "http://127.0.0.1:1/v1",
+                    "stream": False,
+                }}}))
+            (home_rebind / "credentials.json").write_text(json.dumps({
+                "version": 1, "providers": {"custom": "old-endpoint-a-secret-key"}}))
+            for path in home_rebind.iterdir():
+                path.chmod(0o600)
+            before_cfg = (home_rebind / "config.json").read_bytes()
+            before_cred = (home_rebind / "credentials.json").read_bytes()
+            terminal = ConnectTerminal(binary, workspace, home_rebind, ["connect", "custom"])
+            try:
+                terminal.expect("Адрес API")
+                terminal.send(endpoint + "/v1\r")
+                terminal.expect("Ключ (ввод скрыт):")
+                assert "Заменить сохранённый ключ?" not in terminal.text()
+                terminal.send("new-endpoint-b-secret-key\r")
+                terminal.expect("GigaChat 3 Ultra")
+                assert all("old-endpoint-a-secret-key" not in str(r[2]) for r in fixture.requests), fixture.requests
+                assert any(
+                    r[0] == "GET" and r[1] == "/v1/models" and r[2] == "Bearer new-endpoint-b-secret-key"
+                    for r in fixture.requests
+                ), fixture.requests
+                terminal.send("\x1b")
+                terminal.finished(130)
+                assert (home_rebind / "config.json").read_bytes() == before_cfg
+                assert (home_rebind / "credentials.json").read_bytes() == before_cred
+            finally:
+                terminal.close()
             print("PASS connect: authenticated catalog, selection, cancellation, manual fallback, full-screen footer, hidden keys")
     finally:
         fixture.shutdown()

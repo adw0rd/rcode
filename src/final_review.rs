@@ -466,18 +466,13 @@ pub fn resolve_target(
             .context("В снимке local отсутствуют параметры профиля")?
             .profile
             .as_str();
-        settings
-            .local
-            .profiles
-            .get(profile)
+        crate::model_route::configured_local_profile(settings, profile)?
             .context("Выбранный профиль local больше не настроен")?
     } else {
-        settings
-            .providers
-            .get(selected.kind.as_str())
+        crate::model_route::configured_cloud_provider(settings, selected.kind)?
             .with_context(|| format!("Провайдер {} больше не настроен", selected.kind))?
     };
-    if !same_route(selected, configured) {
+    if !same_route(selected, &configured) {
         bail!("Маршрут финального ревью устарел; выберите провайдера и модель заново");
     }
     Ok(selected.clone())
@@ -618,14 +613,133 @@ pub fn prepare_review(
     provider: ProviderSettings,
     events: &crate::app::Events,
 ) -> Result<PreparedReview> {
-    let credential = store.credential_for(&provider)?;
+    prepare_review_with_primary(store, provider, false, None, events)
+}
+
+pub fn prepare_review_with_primary(
+    store: &ConfigStore,
+    provider: ProviderSettings,
+    reuse_primary: bool,
+    primary: Option<&ProviderClient>,
+    events: &crate::app::Events,
+) -> Result<PreparedReview> {
+    events.refresh_and_check_route(store, &provider)?;
+    if reuse_primary
+        && let Some(p) = primary
+        && p.settings() == &provider
+    {
+        if provider.kind == ProviderKind::Local {
+            let (fresh, cred_state) = store.read_consistent_local(&provider)?;
+            let name = crate::local_app::profile_name(&provider);
+            let same_disk_conn = crate::model_route::configured_local_profile(&fresh, name)?
+                .is_some_and(|cfg| {
+                    crate::model_route::RouteIdentity::same_connection(&provider, &cfg)
+                });
+            match cred_state {
+                CredentialState::Missing => {
+                    bail!("Для финального ревью не настроен ключ выбранного провайдера");
+                }
+                CredentialState::NotRequired => {
+                    if !p.credential_matches(None) || !p.ca_bundle_matches_disk() {
+                        let mut client = ProviderClient::connect(provider.clone(), None)?;
+                        client.share_connection_state_from(p);
+                        client.bind_secret_sink(events.shared_secrets());
+                        return Ok(PreparedReview { provider, client });
+                    }
+                }
+                CredentialState::Present(cred) => {
+                    events.remember(cred.value.clone());
+                    crate::model_route::ensure_route_free_of_secrets(
+                        store,
+                        &provider,
+                        &events.secret_snapshot(),
+                    )?;
+                    if !p.credential_matches(Some(cred.value.as_str()))
+                        || !p.ca_bundle_matches_disk()
+                    {
+                        if !p.credential_matches(Some(cred.value.as_str())) && !same_disk_conn {
+                            bail!(
+                                "Ключ локального профиля изменился и не может быть отправлен с временными параметрами сессии"
+                            );
+                        }
+                        let mut client =
+                            ProviderClient::connect(provider.clone(), Some(cred.value))?;
+                        client.share_connection_state_from(p);
+                        client.bind_secret_sink(events.shared_secrets());
+                        return Ok(PreparedReview { provider, client });
+                    }
+                }
+            }
+        } else {
+            let (fresh, cred_opt) = store.read_consistent_cloud(provider.kind)?;
+            let Some(cred) = cred_opt else {
+                bail!("Для финального ревью не настроен ключ выбранного провайдера");
+            };
+            events.remember(cred.value.clone());
+            crate::model_route::ensure_route_free_of_secrets(
+                store,
+                &provider,
+                &events.secret_snapshot(),
+            )?;
+            if !p.credential_matches(Some(cred.value.as_str())) || !p.ca_bundle_matches_disk() {
+                let same_disk_conn = cred.source != "credentials.json"
+                    || crate::model_route::configured_cloud_provider(&fresh, provider.kind)?
+                        .is_some_and(|cfg| {
+                            crate::model_route::RouteIdentity::same_connection(&provider, &cfg)
+                        });
+                if !p.credential_matches(Some(cred.value.as_str())) && !same_disk_conn {
+                    bail!(
+                        "Ключ провайдера {} изменился в credentials.json и не отправляется на временный endpoint сессии",
+                        provider.kind
+                    );
+                }
+                let mut client = ProviderClient::connect(provider.clone(), Some(cred.value))?;
+                client.share_connection_state_from(p);
+                client.bind_secret_sink(events.shared_secrets());
+                return Ok(PreparedReview { provider, client });
+            }
+        }
+        let mut client = p.clone();
+        let _ = client.isolate_partial_usage();
+        client.bind_secret_sink(events.shared_secrets());
+        return Ok(PreparedReview { provider, client });
+    }
+    let credential = if provider.kind == ProviderKind::Local {
+        let (fresh, cred_state) = store.read_consistent_local(&provider)?;
+        let name = crate::local_app::profile_name(&provider);
+        let configured = crate::model_route::configured_local_profile(&fresh, name)?
+            .context("Выбранный профиль local больше не настроен")?;
+        if !same_route(&provider, &configured) {
+            bail!("Маршрут финального ревью устарел; выберите провайдера и модель заново");
+        }
+        cred_state
+    } else {
+        let (fresh, cred_opt) = store.read_consistent_cloud(provider.kind)?;
+        let configured = crate::model_route::configured_cloud_provider(&fresh, provider.kind)?
+            .with_context(|| format!("Провайдер {} больше не настроен", provider.kind))?;
+        if !same_route(&provider, &configured) {
+            bail!("Маршрут финального ревью устарел; выберите провайдера и модель заново");
+        }
+        match cred_opt {
+            Some(c) => CredentialState::Present(c),
+            None => CredentialState::Missing,
+        }
+    };
     if credential.is_missing() {
         bail!("Для финального ревью не настроен ключ выбранного провайдера");
     }
     if let CredentialState::Present(credential) = &credential {
         events.remember(credential.value.clone());
     }
-    let client = ProviderClient::connect(provider.clone(), credential.into_key())?;
+    crate::model_route::ensure_route_free_of_secrets(store, &provider, &events.secret_snapshot())?;
+    let fresh_key = credential.into_key();
+    let mut client = ProviderClient::connect(provider.clone(), fresh_key.clone())?;
+    if let Some(p) = primary
+        && crate::model_route::RouteIdentity::same_connection(p.settings(), &provider)
+    {
+        client.share_connection_state_from(p);
+    }
+    client.bind_secret_sink(events.shared_secrets());
     Ok(PreparedReview { provider, client })
 }
 
@@ -641,11 +755,22 @@ pub async fn review(
     }
     let provider = prepared.provider;
     let mut client = prepared.client;
+    if client.is_local() {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("Финальное ревью отменено"),
+            _ = client.refresh_local_context() => {}
+        }
+    }
     let system = Message::text("system", REVIEW_SYSTEM);
     let user = Message::user(packet);
     let messages = [system, user];
     let budget = client.context_budget(crate::context::estimate_overhead(REVIEW_SYSTEM, &[]));
-    let used = budget.request_used(&messages);
+    let used = if budget.is_tokens() {
+        budget.request_used(std::slice::from_ref(&messages[1]))
+    } else {
+        budget.request_used(&messages)
+    };
     if used > budget.limit {
         bail!("Пакет финального ревью не помещается в контекст выбранной модели");
     }
@@ -677,6 +802,12 @@ pub async fn review(
         bail!("Модель финального ревью вернула пустой ответ");
     }
     let result = redact_result(&completion.content, &secrets)?;
+    let clean_model = redact_result(&provider.model, &secrets)?;
+    let clean_profile = provider
+        .local
+        .as_ref()
+        .map(|local| redact_result(&local.profile, &secrets))
+        .transpose()?;
     Ok(FinalReviewRecord {
         status: if completion.refusal {
             "refused"
@@ -685,11 +816,11 @@ pub async fn review(
         }
         .into(),
         provider: provider.kind.as_str().into(),
-        model: provider.model,
+        model: clean_model,
         turn_index: 0,
         draft_sha256: String::new(),
         route_fingerprint: String::new(),
-        local_profile: provider.local.as_ref().map(|local| local.profile.clone()),
+        local_profile: clean_profile,
         packet_sha256: None,
         result: (!completion.refusal).then_some(result),
         refusal: completion.refusal,
@@ -887,9 +1018,10 @@ pub fn model_target_summary_for_mode(settings: &Settings, mode: FinalReviewMode)
 
 pub fn set_same(store: &ConfigStore, settings: &mut Settings) -> Result<()> {
     ensure_user_controlled()?;
-    let mut candidate = settings.clone();
-    candidate.final_review = ReviewTarget::Same;
-    store.save(&candidate)?;
+    let candidate = store.update_settings(|current| {
+        current.final_review = ReviewTarget::Same;
+        Ok(())
+    })?;
     *settings = candidate;
     Ok(())
 }
@@ -901,36 +1033,58 @@ pub fn set_selected(
     profile: Option<&str>,
     model: &str,
 ) -> Result<()> {
+    set_selected_with_secrets(store, settings, provider_name, profile, model, Vec::new)
+}
+
+pub(crate) fn set_selected_with_secrets(
+    store: &ConfigStore,
+    settings: &mut Settings,
+    provider_name: &str,
+    profile: Option<&str>,
+    model: &str,
+    extra_secrets: impl FnOnce() -> Vec<String>,
+) -> Result<()> {
     ensure_user_controlled()?;
     let kind: ProviderKind = provider_name.parse()?;
     if model.trim().is_empty() || model.len() > 256 || model.contains(['\r', '\n']) {
         bail!("Укажите корректное непустое имя модели");
     }
-    let mut snapshot = if kind == ProviderKind::Local {
-        let profile = profile.context("Для local укажите --profile ИМЯ")?;
-        settings
-            .local
-            .profiles
-            .get(profile)
-            .cloned()
-            .with_context(|| format!("Профиль local «{profile}» не найден"))?
-    } else {
-        if profile.is_some() {
-            bail!("--profile применяется только к provider local");
+    let candidate = store.update_settings_with_credentials(|fresh, providers_creds| {
+        let live_extra = extra_secrets();
+        let route_dict = crate::model_route::build_route_secret_dictionary_from_raw(
+            providers_creds.values().cloned(),
+            &live_extra,
+        )?;
+        let mut snapshot = if kind == ProviderKind::Local {
+            let profile = profile.context("Для local укажите --profile ИМЯ")?;
+            crate::model_route::configured_local_profile(fresh, profile)?.with_context(|| {
+                let safe_prof = match route_dict.as_ref() {
+                    Some(dict) => crate::redaction::redact_text_with(dict, profile)
+                        .unwrap_or_else(|_| "[скрыто]".into()),
+                    None => profile.to_owned(),
+                };
+                format!("Профиль local «{safe_prof}» не найден")
+            })?
+        } else {
+            if profile.is_some() {
+                bail!("--profile применяется только к provider local");
+            }
+            crate::model_route::configured_cloud_provider(fresh, kind)?
+                .with_context(|| format!("Провайдер {kind} не настроен"))?
+        };
+        snapshot.model = model.to_owned();
+        if snapshot.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            bail!(
+                "Путь ca_file маршрута финального ревью должен быть абсолютным; пересохраните подключение с --ca-file"
+            );
         }
-        settings
-            .providers
-            .get(kind.as_str())
-            .cloned()
-            .with_context(|| format!("Провайдер {kind} не настроен"))?
-    };
-    snapshot.model = model.to_owned();
-    snapshot
-        .validate()
-        .context("Некорректная конфигурация модели финального ревью")?;
-    let mut candidate = settings.clone();
-    candidate.final_review = ReviewTarget::Selected { snapshot };
-    store.save(&candidate)?;
+        snapshot
+            .validate()
+            .context("Некорректная конфигурация модели финального ревью")?;
+        crate::model_route::check_route_against_secret_dictionary(route_dict.as_ref(), &snapshot)?;
+        fresh.final_review = ReviewTarget::Selected { snapshot };
+        Ok(())
+    })?;
     *settings = candidate;
     Ok(())
 }
@@ -990,7 +1144,7 @@ pub fn run_model_command_for_mode(
             true
         }
     };
-    let summary = model_target_summary_for_mode(settings, mode);
+    let summary = redacted_model_target_summary_for_mode(store, settings, mode, &[]);
     if json_output {
         let mut value = summary;
         value["changed"] = json!(changed);
@@ -1003,10 +1157,10 @@ pub fn run_model_command_for_mode(
             "{}Финальное ревью: {} · {}{}",
             if changed { "✓ " } else { "" },
             summary["provider"].as_str().unwrap_or("same"),
-            summary["model"].as_str().unwrap_or_default(),
+            crate::ui::safe(summary["model"].as_str().unwrap_or_default()),
             summary["profile"]
                 .as_str()
-                .map(|profile| format!(" · профиль {profile}"))
+                .map(|profile| format!(" · профиль {}", crate::ui::safe(profile)))
                 .unwrap_or_default(),
         );
         println!(
@@ -1014,6 +1168,23 @@ pub fn run_model_command_for_mode(
         );
     }
     Ok(0)
+}
+
+pub(crate) fn redacted_model_target_summary_for_mode(
+    store: &ConfigStore,
+    settings: &Settings,
+    mode: FinalReviewMode,
+    extra_secrets: &[String],
+) -> Value {
+    let mut summary = model_target_summary_for_mode(settings, mode);
+    if let Some(obj) = summary.as_object_mut() {
+        for key in ["model", "profile"] {
+            if let Some(serde_json::Value::String(s)) = obj.get_mut(key) {
+                *s = crate::model_route::redact_route_display_field(store, extra_secrets, s);
+            }
+        }
+    }
+    summary
 }
 
 #[cfg(test)]

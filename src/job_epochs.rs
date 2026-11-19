@@ -35,6 +35,40 @@ struct Manifest {
     stderr: Vec<EpochPage>,
 }
 
+pub(crate) fn try_redact_manifest(
+    text: &str,
+    secrets: &[String],
+) -> Result<Option<(String, usize)>> {
+    let Ok(mut manifest) = serde_json::from_str::<Manifest>(text) else {
+        return Ok(None);
+    };
+    let dict = (!secrets.is_empty())
+        .then(|| crate::redaction::SecretDictionary::new(secrets))
+        .transpose()?;
+    let mut redact_str = |s: &str| match &dict {
+        Some(d) => crate::redaction::redact_text_with(d, s),
+        None => Ok(s.to_owned()),
+    };
+    manifest.command_id = redact_str(&manifest.command_id)?;
+    crate::artifacts::redact_origin_strings(&mut manifest.origin, &mut redact_str)?;
+    crate::artifacts::redact_job_receipt_value(&mut manifest.terminal, &mut redact_str)?;
+    manifest.handoff.operation_id = redact_str(&manifest.handoff.operation_id)?;
+    crate::artifacts::redact_artifact_meta_strings(
+        &mut manifest.handoff.terminal,
+        &mut redact_str,
+    )?;
+    for page in manifest.stdout.iter_mut().chain(manifest.stderr.iter_mut()) {
+        crate::artifacts::redact_artifact_meta_strings(&mut page.artifact, &mut redact_str)?;
+    }
+    let reserialized = serde_json::to_string(&manifest)?;
+    let len = reserialized.len();
+    let mut end = len.min(16 * 1024 * 1024);
+    while !reserialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(Some((reserialized[..end].to_owned(), len)))
+}
+
 fn command_origin(job: &JobSnapshot) -> ArtifactOrigin {
     ArtifactOrigin {
         actor: job.origin.actor.clone(),
@@ -434,10 +468,11 @@ pub(crate) fn page(
     );
     let manifest = validate(artifacts, text, session_id, false)?;
     bind_manifest(&manifest, lifetime, &request.command_id, proof)?;
-    let mut terminal: Value = serde_json::from_str(&crate::redaction::redact_text(
-        &manifest.terminal.to_string(),
-        secrets,
-    )?)?;
+    let credentials = crate::redaction::SecretDictionary::new(secrets)?;
+    let mut terminal = manifest.terminal.clone();
+    crate::artifacts::redact_job_receipt_value(&mut terminal, &mut |s| {
+        crate::redaction::redact_text_with(&credentials, s)
+    })?;
     ensure!(
         terminal["id"] == request.command_id
             && terminal["session_id"] == session_id
@@ -472,13 +507,13 @@ pub(crate) fn page(
             .iter()
             .map(|p| (p.offset, p.end, &p.artifact))
             .collect();
-        let (mut output, mut next) = crate::job_manifest::render_pages(
+        let (mut output, mut next) = crate::job_manifest::render_pages_with_dictionary(
             artifacts,
             &descriptors,
             total,
             requested,
             request.max_bytes,
-            secrets,
+            &credentials,
         )?;
         if worker_scope && next > limit {
             output.truncate(limit - requested);

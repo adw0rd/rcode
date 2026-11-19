@@ -328,6 +328,12 @@ const ESSENTIAL: &[&str] = &[
     "committed",
     "directory_durability",
     "warning_note",
+    "advisory",
+    "provider",
+    "model",
+    "profile",
+    "uses_remaining",
+    "note",
 ];
 const ESSENTIAL_CHARS: usize = 400;
 /// Head of a non-JSON result kept by the last-resort receipt.
@@ -548,6 +554,7 @@ fn shrink_object(
                                     "partial_line": start,
                                     "char_offset": orig_char_offset,
                                     "shown_chars": taken,
+                                    "omitted_chars": chars.len().saturating_sub(taken),
                                     "next_char_offset": next_char,
                                     "complete_lines": false,
                                     "next_line": next_line,
@@ -685,7 +692,54 @@ fn shrink_object(
         TRUNCATED.into(),
         json!({"original_chars": original, "fields": omitted, "hint": hint}),
     );
-    Value::Object(object).to_string()
+    serialize_receipt_map(tool, &object)
+}
+
+pub(crate) fn serialize_receipt_map(tool: &str, object: &Map<String, Value>) -> String {
+    if tool != crate::advisor::TOOL_NAME {
+        return Value::Object(object.clone()).to_string();
+    }
+    let priority = [
+        "advisory",
+        "status",
+        "provider",
+        "model",
+        "profile",
+        "uses_remaining",
+        "artifact_id",
+        "artifact_bytes",
+        "artifact_truncated",
+        "error",
+        "message",
+        "note",
+    ];
+    let mut out = String::from("{");
+    let mut first = true;
+    let mut emit_pair = |k: &str, v: &Value| {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&serde_json::to_string(k).expect("key string"));
+        out.push(':');
+        out.push_str(&v.to_string());
+    };
+    for &k in &priority {
+        if let Some(v) = object.get(k) {
+            emit_pair(k, v);
+        }
+    }
+    for (k, v) in object {
+        if k == "guidance" || priority.contains(&k.as_str()) {
+            continue;
+        }
+        emit_pair(k, v);
+    }
+    if let Some(guidance) = object.get("guidance") {
+        emit_pair("guidance", guidance);
+    }
+    out.push('}');
+    out.replace("</", "<\\/")
 }
 
 /// Last resort when no proportional shortening fits: the status and identity
@@ -701,6 +755,7 @@ fn essential_receipt(
 ) -> String {
     let mut receipt = Map::new();
     let mut dropped = Vec::new();
+    let mut essential_sliced = Map::new();
     match object {
         Some(object) => {
             for (key, value) in object {
@@ -710,7 +765,9 @@ fn essential_receipt(
                 }
                 let value = match value {
                     Value::String(text) if text.chars().count() > ESSENTIAL_CHARS => {
-                        bound_essential(text, ESSENTIAL_CHARS).0.into()
+                        let (short, info) = bound_essential(text, ESSENTIAL_CHARS);
+                        essential_sliced.insert(key.clone(), info);
+                        short.into()
                     }
                     other => other.clone(),
                 };
@@ -718,7 +775,14 @@ fn essential_receipt(
             }
         }
         None => {
+            let total_chars = content.chars().count();
             let excerpt: String = content.chars().take(EXCERPT_CHARS).collect();
+            if total_chars > EXCERPT_CHARS {
+                essential_sliced.insert(
+                    "excerpt".into(),
+                    json!({ "omitted_chars": total_chars - EXCERPT_CHARS }),
+                );
+            }
             receipt.insert("excerpt".into(), excerpt.into());
         }
     }
@@ -770,8 +834,11 @@ fn essential_receipt(
     if !dropped.is_empty() {
         truncated["omitted_fields"] = json!(dropped);
     }
+    if !essential_sliced.is_empty() {
+        truncated["fields"] = Value::Object(essential_sliced);
+    }
     receipt.insert(TRUNCATED.into(), truncated);
-    Value::Object(receipt).to_string()
+    serialize_receipt_map(tool, &receipt)
 }
 
 /// Bounds one tool result to `limit` units of `budget` before it enters the

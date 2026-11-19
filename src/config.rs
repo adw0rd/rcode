@@ -5,14 +5,13 @@ use std::{
     env, fmt,
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
-    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 const FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Yandex,
@@ -130,7 +129,7 @@ impl FromStr for Effort {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub model: String,
@@ -302,10 +301,7 @@ fn validate_endpoint(value: &str) -> Result<()> {
         bail!("URL провайдера должен содержать адрес сервера без userinfo, query и fragment");
     }
     let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
+    let loopback = crate::model_route::is_loopback_or_v4_mapped_host(host);
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         bail!("URL провайдера требует HTTPS; HTTP разрешён только для loopback");
     }
@@ -344,6 +340,12 @@ pub struct Settings {
     pub vision: VisionSettings,
     #[serde(default, skip_serializing_if = "ReviewTarget::is_same")]
     pub final_review: ReviewTarget,
+    #[serde(default, skip_serializing_if = "AdvisorTarget::is_off")]
+    pub advisor: AdvisorTarget,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) custom_unconfigured_default: Option<bool>,
 }
 
 /// Отдельный маршрут дополнительного host-owned финального ревью.
@@ -361,6 +363,24 @@ pub enum ReviewTarget {
 impl ReviewTarget {
     pub fn is_same(&self) -> bool {
         matches!(self, Self::Same)
+    }
+}
+
+/// Маршрут модели-советника (`/advisor`, паттерн Executor + Advisor).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+pub enum AdvisorTarget {
+    #[default]
+    Off,
+    Selected {
+        snapshot: ProviderSettings,
+    },
+}
+
+impl AdvisorTarget {
+    pub fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
     }
 }
 
@@ -405,13 +425,16 @@ impl Default for Settings {
             active: ProviderKind::Yandex,
             providers: ProviderKind::all()
                 .into_iter()
-                .filter(|kind| *kind != ProviderKind::Local)
+                .filter(|kind| !matches!(*kind, ProviderKind::Local))
                 .map(|kind| (kind.as_str().into(), ProviderSettings::new(kind)))
                 .collect(),
             local: crate::local::LocalProfiles::default(),
             websearch: WebSearchSettings::default(),
             vision: VisionSettings::default(),
             final_review: ReviewTarget::Same,
+            advisor: AdvisorTarget::Off,
+            custom_configured: false,
+            custom_unconfigured_default: Some(true),
         }
     }
 }
@@ -439,6 +462,10 @@ impl Settings {
     pub fn remember_provider(&mut self, provider: &ProviderSettings) {
         if provider.kind != ProviderKind::Local {
             self.active = provider.kind;
+            if provider.kind == ProviderKind::Custom {
+                self.custom_configured = true;
+                self.custom_unconfigured_default = None;
+            }
             self.providers
                 .insert(provider.kind.to_string(), provider.clone());
             return;
@@ -532,7 +559,7 @@ pub struct ConfigStore {
     root: PathBuf,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Credentials {
     version: u32,
     providers: BTreeMap<String, String>,
@@ -799,20 +826,173 @@ impl ConfigStore {
         Ok(permissions)
     }
 
-    pub fn load(&self) -> Result<Settings> {
-        ensure_directory(&self.root)?;
-        let Some(settings) = read_json::<Settings>(&self.root.join("config.json"), "настроек")?
+    fn apply_legacy_custom_migration(&self, settings: &mut Settings) {
+        if settings.custom_configured {
+            settings.custom_unconfigured_default = None;
+        } else if let Some(entry) = settings.providers.get(ProviderKind::Custom.as_str())
+            && (settings.active == ProviderKind::Custom
+                || *entry != ProviderSettings::new(ProviderKind::Custom)
+                || (settings.custom_unconfigured_default != Some(true)
+                    && self.load_credentials().ok().is_some_and(|creds| {
+                        creds
+                            .providers
+                            .get(ProviderKind::Custom.as_str())
+                            .is_some_and(|v| !v.trim().is_empty())
+                    })))
+        {
+            settings.custom_configured = true;
+            settings.custom_unconfigured_default = None;
+        }
+    }
+
+    fn load_unlocked(&self) -> Result<Settings> {
+        let Some(mut settings) = read_json::<Settings>(&self.root.join("config.json"), "настроек")?
         else {
             return Ok(Settings::default());
         };
         check_version(settings.version, "настроек")?;
+        self.apply_legacy_custom_migration(&mut settings);
         Ok(settings)
+    }
+
+    pub fn load(&self) -> Result<Settings> {
+        ensure_directory(&self.root)?;
+        self.load_unlocked()
     }
 
     pub fn save(&self, settings: &Settings) -> Result<()> {
         check_version(settings.version, "настроек")?;
         ensure_directory(&self.root)?;
-        write_private_json(&self.root.join("config.json"), settings)
+        let _lock = lock_state_file(&self.root.join("config.lock"))?;
+        let mut normalized = settings.clone();
+        if normalized.custom_configured {
+            normalized.custom_unconfigured_default = None;
+        }
+        write_private_json(&self.root.join("config.json"), &normalized)
+    }
+
+    /// Atomically loads `config.json` under `config.lock`, applies `mutate`, and writes back.
+    pub fn update_settings<F>(&self, mutate: F) -> Result<Settings>
+    where
+        F: FnOnce(&mut Settings) -> Result<()>,
+    {
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("config.lock"))?;
+        let mut settings = self.load_unlocked()?;
+        mutate(&mut settings)?;
+        if settings.custom_configured {
+            settings.custom_unconfigured_default = None;
+        }
+        check_version(settings.version, "настроек")?;
+        write_private_json(&self.root.join("config.json"), &settings)?;
+        Ok(settings)
+    }
+
+    /// Atomically updates `config.json` while holding `config.lock` -> `credentials.lock`
+    /// so secret-dictionary and credential-presence checks cannot race concurrent key writes.
+    pub(crate) fn update_settings_with_credentials<F>(&self, mutate: F) -> Result<Settings>
+    where
+        F: FnOnce(&mut Settings, &BTreeMap<String, String>) -> Result<()>,
+    {
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let mut settings = self.load_unlocked()?;
+        let credentials = self.load_credentials()?;
+        mutate(&mut settings, &credentials.providers)?;
+        if settings.custom_configured {
+            settings.custom_unconfigured_default = None;
+        }
+        check_version(settings.version, "настроек")?;
+        write_private_json(&self.root.join("config.json"), &settings)?;
+        Ok(settings)
+    }
+
+    /// Reads an atomic `(Settings, credentials.providers)` snapshot under `config.lock` -> `credentials.lock`
+    /// in a single lock acquisition so route enumeration never re-locks or re-parses per profile.
+    pub(crate) fn read_consistent_routing_state(
+        &self,
+    ) -> Result<(Settings, BTreeMap<String, String>)> {
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let settings = self.load_unlocked()?;
+        let credentials = self.load_credentials()?;
+        Ok((settings, credentials.providers))
+    }
+
+    pub(crate) fn cloud_credential_from_map(
+        kind: ProviderKind,
+        providers_creds: &BTreeMap<String, String>,
+    ) -> Result<Option<Credential>> {
+        if kind == ProviderKind::Local {
+            return Ok(None);
+        }
+        if let Some(credential) = credential_from_env(kind, |name| env::var(name).ok())? {
+            return Ok(Some(credential));
+        }
+        providers_creds
+            .get(kind.as_str())
+            .map(|value| {
+                validate_credential(value)?;
+                Ok(Credential {
+                    value: value.clone(),
+                    source: "credentials.json".into(),
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn local_credential_state_from_snapshot(
+        disk_settings: &Settings,
+        providers_creds: &BTreeMap<String, String>,
+        provider: &ProviderSettings,
+    ) -> Result<CredentialState> {
+        let Some(local) = &provider.local else {
+            bail!("Профиль local повреждён: нет параметров local");
+        };
+        crate::local::validate_profile_name(&local.profile)?;
+        let Some(disk_profile) = disk_settings.local.profiles.get(&local.profile) else {
+            bail!("Профиль local «{}» больше не существует", local.profile);
+        };
+        let key = providers_creds
+            .get(&format!(
+                "{}{}",
+                crate::local::CREDENTIAL_PREFIX,
+                local.profile
+            ))
+            .map(|value| -> Result<Credential> {
+                crate::local::validate_key(value)?;
+                Ok(Credential {
+                    value: value.clone(),
+                    source: "credentials.json".into(),
+                })
+            })
+            .transpose()?;
+        let same_endpoint = provider
+            .base_url
+            .as_deref()
+            .and_then(crate::local::endpoint_identity)
+            .is_some_and(|snapshot| {
+                disk_profile
+                    .base_url
+                    .as_deref()
+                    .and_then(crate::local::endpoint_identity)
+                    == Some(snapshot)
+            });
+        if !same_endpoint {
+            if key.is_some() || disk_profile.local.as_ref().is_some_and(|l| l.key_required) {
+                bail!("Адрес профиля local «{}» изменился", local.profile);
+            }
+            return Ok(CredentialState::NotRequired);
+        }
+        Ok(match key {
+            Some(credential) => CredentialState::Present(credential),
+            None if disk_profile.local.as_ref().is_some_and(|l| l.key_required) => {
+                CredentialState::Missing
+            }
+            None => CredentialState::NotRequired,
+        })
     }
 
     pub fn credential(&self, kind: ProviderKind) -> Result<Option<Credential>> {
@@ -823,6 +1003,12 @@ impl ConfigStore {
         if let Some(credential) = credential_from_env(kind, |name| env::var(name).ok())? {
             return Ok(Some(credential));
         }
+        ensure_directory(&self.root)?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        self.credential_from_disk_unlocked(kind)
+    }
+
+    fn credential_from_disk_unlocked(&self, kind: ProviderKind) -> Result<Option<Credential>> {
         let credentials = self.load_credentials()?;
         credentials
             .providers
@@ -837,12 +1023,231 @@ impl ConfigStore {
             .transpose()
     }
 
+    fn has_persisted_cloud_provider_unlocked(&self, kind: ProviderKind) -> Result<bool> {
+        let Some(mut on_disk) = read_json::<Settings>(&self.root.join("config.json"), "настроек")?
+        else {
+            return Ok(false);
+        };
+        check_version(on_disk.version, "настроек")?;
+        self.apply_legacy_custom_migration(&mut on_disk);
+        Ok(on_disk.providers.contains_key(kind.as_str())
+            && crate::model_route::configured_cloud_provider(&on_disk, kind)
+                .ok()
+                .flatten()
+                .is_some())
+    }
+
+    /// Reads an atomic `(Settings, Option<Credential>)` snapshot under `config.lock` -> `credentials.lock`.
+    pub fn read_consistent_cloud(
+        &self,
+        kind: ProviderKind,
+    ) -> Result<(Settings, Option<Credential>)> {
+        let (settings, cred, _) = self.read_consistent_cloud_with_presence(kind)?;
+        Ok((settings, cred))
+    }
+
+    /// Reads `(Settings, Option<Credential>, persisted_provider_slot_on_disk)` under
+    /// `config.lock` -> `credentials.lock` so callers can distinguish a saved connection
+    /// in `config.json` from `Settings::default()` when `config.json` is absent.
+    pub fn read_consistent_cloud_with_presence(
+        &self,
+        kind: ProviderKind,
+    ) -> Result<(Settings, Option<Credential>, bool)> {
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let persisted = self.has_persisted_cloud_provider_unlocked(kind)?;
+        let settings = self.load_unlocked()?;
+        let cred = if kind == ProviderKind::Local {
+            None
+        } else if let Some(c) = credential_from_env(kind, |name| env::var(name).ok())? {
+            Some(c)
+        } else {
+            self.credential_from_disk_unlocked(kind)?
+        };
+        Ok((settings, cred, persisted))
+    }
+
+    /// Atomically commits a cloud connection + key under `config.lock` -> `credentials.lock`,
+    /// verifying that neither the on-disk connection nor a reused key changed since `/connect` started,
+    /// and never coexisting on disk as `(old_endpoint, new_key)` or `(new_endpoint, old_key)`.
+    pub fn commit_cloud_connection(
+        &self,
+        initial_expected: &ProviderSettings,
+        next: &ProviderSettings,
+        chosen_key: &str,
+        save_key: bool,
+    ) -> Result<Settings> {
+        self.commit_cloud_connection_with_secrets(
+            initial_expected,
+            next,
+            chosen_key,
+            save_key,
+            Vec::new,
+        )
+    }
+
+    pub(crate) fn commit_cloud_connection_with_secrets(
+        &self,
+        initial_expected: &ProviderSettings,
+        next: &ProviderSettings,
+        chosen_key: &str,
+        save_key: bool,
+        extra_secrets: impl FnOnce() -> Vec<String>,
+    ) -> Result<Settings> {
+        if next.kind == ProviderKind::Local {
+            bail!("commit_cloud_connection применяется только к облачным провайдерам");
+        }
+        if next.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            bail!("Путь ca_file в конфигурации должен быть абсолютным");
+        }
+        next.validate()?;
+        validate_credential(chosen_key)?;
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let prev_settings = self.load_unlocked()?;
+        let configured_on_disk =
+            crate::model_route::configured_cloud_provider(&prev_settings, next.kind)?;
+        let current_disk = configured_on_disk
+            .clone()
+            .unwrap_or_else(|| prev_settings.provider(next.kind));
+        if !crate::model_route::RouteIdentity::disk_unchanged(initial_expected, &current_disk) {
+            bail!(
+                "Конфигурация провайдера {} изменилась в другом процессе; повторите подключение",
+                next.kind
+            );
+        }
+        let prev_credentials = self.load_credentials()?;
+        let persisted_on_disk = self.has_persisted_cloud_provider_unlocked(next.kind)?;
+        let endpoint_changed = !persisted_on_disk
+            || configured_on_disk.as_ref().is_none_or(|saved| {
+                !crate::model_route::RouteIdentity::same_connection(saved, next)
+            });
+        let mut to_save = current_disk.clone();
+        to_save.kind = next.kind;
+        to_save.base_url = next.base_url.clone();
+        to_save.folder_id = next.folder_id.clone();
+        to_save.auth_url = next.auth_url.clone();
+        to_save.scope = next.scope.clone();
+        to_save.ca_file = next.ca_file.clone();
+        if to_save.model != next.model {
+            to_save.model = next.model.clone();
+            to_save.effort = next.effort;
+        } else if initial_expected.effort != next.effort {
+            to_save.effort = next.effort;
+        }
+        to_save.validate()?;
+        let mut live_extra = extra_secrets();
+        crate::redaction::push_secret_variants(&mut live_extra, chosen_key);
+        let route_dict = crate::model_route::build_route_secret_dictionary_from_raw(
+            prev_credentials.providers.values().cloned(),
+            &live_extra,
+        )?;
+        crate::model_route::check_route_against_secret_dictionary(route_dict.as_ref(), &to_save)?;
+        let mut settings = prev_settings.clone();
+        settings.remember_provider(&to_save);
+        check_version(settings.version, "настроек")?;
+        let mut cleared_old_disk_key = false;
+        if !save_key {
+            let current_cred =
+                if let Some(c) = credential_from_env(next.kind, |n| env::var(n).ok())? {
+                    Some(c)
+                } else {
+                    self.credential_from_disk_unlocked(next.kind)?
+                };
+            let Some(cred) = current_cred.filter(|c| c.value == chosen_key) else {
+                bail!(
+                    "Ключ провайдера {} изменился в другом процессе; повторите подключение",
+                    next.kind
+                );
+            };
+            if endpoint_changed && cred.source == "credentials.json" {
+                bail!(
+                    "Параметры подключения провайдера {} изменились; для нового адреса требуется ввести ключ заново",
+                    next.kind
+                );
+            }
+            // If switching endpoint while authenticating via an env var, remove any stale disk key
+            // for the previous endpoint so a later run without the env var never sends old key -> new URL.
+            if endpoint_changed
+                && cred.source != "credentials.json"
+                && prev_credentials.providers.contains_key(next.kind.as_str())
+            {
+                self.clear_credential_slot_before_config(&prev_credentials, next.kind.as_str())?;
+                cleared_old_disk_key = true;
+            }
+        } else if endpoint_changed && prev_credentials.providers.contains_key(next.kind.as_str()) {
+            self.clear_credential_slot_before_config(&prev_credentials, next.kind.as_str())?;
+            cleared_old_disk_key = true;
+        }
+        if let Err(err) = write_private_json(&self.root.join("config.json"), &settings) {
+            if cleared_old_disk_key
+                && let Ok(on_disk) = self.load_unlocked()
+                && crate::model_route::RouteIdentity::disk_unchanged(
+                    &current_disk,
+                    &crate::model_route::configured_cloud_provider(&on_disk, next.kind)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| on_disk.provider(next.kind)),
+                )
+            {
+                let _ = write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+            }
+            return Err(err);
+        }
+        if save_key {
+            let slot = next.kind.as_str();
+            let mut updated_creds = prev_credentials.clone();
+            updated_creds
+                .providers
+                .insert(slot.into(), chosen_key.into());
+            if let Err(err) =
+                write_private_json(&self.root.join("credentials.json"), &updated_creds)
+            {
+                // `write_private_json` can fail on directory `fsync` after `rename` already
+                // placed `chosen_key` on disk. Never restore `prev_settings` (old endpoint)
+                // until `chosen_key` is confirmed absent from `credentials.json`.
+                let mut cleared = prev_credentials.clone();
+                cleared.providers.remove(slot);
+                if self
+                    .load_credentials()
+                    .ok()
+                    .is_none_or(|c| c.providers.contains_key(slot))
+                {
+                    let _ = write_private_json(&self.root.join("credentials.json"), &cleared);
+                }
+                if self
+                    .load_credentials()
+                    .is_ok_and(|c| !c.providers.contains_key(slot))
+                    && write_private_json(&self.root.join("config.json"), &prev_settings).is_ok()
+                    && prev_credentials.providers.contains_key(slot)
+                    && let Ok(on_disk) = self.load_unlocked()
+                    && crate::model_route::RouteIdentity::disk_unchanged(
+                        &current_disk,
+                        &crate::model_route::configured_cloud_provider(&on_disk, next.kind)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| on_disk.provider(next.kind)),
+                    )
+                {
+                    let _ =
+                        write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+                }
+                return Err(err);
+            }
+        }
+        Ok(settings)
+    }
+
     pub fn save_credential(&self, kind: ProviderKind, value: &str) -> Result<()> {
         if kind == ProviderKind::Local {
             // An unscoped "local" entry would never be read or deleted.
             bail!("Ключ local хранится в профиле: rcode local key ИМЯ --stdin");
         }
         validate_credential(value)?;
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
         let mut credentials = self.load_credentials()?;
         credentials
             .providers
@@ -853,16 +1258,27 @@ impl ConfigStore {
     /// Generic key slot for auxiliary integrations (for example websearch).
     /// Host-only redaction material. Never pass this list to children or tools.
     pub(crate) fn redaction_secrets(&self) -> Result<Vec<String>> {
-        Ok(self.load_credentials()?.providers.into_values().collect())
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        Ok(self
+            .load_credentials()?
+            .providers
+            .into_values()
+            .filter(|v| !v.is_empty())
+            .collect())
     }
 
     pub fn named_credential(&self, name: &str) -> Result<Option<String>> {
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
         let credentials = self.load_credentials()?;
         Ok(credentials.providers.get(name).cloned())
     }
 
     pub fn save_named_credential(&self, name: &str, value: &str) -> Result<()> {
         validate_credential(value)?;
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
         let mut credentials = self.load_credentials()?;
         credentials
             .providers
@@ -871,6 +1287,8 @@ impl ConfigStore {
     }
 
     pub fn delete_named_credential(&self, name: &str) -> Result<()> {
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
         let mut credentials = self.load_credentials()?;
         if credentials.providers.remove(name).is_some() {
             write_private_json(&self.root.join("credentials.json"), &credentials)?;
@@ -879,6 +1297,8 @@ impl ConfigStore {
     }
 
     pub fn delete_credential(&self, kind: ProviderKind) -> Result<()> {
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
         let mut credentials = self.load_credentials()?;
         if credentials.providers.remove(kind.as_str()).is_some() {
             write_private_json(&self.root.join("credentials.json"), &credentials)?;
@@ -895,10 +1315,20 @@ impl ConfigStore {
                 None => CredentialState::Missing,
             });
         }
+        Ok(self.read_consistent_local(provider)?.1)
+    }
+
+    pub fn read_consistent_local(
+        &self,
+        provider: &ProviderSettings,
+    ) -> Result<(Settings, CredentialState)> {
         let Some(local) = &provider.local else {
             bail!("Профиль local повреждён: нет параметров local");
         };
-        let settings = self.load()?;
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let settings = self.load_unlocked()?;
         let Some(profile) = settings.local.profiles.get(&local.profile) else {
             // A deleted profile also deleted its key: a server that required
             // one cannot be used until the user chooses a profile again.
@@ -908,9 +1338,9 @@ impl ConfigStore {
                     local.profile
                 );
             }
-            return Ok(CredentialState::NotRequired);
+            return Ok((settings, CredentialState::NotRequired));
         };
-        let key = self.local_credential(&local.profile)?;
+        let key = self.local_credential_unlocked(&local.profile)?;
         let same_endpoint = provider
             .base_url
             .as_deref()
@@ -930,18 +1360,26 @@ impl ConfigStore {
                     local.profile
                 );
             }
-            return Ok(CredentialState::NotRequired);
+            return Ok((settings, CredentialState::NotRequired));
         }
-        Ok(match key {
+        let state = match key {
             Some(credential) => CredentialState::Present(credential),
             None if profile.local.as_ref().is_some_and(|l| l.key_required) => {
                 CredentialState::Missing
             }
             None => CredentialState::NotRequired,
-        })
+        };
+        Ok((settings, state))
     }
 
     pub fn local_credential(&self, profile: &str) -> Result<Option<Credential>> {
+        crate::local::validate_profile_name(profile)?;
+        ensure_directory(&self.root)?;
+        let _lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        self.local_credential_unlocked(profile)
+    }
+
+    fn local_credential_unlocked(&self, profile: &str) -> Result<Option<Credential>> {
         crate::local::validate_profile_name(profile)?;
         self.load_credentials()?
             .providers
@@ -956,6 +1394,391 @@ impl ConfigStore {
                 })
             })
             .transpose()
+    }
+
+    /// Atomically adds/replaces a local profile and updates its bound key under
+    /// `config.lock` -> `credentials.lock`. Rejects conflicts BEFORE touching credentials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_local_profile_add(
+        &self,
+        name: &str,
+        force: bool,
+        activate: bool,
+        allow_draft_model: bool,
+        profile: ProviderSettings,
+        new_key: Option<&str>,
+    ) -> Result<(Settings, bool)> {
+        self.commit_local_profile_add_with_secrets(
+            name,
+            force,
+            activate,
+            allow_draft_model,
+            profile,
+            new_key,
+            Vec::new,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_local_profile_add_with_secrets(
+        &self,
+        name: &str,
+        force: bool,
+        activate: bool,
+        allow_draft_model: bool,
+        mut profile: ProviderSettings,
+        new_key: Option<&str>,
+        extra_secrets: impl FnOnce() -> Vec<String>,
+    ) -> Result<(Settings, bool)> {
+        crate::local::validate_profile_name(name)?;
+        if profile.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            bail!("Путь ca_file профиля local должен быть абсолютным");
+        }
+        if allow_draft_model && !activate && profile.model.trim().is_empty() {
+            profile.validate_effort()?;
+            if profile.max_output_tokens == 0
+                || profile.request_timeout_secs == 0
+                || profile.idle_timeout_secs == 0
+            {
+                bail!("Лимит выходных токенов и таймауты должны быть больше нуля");
+            }
+            crate::local::validate(&profile)?;
+        } else {
+            profile.validate()?;
+        }
+        if let Some(key) = new_key {
+            crate::local::validate_key(key)?;
+        }
+        let snapshot_name = profile
+            .local
+            .as_ref()
+            .map(|l| l.profile.as_str())
+            .context("Профиль local повреждён: нет параметров local")?;
+        if snapshot_name != name {
+            bail!("Имя профиля local («{name}») не совпадает со снимком («{snapshot_name}»)");
+        }
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let prev_settings = self.load_unlocked()?;
+        let mut settings = prev_settings.clone();
+        let existing = prev_settings.local.profiles.get(name);
+        if !force && existing.is_some() {
+            bail!("Профиль {name} уже существует; замените его с --force или выберите другое имя");
+        }
+        let moved = existing.is_some_and(|old| {
+            old.base_url
+                .as_deref()
+                .and_then(crate::local::endpoint_identity)
+                != profile
+                    .base_url
+                    .as_deref()
+                    .and_then(crate::local::endpoint_identity)
+        });
+        let prev_credentials = self.load_credentials()?;
+        let mut live_extra = extra_secrets();
+        if let Some(key) = new_key {
+            crate::redaction::push_secret_variants(&mut live_extra, key);
+        }
+        let route_dict = crate::model_route::build_route_secret_dictionary_from_raw(
+            prev_credentials.providers.values().cloned(),
+            &live_extra,
+        )?;
+        crate::model_route::check_route_against_secret_dictionary(route_dict.as_ref(), &profile)?;
+        let cred_slot = format!("{}{name}", crate::local::CREDENTIAL_PREFIX);
+        let kept_key = existing.is_some_and(|old| old.ca_file == profile.ca_file)
+            && !moved
+            && new_key.is_none()
+            && prev_credentials.providers.contains_key(&cred_slot);
+        if let Some(local) = profile.local.as_mut() {
+            local.key_required = new_key.is_some() || kept_key;
+        }
+        // Step 1: Drop any stale key BEFORE updating `config.json`, so an untimely kill
+        // leaves the old profile without a key rather than pairing `(old_url, new_key)` or `(new_url, old_key)`.
+        let mut cleared_old_key = false;
+        if !kept_key && prev_credentials.providers.contains_key(&cred_slot) {
+            self.clear_credential_slot_before_config(&prev_credentials, &cred_slot)?;
+            cleared_old_key = true;
+        }
+        // Step 2: Persist the new profile in `config.json`.
+        settings
+            .local
+            .profiles
+            .insert(name.to_owned(), profile.clone());
+        if activate {
+            settings.remember_provider(&profile);
+        } else if !allow_draft_model && settings.local.active.is_none() {
+            settings.local.active = Some(name.to_owned());
+        }
+        check_version(settings.version, "настроек")?;
+        if let Err(err) = write_private_json(&self.root.join("config.json"), &settings) {
+            if cleared_old_key
+                && let Some(old_prof) = existing
+                && let Ok(on_disk) = self.load_unlocked()
+                && on_disk
+                    .local
+                    .profiles
+                    .get(name)
+                    .is_some_and(|p| crate::model_route::RouteIdentity::disk_unchanged(p, old_prof))
+            {
+                let _ = write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+            }
+            return Err(err);
+        }
+        // Step 3: Bind the new key after the new endpoint is persisted on disk.
+        if let Some(key) = new_key {
+            let mut updated_creds = prev_credentials.clone();
+            updated_creds
+                .providers
+                .insert(cred_slot.clone(), key.to_owned());
+            if let Err(err) =
+                write_private_json(&self.root.join("credentials.json"), &updated_creds)
+            {
+                let mut cleared = prev_credentials.clone();
+                cleared.providers.remove(&cred_slot);
+                if self
+                    .load_credentials()
+                    .ok()
+                    .is_none_or(|c| c.providers.contains_key(&cred_slot))
+                {
+                    let _ = write_private_json(&self.root.join("credentials.json"), &cleared);
+                }
+                if self
+                    .load_credentials()
+                    .is_ok_and(|c| !c.providers.contains_key(&cred_slot))
+                    && write_private_json(&self.root.join("config.json"), &prev_settings).is_ok()
+                    && prev_credentials.providers.contains_key(&cred_slot)
+                    && let Some(old_prof) = existing
+                    && let Ok(on_disk) = self.load_unlocked()
+                    && on_disk.local.profiles.get(name).is_some_and(|p| {
+                        crate::model_route::RouteIdentity::disk_unchanged(p, old_prof)
+                    })
+                {
+                    let _ =
+                        write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+                }
+                return Err(err);
+            }
+        }
+        Ok((settings, moved))
+    }
+
+    /// Commits a final `(model, ca_file)` selection from `rcode connect local` on an
+    /// existing profile under `config.lock` -> `credentials.lock`, rejecting concurrent
+    /// edits/deletions of `initial_expected` and rotating/clearing keys when `ca_file` changed.
+    pub fn commit_local_profile_connect(
+        &self,
+        initial_expected: &ProviderSettings,
+        name: &str,
+        next_profile: ProviderSettings,
+        new_key: Option<&str>,
+        catalog_verified_noauth: bool,
+    ) -> Result<Settings> {
+        self.commit_local_profile_connect_with_secrets(
+            initial_expected,
+            name,
+            next_profile,
+            new_key,
+            catalog_verified_noauth,
+            Vec::new,
+        )
+    }
+
+    pub(crate) fn commit_local_profile_connect_with_secrets(
+        &self,
+        initial_expected: &ProviderSettings,
+        name: &str,
+        next_profile: ProviderSettings,
+        new_key: Option<&str>,
+        catalog_verified_noauth: bool,
+        extra_secrets: impl FnOnce() -> Vec<String>,
+    ) -> Result<Settings> {
+        crate::local::validate_profile_name(name)?;
+        if next_profile
+            .ca_file
+            .as_ref()
+            .is_some_and(|ca| !ca.is_absolute())
+        {
+            bail!("Путь ca_file профиля local должен быть абсолютным");
+        }
+        next_profile.validate()?;
+        if let Some(key) = new_key {
+            crate::local::validate_key(key)?;
+        }
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let prev_settings = self.load_unlocked()?;
+        let current_disk = crate::model_route::configured_local_profile(&prev_settings, name)?
+            .ok_or_else(|| anyhow::anyhow!("Профиль local «{name}» больше не сохранён"))?;
+        if !crate::model_route::RouteIdentity::disk_unchanged(initial_expected, &current_disk) {
+            bail!(
+                "Параметры локального профиля «{name}» изменились в другом процессе; повторите подключение"
+            );
+        }
+        let prev_key_required = current_disk
+            .local
+            .as_ref()
+            .is_some_and(|local| local.key_required);
+        let mut merged_profile = current_disk.clone();
+        merged_profile.ca_file = next_profile.ca_file;
+        merged_profile.model = next_profile.model;
+        let prev_credentials = self.load_credentials()?;
+        let mut live_extra = extra_secrets();
+        if let Some(key) = new_key {
+            crate::redaction::push_secret_variants(&mut live_extra, key);
+        }
+        let route_dict = crate::model_route::build_route_secret_dictionary_from_raw(
+            prev_credentials.providers.values().cloned(),
+            &live_extra,
+        )?;
+        crate::model_route::check_route_against_secret_dictionary(
+            route_dict.as_ref(),
+            &merged_profile,
+        )?;
+        let cred_slot = format!("{}{name}", crate::local::CREDENTIAL_PREFIX);
+        let kept_key = current_disk.ca_file == merged_profile.ca_file
+            && new_key.is_none()
+            && prev_credentials.providers.contains_key(&cred_slot);
+        if let Some(local) = merged_profile.local.as_mut() {
+            local.key_required =
+                new_key.is_some() || kept_key || (!catalog_verified_noauth && prev_key_required);
+        }
+        merged_profile.validate()?;
+        let mut cleared_old_key = false;
+        if !kept_key && prev_credentials.providers.contains_key(&cred_slot) {
+            self.clear_credential_slot_before_config(&prev_credentials, &cred_slot)?;
+            cleared_old_key = true;
+        }
+        let mut settings = prev_settings.clone();
+        settings.remember_provider(&merged_profile);
+        check_version(settings.version, "настроек")?;
+        if let Err(err) = write_private_json(&self.root.join("config.json"), &settings) {
+            if cleared_old_key
+                && let Ok(on_disk) = self.load_unlocked()
+                && on_disk.local.profiles.get(name).is_some_and(|p| {
+                    crate::model_route::RouteIdentity::disk_unchanged(p, &current_disk)
+                })
+            {
+                let _ = write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+            }
+            return Err(err);
+        }
+        if let Some(key) = new_key {
+            let mut updated_creds = prev_credentials.clone();
+            updated_creds
+                .providers
+                .insert(cred_slot.clone(), key.to_owned());
+            if let Err(err) =
+                write_private_json(&self.root.join("credentials.json"), &updated_creds)
+            {
+                let mut cleared = prev_credentials.clone();
+                cleared.providers.remove(&cred_slot);
+                if self
+                    .load_credentials()
+                    .ok()
+                    .is_none_or(|c| c.providers.contains_key(&cred_slot))
+                {
+                    let _ = write_private_json(&self.root.join("credentials.json"), &cleared);
+                }
+                if self
+                    .load_credentials()
+                    .is_ok_and(|c| !c.providers.contains_key(&cred_slot))
+                    && write_private_json(&self.root.join("config.json"), &prev_settings).is_ok()
+                    && prev_credentials.providers.contains_key(&cred_slot)
+                    && let Ok(on_disk) = self.load_unlocked()
+                    && on_disk.local.profiles.get(name).is_some_and(|p| {
+                        crate::model_route::RouteIdentity::disk_unchanged(p, &current_disk)
+                    })
+                {
+                    let _ =
+                        write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+                }
+                return Err(err);
+            }
+        }
+        Ok(settings)
+    }
+
+    /// Atomically binds `key` to `name` under `config.lock` -> `credentials.lock` ONLY if
+    /// the on-disk profile still matches `expected_profile`'s endpoint.
+    pub fn commit_local_profile_key(
+        &self,
+        expected_profile: &ProviderSettings,
+        name: &str,
+        key: &str,
+    ) -> Result<Settings> {
+        crate::local::validate_profile_name(name)?;
+        crate::local::validate_key(key)?;
+        let snapshot_name = expected_profile
+            .local
+            .as_ref()
+            .map(|l| l.profile.as_str())
+            .context("Профиль local повреждён: нет параметров local")?;
+        if snapshot_name != name {
+            bail!("Имя профиля local («{name}») не совпадает со снимком («{snapshot_name}»)");
+        }
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let prev_settings = self.load_unlocked()?;
+        crate::local_app::check_commit(&prev_settings, expected_profile)?;
+        let prev_credentials = self.load_credentials()?;
+        let disk_profile = crate::model_route::configured_local_profile(&prev_settings, name)?
+            .unwrap_or_else(|| expected_profile.clone());
+        if !crate::model_route::RouteIdentity::same_connection(expected_profile, &disk_profile) {
+            bail!(
+                "Параметры подключения локального профиля «{name}» изменились в другом процессе; выберите профиль заново"
+            );
+        }
+        let key_slice = [key.to_owned()];
+        let dict = crate::model_route::build_route_secret_dictionary_from_raw(
+            prev_credentials.providers.values().cloned(),
+            &key_slice,
+        )?;
+        crate::model_route::check_route_against_secret_dictionary(dict.as_ref(), &disk_profile)?;
+        let slot = format!("{}{name}", crate::local::CREDENTIAL_PREFIX);
+        let mut settings = prev_settings.clone();
+        let mut wrote_config = false;
+        if let Some(local) = settings
+            .local
+            .profiles
+            .get_mut(name)
+            .and_then(|p| p.local.as_mut())
+            .filter(|l| !l.key_required)
+        {
+            local.key_required = true;
+            check_version(settings.version, "настроек")?;
+            if let Err(err) = write_private_json(&self.root.join("config.json"), &settings) {
+                if !prev_credentials.providers.contains_key(&slot)
+                    && self.load_unlocked().is_ok_and(|on_disk| {
+                        on_disk
+                            .local
+                            .profiles
+                            .get(name)
+                            .and_then(|p| p.local.as_ref())
+                            .is_some_and(|l| l.key_required)
+                    })
+                {
+                    let _ = write_private_json(&self.root.join("config.json"), &prev_settings);
+                }
+                return Err(err);
+            }
+            wrote_config = true;
+        }
+        let mut updated_creds = prev_credentials;
+        updated_creds.providers.insert(slot.clone(), key.to_owned());
+        if let Err(err) = write_private_json(&self.root.join("credentials.json"), &updated_creds) {
+            if wrote_config
+                && self
+                    .load_credentials()
+                    .is_ok_and(|c| !c.providers.contains_key(&slot))
+            {
+                let _ = write_private_json(&self.root.join("config.json"), &prev_settings);
+            }
+            return Err(err);
+        }
+        Ok(settings)
     }
 
     pub fn save_local_credential(&self, profile: &str, value: &str) -> Result<()> {
@@ -987,14 +1810,57 @@ impl ConfigStore {
     /// Removes a profile together with its key; the active choice is cleared.
     pub fn remove_local_profile(&self, settings: &mut Settings, profile: &str) -> Result<()> {
         crate::local::validate_profile_name(profile)?;
-        if settings.local.profiles.remove(profile).is_none() {
+        ensure_directory(&self.root)?;
+        let _cfg_lock = lock_state_file(&self.root.join("config.lock"))?;
+        let _cred_lock = lock_state_file(&self.root.join("credentials.lock"))?;
+        let mut current = self.load_unlocked()?;
+        if current.local.profiles.remove(profile).is_none() {
             bail!("Профиль local «{profile}» не найден");
         }
-        if settings.local.active.as_deref() == Some(profile) {
-            settings.local.active = None;
+        if current.local.active.as_deref() == Some(profile) {
+            current.local.active = None;
         }
-        self.delete_local_credential(profile)?;
-        self.save(settings)
+        check_version(current.version, "настроек")?;
+        // Remove the profile's key FIRST so an error never orphans an undeletable credential.
+        let prev_credentials = self.load_credentials()?;
+        let slot = format!("{}{profile}", crate::local::CREDENTIAL_PREFIX);
+        let removed_cred = prev_credentials.providers.contains_key(&slot);
+        if removed_cred {
+            self.clear_credential_slot_before_config(&prev_credentials, &slot)?;
+        }
+        if let Err(err) = write_private_json(&self.root.join("config.json"), &current) {
+            if removed_cred
+                && let Ok(on_disk) = self.load_unlocked()
+                && on_disk.local.profiles.contains_key(profile)
+            {
+                let _ = write_private_json(&self.root.join("credentials.json"), &prev_credentials);
+            }
+            return Err(err);
+        }
+        *settings = current;
+        Ok(())
+    }
+
+    /// Clears `slot` from `credentials.json` BEFORE `config.json` has been modified. If
+    /// `write_private_json` fails on directory `fsync` after `rename` already removed `slot`,
+    /// restores `prev_credentials` because the previous endpoint/profile is still in `config.json`.
+    fn clear_credential_slot_before_config(
+        &self,
+        prev_credentials: &Credentials,
+        slot: &str,
+    ) -> Result<()> {
+        let mut cleared = prev_credentials.clone();
+        cleared.providers.remove(slot);
+        if let Err(err) = write_private_json(&self.root.join("credentials.json"), &cleared) {
+            if self
+                .load_credentials()
+                .is_ok_and(|c| !c.providers.contains_key(slot))
+            {
+                let _ = write_private_json(&self.root.join("credentials.json"), prev_credentials);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn load_credentials(&self) -> Result<Credentials> {
@@ -1006,11 +1872,8 @@ impl ConfigStore {
     }
 }
 
-fn credential_from_env(
-    kind: ProviderKind,
-    mut lookup: impl FnMut(&str) -> Option<String>,
-) -> Result<Option<Credential>> {
-    let names: &[&str] = match kind {
+fn provider_env_names(kind: ProviderKind) -> &'static [&'static str] {
+    match kind {
         ProviderKind::Yandex => &["RCODE_YANDEX_API_KEY", "YANDEX_API_KEY"],
         ProviderKind::GigaChat => &[
             "RCODE_GIGACHAT_AUTH_KEY",
@@ -1021,8 +1884,32 @@ fn credential_from_env(
         ProviderKind::Custom => &["RCODE_CUSTOM_API_KEY", "OPENAI_API_KEY"],
         // Generic and cloud env keys must never reach a local server.
         ProviderKind::Local => &[],
-    };
-    for name in names {
+    }
+}
+
+pub(crate) fn env_redaction_secrets() -> Vec<String> {
+    let mut out = Vec::new();
+    for kind in ProviderKind::all() {
+        let mut primary_found = false;
+        for &name in provider_env_names(kind) {
+            if let Ok(value) = env::var(name)
+                && validate_credential(&value).is_ok()
+            {
+                if !(out.contains(&value) || primary_found && value == "-") {
+                    out.push(value);
+                }
+                primary_found = true;
+            }
+        }
+    }
+    out
+}
+
+fn credential_from_env(
+    kind: ProviderKind,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<Credential>> {
+    for name in provider_env_names(kind) {
         if let Some(value) = lookup(name) {
             validate_credential(&value)
                 .with_context(|| format!("Некорректный ключ в переменной {name}"))?;

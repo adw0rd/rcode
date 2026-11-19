@@ -270,6 +270,30 @@ def main(binary):
             assert [r[2] for r in fixture.requests] == [None, "Bearer " + KEY], fixture.requests
             assert ORPHAN not in (home / "credentials.json").read_text()
 
+            # 3b. After 401, a short/invalid key aborts connect local without manual fallback.
+            fixture.requests.clear()
+            home_short = root / "short-key"
+            home_short.mkdir(mode=0o700)
+            terminal = LocalTerminal(binary, workspace, home_short, ["--plain", "connect", "local"])
+            try:
+                terminal.expect("Номер")
+                terminal.send("2\r")
+                terminal.expect("Адрес API")
+                terminal.send(base + "\r")
+                terminal.expect("Сервер")
+                terminal.drain()
+                terminal.send("\r")
+                terminal.expect("Имя профиля")
+                terminal.send("shortp\r")
+                terminal.expect("Сервер требует ключ")
+                terminal.send("short\r")
+                terminal.finished(2)
+                assert "Выберите модель" not in terminal.text()
+                assert not (home_short / "config.json").exists()
+                assert not (home_short / "credentials.json").exists()
+            finally:
+                terminal.close()
+
             # 4. The profile moves while its key is being typed: the key is not
             # saved under the name and is not sent anywhere. Then /model with the
             # stale snapshot (moved, then deleted) never asks for a key.

@@ -13,6 +13,9 @@ pub(crate) async fn run(command: &EvalCommand, cli: &Cli, events: &Events) -> Re
     if cli.thinking.is_some() && !matches!(command, EvalCommand::Run(_)) {
         anyhow::bail!("Флаг --thinking не используется в rcode eval validate и compare");
     }
+    if cli.advisor.is_some() {
+        anyhow::bail!("Флаг --advisor отключён в изолированном режиме rcode eval");
+    }
     match command {
         EvalCommand::Validate { suite } => {
             let data = manifest::validate(suite)?;

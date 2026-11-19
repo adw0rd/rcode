@@ -110,6 +110,7 @@ pub async fn run_commands(
         .context("Рабочая папка не найдена")?;
     match command {
         CommandsCommand::List => {
+            let secrets = events.secret_snapshot();
             let registry = crate::commands::CommandRegistry::discover(store.root(), &root);
             for problem in &registry.problems {
                 events.emit(
@@ -119,11 +120,11 @@ pub async fn run_commands(
                 );
             }
             for command in &registry.commands {
-                let event = json!({
+                let mut event = json!({
                     "version": 1,
                     "name": command.name,
                     "scope": scope_json(command.scope),
-                    "description": command.description,
+                    "description": command.description_redacted(&secrets),
                     "argument_hint": command.hint,
                     "unsupported": command.unsupported,
                     "ignored_fields": command.ignored_fields,
@@ -135,6 +136,7 @@ pub async fn run_commands(
                 if cli.json {
                     events.emit("command", event);
                 } else {
+                    events.redact_value(&mut event);
                     println!("{}", plain(&event));
                 }
             }
@@ -158,12 +160,13 @@ fn list(
     verbose: bool,
     events: &mut Events,
 ) -> Result<i32> {
+    let secrets = events.secret_snapshot();
     let catalog = SkillCatalog::discover(store.root(), root, config);
     for problem in &catalog.problems {
         events.emit(
             "warning",
             json!({"version": 1, "path": problem.path.display().to_string(),
-                   "code": problem.code, "message": problem.message}),
+                   "code": problem.code, "message": problem.message_redacted(&secrets)}),
         );
     }
     for skill in &catalog.skills {
@@ -187,12 +190,13 @@ fn list(
             "shadowed_by": skill.shadowed_by,
         });
         if verbose {
-            event["description"] = json!(skill.description);
+            event["description"] = json!(skill.description_redacted(&secrets));
             event["notes"] = json!(skill.notes);
         }
         if cli.json {
             events.emit("skill", event);
         } else {
+            events.redact_value(&mut event);
             println!("{}", plain(&event));
         }
     }
