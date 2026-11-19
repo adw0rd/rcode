@@ -2116,24 +2116,26 @@ fn bounded_agent_text(text: &str, limit: usize) -> String {
     result
 }
 fn help(registry: &crate::commands::CommandRegistry, events: &Events) {
-    notice!("\nКоманды rcode");
+    use std::fmt::Write as _;
+    let mut out = String::from("\nКоманды rcode\n");
     for c in terminal::COMMANDS {
-        notice!("  {:15} {}", c.name, c.description);
+        let _ = writeln!(out, "  {:15} {}", c.name, c.description);
     }
-    notice!(
-        "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать"
+    out.push_str(
+        "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать\n",
     );
     let custom: Vec<_> = registry.loadable().collect();
     if !custom.is_empty() {
         let secrets = events.secret_snapshot();
-        notice!("\nПользовательские команды");
+        out.push_str("\nПользовательские команды\n");
         for c in custom {
             let hint = c
                 .hint
                 .as_deref()
                 .map(|hint| format!(" [{}]", events.redact(hint)))
                 .unwrap_or_default();
-            notice!(
+            let _ = writeln!(
+                out,
                 "  {:15} {} · {}",
                 ui::safe(&events.redact(&format!("/{}", c.name))),
                 ui::safe(&format!("{}{hint}", c.description_redacted(&secrets))),
@@ -2146,7 +2148,8 @@ fn help(registry: &crate::commands::CommandRegistry, events: &Events) {
             .map(|c| ui::safe(&events.redact(&format!("/{}", c.name))))
             .collect();
         if !unsupported.is_empty() {
-            notice!(
+            let _ = writeln!(
+                out,
                 "  {} — синтаксис !-shell и @файл не исполняется, текст уходит модели как есть",
                 unsupported.join(", ")
             );
@@ -2157,11 +2160,14 @@ fn help(registry: &crate::commands::CommandRegistry, events: &Events) {
         .iter()
         .any(|c| c.shadowed_by == Some(crate::commands::Shadow::Builtin))
     {
-        notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
+        out.push_str(
+            "  Файлы с именами встроенных команд не используются (например, permissions.md).\n",
+        );
     }
-    notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень] · /thinking [auto|on|off]\n/advisor [status|off|СЕЛЕКТОР] — модель-советник (паттерн Executor + Advisor)\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+    out.push_str(
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень] · /thinking [auto|on|off]\n/advisor [status|off|СЕЛЕКТОР] — модель-советник · /review-model status|same|ПРОВАЙДЕР МОДЕЛЬ\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов.",
     );
+    notice!("{out}");
 }
 
 fn permissions_choice(

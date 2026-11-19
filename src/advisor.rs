@@ -5858,18 +5858,37 @@ mod tests {
             "essential_receipt sliced error must rebuild/strip on secret rotation: {ess_rebuilt}"
         );
 
-        //     d) `normalize_ca_path` does NOT lexically collapse `..` when parent dir is missing.
-        let missing_dotdot = p35_dir
+        //     d) `normalize_ca_path` matches OS `open()` semantics for `..` under missing directories:
+        //        on POSIX, `existing/nonexistent/..` fails `realpath` and preserves `..`;
+        //        on all OSes (including Windows where Win32 normalizes `nonexistent\..` before open),
+        //        an unresolvable parent (`missing-outer/nonexistent/..`) falls back without panicking.
+        #[cfg(unix)]
+        {
+            let missing_dotdot = p35_dir
+                .path()
+                .join("nonexistent-subdir-xyz")
+                .join("..")
+                .join("ca.pem");
+            let norm_missing = crate::model_route::normalize_ca_path(&missing_dotdot);
+            assert!(
+                norm_missing
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "normalize_ca_path must preserve '..' on POSIX when parent directory does not exist: {norm_missing:?}"
+            );
+        }
+        let missing_outer_dotdot = p35_dir
             .path()
+            .join("missing-outer-dir-xyz")
             .join("nonexistent-subdir-xyz")
             .join("..")
             .join("ca.pem");
-        let norm_missing = crate::model_route::normalize_ca_path(&missing_dotdot);
+        let norm_missing_outer = crate::model_route::normalize_ca_path(&missing_outer_dotdot);
         assert!(
-            norm_missing
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir)),
-            "normalize_ca_path must preserve '..' when parent directory does not exist: {norm_missing:?}"
+            norm_missing_outer
+                .to_string_lossy()
+                .contains("missing-outer-dir-xyz"),
+            "normalize_ca_path must preserve unresolvable missing outer directory: {norm_missing_outer:?}"
         );
 
         //     e) `checked_status_summary` reports `available: false` when inherited `/advisor`
