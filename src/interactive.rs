@@ -2,7 +2,7 @@ use crate::{
     app::{
         Events, catalog_unit, catalog_unit_for_client, configured_tools,
         context_budget_with_memory, discover_memory, discover_skills, prepare_context,
-        skill_catalog, turn, user_shell,
+        skill_catalog_redacted, turn, user_shell,
     },
     balance::BalanceMonitor,
     cli::{ApprovalMode, Cli},
@@ -86,7 +86,10 @@ async fn provider_choice(
     settings: &Settings,
     active: &ProviderSettings,
     rich: bool,
+    events: &Events,
 ) -> Result<Option<ProviderKind>> {
+    let _ = events.refresh_keys(store);
+    let base_secrets = events.secret_snapshot();
     let kinds = ProviderKind::all();
     let (send, updates) = std::sync::mpsc::channel();
     // The menu owns all requests: leaving it aborts the JoinSet's tasks.
@@ -97,12 +100,19 @@ async fn provider_choice(
             // Local servers have no balance API and no request is made here.
             choices.push(Choice {
                 label: kind.to_string(),
-                detail: crate::local_ui::summary(settings, store),
+                detail: crate::local_ui::summary_with_secrets(settings, store, &base_secrets),
                 enabled: true,
             });
             continue;
         }
-        let credential = store.credential(kind).ok().flatten();
+        let Ok((fresh_settings, credential)) = store.read_consistent_cloud(kind) else {
+            choices.push(Choice {
+                label: kind.to_string(),
+                detail: "конфигурация недоступна".into(),
+                enabled: true,
+            });
+            continue;
+        };
         let detail = match credential {
             None => "настроить ключ доступа".into(),
             Some(_) if kind == ProviderKind::Yandex => "ключ подключён (баланс в кабинете)".into(),
@@ -110,28 +120,40 @@ async fn provider_choice(
                 "ключ подключён (баланс API недоступен)".into()
             }
             Some(key) => {
-                let provider = if kind == active.kind {
-                    active.clone()
-                } else {
-                    settings.provider(kind)
-                };
-                let send = send.clone();
-                pending.spawn(async move {
-                    // Never forward a key through a copied or inconsistent provider entry.
-                    let label = if provider.kind != kind {
-                        "Баланс: недоступен".into()
-                    } else {
-                        match ProviderClient::new(provider.clone(), key.value) {
-                            Ok(mut client) => match crate::balance::fetch(&mut client).await {
-                                Ok(report) => report.footer(&provider.model),
-                                Err(_) => "Баланс: недоступен".into(),
-                            },
+                let mut combined_secrets = base_secrets.clone();
+                crate::redaction::push_secret_variants(&mut combined_secrets, &key.value);
+                let provider = crate::model_route::configured_cloud_provider(&fresh_settings, kind)
+                    .ok()
+                    .flatten()
+                    .filter(|p| {
+                        crate::model_route::ensure_connection_free_of_secrets(
+                            store,
+                            p,
+                            &combined_secrets,
+                        )
+                        .is_ok()
+                    });
+                if let Some(p) = provider.filter(|p| p.kind == kind) {
+                    let send = send.clone();
+                    let sink = events.shared_secrets();
+                    pending.spawn(async move {
+                        // Never forward a key through a copied, stale, or inconsistent provider entry.
+                        let label = match ProviderClient::new(p.clone(), key.value) {
+                            Ok(mut client) => {
+                                client.bind_secret_sink(sink);
+                                match crate::balance::fetch(&mut client).await {
+                                    Ok(report) => report.footer(&p.model),
+                                    Err(_) => "Баланс: недоступен".into(),
+                                }
+                            }
                             Err(_) => "Баланс: недоступен".into(),
-                        }
-                    };
-                    let _ = send.send((index, format!("ключ подключён ({label})")));
-                });
-                "ключ подключён (баланс: …)".into()
+                        };
+                        let _ = send.send((index, format!("ключ подключён ({label})")));
+                    });
+                    "ключ подключён (баланс: …)".into()
+                } else {
+                    "ключ подключён (Баланс: недоступен)".into()
+                }
             }
         };
         choices.push(Choice {
@@ -170,24 +192,358 @@ async fn catalog(client: &mut ProviderClient, events: &Events) -> Result<Option<
     result
 }
 
+enum ProviderEdit {
+    Switch(ProviderSettings),
+    Model {
+        disk_expected: ProviderSettings,
+        session_base: ProviderSettings,
+        model: String,
+    },
+    Effort {
+        disk_expected: ProviderSettings,
+        session_base: ProviderSettings,
+        effort: Effort,
+    },
+    Thinking {
+        disk_expected: ProviderSettings,
+        session_base: ProviderSettings,
+        thinking: Option<bool>,
+    },
+}
+
+/// Computes `(verified_disk_provider, persist_disk, session_provider_to_activate)`.
+/// When the session runs under a temporary CLI connection or model override that differs from
+/// `config.json`, `persist_disk` is `false` so `/model` and `/effort` update the running session
+/// without overwriting an unrelated saved connection/model on disk.
+fn resolve_provider_edit(
+    current: &Settings,
+    edit: &ProviderEdit,
+) -> Result<(ProviderSettings, bool, ProviderSettings)> {
+    match edit {
+        ProviderEdit::Switch(p) => {
+            p.validate()?;
+            if p.kind == ProviderKind::Local {
+                local_app::check_commit(current, p)?;
+                let name = local_app::profile_name(p);
+                let mut base = crate::model_route::configured_local_profile(current, name)?
+                    .context("Профиль local больше не сохранён")?;
+                base.model = p.model.clone();
+                base.validate()?;
+                Ok((base.clone(), true, base))
+            } else {
+                let mut base = crate::model_route::configured_cloud_provider(current, p.kind)?
+                    .unwrap_or_else(|| current.provider(p.kind));
+                if !crate::model_route::RouteIdentity::same_connection(p, &base) {
+                    bail!(
+                        "Параметры подключения провайдера {} изменились в другом процессе; повторите команду",
+                        p.kind
+                    );
+                }
+                if p.model != base.model {
+                    base.effort = p.effort;
+                    base.model = p.model.clone();
+                }
+                base.validate()?;
+                Ok((base.clone(), true, base))
+            }
+        }
+        ProviderEdit::Model {
+            disk_expected,
+            session_base,
+            model,
+        } => {
+            let mut next_session = session_base.clone();
+            if *model != next_session.model {
+                next_session.effort = Effort::Auto;
+            }
+            next_session.model = model.clone();
+            next_session.validate()?;
+
+            if disk_expected.kind == ProviderKind::Local {
+                let name = local_app::profile_name(disk_expected);
+                let mut disk_base = crate::model_route::configured_local_profile(current, name)?
+                    .context("Профиль local больше не сохранён")?;
+                if !crate::model_route::RouteIdentity::disk_unchanged(disk_expected, &disk_base) {
+                    bail!(
+                        "Параметры подключения локального профиля «{name}» изменились в другом процессе; переключите профиль через /provider local"
+                    );
+                }
+                if let (Some(disk_local), Some(sess_local)) =
+                    (&disk_base.local, next_session.local.as_mut())
+                {
+                    sess_local.key_required = disk_local.key_required;
+                }
+                if crate::model_route::RouteIdentity::same_connection(&next_session, &disk_base)
+                    && disk_base.model == session_base.model
+                    && *model != disk_base.model
+                {
+                    disk_base.model = model.clone();
+                    disk_base.validate()?;
+                    Ok((disk_base, true, next_session))
+                } else {
+                    Ok((disk_base, false, next_session))
+                }
+            } else {
+                let mut disk_base =
+                    crate::model_route::configured_cloud_provider(current, disk_expected.kind)?
+                        .unwrap_or_else(|| current.provider(disk_expected.kind));
+                if !crate::model_route::RouteIdentity::disk_unchanged(disk_expected, &disk_base) {
+                    bail!(
+                        "Параметры подключения провайдера {} изменились в другом процессе; переключите провайдера через /provider или /connect",
+                        disk_expected.kind
+                    );
+                }
+                if crate::model_route::RouteIdentity::same_connection(&next_session, &disk_base)
+                    && disk_base.model == session_base.model
+                    && (*model != disk_base.model || current.active != disk_base.kind)
+                {
+                    if *model != disk_base.model {
+                        disk_base.effort = Effort::Auto;
+                    }
+                    disk_base.model = model.clone();
+                    disk_base.validate()?;
+                    Ok((disk_base, true, next_session))
+                } else {
+                    Ok((disk_base, false, next_session))
+                }
+            }
+        }
+        ProviderEdit::Effort {
+            disk_expected,
+            session_base,
+            effort,
+        } => {
+            let mut next_session = session_base.clone();
+            next_session.effort = *effort;
+            next_session.validate()?;
+
+            let mut disk_base =
+                crate::model_route::configured_cloud_provider(current, disk_expected.kind)?
+                    .unwrap_or_else(|| current.provider(disk_expected.kind));
+            if !crate::model_route::RouteIdentity::disk_unchanged(disk_expected, &disk_base) {
+                bail!(
+                    "Параметры подключения провайдера {} изменились в другом процессе; переключите провайдера через /provider или /connect",
+                    disk_expected.kind
+                );
+            }
+            if crate::model_route::RouteIdentity::same_connection(&next_session, &disk_base)
+                && disk_base.model == next_session.model
+            {
+                disk_base.effort = *effort;
+                disk_base.validate()?;
+                Ok((disk_base, true, next_session))
+            } else {
+                Ok((disk_base, false, next_session))
+            }
+        }
+        ProviderEdit::Thinking {
+            disk_expected,
+            session_base,
+            thinking,
+        } => {
+            let mut next_session = session_base.clone();
+            if let Some(local) = next_session.local.as_mut() {
+                local.thinking = *thinking;
+            }
+            next_session.validate()?;
+
+            let name = local_app::profile_name(disk_expected);
+            let mut disk_base = crate::model_route::configured_local_profile(current, name)?
+                .context("Профиль local больше не сохранён")?;
+            if !crate::model_route::RouteIdentity::disk_unchanged(disk_expected, &disk_base) {
+                bail!(
+                    "Параметры подключения локального профиля «{name}» изменились в другом процессе; переключите профиль через /provider local"
+                );
+            }
+            if let (Some(disk_local), Some(sess_local)) =
+                (&disk_base.local, next_session.local.as_mut())
+            {
+                sess_local.key_required = disk_local.key_required;
+            }
+            if crate::model_route::RouteIdentity::same_connection(&next_session, &disk_base)
+                && disk_base.model == session_base.model
+            {
+                if let Some(local) = disk_base.local.as_mut() {
+                    local.thinking = *thinking;
+                }
+                disk_base.validate()?;
+                Ok((disk_base, true, next_session))
+            } else {
+                Ok((disk_base, false, next_session))
+            }
+        }
+    }
+}
+
 fn commit_provider(
     store: &ConfigStore,
     settings: &mut Settings,
+    active_disk_origin: &mut ProviderSettings,
     session: &mut Session,
     client: &mut ProviderClient,
     events: &mut Events,
-    p: ProviderSettings,
+    edit: ProviderEdit,
 ) -> Result<()> {
-    p.validate()?;
-    if p.kind == ProviderKind::Local {
-        // The in-memory profiles may predate another process's changes.
-        settings.local = local_app::check_current(store, &p)?.local;
+    let target_kind = match &edit {
+        ProviderEdit::Switch(p) => p.kind,
+        ProviderEdit::Model { disk_expected, .. }
+        | ProviderEdit::Effort { disk_expected, .. }
+        | ProviderEdit::Thinking { disk_expected, .. } => disk_expected.kind,
+    };
+    let (preview_settings, preview_cred) = if target_kind == ProviderKind::Local {
+        let probe = match &edit {
+            ProviderEdit::Switch(p) => p,
+            ProviderEdit::Model { disk_expected, .. }
+            | ProviderEdit::Effort { disk_expected, .. }
+            | ProviderEdit::Thinking { disk_expected, .. } => disk_expected,
+        };
+        store.read_consistent_local(probe)?
+    } else {
+        let (s, c) = store.read_consistent_cloud(target_kind)?;
+        let state = match c {
+            Some(cred) => crate::config::CredentialState::Present(cred),
+            None => crate::config::CredentialState::Missing,
+        };
+        (s, state)
+    };
+    let (preview_disk, preview_persist, preview_session) =
+        resolve_provider_edit(&preview_settings, &edit)?;
+    let is_switch = matches!(edit, ProviderEdit::Switch(_));
+    if !is_switch
+        && let crate::config::CredentialState::Present(ref cred) = preview_cred
+        && cred.source == "credentials.json"
+        && !crate::model_route::RouteIdentity::same_connection(&preview_session, &preview_disk)
+        && !client.credential_matches(Some(cred.value.as_str()))
+    {
+        bail!(
+            "Ключ провайдера {} в credentials.json изменился в другом процессе и не отправляется на временный endpoint сессии; переключите провайдера через /provider или /connect",
+            preview_session.kind
+        );
     }
-    let next = local_app::client(store, &p, events, "Нет ключа — сначала /connect")?;
-    settings.remember_provider(&p);
-    store.save(settings)?;
-    session.provider = p;
-    session.save(store)?;
+    let mut next = local_app::client_with_credential(
+        &preview_session,
+        preview_cred,
+        events,
+        "Нет ключа — сначала /connect",
+    )?;
+    let mut committed_disk = preview_disk.clone();
+    let mut committed_session = preview_session.clone();
+    let mut committed_cred: Option<crate::config::CredentialState> = None;
+    let updated = if preview_persist {
+        store.update_settings_with_credentials(|current, providers_creds| {
+            let (resolved_disk, resolved_persist, resolved_session) =
+                resolve_provider_edit(current, &edit)?;
+            if !crate::model_route::RouteIdentity::disk_unchanged(&preview_disk, &resolved_disk) {
+                bail!(
+                    "Параметры подключения провайдера {} изменились в другом процессе; повторите команду",
+                    resolved_disk.kind
+                );
+            }
+            if let Some(ref ca) = resolved_session.ca_file
+                && !crate::model_route::is_usable_ca_file(ca)
+            {
+                bail!(
+                    "Файл корневого сертификата ca_file провайдера {} недоступен, пуст или не содержит PEM-сертификатов",
+                    resolved_session.kind
+                );
+            }
+            let tx_cred = if resolved_session.kind == ProviderKind::Local {
+                let cred_state = ConfigStore::local_credential_state_from_snapshot(
+                    current,
+                    providers_creds,
+                    &resolved_session,
+                )?;
+                let name = local_app::profile_name(&resolved_session);
+                if !is_switch
+                    && let crate::config::CredentialState::Present(ref cred) = cred_state
+                    && !crate::model_route::RouteIdentity::same_connection(
+                        &resolved_session,
+                        &resolved_disk,
+                    )
+                    && !client.credential_matches(Some(cred.value.as_str()))
+                {
+                    bail!(
+                        "Ключ локального профиля «{name}» изменился в другом процессе и не отправляется на временные параметры сессии; переключите профиль через /provider local"
+                    );
+                }
+                if matches!(cred_state, crate::config::CredentialState::Missing) {
+                    bail!("Нет ключа — сначала /connect");
+                }
+                cred_state
+            } else {
+                let c =
+                    ConfigStore::cloud_credential_from_map(resolved_session.kind, providers_creds)?;
+                if !is_switch
+                    && let Some(ref cred) = c
+                    && cred.source == "credentials.json"
+                    && !crate::model_route::RouteIdentity::same_connection(
+                        &resolved_session,
+                        &resolved_disk,
+                    )
+                    && !client.credential_matches(Some(cred.value.as_str()))
+                {
+                    bail!(
+                        "Ключ провайдера {} в credentials.json изменился в другом процессе и не отправляется на временный endpoint сессии; переключите провайдера через /provider или /connect",
+                        resolved_session.kind
+                    );
+                }
+                match c {
+                    Some(cred) => crate::config::CredentialState::Present(cred),
+                    None => bail!("Нет ключа — сначала /connect"),
+                }
+            };
+            let live_extra = events.secret_snapshot();
+            let route_dict = crate::model_route::build_route_secret_dictionary_from_raw(
+                providers_creds.values().cloned(),
+                &live_extra,
+            )?;
+            crate::model_route::check_route_against_secret_dictionary(
+                route_dict.as_ref(),
+                &resolved_disk,
+            )?;
+            crate::model_route::check_route_against_secret_dictionary(
+                route_dict.as_ref(),
+                &resolved_session,
+            )?;
+            if resolved_persist {
+                current.remember_provider(&resolved_disk);
+            }
+            for secret in providers_creds.values().filter(|v| !v.is_empty()) {
+                events.remember(secret.clone());
+            }
+            committed_disk = resolved_disk;
+            committed_session = resolved_session;
+            committed_cred = Some(tx_cred);
+            Ok(())
+        })?
+    } else {
+        preview_settings
+    };
+    if let Some(tx_cred) = committed_cred {
+        let tx_cred_str = match &tx_cred {
+            crate::config::CredentialState::Present(c) => Some(c.value.as_str()),
+            crate::config::CredentialState::NotRequired
+            | crate::config::CredentialState::Missing => None,
+        };
+        if committed_session != preview_session
+            || !next.credential_matches(tx_cred_str)
+            || !next.ca_bundle_matches_disk()
+        {
+            next = local_app::client_with_credential(
+                &committed_session,
+                tx_cred,
+                events,
+                "Нет ключа — сначала /connect",
+            )?;
+        }
+    }
+    session.share_connection_peers_into(&mut next, Some(client));
+    let mut candidate_session = session.clone();
+    candidate_session.provider = committed_session;
+    candidate_session.save(store)?;
+    *settings = updated;
+    *active_disk_origin = committed_disk;
+    *session = candidate_session;
     *client = next;
     if session.provider.kind == ProviderKind::Local {
         let thinking = crate::local::ThinkingMode::from_option(
@@ -199,15 +555,15 @@ fn commit_provider(
         );
         notice!(
             "✓ local · профиль {} / {} · thinking {}",
-            ui::safe(local_app::profile_name(&session.provider)),
-            ui::safe(&session.provider.model),
+            ui::safe(&events.redact(local_app::profile_name(&session.provider))),
+            ui::safe(&events.redact(&session.provider.model)),
             thinking
         );
     } else {
         notice!(
             "✓ {} / {} · effort {}",
             session.provider.kind,
-            ui::safe(&session.provider.model),
+            ui::safe(&events.redact(&session.provider.model)),
             session.provider.effort
         );
     }
@@ -221,6 +577,7 @@ async fn select_model(
     rich: bool,
     store: &ConfigStore,
     settings: &mut Settings,
+    active_disk_origin: &mut ProviderSettings,
     session: &mut Session,
     client: &mut ProviderClient,
     events: &mut Events,
@@ -229,7 +586,7 @@ async fn select_model(
     let (kind, model) = if force_provider {
         let selected = match args.first() {
             Some(s) => Some(s.parse::<ProviderKind>()?),
-            None => provider_choice(store, settings, &session.provider, rich).await?,
+            None => provider_choice(store, settings, &session.provider, rich, events).await?,
         };
         let Some(kind) = selected else {
             return Ok(());
@@ -238,53 +595,333 @@ async fn select_model(
     } else {
         model_target(session.provider.kind, args)
     };
-    let mut next = if kind == ProviderKind::Local
-        && (force_provider || session.provider.kind != ProviderKind::Local)
-    {
-        // /provider local: saved profiles, discovery or a manual address.
-        let Some(profile) = crate::local_ui::choose_profile(store, settings, rich).await? else {
-            return Ok(());
-        };
-        profile
-    } else if kind == session.provider.kind {
+    let mut switching_provider = force_provider || kind != session.provider.kind;
+    let mut disk_baseline = if !switching_provider {
+        active_disk_origin.clone()
+    } else if kind == ProviderKind::Local {
         session.provider.clone()
     } else {
-        settings.provider(kind)
+        crate::model_route::configured_cloud_provider(settings, kind)?
+            .unwrap_or_else(|| settings.provider(kind))
     };
-    if kind != ProviderKind::Local && store.credential(kind)?.is_none() {
-        next = ui::connect(store, settings, Some(kind), rich, None).await?;
+    let mut cloud_cred_snapshot: Option<crate::config::Credential> = None;
+    let mut local_cred_snapshot: Option<String> = None;
+    let mut pending_draft_local: Option<(Option<String>, bool)> = None;
+    let mut existing_local_protected = false;
+    let mut next = if kind == ProviderKind::Local && switching_provider {
+        // /provider local: saved profiles, discovery or a manual address.
+        let Some(chosen) = crate::local_ui::choose_profile_choice_with_secrets(
+            store,
+            settings,
+            rich,
+            None,
+            &events.secret_snapshot(),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        match chosen {
+            crate::local_ui::ChosenLocalProfile::Existing {
+                profile,
+                server_known_protected,
+            } => {
+                existing_local_protected = server_known_protected;
+                let (fresh, cred_state) = store.read_consistent_local(&profile)?;
+                let name = local_app::profile_name(&profile);
+                if let Some(disk_p) = crate::model_route::configured_local_profile(&fresh, name)?
+                    && !crate::model_route::RouteIdentity::same_connection(&profile, &disk_p)
+                {
+                    bail!(
+                        "Параметры подключения локального профиля «{name}» изменились в другом процессе; повторите /provider local"
+                    );
+                }
+                *settings = fresh;
+                events.refresh_keys(store)?;
+                local_cred_snapshot = cred_state.into_key();
+                disk_baseline = profile.clone();
+                profile
+            }
+            crate::local_ui::ChosenLocalProfile::DraftNew {
+                profile,
+                typed_key,
+                auth_challenged,
+            } => {
+                pending_draft_local = Some((typed_key, auth_challenged));
+                disk_baseline = profile.clone();
+                profile
+            }
+        }
+    } else if !switching_provider {
+        if kind == ProviderKind::Local {
+            let (fresh, cred_state) = store.read_consistent_local(&session.provider)?;
+            let name = local_app::profile_name(&session.provider);
+            if let Some(disk_p) = crate::model_route::configured_local_profile(&fresh, name)? {
+                if !crate::model_route::RouteIdentity::disk_unchanged(&disk_baseline, &disk_p) {
+                    bail!(
+                        "Параметры подключения локального профиля «{name}» изменились в другом процессе; переключите профиль явно через /provider local"
+                    );
+                }
+                if let crate::config::CredentialState::Present(ref cred) = cred_state
+                    && !crate::model_route::RouteIdentity::same_connection(
+                        &session.provider,
+                        &disk_p,
+                    )
+                    && !client.credential_matches(Some(cred.value.as_str()))
+                {
+                    bail!(
+                        "Ключ локального профиля «{name}» изменился в другом процессе и не отправляется с временными параметрами TLS/адреса сессии; переключите профиль через /provider local"
+                    );
+                }
+                disk_baseline = disk_p;
+            }
+            *settings = fresh;
+            events.refresh_keys(store)?;
+            local_cred_snapshot = cred_state.into_key();
+            session.provider.clone()
+        } else {
+            let (fresh, cred_opt) = store.read_consistent_cloud(kind)?;
+            let disk_p = crate::model_route::configured_cloud_provider(&fresh, kind)?
+                .unwrap_or_else(|| fresh.provider(kind));
+            if !crate::model_route::RouteIdentity::disk_unchanged(&disk_baseline, &disk_p) {
+                bail!(
+                    "Параметры подключения провайдера {kind} изменились в другом процессе; переключите провайдера явно через /provider {kind} или /connect {kind}"
+                );
+            }
+            if let Some(ref cred) = cred_opt
+                && cred.source == "credentials.json"
+                && !crate::model_route::RouteIdentity::same_connection(&session.provider, &disk_p)
+                && !client.credential_matches(Some(cred.value.as_str()))
+            {
+                bail!(
+                    "Ключ провайдера {kind} в credentials.json изменился в другом процессе и не отправляется на временный endpoint сессии; переключите провайдера явно через /provider {kind} или /connect {kind}"
+                );
+            }
+            *settings = fresh;
+            events.refresh_keys(store)?;
+            disk_baseline = disk_p;
+            cloud_cred_snapshot = cred_opt;
+            session.provider.clone()
+        }
+    } else {
+        let (fresh, cred_opt) = store.read_consistent_cloud(kind)?;
+        *settings = fresh;
+        events.refresh_keys(store)?;
+        let disk_p = crate::model_route::configured_cloud_provider(settings, kind)?
+            .unwrap_or_else(|| settings.provider(kind));
+        disk_baseline = disk_p.clone();
+        cloud_cred_snapshot = cred_opt;
+        disk_p
+    };
+    let unconfigured_custom_with_disk_key = kind == ProviderKind::Custom
+        && crate::model_route::configured_cloud_provider(settings, ProviderKind::Custom)?.is_none()
+        && cloud_cred_snapshot
+            .as_ref()
+            .is_some_and(|c| c.source == "credentials.json");
+    if kind != ProviderKind::Local
+        && (cloud_cred_snapshot.is_none() || unconfigured_custom_with_disk_key)
+    {
+        next = ui::connect_with_secrets(
+            store,
+            settings,
+            Some(kind),
+            rich,
+            None,
+            &events.secret_snapshot(),
+            Some(events.shared_secrets()),
+        )
+        .await?;
+        let (fresh_after, cred_after) = store.read_consistent_cloud(kind)?;
+        let disk_after = crate::model_route::configured_cloud_provider(&fresh_after, kind)?
+            .unwrap_or_else(|| fresh_after.provider(kind));
+        if !crate::model_route::RouteIdentity::same_connection(&next, &disk_after) {
+            bail!(
+                "Параметры подключения провайдера {kind} изменились в другом процессе; повторите /provider {kind}"
+            );
+        }
+        *settings = fresh_after;
+        events.refresh_keys(store)?;
+        disk_baseline = disk_after;
+        switching_provider = true;
+        cloud_cred_snapshot = cred_after;
     }
-    if kind == ProviderKind::Local {
+    if kind == ProviderKind::Local && pending_draft_local.is_none() {
         // A session snapshot whose profile moved or was removed neither lists
         // models nor asks for a key: that key would be saved under the name.
-        local_app::check_current(store, &next)?;
+        local_app::check_current_with_baseline(store, &next, &disk_baseline)?;
     }
     if let Some(id) = model {
-        if id != next.model {
-            next.effort = Effort::Auto;
+        let mut extra_secrets = events.secret_snapshot();
+        if let Some((draft_key, auth_challenged)) = pending_draft_local.take() {
+            let mut key_to_save = draft_key.clone();
+            if let Some(ref k) = draft_key {
+                extra_secrets.push(k.clone());
+            }
+            if auth_challenged {
+                let _ = events.refresh_keys(store);
+                let mut probe_secrets = events.secret_snapshot();
+                if let Some(ref k) = draft_key {
+                    probe_secrets.push(k.clone());
+                }
+                match crate::local_ui::catalog_for_connect(
+                    store,
+                    None,
+                    &next,
+                    draft_key,
+                    auth_challenged,
+                    auth_challenged,
+                    &probe_secrets,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        if let Some(ref k) = out.newly_entered_key {
+                            extra_secrets.push(k.clone());
+                        }
+                        key_to_save = out.newly_entered_key;
+                    }
+                    Err(crate::local_ui::ConnectCatalogError::Fatal(err))
+                    | Err(crate::local_ui::ConnectCatalogError::Unreachable(err)) => {
+                        return Err(err);
+                    }
+                }
+            }
+            next.model = id.clone();
+            next.validate()?;
+            let _ = events.refresh_keys(store);
+            let mut commit_secrets = events.secret_snapshot();
+            if let Some(ref k) = key_to_save {
+                commit_secrets.push(k.clone());
+            }
+            crate::model_route::ensure_route_free_of_secrets(store, &next, &commit_secrets)?;
+            let name = local_app::profile_name(&next).to_owned();
+            let (updated, _) = store.commit_local_profile_add_with_secrets(
+                &name,
+                false,
+                false,
+                false,
+                next.clone(),
+                key_to_save.as_deref(),
+                || events.secret_snapshot(),
+            )?;
+            next = updated.local.profiles[&name].clone();
+            *settings = updated;
+            events.refresh_keys(store)?;
         }
-        next.model = id;
+        let mut candidate_check = next.clone();
+        candidate_check.model = id.clone();
+        crate::model_route::ensure_route_free_of_secrets(store, &candidate_check, &extra_secrets)?;
+        let edit = if switching_provider {
+            if id != next.model {
+                next.effort = Effort::Auto;
+            }
+            next.model = id;
+            next.validate()?;
+            ProviderEdit::Switch(next)
+        } else {
+            let mut preview = next.clone();
+            preview.model = id.clone();
+            preview.validate()?;
+            ProviderEdit::Model {
+                disk_expected: disk_baseline,
+                session_base: next,
+                model: id,
+            }
+        };
         // A direct model ID works even when /models is unavailable.
-        next.validate()?;
-        commit_provider(store, settings, session, client, events, next)?;
+        commit_provider(
+            store,
+            settings,
+            active_disk_origin,
+            session,
+            client,
+            events,
+            edit,
+        )?;
         models.clear();
         return Ok(());
     }
-    let Some(mut fetched) = (if kind == ProviderKind::Local {
-        local_catalog(store, &mut next, events).await?
+    let mut draft_key_to_save: Option<String> = None;
+    let is_draft_local = pending_draft_local.is_some();
+    let Some(mut fetched) = (if let Some((draft_key, auth_challenged)) = pending_draft_local.take()
+    {
+        match local_draft_catalog(store, &next, draft_key, auth_challenged, events).await? {
+            Some((list, key_opt)) => {
+                draft_key_to_save = key_opt;
+                Some(list)
+            }
+            None => None,
+        }
+    } else if kind == ProviderKind::Local {
+        local_catalog(
+            store,
+            &mut next,
+            &disk_baseline,
+            local_cred_snapshot,
+            existing_local_protected,
+            events,
+        )
+        .await?
     } else {
-        let mut candidate_client =
-            local_app::client(store, &next, events, "Нет ключа выбранного провайдера")?;
-        catalog(&mut candidate_client, events).await?
+        let cred_state = match cloud_cred_snapshot {
+            Some(c) => crate::config::CredentialState::Present(c),
+            None => crate::config::CredentialState::Missing,
+        };
+        let mut candidate_client = local_app::client_with_credential(
+            &next,
+            cred_state,
+            events,
+            "Нет ключа выбранного провайдера",
+        )?;
+        let _ = events.refresh_keys(store);
+        crate::model_route::ensure_connection_free_of_secrets(
+            store,
+            &next,
+            &events.secret_snapshot(),
+        )?;
+        let out = catalog(&mut candidate_client, events).await?;
+        for s in candidate_client.redaction_secrets() {
+            events.remember(s);
+        }
+        out
     }) else {
         return Ok(());
     };
+    let _ = events.refresh_keys(store);
+    let mut extra_secrets = events.secret_snapshot();
+    if let Some(ref k) = draft_key_to_save {
+        extra_secrets.push(k.clone());
+    }
+    let secret_dict = crate::model_route::build_route_secret_dictionary(store, &extra_secrets)?;
+    let contains_secret = |text: &str| -> bool {
+        secret_dict.as_ref().is_some_and(|dict| {
+            crate::redaction::redact_text_with(dict, text)
+                .ok()
+                .as_deref()
+                != Some(text)
+        })
+    };
+    fetched = fetched
+        .into_iter()
+        .filter(|m| !m.id.chars().any(char::is_control) && !contains_secret(&m.id))
+        .map(|mut m| {
+            if let Some(ref dict) = secret_dict {
+                m.name = crate::redaction::redact_text_idempotent_with(dict, &m.name)
+                    .unwrap_or_else(|_| "[скрыто]".into());
+            }
+            m.name = ui::safe(&m.name);
+            m
+        })
+        .collect();
     fetched.sort_by(|a, b| {
         (a.id != next.model)
             .cmp(&(b.id != next.model))
             .then_with(|| a.id.cmp(&b.id))
     });
-    if !next.model.is_empty() && !fetched.iter().any(|m| m.id == next.model) {
+    if !next.model.is_empty()
+        && !contains_secret(&next.model)
+        && !fetched.iter().any(|m| m.id == next.model)
+    {
         fetched.insert(
             0,
             ModelInfo {
@@ -333,32 +970,129 @@ async fn select_model(
         return Ok(());
     };
     let id = if selected == fetched.len() {
-        ui::line("ID модели", &next.model)?
+        let _ = events.refresh_keys(store);
+        let mut live_manual_secrets = events.secret_snapshot();
+        if let Some(ref k) = draft_key_to_save {
+            live_manual_secrets.push(k.clone());
+        }
+        let manual_default =
+            if crate::model_route::ensure_route_free_of_secrets(store, &next, &live_manual_secrets)
+                .is_ok()
+            {
+                next.model.as_str()
+            } else {
+                ""
+            };
+        ui::line("ID модели", manual_default)?
     } else {
         fetched[selected].id.clone()
     };
-    if id != next.model {
-        next.effort = Effort::Auto;
+    let _ = events.refresh_keys(store);
+    let mut post_pick_secrets = events.secret_snapshot();
+    if let Some(ref k) = draft_key_to_save {
+        post_pick_secrets.push(k.clone());
     }
-    next.model = id;
-    commit_provider(store, settings, session, client, events, next)?;
+    let mut candidate_check = next.clone();
+    candidate_check.model = id.clone();
+    crate::model_route::ensure_route_free_of_secrets(store, &candidate_check, &post_pick_secrets)?;
+    if is_draft_local {
+        next.model = id.clone();
+        next.validate()?;
+        let name = local_app::profile_name(&next).to_owned();
+        let (updated, _) = store.commit_local_profile_add_with_secrets(
+            &name,
+            false,
+            false,
+            false,
+            next.clone(),
+            draft_key_to_save.as_deref(),
+            || events.secret_snapshot(),
+        )?;
+        next = updated.local.profiles[&name].clone();
+        *settings = updated;
+        events.refresh_keys(store)?;
+    }
+    let edit = if switching_provider {
+        if id != next.model {
+            next.effort = Effort::Auto;
+        }
+        next.model = id;
+        ProviderEdit::Switch(next)
+    } else {
+        ProviderEdit::Model {
+            disk_expected: disk_baseline,
+            session_base: next,
+            model: id,
+        }
+    };
+    commit_provider(
+        store,
+        settings,
+        active_disk_origin,
+        session,
+        client,
+        events,
+        edit,
+    )?;
     *models = fetched;
     Ok(())
+}
+async fn local_draft_catalog(
+    store: &ConfigStore,
+    profile: &ProviderSettings,
+    initial_key: Option<String>,
+    pre_challenged_auth: bool,
+    events: &Events,
+) -> Result<Option<(Vec<ModelInfo>, Option<String>)>> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    if let Some(screen) = crate::screen::current() {
+        screen.bind_cancel(cancel.clone());
+    }
+    let _ = events.refresh_keys(store);
+    let caller_secrets = events.secret_snapshot();
+    events.busy("Получаю список моделей локального сервера");
+    let result = tokio::select! {
+        value = crate::local_ui::catalog_for_connect(store, None, profile, initial_key, pre_challenged_auth, pre_challenged_auth, &caller_secrets) => Some(value),
+        _ = tokio::signal::ctrl_c() => None,
+        _ = cancel.cancelled() => None,
+    };
+    events.pause();
+    let (fetched, key_opt) = match result {
+        None => return Ok(None),
+        Some(Ok(out)) => (out.models, out.newly_entered_key),
+        Some(Err(crate::local_ui::ConnectCatalogError::Fatal(error))) => return Err(error),
+        Some(Err(crate::local_ui::ConnectCatalogError::Unreachable(error))) => {
+            notice!(
+                "Список моделей недоступен: {}. Можно ввести ID модели вручную.",
+                ui::safe(&events.redact(&format!("{error:#}")))
+            );
+            (Vec::new(), None)
+        }
+    };
+    Ok(Some((
+        crate::local_ui::local_models(fetched, &profile.model),
+        key_opt,
+    )))
 }
 /// Models of a local profile endpoint; a 401/403 asks once for the profile key.
 /// Unreachable servers still allow a manual model ID.
 async fn local_catalog(
     store: &ConfigStore,
     profile: &mut ProviderSettings,
+    expected_disk: &ProviderSettings,
+    initial_key: Option<String>,
+    server_known_protected: bool,
     events: &Events,
 ) -> Result<Option<Vec<ModelInfo>>> {
     let cancel = tokio_util::sync::CancellationToken::new();
     if let Some(screen) = crate::screen::current() {
         screen.bind_cancel(cancel.clone());
     }
+    let _ = events.refresh_keys(store);
+    let caller_secrets = events.secret_snapshot();
     events.busy("Получаю список моделей локального сервера");
     let result = tokio::select! {
-        value = crate::local_ui::catalog(store, profile) => Some(value),
+        value = crate::local_ui::catalog_with_key(store, profile, Some(expected_disk), initial_key, server_known_protected, &caller_secrets) => Some(value),
         _ = tokio::signal::ctrl_c() => None,
         _ = cancel.cancelled() => None,
     };
@@ -366,9 +1100,10 @@ async fn local_catalog(
     let fetched = match result {
         None => return Ok(None),
         Some(Ok((models, _))) => models,
-        Some(Err(error)) => {
+        Some(Err(crate::local_ui::ConnectCatalogError::Fatal(error))) => return Err(error),
+        Some(Err(crate::local_ui::ConnectCatalogError::Unreachable(error))) => {
             // A profile moved meanwhile is an error, not a missing catalog.
-            local_app::check_current(store, profile)?;
+            local_app::check_current_with_baseline(store, profile, expected_disk)?;
             notice!(
                 "Список моделей недоступен: {}. Можно ввести ID модели вручную.",
                 ui::safe(&events.redact(&format!("{error:#}")))
@@ -385,6 +1120,7 @@ async fn select_effort(
     rich: bool,
     store: &ConfigStore,
     settings: &mut Settings,
+    active_disk_origin: &mut ProviderSettings,
     session: &mut Session,
     client: &mut ProviderClient,
     events: &mut Events,
@@ -458,15 +1194,28 @@ async fn select_effort(
                 .join(", ")
         );
     }
-    let mut p = session.provider.clone();
-    p.effort = effort;
-    commit_provider(store, settings, session, client, events, p)
+    let disk_baseline = active_disk_origin.clone();
+    commit_provider(
+        store,
+        settings,
+        active_disk_origin,
+        session,
+        client,
+        events,
+        ProviderEdit::Effort {
+            disk_expected: disk_baseline,
+            session_base: session.provider.clone(),
+            effort,
+        },
+    )
 }
+#[allow(clippy::too_many_arguments)]
 fn select_thinking(
     args: &[&str],
     rich: bool,
     store: &ConfigStore,
     settings: &mut Settings,
+    active_disk_origin: &mut ProviderSettings,
     session: &mut Session,
     client: &mut ProviderClient,
     events: &mut Events,
@@ -479,7 +1228,7 @@ fn select_thinking(
     if args.len() > 1 {
         bail!("Использование: /thinking [auto|on|off]");
     }
-    local_app::check_current(store, &session.provider)?;
+    local_app::check_current_with_baseline(store, &session.provider, active_disk_origin)?;
     let runtime = session
         .provider
         .local
@@ -531,13 +1280,27 @@ fn select_thinking(
         };
         options[index]
     };
-    let mut next = session.provider.clone();
-    if let Some(local) = next.local.as_mut() {
-        local.thinking = mode.into_option();
-    }
-    commit_provider(store, settings, session, client, events, next)
+    commit_provider(
+        store,
+        settings,
+        active_disk_origin,
+        session,
+        client,
+        events,
+        ProviderEdit::Thinking {
+            disk_expected: active_disk_origin.clone(),
+            session_base: session.provider.clone(),
+            thinking: mode.into_option(),
+        },
+    )
 }
-fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) -> Footer {
+fn footer(
+    session: &Session,
+    runtime: &Cli,
+    plan: bool,
+    budget: &ContextBudget,
+    events: &Events,
+) -> Footer {
     let base_permissions = if runtime.permissions() == ApprovalMode::FullAccess {
         "full-access"
     } else if runtime.allow_shell {
@@ -574,7 +1337,7 @@ fn footer(session: &Session, runtime: &Cli, plan: bool, budget: &ContextBudget) 
         session.provider.effort.to_string()
     };
     Footer {
-        model: session.provider.model.clone(),
+        model: events.redact(&session.provider.model),
         provider: session.provider.kind.to_string(),
         effort,
         permissions,
@@ -597,11 +1360,12 @@ fn status(
     budget: &ContextBudget,
     skills: &str,
     memory_line: &str,
+    events: &Events,
 ) {
     notice!(
         "\nМодель       {} / {}\nEffort       {}\nРежим        {} · shell {}\nПесочница    {}\nПапка        {}\nСессия       {}",
         session.provider.kind,
-        ui::safe(&session.provider.model),
+        ui::safe(&events.redact(&session.provider.model)),
         session.provider.effort,
         if plan {
             "план (только чтение)"
@@ -633,8 +1397,8 @@ fn status(
         );
         notice!(
             "Профиль      local · {} @{} · thinking {}",
-            ui::safe(local_app::profile_name(&session.provider)),
-            ui::safe(session.provider.base_url.as_deref().unwrap_or_default()),
+            ui::safe(&events.redact(local_app::profile_name(&session.provider))),
+            ui::safe(&events.redact(session.provider.base_url.as_deref().unwrap_or_default())),
             thinking
         );
     }
@@ -645,7 +1409,23 @@ fn status(
         "Финальное ревью {} · {} / {}",
         mode.label_ru(),
         review["provider"].as_str().unwrap_or("same"),
-        ui::safe(review["model"].as_str().unwrap_or_default())
+        ui::safe(&events.redact(review["model"].as_str().unwrap_or_default()))
+    );
+    let total_adv_calls = session.effective_advisor_calls();
+    let advisor_calls_suffix = if total_adv_calls > 0 {
+        let last_status = session
+            .advisor_calls
+            .last()
+            .map(|r| ui::safe(&events.redact(&r.status)))
+            .unwrap_or_else(|| String::from("compacted"));
+        format!(" · вызовов в сессии: {total_adv_calls} (последний: {last_status})")
+    } else {
+        String::new()
+    };
+    notice!(
+        "Советник     {}{}",
+        ui::safe(&events.redact(&crate::advisor::runtime_status_line_ru(runtime))),
+        advisor_calls_suffix
     );
 }
 /// `skills`: the catalog line of `catalog_summary`.
@@ -810,6 +1590,7 @@ fn skills_view(
     catalog: &SkillCatalog,
     unit: CatalogUnit,
     rendered: Option<&RenderedCatalog>,
+    secrets: &[String],
 ) -> String {
     const SHOWN_PROBLEMS: usize = 10;
     // Shadowed skills are rows of the table with their winner.
@@ -841,14 +1622,24 @@ fn skills_view(
         ),
     };
     if !catalog.skills.is_empty() {
-        let entries = catalog.entries(&catalog.limits, unit, rendered);
+        let compiled_dict =
+            (!secrets.is_empty()).then(|| crate::redaction::SecretDictionary::new(secrets));
+        let redact_cell = |text: &str| -> String {
+            match &compiled_dict {
+                None => text.to_owned(),
+                Some(Ok(dict)) => crate::redaction::redact_text_idempotent_with(dict, text)
+                    .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into()),
+                Some(Err(_)) => "[rcode: текст скрыт из-за ошибки redaction]".into(),
+            }
+        };
+        let entries = catalog.entries_redacted(&catalog.limits, unit, rendered, secrets);
         let rows: Vec<[String; 5]> = catalog
             .skills
             .iter()
             .zip(entries)
             .map(|(skill, entry)| {
                 let status = match (&skill.shadowed_by, entry) {
-                    (Some(winner), _) => format!("перекрыт: {winner}"),
+                    (Some(winner), _) => format!("перекрыт: {}", redact_cell(winner)),
                     _ if skill.disabled => "отключён".into(),
                     _ if skill.disable_model_invocation => "только /skill".into(),
                     (_, CatalogEntry::Described(_)) => "в каталоге".into(),
@@ -862,9 +1653,9 @@ fn skills_view(
                     CatalogEntry::Counted | CatalogEntry::Absent => "—".into(),
                 };
                 [
-                    ui::safe(&skill.id),
+                    ui::safe(&redact_cell(&skill.id)),
                     skill.scope.as_str().into(),
-                    ui::safe(&status),
+                    ui::safe(&redact_cell(&status)),
                     size(skill.bytes),
                     cost,
                 ]
@@ -903,7 +1694,10 @@ fn skills_view(
             problems.len()
         ));
         for problem in problems.iter().take(SHOWN_PROBLEMS) {
-            output.push_str(&format!("\n  ! {}", ui::safe(&problem.warning())));
+            output.push_str(&format!(
+                "\n  ! {}",
+                ui::safe(&problem.warning_redacted(secrets))
+            ));
         }
         if problems.len() > SHOWN_PROBLEMS {
             output.push_str(&format!("\n  … ещё {}", problems.len() - SHOWN_PROBLEMS));
@@ -925,11 +1719,27 @@ struct SkillRequest {
 /// `load_skill` call before the first model request; unknown and ambiguous ids
 /// fail here, without a model request.
 fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<SkillRequest> {
+    skill_request_with_secrets(catalog, rest, &[])
+}
+
+fn skill_request_with_secrets(
+    catalog: &SkillCatalog,
+    rest: &str,
+    secrets: &[String],
+) -> Result<SkillRequest> {
     let rest = rest.trim();
     let (id, request) = rest
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(id, request)| (id, request.trim()));
-    let shown = || ui::safe(&presentation::inline(id, 80));
+    let redact_item = |text: &str| -> String {
+        if secrets.is_empty() {
+            text.to_owned()
+        } else {
+            crate::redaction::redact_text_idempotent(text, secrets)
+                .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
+        }
+    };
+    let shown = || ui::safe(&presentation::inline(&redact_item(id), 80));
     let skill = match catalog.find(id) {
         Ok(skill) => skill,
         Err(LookupError::Unknown { suggestions }) if suggestions.is_empty() => {
@@ -941,12 +1751,20 @@ fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<SkillRequest> {
         Err(LookupError::Unknown { suggestions }) => bail!(
             "Скилл {} не найден. Похожие: {}. /skills — список",
             shown(),
-            suggestions.join(", ")
+            suggestions
+                .iter()
+                .map(|s| redact_item(s))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Err(LookupError::Ambiguous { candidates }) => bail!(
             "Имя {} есть у нескольких скиллов: {}. Укажите полный id",
             shown(),
-            candidates.join(", ")
+            candidates
+                .iter()
+                .map(|s| redact_item(s))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     };
     let mut prompt = format!(
@@ -965,10 +1783,28 @@ fn skill_request(catalog: &SkillCatalog, rest: &str) -> Result<SkillRequest> {
     })
 }
 
+#[cfg(test)]
 fn skill_menu(
     catalog: &SkillCatalog,
     registry: &crate::commands::CommandRegistry,
 ) -> Vec<terminal::MenuCommand> {
+    skill_menu_redacted(catalog, registry, &[])
+}
+
+fn skill_menu_redacted(
+    catalog: &SkillCatalog,
+    registry: &crate::commands::CommandRegistry,
+    secrets: &[String],
+) -> Vec<terminal::MenuCommand> {
+    let compiled_dict =
+        (!secrets.is_empty()).then(|| crate::redaction::SecretDictionary::new(secrets));
+    let redact_item = |text: &str| -> Option<String> {
+        match &compiled_dict {
+            None => Some(text.to_owned()),
+            Some(Ok(dict)) => crate::redaction::redact_text_idempotent_with(dict, text).ok(),
+            Some(Err(_)) => None,
+        }
+    };
     let available: Vec<_> = catalog
         .skills
         .iter()
@@ -984,6 +1820,12 @@ fn skill_menu(
         .collect();
     let mut menu = Vec::new();
     for skill in available {
+        let Some(clean_id) = redact_item(&skill.id) else {
+            continue;
+        };
+        if clean_id != skill.id {
+            continue;
+        }
         let canonical = format!("/{}", skill.id);
         if occupied.contains(&canonical) {
             continue;
@@ -995,7 +1837,12 @@ fn skill_menu(
         } else {
             ""
         };
-        let description = format!("{}{}", skill.description, status);
+        let clean_desc: String = redact_item(&skill.raw_description)
+            .unwrap_or_else(|| "[скрыто]".into())
+            .chars()
+            .take(1024)
+            .collect();
+        let description = format!("{clean_desc}{status}");
         menu.push(terminal::MenuCommand {
             name: canonical,
             description: description.clone(),
@@ -1006,6 +1853,7 @@ fn skill_menu(
         if skill.name != skill.id
             && counts.get(skill.name.as_str()) == Some(&1)
             && !occupied.contains(&alias)
+            && redact_item(&skill.name).as_deref() == Some(skill.name.as_str())
         {
             menu.push(terminal::MenuCommand {
                 name: alias,
@@ -1050,7 +1898,7 @@ fn start_skill_request(
         .map(|id| skill_request(catalog, &format!("{id} {arguments}")))
         .transpose()
 }
-fn cost(session: &Session) {
+fn cost(session: &Session, events: &Events) {
     notice!(
         "\nТокены API за сессию: ↑{} входных · ↓{} выходных · {} кэшированных",
         session.usage.input_tokens,
@@ -1079,11 +1927,56 @@ fn cost(session: &Session) {
         for ((provider, model), (input, output)) in review_totals {
             notice!(
                 "  {} / {} · ↑{} входных · ↓{} выходных",
-                ui::safe(&provider),
-                ui::safe(&model),
+                ui::safe(&events.redact(&provider)),
+                ui::safe(&events.redact(&model)),
                 input,
                 output
             );
+        }
+    }
+    for (source_key, title) in [
+        ("advisor", "Советник (/advisor):"),
+        ("subagent", "Маршрутизированные субагенты:"),
+    ] {
+        let rows: Vec<_> = session
+            .auxiliary_usage
+            .iter()
+            .filter(|entry| entry.source == source_key)
+            .collect();
+        if !rows.is_empty() {
+            notice!("{title}");
+            for row in rows {
+                let route = match &row.local_profile {
+                    Some(profile) => {
+                        format!(
+                            "local:{} / {}",
+                            ui::safe(&events.redact(profile)),
+                            ui::safe(&events.redact(&row.model))
+                        )
+                    }
+                    None => format!(
+                        "{} / {}",
+                        ui::safe(&events.redact(&row.provider)),
+                        ui::safe(&events.redact(&row.model))
+                    ),
+                };
+                let cost_suffix = match row.usage.cost_usd {
+                    Some(usd) if row.priced_calls > 0 && row.priced_calls < row.calls => {
+                        format!(
+                            " · ${usd:.6} (цена для {}/{} выз.)",
+                            row.priced_calls, row.calls
+                        )
+                    }
+                    Some(usd) => format!(" · ${usd:.6}"),
+                    None => String::new(),
+                };
+                notice!(
+                    "  {route} ({} выз.) · ↑{} входных · ↓{} выходных{cost_suffix}",
+                    row.calls,
+                    row.usage.input_tokens,
+                    row.usage.output_tokens,
+                );
+            }
         }
     }
 }
@@ -1093,15 +1986,22 @@ fn review_model_command(
     store: &ConfigStore,
     settings: &mut Settings,
     mode: crate::final_review::FinalReviewMode,
+    events: &Events,
 ) -> Result<()> {
     match args {
         [] | ["status"] => {
-            let value = crate::final_review::model_target_summary_for_mode(settings, mode);
+            let _ = events.refresh_keys(store);
+            let value = crate::final_review::redacted_model_target_summary_for_mode(
+                store,
+                settings,
+                mode,
+                &events.secret_snapshot(),
+            );
             notice!(
                 "Финальное ревью: {} · {} / {}",
                 mode.label_ru(),
                 value["provider"].as_str().unwrap_or("same"),
-                value["model"].as_str().unwrap_or_default()
+                ui::safe(value["model"].as_str().unwrap_or_default())
             );
         }
         ["same"] => {
@@ -1109,19 +2009,37 @@ fn review_model_command(
             notice!("✓ Цель финального ревью: текущая основная модель");
         }
         [provider, model] => {
-            crate::final_review::set_selected(store, settings, provider, None, model)?;
+            let _ = events.refresh_keys(store);
+            crate::final_review::set_selected_with_secrets(
+                store,
+                settings,
+                provider,
+                None,
+                model,
+                || events.secret_snapshot(),
+            )?;
+            let _ = events.refresh_keys(store);
             notice!(
                 "✓ Цель финального ревью сохранена для {} / {}",
-                ui::safe(provider),
-                ui::safe(model)
+                ui::safe(&events.redact(provider)),
+                ui::safe(&events.redact(model))
             );
         }
         ["local", profile, model] => {
-            crate::final_review::set_selected(store, settings, "local", Some(profile), model)?;
+            let _ = events.refresh_keys(store);
+            crate::final_review::set_selected_with_secrets(
+                store,
+                settings,
+                "local",
+                Some(profile),
+                model,
+                || events.secret_snapshot(),
+            )?;
+            let _ = events.refresh_keys(store);
             notice!(
                 "✓ Цель финального ревью сохранена для local / {} / {}",
-                ui::safe(profile),
-                ui::safe(model)
+                ui::safe(&events.redact(profile)),
+                ui::safe(&events.redact(model))
             );
         }
         _ => bail!("Использование: /review-model [status|same|PROVIDER MODEL|local PROFILE MODEL]"),
@@ -1197,37 +2115,41 @@ fn bounded_agent_text(text: &str, limit: usize) -> String {
     }
     result
 }
-fn help(registry: &crate::commands::CommandRegistry) {
-    notice!("\nКоманды rcode");
+fn help(registry: &crate::commands::CommandRegistry, events: &Events) {
+    use std::fmt::Write as _;
+    let mut out = String::from("\nКоманды rcode\n");
     for c in terminal::COMMANDS {
-        notice!("  {:15} {}", c.name, c.description);
+        let _ = writeln!(out, "  {:15} {}", c.name, c.description);
     }
-    notice!(
-        "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать"
+    out.push_str(
+        "  !команда       Выполнить локальную shell-команду без запроса к модели; Ctrl+C/Esc — прервать\n",
     );
     let custom: Vec<_> = registry.loadable().collect();
     if !custom.is_empty() {
-        notice!("\nПользовательские команды");
+        let secrets = events.secret_snapshot();
+        out.push_str("\nПользовательские команды\n");
         for c in custom {
             let hint = c
                 .hint
                 .as_deref()
-                .map(|hint| format!(" [{hint}]"))
+                .map(|hint| format!(" [{}]", events.redact(hint)))
                 .unwrap_or_default();
-            notice!(
+            let _ = writeln!(
+                out,
                 "  {:15} {} · {}",
-                format!("/{}", c.name),
-                format!("{}{hint}", c.description),
+                ui::safe(&events.redact(&format!("/{}", c.name))),
+                ui::safe(&format!("{}{hint}", c.description_redacted(&secrets))),
                 c.scope.as_str()
             );
         }
         let unsupported: Vec<_> = registry
             .loadable()
             .filter(|c| !c.unsupported.is_empty())
-            .map(|c| format!("/{}", c.name))
+            .map(|c| ui::safe(&events.redact(&format!("/{}", c.name))))
             .collect();
         if !unsupported.is_empty() {
-            notice!(
+            let _ = writeln!(
+                out,
                 "  {} — синтаксис !-shell и @файл не исполняется, текст уходит модели как есть",
                 unsupported.join(", ")
             );
@@ -1238,11 +2160,14 @@ fn help(registry: &crate::commands::CommandRegistry) {
         .iter()
         .any(|c| c.shadowed_by == Some(crate::commands::Shadow::Builtin))
     {
-        notice!("  Файлы с именами встроенных команд не используются (например, permissions.md).");
+        out.push_str(
+            "  Файлы с именами встроенных команд не используются (например, permissions.md).\n",
+        );
     }
-    notice!(
-        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень] · /thinking [auto|on|off]\n/review-model status|same|ПРОВАЙДЕР МОДЕЛЬ — маршрут отдельного ревью\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов."
+    out.push_str(
+        "\n/model [ID] | /model [провайдер] [ID] · /effort [уровень] · /thinking [auto|on|off]\n/advisor [status|off|СЕЛЕКТОР] — модель-советник · /review-model status|same|ПРОВАЙДЕР МОДЕЛЬ\n/final-review on|off|status — включить ревью для следующих ходов этого запуска\n/resume [ID|latest] · /permissions [ask|auto-edit|full-access]\n/sandbox [status|off|workspace-write|read-only|network on|off] — OS-песочница shell модели\n/export [\"путь.md\"] — сохранённый диалог и отдельные ревью в Markdown\n/attach \"путь.png\" [запрос] — изображение; также можно вставить путь к PNG/JPEG/TIFF\n/agents [ID] — задачи и результаты субагентов; ID можно сократить\n/skills — найденные скиллы и стоимость каталога · /skill ID [запрос] — явно выбрать скилл\n/memory [status|show|log|undo|rm|on|off] — межсессионная память и ревизии\n/btw <вопрос> — быстрый вопрос по контексту без инструментов и записи в историю\nВвод: / меню · Tab дополнение · ↑↓ выбор/история · Shift+Enter / Alt+Enter / Ctrl+J новая строка · Enter в ходе — дорулить задачу\nМышь: колесо — история; выделение — копирование; Ctrl+C копирует выделение; Esc снимает.\nCtrl+O раскрыть/свернуть вывод команд в полноэкранном интерфейсе\nCtrl+C отменить без выделения · Ctrl+D выход · Esc закрыть меню\nФинальное ревью выключено по умолчанию; это отдельный запрос к выбранной модели без инструментов.\nИзменения файлов — через diff/подтверждение; full-access выполняет файлы и shell без запросов.",
     );
+    notice!("{out}");
 }
 
 fn permissions_choice(
@@ -1512,8 +2437,9 @@ fn sandbox_command(
 /// Discovery warnings, at most ten lines; shown again only when the set changes.
 fn skill_problems(problems: &[SkillProblem], events: &Events) {
     const SHOWN: usize = 10;
+    let secrets = events.secret_snapshot();
     for problem in problems.iter().take(SHOWN) {
-        notice!("! {}", ui::safe(&events.redact(&problem.warning())));
+        notice!("! {}", ui::safe(&problem.warning_redacted(&secrets)));
     }
     if problems.len() > SHOWN {
         notice!("! Скиллы: ещё предупреждений — {}", problems.len() - SHOWN);
@@ -1527,7 +2453,7 @@ fn command_problems(problems: &[crate::commands::CommandProblem], events: &Event
         notice!(
             "! {}: {} ({})",
             ui::safe(&events.redact(&problem.path.display().to_string())),
-            problem.message,
+            ui::safe(&events.redact(&problem.message)),
             problem.code
         );
     }
@@ -1674,6 +2600,135 @@ fn memory_command(
         ),
     }
 }
+fn validate_restored_cloud_connection(
+    same_session: bool,
+    credential_unchanged: bool,
+    current_session_provider: &ProviderSettings,
+    current_disk_origin: &ProviderSettings,
+    provider: &ProviderSettings,
+    disk_origin: &ProviderSettings,
+    cred_source: Option<&str>,
+) -> Result<()> {
+    let unchanged_in_process_override = same_session
+        && credential_unchanged
+        && provider.kind == current_session_provider.kind
+        && crate::model_route::RouteIdentity::same_connection(provider, current_session_provider)
+        && crate::model_route::RouteIdentity::disk_unchanged(current_disk_origin, disk_origin);
+    if cred_source == Some("credentials.json")
+        && !unchanged_in_process_override
+        && !crate::model_route::RouteIdentity::same_connection(provider, disk_origin)
+    {
+        bail!(
+            "Параметры подключения провайдера {} изменились после сохранения сессии; переключите провайдера через /provider {} или /connect {}",
+            provider.kind,
+            provider.kind,
+            provider.kind
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_session_client(
+    store: &ConfigStore,
+    settings: &mut Settings,
+    same_session: bool,
+    current_client: &ProviderClient,
+    current_session_provider: &ProviderSettings,
+    current_disk_origin: &ProviderSettings,
+    provider: &ProviderSettings,
+    events: &mut Events,
+) -> Result<(ProviderClient, ProviderSettings)> {
+    if provider.kind == ProviderKind::Local {
+        let (fresh, cred) = store.read_consistent_local(provider)?;
+        let name = local_app::profile_name(provider);
+        let disk_origin = crate::model_route::configured_local_profile(&fresh, name)?
+            .unwrap_or_else(|| provider.clone());
+        let credential_unchanged = match &cred {
+            crate::config::CredentialState::Present(c) => {
+                current_client.credential_matches(Some(c.value.as_str()))
+            }
+            _ => current_client.credential_matches(None),
+        };
+        if matches!(cred, crate::config::CredentialState::Present(_)) {
+            validate_restored_cloud_connection(
+                same_session,
+                credential_unchanged,
+                current_session_provider,
+                current_disk_origin,
+                provider,
+                &disk_origin,
+                Some("credentials.json"),
+            )?;
+        } else if same_session
+            && fresh.local.profiles.contains_key(name)
+            && !crate::model_route::RouteIdentity::disk_unchanged(current_disk_origin, &disk_origin)
+        {
+            bail!(
+                "Параметры подключения локального профиля «{name}» изменились в другом процессе; переключите профиль через /provider local"
+            );
+        }
+        *settings = fresh;
+        events.refresh_keys(store)?;
+        let next = local_app::client_with_credential(
+            provider,
+            cred,
+            events,
+            "Нет ключа провайдера сохранённой сессии",
+        )?;
+        crate::model_route::ensure_route_free_of_secrets(
+            store,
+            provider,
+            &events.secret_snapshot(),
+        )?;
+        Ok((next, disk_origin))
+    } else {
+        let (fresh, cred) = store.read_consistent_cloud(provider.kind)?;
+        let configured_on_disk =
+            crate::model_route::configured_cloud_provider(&fresh, provider.kind)?;
+        if provider.kind == ProviderKind::Custom
+            && configured_on_disk.is_none()
+            && cred
+                .as_ref()
+                .is_some_and(|c| c.source == "credentials.json")
+        {
+            bail!(
+                "Провайдер custom не настроен в config.json; сохранённый ключ в credentials.json не отправляется на адрес по умолчанию. Выполните /connect custom"
+            );
+        }
+        let disk_origin = configured_on_disk.unwrap_or_else(|| fresh.provider(provider.kind));
+        let credential_unchanged =
+            current_client.credential_matches(cred.as_ref().map(|c| c.value.as_str()));
+        validate_restored_cloud_connection(
+            same_session,
+            credential_unchanged,
+            current_session_provider,
+            current_disk_origin,
+            provider,
+            &disk_origin,
+            cred.as_ref().map(|c| c.source.as_str()),
+        )?;
+        *settings = fresh;
+        events.refresh_keys(store)?;
+        let state = match cred {
+            Some(c) => crate::config::CredentialState::Present(c),
+            None => crate::config::CredentialState::Missing,
+        };
+        let next = local_app::client_with_credential(
+            provider,
+            state,
+            events,
+            "Нет ключа провайдера сохранённой сессии",
+        )?;
+        crate::model_route::ensure_route_free_of_secrets(
+            store,
+            provider,
+            &events.secret_snapshot(),
+        )?;
+        Ok((next, disk_origin))
+    }
+}
+
 /// `skills`: the snapshot `dispatch` discovered; later inputs rediscover.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -1687,6 +2742,7 @@ pub(crate) async fn run(
     skills: SkillCatalog,
     execution: &mut crate::session_runtime::SessionRuntime,
 ) -> Result<i32> {
+    session.bind_secret_source(events.shared_secrets());
     execution.activate()?;
     execution.reconcile_receipts(session)?;
     let rich = events.display.is_rich();
@@ -1705,11 +2761,26 @@ pub(crate) async fn run(
                 &initial_memory,
                 &events.secret_snapshot(),
             ),
+            events,
         ))?)
     } else {
         None
     };
     let mut runtime = cli.clone();
+    let mut active_disk_origin = if session.provider.kind == ProviderKind::Local {
+        crate::model_route::configured_local_profile(
+            settings,
+            local_app::profile_name(&session.provider),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| session.provider.clone())
+    } else {
+        crate::model_route::configured_cloud_provider(settings, session.provider.kind)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| settings.provider(session.provider.kind))
+    };
     let mut balance_monitor = start_balance_monitor(client, session);
     let mut plan = cli.plan;
     let mut composer = terminal::Editor::new();
@@ -1737,7 +2808,7 @@ pub(crate) async fn run(
     presentation::welcome(
         &session.root,
         &session.provider.kind.to_string(),
-        &session.provider.model,
+        &events.redact(&session.provider.model),
         rich,
     );
     if !rich && runtime.effective_sandbox.is_active() {
@@ -1811,8 +2882,9 @@ pub(crate) async fn run(
             command_problems(&registry.problems, events);
             shown_command_problems = command_fingerprints;
         }
-        let mut menu = registry.menu();
-        menu.extend(skill_menu(&skills, &registry));
+        let live_menu_secrets = events.secret_snapshot();
+        let mut menu: Vec<terminal::MenuCommand> = registry.menu_redacted(&live_menu_secrets);
+        menu.extend(skill_menu_redacted(&skills, &registry, &live_menu_secrets));
         composer.set_commands(menu.clone());
         let budget = context_budget_with_memory(
             client,
@@ -1824,7 +2896,7 @@ pub(crate) async fn run(
             &events.secret_snapshot(),
         );
         if let Some(screen) = crate::screen::current() {
-            screen.set_footer(footer(session, &runtime, plan, &budget));
+            screen.set_footer(footer(session, &runtime, plan, &budget, events));
         }
         let input = if let Some(p) = pending.pop_front() {
             if let Some(screen) = crate::screen::current() {
@@ -1835,7 +2907,7 @@ pub(crate) async fn run(
             // One input owner. Keep the async host available to persist natural
             // command completion while the user is composing or simply idle.
             let mut editor = std::mem::take(&mut composer);
-            let current_footer = footer(session, &runtime, plan, &budget);
+            let current_footer = footer(session, &runtime, plan, &budget, events);
             let prompt = if plan {
                 "rcode [план] › "
             } else if runtime.permissions() == ApprovalMode::FullAccess {
@@ -1903,6 +2975,7 @@ pub(crate) async fn run(
                 | "/resume"
                 | "/help"
                 | "/status"
+                | "/advisor"
                 | "/memory"
                 | "/sandbox"
                 | "/btw"
@@ -1990,30 +3063,47 @@ pub(crate) async fn run(
                 .and_then(|name| registry.find(name))
                 .map(|entry| (entry.name.clone(), entry.unsupported.to_vec()));
             let result:Result<()>=async{match command{
-                "/help"=>{help(&registry);Ok(())},
-                "/model"|"/models"=>select_model(&args,false,rich,store,settings,session,client,events,&mut models).await,
-                "/provider"=>select_model(&args,true,rich,store,settings,session,client,events,&mut models).await,
-                "/effort"=>select_effort(&args,rich,store,settings,session,client,events,&mut models).await,
-                "/thinking"=>select_thinking(&args,rich,store,settings,session,client,events),
-                "/review-model"=>review_model_command(&args,store,settings,runtime.final_review_mode()),
+                "/help"=>{help(&registry,events);Ok(())},
+                "/model"|"/models"=>{select_model(&args,false,rich,store,settings,&mut active_disk_origin,session,client,events,&mut models).await?;runtime.refresh_routing_soft(store,settings,&session.provider,events);Ok(())},
+                "/provider"=>{select_model(&args,true,rich,store,settings,&mut active_disk_origin,session,client,events,&mut models).await?;runtime.refresh_routing_soft(store,settings,&session.provider,events);Ok(())},
+                "/effort"=>{select_effort(&args,rich,store,settings,&mut active_disk_origin,session,client,events,&mut models).await?;runtime.refresh_routing_soft(store,settings,&session.provider,events);Ok(())},
+                "/thinking"=>{select_thinking(&args,rich,store,settings,&mut active_disk_origin,session,client,events)?;runtime.refresh_routing_soft(store,settings,&session.provider,events);Ok(())},
+                "/advisor"=>{
+                    if runtime.in_eval {
+                        bail!("Команда /advisor отключена в изолированном режиме rcode eval");
+                    }
+                    crate::advisor::interactive_command(&args,rich,store,settings,session,&mut runtime.advisor_override,events).await?;
+                    if args.as_slice() == ["status"] {
+                        runtime.refresh_routing_soft(store,settings,&session.provider,events);
+                        Ok(())
+                    } else {
+                        runtime.refresh_routing(store,settings,&session.provider,events)
+                    }
+                },
+                "/review-model"=>review_model_command(&args,store,settings,runtime.final_review_mode(),events),
                 "/final-review"=>{
                     match args.as_slice() {
                         [] | ["status"] => {
+                            let _ = events.refresh_keys(store);
                             let mode=runtime.final_review_mode();
-                            let target=crate::final_review::model_target_summary_for_mode(settings,mode);
-                            notice!("Финальное ревью: {} · {} / {}",mode.label_ru(),target["provider"].as_str().unwrap_or("same"),target["model"].as_str().unwrap_or_default());
+                            let target=crate::final_review::redacted_model_target_summary_for_mode(store,settings,mode,&events.secret_snapshot());
+                            notice!("Финальное ревью: {} · {} / {}",mode.label_ru(),target["provider"].as_str().unwrap_or("same"),ui::safe(target["model"].as_str().unwrap_or_default()));
                         }
                         ["on"] => {
                             crate::final_review::ensure_user_controlled()?;
+                            let _ = events.refresh_keys(store);
                             let route=crate::final_review::resolve_target(settings,&session.provider,&settings.final_review)?;
                             crate::final_review::selected_credentials(store,&route)?;
+                            crate::model_route::ensure_route_free_of_secrets(store,&route,&events.secret_snapshot())?;
                             runtime.set_final_review_mode(crate::final_review::FinalReviewMode::OneShot);
                             notice!("✓ Финальное ревью включено для последующих ходов этого запуска");
                         }
                         ["repair"] => {
                             crate::final_review::ensure_user_controlled()?;
+                            let _ = events.refresh_keys(store);
                             let route=crate::final_review::resolve_target(settings,&session.provider,&settings.final_review)?;
                             crate::final_review::selected_credentials(store,&route)?;
+                            crate::model_route::ensure_route_free_of_secrets(store,&route,&events.secret_snapshot())?;
                             runtime.set_final_review_mode(crate::final_review::FinalReviewMode::Repair);
                             notice!("✓ Финальное ревью с исправлением (repair) включено для последующих ходов этого запуска");
                         }
@@ -2024,7 +3114,7 @@ pub(crate) async fn run(
                 },
                 "/vision"=>crate::vision::choose(rich,store,settings,events).await,
                 "/websearch"=>crate::web_search::choose(rich,store,settings,events).await,
-                "/connect"|"/login"=>{let kind=args.first().map(|s|s.parse::<ProviderKind>()).transpose()?;let next=ui::connect(store,settings,kind,rich,None).await?;commit_provider(store,settings,session,client,events,next)?;models.clear();Ok(())},
+                "/connect"|"/login"=>{let kind=args.first().map(|s|s.parse::<ProviderKind>()).transpose()?;let next=ui::connect_with_secrets(store,settings,kind,rich,None,&events.secret_snapshot(),Some(events.shared_secrets())).await?;commit_provider(store,settings,&mut active_disk_origin,session,client,events,ProviderEdit::Switch(next))?;runtime.refresh_routing_soft(store,settings,&session.provider,events);models.clear();Ok(())},
                 "/permissions"=>{
                     if let Some(mode)=permissions_choice(&args,rich,runtime.permissions())? {
                         apply_permissions(mode,store,session,&mut runtime,tools)?;
@@ -2040,7 +3130,19 @@ pub(crate) async fn run(
                         Err(err)=>Err(err),
                     }
                 },
-                "/status"=>{let rendered=skill_catalog(session,&skills);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&events.secret_snapshot()));status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
+                "/status"=>{
+                    match store.load() {
+                        Ok(fresh) => {
+                            *settings = fresh;
+                            runtime.refresh_routing_soft(store, settings, &session.provider, events);
+                        }
+                        Err(err) => {
+                            runtime.effective_advisor = None;
+                            runtime.advisor_unavailable_reason = Some(events.redact(&format!("{err:#}")));
+                        }
+                    }
+                    let live_sec=events.secret_snapshot();let rendered=skill_catalog_redacted(session,&skills,&live_sec);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&live_sec));status(session,&runtime,settings,plan,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line,events);Ok(())
+                },
                 "/memory"=>memory_command(&args,&runtime,plan,store,session,client,events),
                 "/balance"=>{
                     if !args.is_empty(){bail!("/balance — баланс текущего провайдера; сменить провайдера: /provider");}
@@ -2056,42 +3158,53 @@ pub(crate) async fn run(
                 },
                 "/agents"=>{
                     if args.len()>1{bail!("/agents [ID или однозначный префикс]");}
-                    let records=serde_json::to_value(&session.agents)?;
+                    let mut records=serde_json::to_value(&session.agents)?;
+                    events.redact_value(&mut records);
                     let records=records.as_array().context("Не удалось прочитать список субагентов")?;
                     notice!("{}",events.redact(&agents_view(records,args.first().copied())?));
                     Ok(())
                 },
-                "/context"=>{let rendered=skill_catalog(session,&skills);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&events.secret_snapshot()));context(session,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
+                "/context"=>{let live_sec=events.secret_snapshot();let rendered=skill_catalog_redacted(session,&skills,&live_sec);let mem_unit=catalog_unit_for_client(client,session);let mem_line=events.redact(&memory_summary(&memory,mem_unit,&live_sec));context(session,&models,&budget,&catalog_summary(&skills,rendered.as_ref(),catalog_unit(session)),&mem_line);Ok(())},
                 "/skills"=>{
                     if !args.is_empty(){bail!("/skills — список скиллов; выбрать скилл: /skill ID [запрос]");}
-                    let rendered=skill_catalog(session,&skills);
-                    notice!("{}",events.redact(&skills_view(&skills,catalog_unit(session),rendered.as_ref())));
+                    let live_sec=events.secret_snapshot();
+                    let rendered=skill_catalog_redacted(session,&skills,&live_sec);
+                    notice!("{}",events.redact(&skills_view(&skills,catalog_unit(session),rendered.as_ref(),&live_sec)));
                     Ok(())
                 },
                 "/skill"=>{
                     let rest=input.strip_prefix(command).unwrap_or_default();
                     if rest.trim().is_empty(){
-                        let rendered=skill_catalog(session,&skills);
-                        notice!("{}",events.redact(&skills_view(&skills,catalog_unit(session),rendered.as_ref())));
+                        let live_sec=events.secret_snapshot();
+                        let rendered=skill_catalog_redacted(session,&skills,&live_sec);
+                        notice!("{}",events.redact(&skills_view(&skills,catalog_unit(session),rendered.as_ref(),&live_sec)));
                         notice!("Укажите скилл: /skill ID [запрос]");
                         return Ok(());
                     }
                     // Checked locally first: an unknown id never reaches the model.
-                    let skill=skill_request(&skills,rest)?;
+                    let skill=skill_request_with_secrets(&skills,rest,&events.secret_snapshot())?;
                     if rich{notice!("\n{} {}",presentation::tone("❯","1;38;5;110",true),ui::safe(&redacted));}
                     crate::app::skill_turn(session,store,tools,client,events,&runtime,&skill.prompt,&skill.id,plan,&skills,execution).await.map(drop)
                 },
                 "/export"=>{
-                    let path=crate::export::write(session,input.strip_prefix(command).unwrap_or_default(),|text|events.redact(text))?;
+                    events.refresh_keys(store)?;
+                    let art_store=crate::artifacts::ArtifactStore::open(&session.dir(store),&session.id).ok();
+                    let path=crate::export::write_with_tool_sanitizer(
+                        session,
+                        input.strip_prefix(command).unwrap_or_default(),
+                        |text|events.redact(text),
+                        |tool_name,raw|events.sanitize_tool_result_for_export(tool_name,raw,art_store.as_ref()),
+                    )?;
                     notice!("✓ Диалог сохранён: {}",ui::safe(&events.redact(&path.to_string_lossy())));
                     Ok(())
                 },
-                "/cost"=>{cost(session);Ok(())},
+                "/cost"=>{cost(session,events);Ok(())},
                 "/diff"=>{notice!("{}",ui::safe(&tools.diff()?));Ok(())},
                 "/undo"=>{let text=tools.undo()?;notice!("{}",ui::safe(&text));let mut message=Message::user(format!("Пользователь выполнил /undo: {text}. Перечитай файлы перед изменениями."));message.provider_meta=Some(ProviderMeta{kind:"rcode_runtime".into(),data:json!({"undo":true})});session.messages.push(message);session.save(store)},
                 "/compact"=>{events.refresh_keys(store)?;let saved=session.compact_within_redacted(&budget,&events.secret_snapshot())?;session.save(store)?;notice!("✓ История сокращена на {saved} {}",budget.unit_label());Ok(())},
                 "/clear"|"/new"=>{
-                    let mut next=Session::new(&session.root,session.provider.clone())?;
+                    let mut next=Session::new_clean(&session.root,session.provider.clone(),&events.secret_snapshot())?;
+                    next.bind_secret_source(events.shared_secrets());
                     crate::config::ensure_private_directory(&next.dir(store))?;
                     let mut next_execution=crate::session_runtime::SessionRuntime::new(&next.dir(store),&next.id,events.secret_snapshot())?;
                     execution.shutdown_saved(session,store,&events.secret_snapshot()).await?;
@@ -2114,22 +3227,38 @@ pub(crate) async fn run(
                     if id.as_deref()==Some(session.id.as_str()){
                         // Reload session data without constructing a second
                         // Tools or SessionRuntime for their already leased
-                        // directories.
+                        // directories, while preserving in-process route consent/denials,
+                        // cached route clients, and monotone local prompt calibrations.
                         let mut restored=Session::load(store,&session.id,&session.root)?;
-                        let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
+                        restored.bind_secret_source(events.shared_secrets());
+                        restored.approved_routes=session.approved_routes.clone();
+                        restored.denied_routes=session.denied_routes.clone();
+                        let (mut next,next_origin)=restore_session_client(store,settings,true,client,&session.provider,&active_disk_origin,&restored.provider,events)?;
                         execution.reconcile_receipts(&mut restored)?;
                         restored.save(store)?;
-                        *session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()),events)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        restored.route_clients=std::mem::take(&mut session.route_clients);
+                        restored.local_route_budgets=session.local_route_budgets.clone();
+                        restored.share_connection_peers_into(&mut next, Some(client));
+                        if next.is_local()
+                            && client.is_local()
+                            && crate::model_route::RouteIdentity::of(next.settings())
+                                == crate::model_route::RouteIdentity::of(client.settings())
+                            && let Some((_, cal)) = client.local_budget_snapshot()
+                        {
+                            next.restore_local_budget_snapshot((None, cal));
+                        }
+                        active_disk_origin=next_origin;*session=restored;*client=next;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()),events)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }else if let Some(id)=id{
                         // The snapshot's provider and endpoint are kept; the key is resolved for that endpoint.
                         let mut restored=Session::load(store,&id,&session.root)?;
-                        let next=local_app::client(store,&restored.provider,events,"Нет ключа провайдера сохранённой сессии")?;
+                        restored.bind_secret_source(events.shared_secrets());
+                        let (next,next_origin)=restore_session_client(store,settings,false,client,&session.provider,&active_disk_origin,&restored.provider,events)?;
                         let mut next_execution=crate::session_runtime::SessionRuntime::new(&restored.dir(store),&restored.id,events.secret_snapshot())?;
                         execution.shutdown_saved(session,store,&events.secret_snapshot()).await?;
                         next_execution.activate().context("Предыдущее исполнение остановлено; повторите /new или /resume")?;
                         next_execution.reconcile_receipts(&mut restored)?;
                         let next_tools=configured_tools(&restored.root,&restored.dir(store).join("checkpoints"),&runtime)?;restored.save(store)?;
-                        *session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()),events)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
+                        active_disk_origin=next_origin;*session=restored;*client=next;*tools=next_tools;*execution=next_execution;models.clear();if let Some(screen)=crate::screen::current(){screen.clear_history();}let resumed_mem=discover_memory(store,&runtime,&session.root,&events.secret_snapshot());let context=prepare_context(session,store,0,&context_budget_with_memory(client,session,&runtime,plan,&skills,&resumed_mem,&events.secret_snapshot()),events)?;hydrate(session,events);context.report(events);notice!("✓ Сессия восстановлена: {}",session.id);
                     }Ok(())
                 },
                 _ if custom.is_some() => {
@@ -2159,8 +3288,17 @@ pub(crate) async fn run(
             }}.await;
             if matches!(
                 command,
-                "/model" | "/models" | "/provider" | "/connect" | "/login" | "/effort" | "/resume"
+                "/model"
+                    | "/models"
+                    | "/provider"
+                    | "/connect"
+                    | "/login"
+                    | "/effort"
+                    | "/resume"
+                    | "/clear"
+                    | "/new"
             ) {
+                let _ = runtime.refresh_routing(store, settings, &session.provider, events);
                 drop(balance_monitor.take());
                 balance_monitor = start_balance_monitor(client, session);
             }
@@ -2278,6 +3416,7 @@ mod tests {
             dir: PathBuf::from("/skills").join(&name),
             file: PathBuf::from("/skills").join(&name).join("SKILL.md"),
             description: format!("Use {name} for its workflow. {}", "w".repeat(200)),
+            raw_description: String::new(),
             name,
             bytes: 2560,
             in_catalog: true,
@@ -2368,17 +3507,19 @@ mod tests {
                 path: PathBuf::from("/skills/bad\x1b]52;c;AAAA\x07\u{202e}/SKILL.md"),
                 code: "duplicate_key",
                 message: "Ошибка frontmatter: повтор ключа name в строке 3".into(),
+                raw_invalid_name: None,
             },
             SkillProblem {
                 path: PathBuf::from("/skills/review/SKILL.md"),
                 code: "shadowed",
                 message: "Скилл review перекрыт файлом /home/skills/review/SKILL.md".into(),
+                raw_invalid_name: None,
             },
         ];
         let unit = CatalogUnit::Chars;
         let rendered = catalog.render(&catalog.limits, unit).unwrap();
         assert!(rendered.entries > 0 && !rendered.omitted_ids.is_empty());
-        let view = skills_view(&catalog, unit, Some(&rendered));
+        let view = skills_view(&catalog, unit, Some(&rendered), &[]);
         assert!(!view.contains('\x1b') && !view.contains('\u{202e}') && !view.contains('\x07'));
         assert!(
             view.contains("\\u{202e}"),
@@ -2421,7 +3562,7 @@ mod tests {
         assert!(!view.contains("перекрыт файлом"));
         assert!(view.contains("/skill ID [запрос]"));
         // Without a block every catalog skill is reported as not sent.
-        let none = skills_view(&catalog, unit, None);
+        let none = skills_view(&catalog, unit, None, &[]);
         assert!(none.contains("не помещается в бюджет"));
         assert!(row_in(&none, "brainstorming").contains("не вошёл"));
         // Local units are named as such.
@@ -2430,9 +3571,12 @@ mod tests {
         };
         let rendered = catalog.render(&catalog.limits, local).unwrap();
         assert!(
-            skills_view(&catalog, local, Some(&rendered)).contains("из 2539 оценочных токенов")
+            skills_view(&catalog, local, Some(&rendered), &[])
+                .contains("из 2539 оценочных токенов")
         );
-        assert!(skills_view(&SkillCatalog::empty(), unit, None).starts_with("Скиллы не найдены"));
+        assert!(
+            skills_view(&SkillCatalog::empty(), unit, None, &[]).starts_with("Скиллы не найдены")
+        );
     }
 
     fn row_in(view: &str, id: &str) -> String {
@@ -2609,6 +3753,256 @@ mod tests {
         assert_eq!(
             efforts(&p, Some(&m)),
             vec![Effort::Auto, Effort::Low, Effort::High]
+        );
+    }
+
+    #[test]
+    fn active_disk_origin_blocks_stale_credential_pairing_after_settings_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(dir.path().join("home")).unwrap();
+
+        let mut custom_a = ProviderSettings::new(ProviderKind::Custom);
+        custom_a.base_url = Some("https://endpoint-a.example/v1".into());
+        custom_a.model = "model-a".into();
+        store
+            .commit_cloud_connection(
+                &ProviderSettings::new(ProviderKind::Custom),
+                &custom_a,
+                "secret-key-endpoint-a",
+                true,
+            )
+            .unwrap();
+
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(&workspace, custom_a.clone()).unwrap();
+        let mut events = Events::new(true);
+        let mut client = local_app::client(&store, &session.provider, &mut events, "missing")
+            .expect("initial client A");
+        let mut active_disk_origin = custom_a.clone();
+
+        // Another process switches custom on disk to endpoint B + key B.
+        let mut custom_b = ProviderSettings::new(ProviderKind::Custom);
+        custom_b.base_url = Some("https://endpoint-b.example/v1".into());
+        custom_b.model = "model-b".into();
+        store
+            .commit_cloud_connection(&custom_a, &custom_b, "secret-key-endpoint-b", true)
+            .unwrap();
+
+        // Simulate `/status` or `/advisor` reloading `settings` from disk before `/effort` or `/model`.
+        let mut settings = store.load().unwrap();
+        let disk_expected = active_disk_origin.clone();
+        let session_base = session.provider.clone();
+
+        let err = commit_provider(
+            &store,
+            &mut settings,
+            &mut active_disk_origin,
+            &mut session,
+            &mut client,
+            &mut events,
+            ProviderEdit::Effort {
+                disk_expected,
+                session_base,
+                effort: Effort::High,
+            },
+        )
+        .expect_err("must reject pairing key B with session endpoint A");
+        assert!(
+            format!("{err:#}").contains("изменились в другом процессе"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            session.provider.base_url.as_deref(),
+            Some("https://endpoint-a.example/v1")
+        );
+
+        let resume_err = validate_restored_cloud_connection(
+            true,
+            true,
+            &session.provider,
+            &active_disk_origin,
+            &custom_a,
+            &custom_b,
+            Some("credentials.json"),
+        )
+        .expect_err("disk-stored key B must not be paired with saved endpoint A");
+        assert!(
+            format!("{resume_err:#}").contains("изменились после сохранения сессии"),
+            "unexpected resume error: {resume_err:#}"
+        );
+        // Even if the on-disk endpoint A did not change, rotating key A -> A2 on disk must block
+        // sending A2 to a temporary `--base-url B` session (`credential_unchanged == false`).
+        validate_restored_cloud_connection(
+            true,
+            false,
+            &custom_b,
+            &custom_a,
+            &custom_b,
+            &custom_a,
+            Some("credentials.json"),
+        )
+        .expect_err("rotated disk key for A must not be sent to temporary --base-url B");
+        validate_restored_cloud_connection(
+            true,
+            false,
+            &session.provider,
+            &active_disk_origin,
+            &custom_a,
+            &custom_b,
+            Some("env:OPENAI_API_KEY"),
+        )
+        .expect("env-sourced credential remains valid across temporary --base-url /resume");
+
+        // Temporary `--folder-id` on Yandex updates `next_session` without failing `disk_base.validate()`.
+        let default_settings = Settings::default();
+        let disk_yandex = default_settings.provider(ProviderKind::Yandex);
+        let mut session_yandex = disk_yandex.clone();
+        session_yandex.folder_id = Some("b1gtempfolder".into());
+        let (_, persist_yandex, updated_yandex) = resolve_provider_edit(
+            &default_settings,
+            &ProviderEdit::Model {
+                disk_expected: disk_yandex,
+                session_base: session_yandex,
+                model: "yandexgpt/latest".into(),
+            },
+        )
+        .expect("temporary --folder-id should allow switching Yandex model in session");
+        assert!(!persist_yandex);
+        assert_eq!(updated_yandex.model, "yandexgpt/latest");
+
+        // Temporary `--model` override does not persist `effort` onto a different default model.
+        let disk_or = default_settings.provider(ProviderKind::OpenRouter);
+        let mut session_or = disk_or.clone();
+        session_or.model = "anthropic/claude-opus-4.6".into();
+        let (unchanged_or, persist_or, updated_or) = resolve_provider_edit(
+            &default_settings,
+            &ProviderEdit::Effort {
+                disk_expected: disk_or.clone(),
+                session_base: session_or,
+                effort: Effort::High,
+            },
+        )
+        .unwrap();
+        assert!(!persist_or);
+        assert_eq!(unchanged_or.effort, disk_or.effort);
+        assert_eq!(updated_or.effort, Effort::High);
+
+        // `commit_cloud_connection` rejects `save_key = false` when endpoint changes (`custom_b -> custom_a`).
+        let mut custom_c = custom_b.clone();
+        custom_c.base_url = Some("https://endpoint-c.example/v1".into());
+        assert!(
+            store
+                .commit_cloud_connection(&custom_b, &custom_c, "secret-key-endpoint-b", false)
+                .is_err(),
+            "stored credentials.json key must never be rebound to a new endpoint with save_key=false"
+        );
+
+        // Legacy relative `ca_file` on disk + absolute `--ca-file` in session allows `/model`,
+        // `/effort`, and `/thinking` in-memory (`persist_disk == false`) without false drift errors!
+        let mut rel_settings = Settings::default();
+        let mut rel_cloud = ProviderSettings::new(ProviderKind::OpenRouter);
+        rel_cloud.model = "qwen/qwen-old".into();
+        rel_cloud.ca_file = Some("legacy-rel.pem".into());
+        rel_settings.remember_provider(&rel_cloud);
+        let mut abs_cloud = rel_cloud.clone();
+        abs_cloud.ca_file = Some(dir.path().join("abs-ca.pem"));
+        let (_, persist_rel_model, next_rel_cloud) = resolve_provider_edit(
+            &rel_settings,
+            &ProviderEdit::Model {
+                disk_expected: rel_cloud.clone(),
+                session_base: abs_cloud,
+                model: "qwen/qwen-new".into(),
+            },
+        )
+        .expect("/model must succeed when session overrides legacy relative ca_file");
+        assert!(!persist_rel_model);
+        assert_eq!(next_rel_cloud.model, "qwen/qwen-new");
+
+        let mut rel_local = crate::local::profile_settings(
+            "relbox",
+            "http://127.0.0.1:18280/v1",
+            crate::local::LocalRuntime::Mlx,
+            "mlx-old",
+        );
+        rel_local.ca_file = Some("legacy-local.pem".into());
+        rel_settings.remember_provider(&rel_local);
+        store.save(&rel_settings).unwrap();
+        let mut abs_local = rel_local.clone();
+        abs_local.ca_file = Some(dir.path().join("abs-local.pem"));
+        local_app::check_current_with_baseline(&store, &abs_local, &rel_local).expect(
+            "check_current_with_baseline must accept unchanged legacy relative disk baseline",
+        );
+        let (_, persist_rel_local, next_rel_local) = resolve_provider_edit(
+            &rel_settings,
+            &ProviderEdit::Model {
+                disk_expected: rel_local,
+                session_base: abs_local,
+                model: "mlx-new".into(),
+            },
+        )
+        .expect("local /model must succeed when session overrides legacy relative ca_file");
+        assert!(!persist_rel_local);
+        assert_eq!(next_rel_local.model, "mlx-new");
+
+        // `/resume latest` (`same_session == true`) succeeds when `config.json` has a legacy
+        // relative `ca_file` overridden in-process by `--ca-file /abs/ca.pem`!
+        let mut abs_cloud_for_resume = rel_cloud.clone();
+        abs_cloud_for_resume.ca_file = Some(dir.path().join("abs-ca.pem"));
+        validate_restored_cloud_connection(
+            true,
+            true,
+            &abs_cloud_for_resume,
+            &rel_cloud,
+            &abs_cloud_for_resume,
+            &rel_cloud,
+            Some("credentials.json"),
+        )
+        .expect("/resume latest must accept unchanged legacy relative disk ca_file");
+
+        // Missing `config.json` + leftover `credentials.json` `"custom"` key MUST NOT allow
+        // `commit_cloud_connection(..., save_key = false)` onto `Settings::default()`'s `localhost:11434`!
+        let orphan_store = ConfigStore::at(dir.path().join("orphan-home")).unwrap();
+        orphan_store
+            .save_credential(ProviderKind::Custom, "leftover-custom-secret-key")
+            .unwrap();
+        let default_custom = ProviderSettings::new(ProviderKind::Custom);
+        assert!(
+            orphan_store
+                .commit_cloud_connection(
+                    &default_custom,
+                    &default_custom,
+                    "leftover-custom-secret-key",
+                    false,
+                )
+                .is_err(),
+            "missing config.json must not rebind leftover credentials.json key to default custom URL"
+        );
+
+        // `/skills` redacts a 49-character skill ID matching a secret BEFORE 48-char table clipping!
+        let ws_skills_root = dir.path().join("ws-long-skill");
+        let long_secret_id = format!("sk-{}", "a".repeat(46)); // 49 chars (> 48-char column max)
+        let skill_dir = ws_skills_root
+            .join(".rcode")
+            .join("skills")
+            .join(&long_secret_id);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {long_secret_id}\ndescription: Safe skill\n---\nBody\n"),
+        )
+        .unwrap();
+        let long_cat = SkillCatalog::discover(
+            &dir.path().join("empty-home"),
+            &ws_skills_root,
+            &crate::skills::SkillsConfig::default(),
+        );
+        let sec_vec = vec![long_secret_id.clone()];
+        let rendered = long_cat.render_redacted(&long_cat.limits, CatalogUnit::Chars, &sec_vec);
+        let table = skills_view(&long_cat, CatalogUnit::Chars, rendered.as_ref(), &sec_vec);
+        assert!(
+            !table.contains(&long_secret_id[..47]) && table.contains("[REDACTED]"),
+            "skills_view must redact 49-char skill ID before 48-char table column clipping: {table}"
         );
     }
 }

@@ -217,13 +217,13 @@ def main(binary):
                 # 5. /help lists custom commands.
                 mark = terminal.mark()
                 terminal.send("/help\r")
-                terminal.until(lambda: "Пользовательские команды" in terminal.text(mark),
-                               "/help custom section")
+                terminal.until(lambda: "Пользовательские команды" in terminal.text(mark)
+                               and terminal.editor_ready(),
+                               "/help custom section and composer ready")
                 help_text = terminal.text(mark)
                 assert "/git:pr" in help_text and "/deploy" in help_text, help_text
                 assert "· проект" in help_text, help_text
                 assert "подмена разрешений" not in help_text, help_text
-                terminal.until(terminal.editor_ready, "composer after /help")
 
                 terminal.send("/exit\r")
                 terminal.finished()

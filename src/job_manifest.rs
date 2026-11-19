@@ -25,6 +25,38 @@ struct Manifest {
     stderr: Vec<Page>,
 }
 
+pub(crate) fn try_redact_manifest(
+    text: &str,
+    secrets: &[String],
+) -> Result<Option<(String, usize)>> {
+    if let Some(v2) = crate::job_epochs::try_redact_manifest(text, secrets)? {
+        return Ok(Some(v2));
+    }
+    let Ok(mut manifest) = serde_json::from_str::<Manifest>(text) else {
+        return Ok(None);
+    };
+    let dict = (!secrets.is_empty())
+        .then(|| crate::redaction::SecretDictionary::new(secrets))
+        .transpose()?;
+    let mut redact_str = |s: &str| match &dict {
+        Some(d) => crate::redaction::redact_text_with(d, s),
+        None => Ok(s.to_owned()),
+    };
+    manifest.command_id = redact_str(&manifest.command_id)?;
+    crate::artifacts::redact_origin_strings(&mut manifest.origin, &mut redact_str)?;
+    crate::artifacts::redact_job_receipt_value(&mut manifest.terminal, &mut redact_str)?;
+    for page in manifest.stdout.iter_mut().chain(manifest.stderr.iter_mut()) {
+        crate::artifacts::redact_artifact_meta_strings(&mut page.artifact, &mut redact_str)?;
+    }
+    let reserialized = serde_json::to_string(&manifest)?;
+    let len = reserialized.len();
+    let mut end = len.min(16 * 1024 * 1024);
+    while !reserialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(Some((reserialized[..end].to_owned(), len)))
+}
+
 pub(crate) fn capture(
     jobs: &JobsSupervisor,
     artifacts: &ArtifactStore,
@@ -191,8 +223,10 @@ pub(crate) fn page(
     let credentials = crate::redaction::SecretDictionary::new(secrets)?;
     let dictionary = crate::retained_redaction::RetainedDictionary::new(&credentials)?;
     // Metadata must remain parseable; identity fields cannot be silently masked.
-    let clean = crate::redaction::redact_text(&manifest.terminal.to_string(), secrets)?;
-    let mut terminal: Value = serde_json::from_str(&clean)?;
+    let mut terminal = manifest.terminal.clone();
+    crate::artifacts::redact_job_receipt_value(&mut terminal, &mut |s| {
+        crate::redaction::redact_text_with(&credentials, s)
+    })?;
     ensure!(
         terminal["id"] == request.command_id
             && terminal["session_id"] == session_id
@@ -236,7 +270,7 @@ pub(crate) fn page(
         let output = std::str::from_utf8(&retained.0[offset..end])?;
         // Downstream event/receipt redaction must not change byte coordinates.
         ensure!(
-            crate::redaction::redact_text(output, secrets)? == output,
+            crate::redaction::redact_text_with(&credentials, output)? == output,
             "Маска вывода совпала с ключом"
         );
         terminal[field] = Value::String(output.to_owned());
@@ -249,13 +283,13 @@ pub(crate) fn page(
 
 /// Verify only immutable pages intersecting the window plus bounded secret context.
 /// Full nested verification remains mandatory at capture and recovery boundaries.
-pub(crate) fn render_pages(
+pub(crate) fn render_pages_with_dictionary(
     artifacts: &ArtifactStore,
     pages: &[(usize, usize, &ArtifactMeta)],
     total: usize,
     offset: usize,
     maximum: usize,
-    secrets: &[String],
+    keys: &crate::redaction::SecretDictionary,
 ) -> Result<(String, usize)> {
     ensure!(
         (4..=65536).contains(&maximum) && offset <= total,
@@ -264,7 +298,6 @@ pub(crate) fn render_pages(
     if offset == total {
         return Ok((String::new(), offset));
     }
-    let keys = crate::redaction::SecretDictionary::new(secrets)?;
     let context = keys.max_pattern_len().saturating_sub(1);
     ensure!(context <= 49152, "Redaction context too large");
     let low = offset.saturating_sub(context);
@@ -297,15 +330,15 @@ pub(crate) fn render_pages(
         base <= low && at >= high && bytes.len() <= maximum + 2 * context + 2 * 65536,
         "Incomplete output window context"
     );
-    let (text, next) = render_window(bytes, offset - base, maximum, secrets)?;
+    let (text, next) = render_window_with_dictionary(bytes, offset - base, maximum, keys)?;
     Ok((text, base + next))
 }
 
-pub(crate) fn render_window(
+pub(crate) fn render_window_with_dictionary(
     bytes: Vec<u8>,
     offset: usize,
     maximum: usize,
-    secrets: &[String],
+    keys: &crate::redaction::SecretDictionary,
 ) -> Result<(String, usize)> {
     ensure!((4..=65536).contains(&maximum), "Invalid output page size");
     let original = std::str::from_utf8(&bytes)?;
@@ -321,14 +354,13 @@ pub(crate) fn render_window(
         end > offset || offset == bytes.len(),
         "Page cannot contain next scalar"
     );
-    let keys = crate::redaction::SecretDictionary::new(secrets)?;
-    let dictionary = crate::retained_redaction::RetainedDictionary::new(&keys)?;
+    let dictionary = crate::retained_redaction::RetainedDictionary::new(keys)?;
     let mut retained = StoredText(bytes);
     let mut cursor = dictionary.cursor(retained.0.len(), &[])?;
     while !cursor.step(&mut retained, 4096)? {}
     let output = String::from_utf8(retained.0[offset..end].to_vec())?;
     ensure!(
-        crate::redaction::redact_text(&output, secrets)? == output,
+        crate::redaction::redact_text_with(keys, &output)? == output,
         "Mask matches known secret"
     );
     Ok((output, end))

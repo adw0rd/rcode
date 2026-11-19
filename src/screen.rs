@@ -424,6 +424,9 @@ impl Screen {
     }
     pub fn busy(&self, label: &str) {
         self.change(|s| {
+            if s.mode == Mode::Approval && s.panel.is_some() {
+                return;
+            }
             s.mode = Mode::Busy;
             s.panel = None;
             s.phase = Some((flat(label), Instant::now()));
@@ -818,6 +821,10 @@ impl Drop for AskPanel {
 }
 
 impl AskPanel {
+    pub(crate) fn refresh(&self) {
+        self.render_panel();
+    }
+
     /// Неблокирующий или ограниченный по `timeout` шаг обработки событий панели.
     pub fn step(&mut self, timeout: Duration) -> io::Result<Option<crate::ask_user::AskOutcome>> {
         use crate::ask_user::{AskOutcome, MAX_ANSWER_CHARS};

@@ -1,3 +1,4 @@
+pub mod advisor;
 pub mod agents;
 pub mod ask_user;
 pub mod balance;
@@ -17,6 +18,7 @@ mod local_ui;
 pub mod memory;
 pub mod memory_cli;
 pub mod memory_tool;
+pub mod model_route;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod skill_sources;

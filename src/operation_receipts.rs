@@ -285,7 +285,6 @@ fn worker_summary(
                     source.operation_id.as_str(),
                     source.terminal.id.as_str(),
                     source.origin.call_id.as_str(),
-                    source.origin.tool.as_str(),
                     source.origin.actor.as_deref().unwrap_or_default(),
                 ]
                 .iter()
@@ -369,11 +368,20 @@ fn worker_summary(
         let mut parsed = native_job
             .then(|| serde_json::from_str::<Value>(&text).ok())
             .flatten();
+        if let Some(value) = parsed.as_ref()
+            && worker_fields_have_secret_ids(value, secrets)
+        {
+            unavailable += 1;
+            continue;
+        }
+        // Extract closed host-typed fields (UUIDs, booleans, integers, and static
+        // status/delivery enums) BEFORE string redaction so secrets colliding with
+        // `"delivered"` or `"failed"` do not drop structured delivery/status facts.
+        let fields = parsed
+            .as_ref()
+            .map(|value| worker_fields(&source.origin.tool, value))
+            .unwrap_or_else(|| json!({}));
         if let Some(value) = parsed.as_mut() {
-            if worker_fields_have_secret_ids(value, secrets) {
-                unavailable += 1;
-                continue;
-            }
             redact_json_strings(value, secrets)?;
         }
         let clean = if parsed.is_none() || source.origin.tool == "run_command" {
@@ -381,10 +389,6 @@ fn worker_summary(
         } else {
             String::new()
         };
-        let fields = parsed
-            .as_ref()
-            .map(|value| worker_fields(&source.origin.tool, value))
-            .unwrap_or_else(|| json!({}));
         observation["fields"] = fields;
         let stdout = if matches!(
             source.origin.tool.as_str(),
@@ -438,7 +442,11 @@ fn worker_summary(
         "truncated": sources.omitted > 0 || had_truncation,
         "semantics": "Saved observations at their revisions; worker failure unchanged; absence does not prove no action; no current process state is asserted."
     });
-    redact_json_strings(&mut summary, secrets)?;
+    crate::agents::redact_agent_tool_value(
+        &mut summary,
+        &mut |s| crate::redaction::redact_text(s, secrets),
+        &|_| false,
+    )?;
     loop {
         let bytes = serde_json::to_vec(&summary)?;
         if bytes.len() <= WORKER_SUMMARY_MAX {
@@ -859,14 +867,31 @@ pub(crate) fn preview(text: &str, meta: &ArtifactMeta, is_error: bool) -> String
     // tool. Keep it in ArtifactMeta; showing two hashes here caused models to
     // pass the receipt digest as write_file.expected_sha256.
     value.as_object_mut().unwrap().remove("artifact_sha256");
+    if is_error && meta.origin.tool != crate::advisor::TOOL_NAME {
+        value
+            .as_object_mut()
+            .unwrap()
+            .entry("is_error")
+            .or_insert(Value::Bool(true));
+    }
     value["artifact_id"] = json!(meta.id);
     value["artifact_bytes"] = json!(meta.bytes);
     value["artifact_truncated"] = json!(meta.truncated);
+    let serialized = if meta.origin.tool == crate::advisor::TOOL_NAME {
+        crate::advisor::reserialize_advisory_receipt(&value).unwrap_or_else(|| value.to_string())
+    } else {
+        value.to_string()
+    };
+    let cap = if meta.origin.tool == crate::advisor::TOOL_NAME {
+        crate::advisor::MAX_GUIDANCE_CHARS
+    } else {
+        16 * 1024
+    };
     preview_receipt(
         &ContextBudget::cloud(),
         &meta.origin.tool,
-        &value.to_string(),
-        16 * 1024,
+        &serialized,
+        cap,
         is_error,
     )
 }
@@ -1477,6 +1502,9 @@ mod tests {
             status,
             result: "worker failed after local actions".into(),
             usage: Default::default(),
+            provider: None,
+            model: None,
+            local_profile: None,
             transferred_commands: vec![],
         })
         .unwrap()

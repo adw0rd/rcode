@@ -68,6 +68,18 @@ pub async fn connect(
     rich: bool,
     ca_override: Option<&std::path::Path>,
 ) -> Result<ProviderSettings> {
+    connect_with_secrets(store, settings, kind, rich, ca_override, &[], None).await
+}
+
+pub(crate) async fn connect_with_secrets(
+    store: &ConfigStore,
+    settings: &mut Settings,
+    kind: Option<ProviderKind>,
+    rich: bool,
+    ca_override: Option<&std::path::Path>,
+    caller_secrets: &[String],
+    shared_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+) -> Result<ProviderSettings> {
     if !terminal() {
         bail!(
             "Для настройки откройте rcode connect в терминале или задайте ключ через переменную окружения"
@@ -81,15 +93,41 @@ pub async fn connect(
         }
     };
     if kind == ProviderKind::Local {
-        return crate::local_ui::connect(store, settings, rich).await;
+        return crate::local_ui::connect_with_secrets(
+            store,
+            settings,
+            rich,
+            ca_override,
+            caller_secrets,
+            shared_sink,
+        )
+        .await;
     }
     // Only the legacy line/password forms own the suspended terminal. The
     // searchable picker below needs Screen's input and renderer running.
+    *settings = store.load()?;
+    let initial_disk = crate::model_route::configured_cloud_provider(settings, kind)?
+        .unwrap_or_else(|| settings.provider(kind));
     let (mut p, key, save_key) = {
         let _suspended = crate::screen::suspend()?;
-        let mut p = settings.provider(kind);
+        let mut p = initial_disk.clone();
         if let Some(ca) = ca_override {
-            p.ca_file = Some(ca.to_path_buf());
+            p.ca_file = Some(crate::model_route::normalize_ca_path(ca));
+        } else if p.ca_file.as_ref().is_some_and(|ca| !ca.is_absolute()) {
+            let ca_input = line(
+                "Абсолютный путь к CA-файлу (пусто — сбросить на системный)",
+                "",
+            )?;
+            let trimmed = ca_input.trim();
+            if trimmed.is_empty() {
+                p.ca_file = None;
+            } else {
+                let candidate = std::path::PathBuf::from(trimmed);
+                if !candidate.is_absolute() {
+                    anyhow::bail!("Путь к CA-файлу должен быть абсолютным");
+                }
+                p.ca_file = Some(crate::model_route::normalize_ca_path(&candidate));
+            }
         }
         let link = match kind {
             ProviderKind::Yandex => "https://aistudio.yandex.cloud/ — создать API-ключ AI Studio",
@@ -114,6 +152,18 @@ pub async fn connect(
              Модель выберете из списка после авторизации. Можно также указать полный gpt:// URI."
             );
         }
+        let safe_prompt_default = |candidate: &str, fallback: &str| -> String {
+            if candidate.is_empty() {
+                return fallback.to_owned();
+            }
+            let redacted =
+                crate::model_route::redact_route_display_field(store, caller_secrets, candidate);
+            if redacted == candidate {
+                candidate.to_owned()
+            } else {
+                fallback.to_owned()
+            }
+        };
         if kind == ProviderKind::Yandex {
             eprintln!(
                 "\nОткройте https://console.yandex.cloud/ и выберите каталог, в котором создан ключ.\n\
@@ -123,12 +173,15 @@ pub async fn connect(
             let uri = reqwest::Url::parse(&p.model)
                 .ok()
                 .filter(|u| u.scheme() == "gpt");
+            let raw_folder_default = p
+                .folder_id
+                .as_deref()
+                .or_else(|| uri.as_ref().and_then(|u| u.host_str()))
+                .unwrap_or_default();
+            let folder_default = safe_prompt_default(raw_folder_default, "");
             let folder = line(
                 "ID каталога (Folder ID) или полный gpt:// URI",
-                p.folder_id
-                    .as_deref()
-                    .or_else(|| uri.as_ref().and_then(|u| u.host_str()))
-                    .unwrap_or_default(),
+                &folder_default,
             )?;
             if folder.starts_with("gpt://") {
                 p.model = folder;
@@ -142,44 +195,94 @@ pub async fn connect(
             }
         }
         if kind == ProviderKind::Custom {
-            p.base_url = Some(line(
-                "Адрес API",
+            let base_default = safe_prompt_default(
                 p.base_url.as_deref().unwrap_or_default(),
-            )?);
+                "http://localhost:11434/v1",
+            );
+            p.base_url = Some(line("Адрес API", &base_default)?);
         }
         if kind == ProviderKind::GigaChat {
             eprintln!(
                 "\nИз Sber Studio понадобится Authorization Key; Client ID отдельно не нужен."
             );
-            let scope = line("Scope", p.scope.as_deref().unwrap_or("GIGACHAT_API_PERS"))?;
+            let scope_default = safe_prompt_default(
+                p.scope.as_deref().unwrap_or("GIGACHAT_API_PERS"),
+                "GIGACHAT_API_PERS",
+            );
+            let scope = line("Scope", &scope_default)?;
             p.scope = Some(scope);
             eprintln!(
                 "Сертификат для GigaChat настраивается автоматически. Собственный CA можно задать через --ca-file."
             );
         }
         p.validate()?;
-        let (key, save_key) = if let Some(existing) = store.credential(kind)? {
-            eprintln!("Ключ уже доступен: {}", safe(&existing.source));
-            if existing.source == "credentials.json"
-                && line("Заменить сохранённый ключ? y/N", "n")?.eq_ignore_ascii_case("y")
-            {
-                (password("Новый ключ: ")?, true)
-            } else {
-                (existing.value, false)
+        let (latest_disk, existing_cred, persisted_on_disk) =
+            store.read_consistent_cloud_with_presence(kind)?;
+        let configured_on_disk = crate::model_route::configured_cloud_provider(&latest_disk, kind)?;
+        let current_disk = configured_on_disk
+            .clone()
+            .unwrap_or_else(|| latest_disk.provider(kind));
+        if !crate::model_route::RouteIdentity::disk_unchanged(&initial_disk, &current_disk) {
+            anyhow::bail!(
+                "Конфигурация провайдера {kind} изменилась в другом процессе; повторите /connect"
+            );
+        }
+        let connection_changed = !persisted_on_disk
+            || configured_on_disk
+                .as_ref()
+                .is_none_or(|saved| !crate::model_route::RouteIdentity::same_connection(saved, &p));
+        let (key, save_key) = match existing_cred {
+            Some(existing) if !(connection_changed && existing.source == "credentials.json") => {
+                eprintln!("Ключ уже доступен: {}", safe(&existing.source));
+                if existing.source == "credentials.json"
+                    && line("Заменить сохранённый ключ? y/N", "n")?.eq_ignore_ascii_case("y")
+                {
+                    (password("Новый ключ: ")?, true)
+                } else {
+                    (existing.value, false)
+                }
             }
-        } else {
-            let key = password(if kind == ProviderKind::Yandex {
-                "Секретный ключ AI Studio (ввод скрыт): "
-            } else {
-                "Ключ (ввод скрыт): "
-            })?;
-            (key, true)
+            _ => {
+                if connection_changed {
+                    eprintln!(
+                        "Параметры подключения изменились; сохранённый ключ прежнего адреса не переносится."
+                    );
+                }
+                let key = password(if kind == ProviderKind::Yandex {
+                    "Секретный ключ AI Studio (ввод скрыт): "
+                } else {
+                    "Ключ (ввод скрыт): "
+                })?;
+                (key, true)
+            }
         };
         crate::config::validate_credential(&key)?;
+        let after_prompt_settings = store.load()?;
+        let after_prompt_disk =
+            crate::model_route::configured_cloud_provider(&after_prompt_settings, kind)?
+                .unwrap_or_else(|| after_prompt_settings.provider(kind));
+        if !crate::model_route::RouteIdentity::disk_unchanged(&initial_disk, &after_prompt_disk) {
+            anyhow::bail!(
+                "Конфигурация провайдера {kind} изменилась в другом процессе; повторите /connect"
+            );
+        }
         (p, key, save_key)
     };
 
     let mut client = ProviderClient::new(p.clone(), key.clone())?;
+    let connect_secrets =
+        shared_sink.unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    {
+        let mut guard = connect_secrets.lock().unwrap_or_else(|e| e.into_inner());
+        crate::redaction::merge_secret_variants(&mut guard, caller_secrets);
+        crate::redaction::push_secret_variants(&mut guard, &key);
+    }
+    client.bind_secret_sink(std::sync::Arc::clone(&connect_secrets));
+    let initial_extra = connect_secrets
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    crate::model_route::ensure_connection_free_of_secrets(store, &p, &initial_extra)?;
     let cancel = tokio_util::sync::CancellationToken::new();
     let screen = crate::screen::current();
     if let Some(screen) = &screen {
@@ -208,8 +311,25 @@ pub async fn connect(
             Vec::new()
         }
     };
-    let models = connection_models(fetched, &p.model, &key);
-    let Some(model) = pick_model(&models, &p, rich)? else {
+    let client_secrets = client.redaction_secrets();
+    let collect_live_secrets = || {
+        let mut live = connect_secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for secret in &client_secrets {
+            crate::redaction::push_secret_variants(&mut live, secret);
+        }
+        crate::redaction::push_secret_variants(&mut live, &key);
+        live
+    };
+    let secret_dict =
+        crate::model_route::build_route_secret_dictionary(store, &collect_live_secrets())?;
+    let models = connection_models_filtered(fetched, &p.model, &key, secret_dict.as_ref());
+    let Some(model) = pick_model(&models, &p, rich, || {
+        crate::model_route::ensure_route_free_of_secrets(store, &p, &collect_live_secrets()).is_ok()
+    })?
+    else {
         return Err(connection_cancelled());
     };
     if model != p.model {
@@ -217,22 +337,44 @@ pub async fn connect(
     }
     p.model = model;
     p.validate()?;
-    if save_key {
-        store.save_credential(p.kind, &key)?;
-    }
-    let mut updated = settings.clone();
-    updated.remember_provider(&p);
-    store.save(&updated)?;
+    crate::model_route::ensure_route_free_of_secrets(store, &p, &collect_live_secrets())?;
+    let updated = store.commit_cloud_connection_with_secrets(
+        &initial_disk,
+        &p,
+        &key,
+        save_key,
+        collect_live_secrets,
+    )?;
+    let saved = crate::model_route::configured_cloud_provider(&updated, p.kind)?.unwrap_or(p);
     *settings = updated;
     crate::screen::notice("Подключение сохранено. rcode doctor --check проверит доступ к API.");
-    Ok(p)
+    Ok(saved)
 }
 
 fn connection_cancelled() -> anyhow::Error {
     io::Error::new(io::ErrorKind::Interrupted, "Подключение отменено").into()
 }
 
+#[cfg(test)]
 fn connection_models(fetched: Vec<ModelInfo>, current: &str, key: &str) -> Vec<ModelInfo> {
+    connection_models_filtered(fetched, current, key, None)
+}
+
+fn connection_models_filtered(
+    fetched: Vec<ModelInfo>,
+    current: &str,
+    key: &str,
+    secret_dict: Option<&crate::redaction::SecretDictionary>,
+) -> Vec<ModelInfo> {
+    let contains_secret = |text: &str| -> bool {
+        text.contains(key)
+            || secret_dict.is_some_and(|dict| {
+                crate::redaction::redact_text_with(dict, text)
+                    .ok()
+                    .as_deref()
+                    != Some(text)
+            })
+    };
     let mut models = std::collections::BTreeMap::new();
     for mut model in fetched {
         let id = model.id.to_ascii_lowercase();
@@ -242,7 +384,7 @@ fn connection_models(fetched: Vec<ModelInfo>, current: &str, key: &str) -> Vec<M
             .map(|uri| uri.path().trim_start_matches('/').to_owned())
             .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(&id).to_owned());
         if model.id.chars().any(char::is_control)
-            || model.id.contains(key)
+            || contains_secret(&model.id)
             || id.starts_with("embeddings")
             || id.starts_with("emb://")
             || id.starts_with("art://")
@@ -260,13 +402,22 @@ fn connection_models(fetched: Vec<ModelInfo>, current: &str, key: &str) -> Vec<M
         {
             continue;
         }
-        model.name = safe(&model.name.replace(key, "[скрыто]"));
+        let masked_name = if let Some(dict) = secret_dict {
+            crate::redaction::redact_text_idempotent_with(
+                dict,
+                &model.name.replace(key, "[скрыто]"),
+            )
+            .unwrap_or_else(|_| "[скрыто]".into())
+        } else {
+            model.name.replace(key, "[скрыто]")
+        };
+        model.name = safe(&masked_name);
         models.insert(model.id.clone(), model);
     }
     let mut models = models.into_values().collect::<Vec<_>>();
     if let Some(index) = models.iter().position(|m| m.id == current) {
         models[..=index].rotate_right(1);
-    } else {
+    } else if !current.is_empty() && !contains_secret(current) {
         models.insert(
             0,
             ModelInfo {
@@ -283,6 +434,7 @@ pub(crate) fn pick_model(
     models: &[ModelInfo],
     provider: &ProviderSettings,
     rich: bool,
+    is_safe_default: impl FnOnce() -> bool,
 ) -> Result<Option<String>> {
     let mut choices = models
         .iter()
@@ -351,7 +503,12 @@ pub(crate) fn pick_model(
         return Ok(None);
     };
     Ok(Some(if index == models.len() {
-        line("ID модели", &provider.model)?
+        let manual_default = if models.iter().any(|m| m.id == provider.model) && is_safe_default() {
+            provider.model.as_str()
+        } else {
+            ""
+        };
+        line("ID модели", manual_default)?
     } else {
         models[index].id.clone()
     }))

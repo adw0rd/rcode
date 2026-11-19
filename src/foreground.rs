@@ -404,6 +404,7 @@ mod tests {
             reply: sender,
             admission: Default::default(),
             transfers: Default::default(),
+            artifact_fit: None,
         };
         let actor = reply_closed.then_some(&worker);
         let owner = actor.map(|a| a.agent_id.as_str());
@@ -625,6 +626,7 @@ mod tests {
                 reply,
                 admission,
                 transfers: Default::default(),
+                artifact_fit: None,
             };
             let outcome = Durable {
                 tools: &mut tools,
@@ -668,6 +670,7 @@ mod tests {
                 reply,
                 admission,
                 transfers: Default::default(),
+                artifact_fit: None,
             };
             let err = Durable {
                 tools: &mut tools,
@@ -783,6 +786,7 @@ mod tests {
             reply: sender,
             admission: Default::default(),
             transfers: Default::default(),
+            artifact_fit: None,
         };
         drop(receiver); // after confirmed EOF, before durable publication
         let off_meta = crate::sandbox::SandboxReceiptMeta::off();

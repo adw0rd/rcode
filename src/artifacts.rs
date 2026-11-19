@@ -36,6 +36,52 @@ const SESSION_MAX: usize = 128 * 1024 * 1024;
 const PAGE_MAX: usize = 64 * 1024;
 const META_MAX: usize = 16 * 1024;
 const MAGIC: &[u8; 8] = b"ARTIF001";
+const SIDE_FILE: &str = "truncated_gens.json";
+const SIDE_TMP_PREFIX: &str = ".truncated_gens.";
+const SIDE_MAX: u64 = 512 * 1024;
+const SIDE_CAP: usize = 4096;
+const SIDE_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TruncatedGenState {
+    version: u32,
+    salt_hex: String,
+    entries: Vec<(String, String)>,
+}
+
+fn fresh_truncated_gen_state() -> TruncatedGenState {
+    let mut salt_hasher = Sha256::new();
+    for _ in 0..3 {
+        salt_hasher.update(Uuid::new_v4().as_bytes());
+    }
+    TruncatedGenState {
+        version: SIDE_VERSION,
+        salt_hex: format!("{:x}", salt_hasher.finalize()),
+        entries: Vec::new(),
+    }
+}
+
+fn is_valid_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_valid_truncated_gen_state(state: &TruncatedGenState) -> bool {
+    state.version == SIDE_VERSION
+        && is_valid_hex_64(&state.salt_hex)
+        && state
+            .entries
+            .iter()
+            .all(|(entry_id, tag)| valid_id(entry_id).is_ok() && is_valid_hex_64(tag))
+}
+
+fn truncated_gen_tag(salt_hex: &str, secret_gen: [u8; 32]) -> String {
+    let mut tag_hasher = Sha256::new();
+    tag_hasher.update(b"rcode-truncated-gen-v1\0");
+    tag_hasher.update(salt_hex.as_bytes());
+    tag_hasher.update(secret_gen);
+    format!("{:x}", tag_hasher.finalize())
+}
 
 #[cfg(test)]
 thread_local! { static FAIL_AFTER_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -110,6 +156,186 @@ fn valid_id(id: &str) -> Result<()> {
             && u.to_string() == id,
         "Некорректный идентификатор артефакта"
     );
+    Ok(())
+}
+
+pub(crate) fn is_canonical_artifact_id(id: &str) -> bool {
+    valid_id(id).is_ok()
+}
+
+pub(crate) fn is_job_receipt_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "start_command"
+            | "poll_command"
+            | "stop_command"
+            | "handoff_command"
+            | "send_command_input"
+            | "command_lifetime"
+            | "command_input_lifetime"
+    )
+}
+
+fn is_job_receipt_key(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "command_id"
+            | "input_id"
+            | "lifetime_id"
+            | "kind"
+            | "session_id"
+            | "origin"
+            | "actor"
+            | "turn"
+            | "tool"
+            | "call_id"
+            | "ownership_epoch"
+            | "credential_epoch"
+            | "status"
+            | "delivery"
+            | "cleanup_complete"
+            | "cleanup_warning"
+            | "reason"
+            | "epoch_boundaries"
+            | "epoch"
+            | "utf8_lossy"
+            | "delivery_cancelled"
+            | "output_truncated"
+            | "payload_unavailable"
+            | "redaction_incomplete"
+            | "exit_code"
+            | "signal"
+            | "written"
+            | "total"
+            | "inputs"
+            | "inputs_truncated"
+            | "output"
+            | "stdout"
+            | "stderr"
+            | "stdout_offset"
+            | "stderr_offset"
+            | "next_stdout_offset"
+            | "next_stderr_offset"
+            | "stdout_bytes"
+            | "stderr_bytes"
+            | "stdout_truncated"
+            | "stderr_truncated"
+            | "elapsed_ms"
+            | "timeout_ms"
+            | "sandbox"
+            | "mode"
+            | "network"
+            | "backend"
+            | "error"
+            | "message"
+            | "result"
+            | "hint"
+            | "artifact_id"
+            | "owner"
+            | "worker"
+            | "handoff"
+            | "closed"
+            | "close"
+            | "bytes"
+            | "truncated"
+    )
+}
+
+pub(crate) fn redact_origin_strings<F>(
+    origin: &mut ArtifactOrigin,
+    redact_str: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    if let Some(actor) = origin.actor.as_mut() {
+        *actor = redact_str(actor)?;
+    }
+    if !crate::app::is_known_builtin_tool_name(&origin.tool) {
+        origin.tool = redact_str(&origin.tool)?;
+    }
+    origin.call_id = redact_str(&origin.call_id)?;
+    Ok(())
+}
+
+pub(crate) fn redact_artifact_meta_strings<F>(
+    meta: &mut ArtifactMeta,
+    redact_str: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    meta.id = redact_str(&meta.id)?;
+    meta.session_id = redact_str(&meta.session_id)?;
+    meta.sha256 = redact_str(&meta.sha256)?;
+    redact_origin_strings(&mut meta.origin, redact_str)
+}
+
+pub(crate) fn redact_job_receipt_value<F>(
+    value: &mut serde_json::Value,
+    redact_str: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<String>,
+{
+    match value {
+        serde_json::Value::String(s) => *s = redact_str(s)?,
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_job_receipt_value(item, redact_str)?;
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let original = std::mem::take(map);
+            for (key, mut child) in original {
+                let clean_key = if is_job_receipt_key(&key) {
+                    key.clone()
+                } else {
+                    redact_str(&key)?
+                };
+                let is_preserved_enum = (key == "status"
+                    && child.as_str().is_some_and(|s| {
+                        matches!(
+                            s,
+                            "running"
+                                | "exited"
+                                | "stopped"
+                                | "timed_out"
+                                | "cancelled"
+                                | "failed"
+                                | "unknown"
+                                | "transferred"
+                        )
+                    }))
+                    || (key == "kind"
+                        && child
+                            .as_str()
+                            .is_some_and(|s| matches!(s, "managed" | "foreground")))
+                    || (key == "tool"
+                        && child
+                            .as_str()
+                            .is_some_and(crate::app::is_known_builtin_tool_name))
+                    || (key == "delivery"
+                        && child.as_str().is_some_and(|s| {
+                            matches!(
+                                s,
+                                "accepted" | "delivered" | "rejected" | "cancelled" | "io_error"
+                            )
+                        }))
+                    || (key == "error"
+                        && child.as_str().is_some_and(|s| {
+                            matches!(s, "worker_reply_closed" | "command_failed")
+                        }));
+                if is_preserved_enum {
+                    map.insert(clean_key, child);
+                } else {
+                    redact_job_receipt_value(&mut child, redact_str)?;
+                    map.insert(clean_key, child);
+                }
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 fn hash(bytes: &[u8]) -> String {
@@ -464,12 +690,63 @@ impl ArtifactStore {
             disk(self.dir.remove_file(name))?;
             removed = true;
         }
+        let mut removed_parent = false;
+        for entry in disk(self.parent.read_dir("."))? {
+            let entry = disk(entry)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name
+                .strip_prefix(SIDE_TMP_PREFIX)
+                .and_then(|s| s.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            if valid_id(id).is_err() {
+                continue;
+            }
+            let before = disk(self.parent.symlink_metadata(name))?;
+            ensure!(
+                before.is_file() && !before.file_type().is_symlink(),
+                "Unsafe truncated metadata staging"
+            );
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No).nonblock(true);
+            let file = disk(self.parent.open_with(name, &options))?;
+            let metadata = disk(file.metadata())?;
+            ensure!(
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && MetadataExt::nlink(&metadata) <= 1
+                    && metadata.len() <= SIDE_MAX * 2,
+                "Unsafe truncated metadata staging"
+            );
+            #[cfg(unix)]
+            ensure!(
+                metadata.mode() & 0o7777 == 0o600,
+                "Unsafe truncated metadata staging permissions"
+            );
+            let current = disk(self.parent.symlink_metadata(name))?;
+            ensure!(
+                same(&before, &metadata) && same(&metadata, &current),
+                "Truncated metadata staging changed"
+            );
+            drop(file);
+            disk(self.parent.remove_file(name))?;
+            removed_parent = true;
+        }
         #[cfg(unix)]
-        if removed {
-            disk(disk(self.dir.open("."))?.sync_all())?;
+        {
+            if removed {
+                disk(disk(self.dir.open("."))?.sync_all())?;
+            }
+            if removed_parent {
+                disk(disk(self.parent.open("."))?.sync_all())?;
+            }
         }
         #[cfg(not(unix))]
-        let _ = removed;
+        let _ = (removed, removed_parent);
         Ok(())
     }
 
@@ -506,6 +783,46 @@ impl ArtifactStore {
         self.capture_inner(origin, text, secrets, false)
     }
 
+    fn verify_header_meta(&self, id: &str) -> Result<ArtifactMeta> {
+        valid_id(id)?;
+        let mut f = self.checked_open(id)?;
+        let opened = disk(f.metadata())?;
+        let len = opened.len();
+        ensure!(
+            len >= 12 && len <= (12 + META_MAX + ARTIFACT_MAX) as u64,
+            "Недопустимый размер артефакта"
+        );
+        let mut header = [0u8; 12];
+        disk(f.read_exact(&mut header))?;
+        ensure!(&header[..8] == MAGIC, "Повреждён формат артефакта");
+        let n = u32::from_le_bytes(
+            header[8..12]
+                .try_into()
+                .map_err(|_| anyhow!("Повреждён заголовок"))?,
+        ) as usize;
+        ensure!(
+            n <= META_MAX && 12 + n <= len as usize,
+            "Повреждены метаданные артефакта"
+        );
+        let mut json = vec![0; n];
+        disk(f.read_exact(&mut json))?;
+        let meta: ArtifactMeta = serde_json::from_slice(&json)
+            .map_err(|_| anyhow!("Повреждены метаданные артефакта"))?;
+        ensure!(
+            meta.version == 1
+                && meta.id == id
+                && meta.session_id == self.session_id
+                && meta.bytes <= ARTIFACT_MAX
+                && 12 + n + meta.bytes == len as usize,
+            "Несовместимые метаданные артефакта"
+        );
+        Ok(meta)
+    }
+
+    pub(crate) fn contains_artifact(&self, id: &str) -> bool {
+        self.verify_header_meta(id).is_ok()
+    }
+
     fn capture_inner(
         &self,
         origin: ArtifactOrigin,
@@ -534,7 +851,19 @@ impl ArtifactStore {
             let (clean, _) = redact_bounded(actor, secrets)?;
             ensure!(clean == *actor, "Секрет в идентификаторе actor");
         }
-        let clean_tool = redact_bounded(&origin.tool, secrets)?.0;
+        let is_advisor_tool = origin.tool == crate::advisor::TOOL_NAME;
+        let is_agent_tool = crate::agents::AgentPool::is_tool(&origin.tool);
+        let is_job_tool = !required && is_job_receipt_tool(&origin.tool);
+        let is_host_request_tool = matches!(
+            origin.tool.as_str(),
+            "user_request" | "user_request_journal"
+        );
+        let clean_tool =
+            if crate::app::is_known_builtin_tool_name(&origin.tool) || is_host_request_tool {
+                origin.tool.clone()
+            } else {
+                redact_bounded(&origin.tool, secrets)?.0
+            };
         let clean_call_id = redact_bounded(&origin.call_id, secrets)?.0;
         if required {
             ensure!(
@@ -548,7 +877,147 @@ impl ArtifactStore {
         }
         origin.tool = clean_tool;
         origin.call_id = clean_call_id;
-        let (mut content, original_len) = redact_bounded(text, secrets)?;
+        let (mut content, original_len) = if is_advisor_tool
+            && let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text)
+            && parsed.get("advisory") == Some(&serde_json::Value::Bool(true))
+        {
+            crate::advisor::redact_advisory_value_unclipped(&mut parsed, |s| {
+                crate::redaction::redact_text_idempotent(s, secrets)
+            })?;
+            if let Some(reserialized) = crate::advisor::reserialize_advisory_receipt(&parsed) {
+                let len = reserialized.len();
+                let mut end = len.min(ARTIFACT_MAX);
+                while !reserialized.is_char_boundary(end) {
+                    end -= 1;
+                }
+                (reserialized[..end].to_owned(), len)
+            } else {
+                redact_bounded(text, secrets)?
+            }
+        } else if is_agent_tool
+            && let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text)
+            && parsed.is_object()
+        {
+            crate::agents::redact_agent_tool_value(
+                &mut parsed,
+                &mut |s| crate::redaction::redact_text_idempotent(s, secrets),
+                &|_| false,
+            )?;
+            let reserialized = parsed.to_string();
+            let len = reserialized.len();
+            let mut end = len.min(ARTIFACT_MAX);
+            while !reserialized.is_char_boundary(end) {
+                end -= 1;
+            }
+            (reserialized[..end].to_owned(), len)
+        } else if required
+            && origin.tool == "command_lifetime"
+            && let Some(redacted_manifest) =
+                crate::job_manifest::try_redact_manifest(text, secrets)?
+        {
+            redacted_manifest
+        } else if is_job_tool
+            && let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text)
+            && parsed.is_object()
+        {
+            redact_job_receipt_value(&mut parsed, &mut |s| {
+                crate::redaction::redact_text_idempotent(s, secrets)
+            })?;
+            let reserialized = parsed.to_string();
+            let len = reserialized.len();
+            let mut end = len.min(ARTIFACT_MAX);
+            while !reserialized.is_char_boundary(end) {
+                end -= 1;
+            }
+            (reserialized[..end].to_owned(), len)
+        } else if origin.tool == "user_request_journal" {
+            #[derive(Serialize, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct JournalEnvelope {
+                version: u32,
+                request: crate::task_state::TaskReference,
+                previous: Option<crate::task_state::TaskReference>,
+            }
+            #[derive(Serialize, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct LegacyMetaEnvelope {
+                request: ArtifactMeta,
+                previous: Option<ArtifactMeta>,
+            }
+            let reserialized = if let Ok(parsed) = serde_json::from_str::<JournalEnvelope>(text) {
+                ensure!(
+                    parsed.version == 1,
+                    "Неподдерживаемая версия журнала запросов"
+                );
+                for r in std::iter::once(&parsed.request).chain(parsed.previous.iter()) {
+                    valid_id(&r.artifact_id)?;
+                    ensure!(
+                        r.session_id == self.session_id,
+                        "Несовпадение сессии в журнале запросов"
+                    );
+                    ensure!(
+                        r.sha256.len() == 64
+                            && r.sha256
+                                .bytes()
+                                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                            && r.bytes <= ARTIFACT_MAX,
+                        "Некорректная ссылка в журнале запросов"
+                    );
+                }
+                let req_meta = self.verify_header_meta(&parsed.request.artifact_id)?;
+                ensure!(
+                    req_meta.origin.tool == "user_request"
+                        && !req_meta.truncated
+                        && req_meta.sha256 == parsed.request.sha256
+                        && req_meta.bytes == parsed.request.bytes,
+                    "Артефакт запроса не соответствует записи журнала"
+                );
+                serde_json::to_string(&parsed)?
+            } else if let Ok(parsed_meta) = serde_json::from_str::<LegacyMetaEnvelope>(text) {
+                let req_meta = self.verify_header_meta(&parsed_meta.request.id)?;
+                ensure!(
+                    req_meta == parsed_meta.request
+                        && req_meta.origin.tool == "user_request"
+                        && !req_meta.truncated
+                        && req_meta.session_id == self.session_id,
+                    "Артефакт запроса не соответствует записи журнала"
+                );
+                if let Some(ref prev) = parsed_meta.previous {
+                    let prev_meta = self.verify_header_meta(&prev.id)?;
+                    ensure!(
+                        prev_meta == *prev && prev_meta.session_id == self.session_id,
+                        "Предыдущая запись журнала не совпадает с артефактом"
+                    );
+                }
+                for m in std::iter::once(&parsed_meta.request).chain(parsed_meta.previous.iter()) {
+                    ensure!(
+                        redact_bounded(&m.origin.call_id, secrets)?.0 == m.origin.call_id,
+                        "Секрет в call_id журнала запросов"
+                    );
+                }
+                serde_json::to_string(&parsed_meta)?
+            } else {
+                return Err(anyhow!(
+                    "Повреждён формат журнала пользовательских запросов"
+                ));
+            };
+            ensure!(
+                reserialized.len() <= ARTIFACT_MAX,
+                "Журнал запросов превышает допустимый размер"
+            );
+            let len = reserialized.len();
+            (reserialized, len)
+        } else if is_host_request_tool {
+            let clean = crate::redaction::redact_text_idempotent(text, secrets)?;
+            let len = clean.len();
+            let mut end = len.min(ARTIFACT_MAX);
+            while !clean.is_char_boundary(end) {
+                end -= 1;
+            }
+            (clean[..end].to_owned(), len)
+        } else {
+            redact_bounded(text, secrets)?
+        };
         ensure!(
             !required || content.len() == original_len,
             "Обязательный артефакт превышает лимит размера"
@@ -612,6 +1081,12 @@ impl ArtifactStore {
             return Err(e);
         }
         self.check_bound()?;
+        if meta.truncated
+            && let Err(e) = self.record_truncated_gen(&id, secrets)
+        {
+            disk(self.dir.remove_file(&tmp))?;
+            return Err(e);
+        }
         // Linking publishes the complete blob atomically and cannot replace an existing ID.
         if let Err(e) = self.dir.hard_link(&tmp, &self.dir, &id) {
             disk(self.dir.remove_file(&tmp))?;
@@ -637,7 +1112,256 @@ impl ArtifactStore {
         Ok(meta)
     }
 
+    fn record_truncated_gen(&self, id: &str, secrets: &[String]) -> Result<()> {
+        valid_id(id)?;
+        let mut norm = Vec::new();
+        crate::redaction::merge_secret_variants(&mut norm, secrets);
+        let gen_id = crate::app::compute_secret_gen(&norm);
+        let mut state = match self.parent.symlink_metadata(SIDE_FILE) {
+            Ok(before) => {
+                ensure!(
+                    before.is_file() && !before.file_type().is_symlink(),
+                    "Unsafe truncated metadata file"
+                );
+                if private_file(&before).is_err() || before.len() > SIDE_MAX {
+                    fresh_truncated_gen_state()
+                } else {
+                    let mut read_opts = OpenOptions::new();
+                    read_opts
+                        .read(true)
+                        .follow(FollowSymlinks::No)
+                        .nonblock(true);
+                    match self.parent.open_with(SIDE_FILE, &read_opts) {
+                        Ok(f) => {
+                            let m = disk(f.metadata())?;
+                            ensure!(
+                                m.is_file() && !m.file_type().is_symlink(),
+                                "Unsafe truncated metadata file"
+                            );
+                            if !same(&before, &m) || private_file(&m).is_err() || m.len() > SIDE_MAX
+                            {
+                                fresh_truncated_gen_state()
+                            } else {
+                                let mut buf = Vec::with_capacity(m.len() as usize);
+                                disk(f.take(SIDE_MAX + 1).read_to_end(&mut buf))?;
+                                if buf.len() as u64 > SIDE_MAX {
+                                    fresh_truncated_gen_state()
+                                } else {
+                                    match serde_json::from_slice::<TruncatedGenState>(&buf) {
+                                        Ok(parsed) if is_valid_truncated_gen_state(&parsed) => {
+                                            parsed
+                                        }
+                                        _ => fresh_truncated_gen_state(),
+                                    }
+                                }
+                            }
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                            ) =>
+                        {
+                            fresh_truncated_gen_state()
+                        }
+                        Err(e) => return disk(Err(e)),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fresh_truncated_gen_state(),
+            Err(e) => return disk(Err(e)),
+        };
+        state.entries.retain(|(existing_id, _)| existing_id != id);
+        while state.entries.len() >= SIDE_CAP {
+            state.entries.remove(0);
+        }
+        let tag = truncated_gen_tag(&state.salt_hex, gen_id);
+        state.entries.push((id.to_owned(), tag));
+        let payload = serde_json::to_vec(&state)
+            .map_err(|_| anyhow!("Failed to serialize truncated metadata"))?;
+        ensure!(
+            payload.len() as u64 <= SIDE_MAX,
+            "Truncated metadata exceeds size limit"
+        );
+        let tmp_name = format!("{SIDE_TMP_PREFIX}{}.tmp", Uuid::new_v4());
+        let mut write_opts = OpenOptions::new();
+        write_opts
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No)
+            .nonblock(true);
+        #[cfg(unix)]
+        write_opts.mode(0o600);
+        let mut tmp_file = disk(self.parent.open_with(&tmp_name, &write_opts))?;
+        let wrote = (|| -> Result<()> {
+            disk(tmp_file.write_all(&payload))?;
+            disk(tmp_file.sync_all())?;
+            Ok(())
+        })();
+        drop(tmp_file);
+        if let Err(e) = wrote {
+            let _ = self.parent.remove_file(&tmp_name);
+            return Err(e);
+        }
+        match self.parent.symlink_metadata(SIDE_FILE) {
+            Ok(current) => {
+                if !current.is_file() || current.file_type().is_symlink() {
+                    let _ = self.parent.remove_file(&tmp_name);
+                    return Err(anyhow!("Unsafe truncated metadata file"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let _ = self.parent.remove_file(&tmp_name);
+                return disk(Err(e));
+            }
+        }
+        if let Err(e) = self.parent.rename(&tmp_name, &self.parent, SIDE_FILE) {
+            let _ = self.parent.remove_file(&tmp_name);
+            return disk(Err(e));
+        }
+        #[cfg(unix)]
+        disk(disk(self.parent.open("."))?.sync_all())?;
+        Ok(())
+    }
+
+    pub(crate) fn can_read_truncated_artifact(&self, id: &str, secret_gen: [u8; 32]) -> bool {
+        if valid_id(id).is_err() {
+            return false;
+        }
+        let Ok(_lock) = self.lock() else {
+            return false;
+        };
+        let Ok(before) = self.parent.symlink_metadata(SIDE_FILE) else {
+            return false;
+        };
+        if private_file(&before).is_err() || before.len() > SIDE_MAX {
+            return false;
+        }
+        let mut opts = OpenOptions::new();
+        opts.read(true).follow(FollowSymlinks::No).nonblock(true);
+        let Ok(f) = self.parent.open_with(SIDE_FILE, &opts) else {
+            return false;
+        };
+        let Ok(m) = f.metadata() else {
+            return false;
+        };
+        if !same(&before, &m) || private_file(&m).is_err() || m.len() > SIDE_MAX {
+            return false;
+        }
+        let mut buf = Vec::with_capacity(m.len() as usize);
+        if f.take(SIDE_MAX + 1).read_to_end(&mut buf).is_err() || buf.len() as u64 > SIDE_MAX {
+            return false;
+        }
+        let Ok(state) = serde_json::from_slice::<TruncatedGenState>(&buf) else {
+            return false;
+        };
+        if !is_valid_truncated_gen_state(&state) {
+            return false;
+        }
+        let tag = truncated_gen_tag(&state.salt_hex, secret_gen);
+        state
+            .entries
+            .iter()
+            .rev()
+            .find(|(k, _)| k == id)
+            .map(|(_, v)| v.as_str())
+            == Some(tag.as_str())
+    }
+
+    pub(crate) fn verify_request_journal(
+        &self,
+        meta: &ArtifactMeta,
+        expected_request: &crate::task_state::TaskReference,
+        expected_previous: Option<&crate::task_state::TaskReference>,
+    ) -> Result<()> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct JournalEnvelope {
+            version: u32,
+            request: crate::task_state::TaskReference,
+            previous: Option<crate::task_state::TaskReference>,
+        }
+        ensure!(
+            !meta.truncated
+                && meta.origin.actor.is_none()
+                && meta.origin.tool == "user_request_journal",
+            "Некорректный артефакт журнала запросов"
+        );
+        let (loaded_meta, raw_text, _) = self.load(&meta.id)?;
+        ensure!(
+            !loaded_meta.truncated && loaded_meta.sha256 == meta.sha256,
+            "Несовпадение метаданных журнала запросов"
+        );
+        let parsed: JournalEnvelope = serde_json::from_str(&raw_text)
+            .map_err(|_| anyhow!("Повреждён сохранённый журнал запросов"))?;
+        ensure!(
+            parsed.version == 1
+                && &parsed.request == expected_request
+                && parsed.previous.as_ref() == expected_previous,
+            "Содержимое журнала запросов не совпадает с ожидаемыми ссылками"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn load_complete_host_source(
+        &self,
+        expected: &crate::task_state::TaskReference,
+    ) -> Result<String> {
+        ensure!(
+            expected.session_id == self.session_id,
+            "Артефакт запроса принадлежит другой сессии"
+        );
+        let (meta, raw_text, _) = self.load(&expected.artifact_id)?;
+        ensure!(
+            meta.origin.actor.is_none()
+                && meta.origin.tool == "user_request"
+                && !meta.truncated
+                && meta.bytes == expected.bytes
+                && meta.sha256 == expected.sha256,
+            "Артефакт запроса неполный или не соответствует ссылке"
+        );
+        Ok(raw_text)
+    }
+
     /// UTF-8-safe byte cursor, including single lines longer than a page.
+    pub(crate) fn load_redacted_preview<F>(
+        &self,
+        id: &str,
+        is_error: bool,
+        transform: F,
+    ) -> Result<String>
+    where
+        F: FnOnce(&ArtifactMeta, String) -> Result<String>,
+    {
+        self.load_redacted_preview_for(None, id, is_error, transform)
+    }
+
+    pub(crate) fn load_redacted_preview_for<F>(
+        &self,
+        actor: Option<&str>,
+        id: &str,
+        is_error: bool,
+        transform: F,
+    ) -> Result<String>
+    where
+        F: FnOnce(&ArtifactMeta, String) -> Result<String>,
+    {
+        let (mut meta, raw_text, _) = self.load(id)?;
+        ensure!(
+            actor.is_none() || actor == meta.origin.actor.as_deref(),
+            "Доступ к артефакту запрещён"
+        );
+        ensure!(
+            !meta.truncated,
+            "Артефакт усечён и не может служить полным источником"
+        );
+        let clean = transform(&meta, raw_text)?;
+        meta.bytes = clean.len();
+        meta.sha256 = hash(clean.as_bytes());
+        Ok(crate::operation_receipts::preview(&clean, &meta, is_error))
+    }
+
     pub fn read_bytes(
         &self,
         actor: Option<&str>,
@@ -645,15 +1369,29 @@ impl ArtifactStore {
         offset: usize,
         max_bytes: usize,
     ) -> Result<ArtifactBytePage> {
+        self.read_bytes_with(actor, id, offset, max_bytes, |_, text| Ok(text))
+    }
+
+    pub(crate) fn read_bytes_with<F>(
+        &self,
+        actor: Option<&str>,
+        id: &str,
+        offset: usize,
+        max_bytes: usize,
+        mut transform: F,
+    ) -> Result<ArtifactBytePage>
+    where
+        F: FnMut(&ArtifactMeta, String) -> Result<String>,
+    {
         ensure!(
             (1..=PAGE_MAX).contains(&max_bytes),
             "Размер страницы должен быть от 1 до 65536 байт"
         );
-        let (meta, text, _) = self.load(id)?;
+        let (mut meta, raw_text, _) = self.load(id)?;
         ensure!(
             actor.is_none()
                 || meta.origin.tool != "command_lifetime"
-                || serde_json::from_str::<serde_json::Value>(&text)
+                || serde_json::from_str::<serde_json::Value>(&raw_text)
                     .ok()
                     .is_none_or(|v| v["version"] != 2 || v.get("handoff").is_none()),
             "Epoch manifest requires typed poll_command; raw worker access denied"
@@ -662,6 +1400,9 @@ impl ArtifactStore {
             actor.is_none() || actor == meta.origin.actor.as_deref(),
             "Доступ к артефакту запрещён"
         );
+        let text = transform(&meta, raw_text)?;
+        meta.bytes = text.len();
+        meta.sha256 = hash(text.as_bytes());
         ensure!(
             offset <= text.len() && text.is_char_boundary(offset),
             "Некорректное смещение UTF-8"
@@ -690,6 +1431,21 @@ impl ArtifactStore {
         max_lines: usize,
         query: Option<&str>,
     ) -> Result<ArtifactPage> {
+        self.read_with(actor, id, start_line, max_lines, query, |_, text| Ok(text))
+    }
+
+    pub(crate) fn read_with<F>(
+        &self,
+        actor: Option<&str>,
+        id: &str,
+        start_line: usize,
+        max_lines: usize,
+        query: Option<&str>,
+        mut transform: F,
+    ) -> Result<ArtifactPage>
+    where
+        F: FnMut(&ArtifactMeta, String) -> Result<String>,
+    {
         valid_id(id)?;
         ensure!(
             start_line >= 1 && (1..=500).contains(&max_lines),
@@ -699,11 +1455,11 @@ impl ArtifactStore {
             query.is_none_or(|q| q.len() <= ARTIFACT_MAX),
             "Слишком длинный поисковый запрос"
         );
-        let (meta, text, _) = self.load(id)?;
+        let (mut meta, raw_text, _) = self.load(id)?;
         ensure!(
             actor.is_none()
                 || meta.origin.tool != "command_lifetime"
-                || serde_json::from_str::<serde_json::Value>(&text)
+                || serde_json::from_str::<serde_json::Value>(&raw_text)
                     .ok()
                     .is_none_or(|v| v["version"] != 2 || v.get("handoff").is_none()),
             "Epoch manifest requires typed poll_command; raw worker access denied"
@@ -712,6 +1468,9 @@ impl ArtifactStore {
             actor.is_none() || actor == meta.origin.actor.as_deref(),
             "Доступ к артефакту запрещён"
         );
+        let text = transform(&meta, raw_text)?;
+        meta.bytes = text.len();
+        meta.sha256 = hash(text.as_bytes());
         let mut content = String::new();
         let mut count = 0;
         let mut next_line = None;
@@ -1099,5 +1858,149 @@ mod tests {
                 .all(|n| n == ".lock" || n.to_str() == Some(&m.id))
         );
         assert_eq!(s.load(&m.id).unwrap().0.sha256, hash(p.content.as_bytes()));
+    }
+
+    #[test]
+    fn truncated_gens_recovery_fifo_eviction_and_staging_cleanup() {
+        let (t, s) = setup();
+        let secrets = vec!["secret-alpha-987654".to_owned()];
+        let mut norm = Vec::new();
+        crate::redaction::merge_secret_variants(&mut norm, &secrets);
+        let secret_gen = crate::app::compute_secret_gen(&norm);
+        let sidecar = t.path().join(SIDE_FILE);
+
+        let capture_truncated = |store: &ArtifactStore| -> ArtifactMeta {
+            let used = store.used().unwrap();
+            let guard = store.reserve_capacity(SESSION_MAX - used - 512).unwrap();
+            let meta = store
+                .capture(origin(None), &"a".repeat(2048), &secrets)
+                .unwrap();
+            assert!(meta.truncated);
+            drop(guard);
+            meta
+        };
+
+        // 1a. chmod 0644 fails closed on read, then recovers cleanly on next truncated capture.
+        let m1 = capture_truncated(&s);
+        assert!(s.can_read_truncated_artifact(&m1.id, secret_gen));
+        assert_eq!(
+            fs::symlink_metadata(&sidecar).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!s.can_read_truncated_artifact(&m1.id, secret_gen));
+        let m2 = capture_truncated(&s);
+        assert_eq!(
+            fs::symlink_metadata(&sidecar).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!s.can_read_truncated_artifact(&m1.id, secret_gen));
+        assert!(s.can_read_truncated_artifact(&m2.id, secret_gen));
+
+        // 1b. Corrupt bytes fail closed on read, then recover cleanly on next truncated capture.
+        fs::write(&sidecar, b"{corrupt-json").unwrap();
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!s.can_read_truncated_artifact(&m2.id, secret_gen));
+        let m3 = capture_truncated(&s);
+        assert_eq!(
+            fs::symlink_metadata(&sidecar).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(!s.can_read_truncated_artifact(&m2.id, secret_gen));
+        assert!(s.can_read_truncated_artifact(&m3.id, secret_gen));
+
+        // Symlink and directory at SIDE_FILE still return Err without unlinking or following.
+        let saved_sidecar = fs::read(&sidecar).unwrap();
+        fs::remove_file(&sidecar).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("target.json");
+        fs::write(&outside_file, b"untouched").unwrap();
+        symlink(&outside_file, &sidecar).unwrap();
+        {
+            let used = s.used().unwrap();
+            let guard = s.reserve_capacity(SESSION_MAX - used - 512).unwrap();
+            assert!(
+                s.capture(origin(None), &"a".repeat(2048), &secrets)
+                    .is_err()
+            );
+            drop(guard);
+        }
+        assert!(
+            fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&outside_file).unwrap(), b"untouched");
+        fs::remove_file(&sidecar).unwrap();
+        fs::create_dir(&sidecar).unwrap();
+        {
+            let used = s.used().unwrap();
+            let guard = s.reserve_capacity(SESSION_MAX - used - 512).unwrap();
+            assert!(
+                s.capture(origin(None), &"a".repeat(2048), &secrets)
+                    .is_err()
+            );
+            drop(guard);
+        }
+        fs::remove_dir(&sidecar).unwrap();
+        fs::write(&sidecar, saved_sidecar).unwrap();
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+
+        // 2. FIFO eviction: 0th oldest entry is evicted even when its UUID is lexicographically largest,
+        //    preserving lexicographically smallest UUID at index 1.
+        let oldest_high = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let second_low = "00000000-0000-4000-8000-000000000000";
+        let salt_hex = "a1".repeat(32);
+        let valid_tag = truncated_gen_tag(&salt_hex, secret_gen);
+        let mut entries = Vec::with_capacity(SIDE_CAP);
+        entries.push((oldest_high.to_owned(), valid_tag.clone()));
+        entries.push((second_low.to_owned(), valid_tag.clone()));
+        let third_id = format!("00000000-0000-4000-8000-{:012x}", 1usize);
+        entries.push((third_id.clone(), valid_tag.clone()));
+        for idx in 2..(SIDE_CAP - 1) {
+            entries.push((
+                format!("00000000-0000-4000-8000-{idx:012x}"),
+                valid_tag.clone(),
+            ));
+        }
+        assert_eq!(entries.len(), SIDE_CAP);
+        let seeded = TruncatedGenState {
+            version: SIDE_VERSION,
+            salt_hex,
+            entries,
+        };
+        fs::write(&sidecar, serde_json::to_vec(&seeded).unwrap()).unwrap();
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(s.can_read_truncated_artifact(oldest_high, secret_gen));
+        assert!(s.can_read_truncated_artifact(second_low, secret_gen));
+
+        let m_fifo = capture_truncated(&s);
+        assert!(!s.can_read_truncated_artifact(oldest_high, secret_gen));
+        assert!(s.can_read_truncated_artifact(second_low, secret_gen));
+        assert!(s.can_read_truncated_artifact(&m_fifo.id, secret_gen));
+
+        // Re-recording an existing ID removes its old slot first and appends at tail (true FIFO).
+        s.record_truncated_gen(second_low, &secrets).unwrap();
+        let m_fifo_next = capture_truncated(&s);
+        assert!(!s.can_read_truncated_artifact(&third_id, secret_gen));
+        assert!(s.can_read_truncated_artifact(second_low, secret_gen));
+        assert!(s.can_read_truncated_artifact(&m_fifo_next.id, secret_gen));
+
+        // 3. Abandoned .truncated_gens.<uuid>.tmp in parent dir removed on next capture via recover_staging.
+        let abandoned = t
+            .path()
+            .join(format!("{SIDE_TMP_PREFIX}{}.tmp", Uuid::new_v4()));
+        fs::write(&abandoned, b"abandoned-staging").unwrap();
+        fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600)).unwrap();
+        let sibling = t.path().join("session.json");
+        fs::write(&sibling, b"{}").unwrap();
+        assert!(abandoned.exists());
+
+        s.capture(origin(None), "trigger-parent-staging-cleanup", &[])
+            .unwrap();
+        assert!(!abandoned.exists());
+        assert!(sibling.exists());
+        assert!(sidecar.exists());
     }
 }

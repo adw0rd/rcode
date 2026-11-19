@@ -215,6 +215,7 @@ pub(crate) struct Skill {
     pub(crate) dir: PathBuf,
     pub(crate) file: PathBuf,
     pub(crate) description: String,
+    pub(crate) raw_description: String,
     pub(crate) bytes: u64,
     pub(crate) in_catalog: bool,
     pub(crate) disabled: bool,
@@ -230,6 +231,20 @@ pub(crate) struct SkillProblem {
     pub(crate) path: PathBuf,
     pub(crate) code: &'static str,
     pub(crate) message: String,
+    pub(crate) raw_invalid_name: Option<String>,
+}
+
+impl Skill {
+    pub(crate) fn description_redacted(&self, secrets: &[String]) -> String {
+        if secrets.is_empty() {
+            return self.description.clone();
+        }
+        crate::redaction::redact_text_idempotent(&self.raw_description, secrets)
+            .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
+            .chars()
+            .take(MAX_DESCRIPTION_CHARS)
+            .collect()
+    }
 }
 
 impl SkillProblem {
@@ -241,6 +256,34 @@ impl SkillProblem {
             self.code,
             self.path.display()
         )
+    }
+
+    pub(crate) fn message_redacted(&self, secrets: &[String]) -> String {
+        if secrets.is_empty() {
+            return self.message.clone();
+        }
+        let redact = |text: &str| -> String {
+            crate::redaction::redact_text_idempotent(text, secrets)
+                .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
+        };
+        if let Some(ref raw_name) = self.raw_invalid_name {
+            let clean_name = redact(raw_name);
+            let shown: String = clean_name.chars().take(80).collect();
+            format!("Недопустимое имя скилла {shown:?}")
+        } else {
+            redact(&self.message)
+        }
+    }
+
+    pub(crate) fn warning_redacted(&self, secrets: &[String]) -> String {
+        if secrets.is_empty() {
+            return self.warning();
+        }
+        let msg = self.message_redacted(secrets);
+        let clean_path =
+            crate::redaction::redact_text_idempotent(&self.path.display().to_string(), secrets)
+                .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into());
+        format!("Скиллы: {msg} ({}). Путь: {clean_path}", self.code)
     }
 }
 
@@ -377,21 +420,61 @@ impl SkillCatalog {
     /// guidance and a skill count fit `limits`. Degradation is deterministic:
     /// entries lose descriptions from the end of the order, then ids from the
     /// end are replaced by a count.
+    #[cfg(test)]
     pub(crate) fn render(
         &self,
         limits: &CatalogLimits,
         unit: CatalogUnit,
     ) -> Option<RenderedCatalog> {
-        let listed: Vec<(&str, String)> = self
+        self.render_redacted(limits, unit, &[])
+    }
+
+    pub(crate) fn render_redacted(
+        &self,
+        limits: &CatalogLimits,
+        unit: CatalogUnit,
+        secrets: &[String],
+    ) -> Option<RenderedCatalog> {
+        let dict =
+            match (!secrets.is_empty()).then(|| crate::redaction::SecretDictionary::new(secrets)) {
+                None => None,
+                Some(Ok(d)) => Some(d),
+                Some(Err(_)) => return None,
+            };
+        let effective_desc_limit = limits.description_chars.min(MAX_DESCRIPTION_CHARS);
+        let owned_listed: Vec<(String, String)> = self
             .skills
             .iter()
             .filter(|skill| skill.in_catalog)
-            .map(|skill| {
-                (
-                    skill.id.as_str(),
-                    clip_description(&skill.description, limits.description_chars),
-                )
+            .filter_map(|skill| {
+                let source_desc = if skill.raw_description.is_empty() {
+                    skill.description.as_str()
+                } else {
+                    skill.raw_description.as_str()
+                };
+                if let Some(ref d) = dict {
+                    let clean_id =
+                        crate::redaction::redact_text_idempotent_with(d, &skill.id).ok()?;
+                    if clean_id != skill.id {
+                        return None;
+                    }
+                    let clean_desc =
+                        crate::redaction::redact_text_idempotent_with(d, source_desc).ok()?;
+                    Some((
+                        clean_id,
+                        clip_description(&clean_desc, effective_desc_limit),
+                    ))
+                } else {
+                    Some((
+                        skill.id.clone(),
+                        clip_description(&skill.description, effective_desc_limit),
+                    ))
+                }
             })
+            .collect();
+        let listed: Vec<(&str, String)> = owned_listed
+            .iter()
+            .map(|(id, desc)| (id.as_str(), desc.clone()))
             .collect();
         if listed.is_empty() {
             return None;
@@ -448,12 +531,30 @@ impl SkillCatalog {
     /// One entry per skill of the snapshot, in its order, for `rendered` (the
     /// result of `render(limits, unit)`). Sizes come from the same text and
     /// cost functions as the block, so `/skills` shows what the budget pays.
+    #[cfg(test)]
     pub(crate) fn entries(
         &self,
         limits: &CatalogLimits,
         unit: CatalogUnit,
         rendered: Option<&RenderedCatalog>,
     ) -> Vec<CatalogEntry> {
+        self.entries_redacted(limits, unit, rendered, &[])
+    }
+
+    pub(crate) fn entries_redacted(
+        &self,
+        limits: &CatalogLimits,
+        unit: CatalogUnit,
+        rendered: Option<&RenderedCatalog>,
+        secrets: &[String],
+    ) -> Vec<CatalogEntry> {
+        let dict =
+            match (!secrets.is_empty()).then(|| crate::redaction::SecretDictionary::new(secrets)) {
+                None => None,
+                Some(Ok(d)) => Some(d),
+                Some(Err(_)) => return vec![CatalogEntry::Absent; self.skills.len()],
+            };
+        let effective_desc_limit = limits.description_chars.min(MAX_DESCRIPTION_CHARS);
         let mut position = 0;
         self.skills
             .iter()
@@ -461,13 +562,33 @@ impl SkillCatalog {
                 let Some(rendered) = rendered.filter(|_| skill.in_catalog) else {
                     return CatalogEntry::Absent;
                 };
+                let source_desc = if skill.raw_description.is_empty() {
+                    skill.description.as_str()
+                } else {
+                    skill.raw_description.as_str()
+                };
+                let (clean_id, clean_desc) = if let Some(ref d) = dict {
+                    let Ok(cid) = crate::redaction::redact_text_idempotent_with(d, &skill.id)
+                    else {
+                        return CatalogEntry::Absent;
+                    };
+                    if cid != skill.id {
+                        return CatalogEntry::Absent;
+                    }
+                    let Ok(cdesc) = crate::redaction::redact_text_idempotent_with(d, source_desc)
+                    else {
+                        return CatalogEntry::Absent;
+                    };
+                    (cid, cdesc)
+                } else {
+                    (skill.id.clone(), skill.description.clone())
+                };
                 position += 1;
                 if position <= rendered.entries {
-                    let description =
-                        clip_description(&skill.description, limits.description_chars);
-                    CatalogEntry::Described(unit.cost(&catalog_pair(&skill.id, &description)))
+                    let description = clip_description(&clean_desc, effective_desc_limit);
+                    CatalogEntry::Described(unit.cost(&catalog_pair(&clean_id, &description)))
                 } else if position <= rendered.entries + rendered.omitted_ids.len() {
-                    CatalogEntry::IdOnly(unit.cost(&skill.id))
+                    CatalogEntry::IdOnly(unit.cost(&clean_id))
                 } else {
                     CatalogEntry::Counted
                 }
@@ -588,10 +709,21 @@ struct Discovery {
 
 impl Discovery {
     fn problem(&mut self, path: PathBuf, code: &'static str, message: impl Into<String>) {
+        self.problem_with_raw_name(path, code, message, None);
+    }
+
+    fn problem_with_raw_name(
+        &mut self,
+        path: PathBuf,
+        code: &'static str,
+        message: impl Into<String>,
+        raw_invalid_name: Option<String>,
+    ) {
         self.problems.push(SkillProblem {
             path,
             code,
             message: message.into(),
+            raw_invalid_name,
         });
     }
 
@@ -736,8 +868,10 @@ impl Discovery {
             }
             count += 1;
             self.total += 1;
-            if let Err((code, message)) = self.read(index, root, &dir, &relative, metadata) {
-                self.problem(file, code, message);
+            if let Err((code, message, raw_invalid_name)) =
+                self.read(index, root, &dir, &relative, metadata)
+            {
+                self.problem_with_raw_name(file, code, message, raw_invalid_name);
             }
         }
         true
@@ -750,7 +884,7 @@ impl Discovery {
         dir: &cap_std::fs::Dir,
         relative: &Path,
         metadata: cap_std::fs::Metadata,
-    ) -> Result<(), (&'static str, String)> {
+    ) -> Result<(), (&'static str, String, Option<String>)> {
         let root_path = root.base.join(&root.relative);
         let skill_dir = if relative.as_os_str().is_empty() {
             root_path.clone()
@@ -764,9 +898,10 @@ impl Discovery {
             return Err((
                 "secret_path",
                 "Путь скилла содержит секретный компонент".into(),
+                None,
             ));
         }
-        check_file(&metadata, root.allow_symlinks)?;
+        check_file(&metadata, root.allow_symlinks).map_err(|(c, m)| (c, m, None))?;
         let mut options = cap_std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -778,7 +913,7 @@ impl Discovery {
                 libc::O_NOFOLLOW | libc::O_NONBLOCK
             });
         }
-        let io = |error: std::io::Error| ("io", format!("Ошибка чтения: {error}"));
+        let io = |error: std::io::Error| ("io", format!("Ошибка чтения: {error}"), None);
         let (file, size) = if root.allow_symlinks {
             let absolute = root_path.join(relative).join(SKILL_FILE);
             let std_file = std::fs::File::open(&absolute).map_err(io)?;
@@ -789,7 +924,7 @@ impl Discovery {
                 .open_with(relative.join(SKILL_FILE), &options)
                 .map_err(io)?;
             let metadata = file.metadata().map_err(io)?;
-            check_file(&metadata, false)?;
+            check_file(&metadata, false).map_err(|(c, m)| (c, m, None))?;
             (file, metadata.len())
         };
         let mut head = Vec::new();
@@ -802,28 +937,40 @@ impl Discovery {
             Err(error) if truncated && error.error_len().is_none() => {
                 std::str::from_utf8(&head[..error.valid_up_to()]).unwrap_or_default()
             }
-            Err(_) => return Err(("not_utf8", "SKILL.md не в кодировке UTF-8".into())),
+            Err(_) => {
+                return Err(("not_utf8", "SKILL.md не в кодировке UTF-8".into(), None));
+            }
         };
         let parsed = match frontmatter::parse(text) {
             Ok(parsed) => parsed,
             Err(FrontmatterError::Unterminated) if truncated => {
                 let error = FrontmatterError::TooLarge;
-                return Err((error.code(), format!("Ошибка frontmatter: {error}")));
+                return Err((error.code(), format!("Ошибка frontmatter: {error}"), None));
             }
-            Err(error) => return Err((error.code(), format!("Ошибка frontmatter: {error}"))),
+            Err(error) => {
+                return Err((error.code(), format!("Ошибка frontmatter: {error}"), None));
+            }
         };
         let name = parsed.fields.get("name").map_or("", String::as_str);
         if name.is_empty() {
-            return Err(("missing_name", "Нет поля name".into()));
+            return Err(("missing_name", "Нет поля name".into(), None));
         }
         if !valid_name(name) {
             let shown: String = name.chars().take(80).collect();
-            return Err(("invalid_name", format!("Недопустимое имя скилла {shown:?}")));
+            let raw_bounded: String = name
+                .chars()
+                .take(80 + crate::redaction::MAX_SECRET_BYTES)
+                .collect();
+            return Err((
+                "invalid_name",
+                format!("Недопустимое имя скилла {shown:?}"),
+                Some(raw_bounded),
+            ));
         }
         let mut description =
             normalize(parsed.fields.get("description").map_or("", String::as_str));
         if description.is_empty() {
-            return Err(("missing_description", "Нет поля description".into()));
+            return Err(("missing_description", "Нет поля description".into(), None));
         }
         let mut notes = Vec::new();
         if skill_dir
@@ -832,6 +979,10 @@ impl Discovery {
         {
             notes.push("name_differs_from_dir");
         }
+        let raw_description: String = description
+            .chars()
+            .take(MAX_DESCRIPTION_CHARS + crate::redaction::MAX_SECRET_BYTES)
+            .collect();
         if description.chars().count() > MAX_DESCRIPTION_CHARS {
             description = description.chars().take(MAX_DESCRIPTION_CHARS).collect();
             notes.push("description_truncated");
@@ -857,6 +1008,7 @@ impl Discovery {
                 file: skill_dir.join(SKILL_FILE),
                 dir: skill_dir,
                 description,
+                raw_description,
                 bytes: size,
                 in_catalog: false,
                 disabled: false,
@@ -1762,6 +1914,7 @@ mod tests {
                     dir: PathBuf::from("/skills").join(id),
                     file: PathBuf::from("/skills").join(id).join("SKILL.md"),
                     description: description.clone(),
+                    raw_description: String::new(),
                     bytes: 100,
                     in_catalog: true,
                     disabled: false,
@@ -2066,6 +2219,7 @@ mod tests {
             path: PathBuf::from("/p/.rcode/skills/x/SKILL.md"),
             code: "duplicate_key",
             message: "Ошибка frontmatter: повтор ключа name в строке 3".into(),
+            raw_invalid_name: None,
         };
         let text = problem.warning();
         assert!(text.contains("duplicate_key"));

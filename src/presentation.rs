@@ -179,8 +179,19 @@ pub fn agent_heading(data: &Value) -> String {
         .chars()
         .take(8)
         .collect();
+    let route_suffix = match (
+        data["provider"].as_str(),
+        data["local_profile"].as_str(),
+        data["model"].as_str(),
+    ) {
+        (Some("local"), Some(prof), Some(mdl)) => {
+            format!(" · local:{}/{}", inline(prof, 24), inline(mdl, 40))
+        }
+        (Some(prov), _, Some(mdl)) => format!(" · {}/{}", inline(prov, 24), inline(mdl, 40)),
+        _ => String::new(),
+    };
     format!(
-        "{} [{}] · {} · {} · ↑{} ↓{}",
+        "{} [{}] · {}{route_suffix} · {} · ↑{} ↓{}",
         inline(data["name"].as_str().unwrap_or("Субагент"), 60),
         inline(&id, 8),
         role,

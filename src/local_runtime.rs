@@ -8,15 +8,72 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex, Weak},
+    sync::{
+        Arc, LazyLock, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 
 /// Short deadline for discovery and metadata probes.
 pub const PROBE_DEADLINE: Duration = Duration::from_millis(800);
 
 static SLOTS: LazyLock<Mutex<HashMap<u16, Weak<Semaphore>>>> = LazyLock::new(Default::default);
+static PORT_GATES: LazyLock<Mutex<HashMap<u16, Weak<PortGate>>>> = LazyLock::new(Default::default);
+
+/// Coordinates in-flight generations on a loopback port across both `local` and loopback `custom`
+/// clients regardless of client creation order:
+/// - `custom` with no active `local` client holds a shared read lock (allowing parallel `custom` calls);
+/// - any `local` client (and `custom` whenever a `local` client exists on that port) acquires an
+///   exclusive write lock, waiting for any already-in-flight `custom` read locks to finish first.
+pub struct PortGate {
+    pub lock: Arc<RwLock<()>>,
+    local_owners: AtomicUsize,
+}
+
+impl PortGate {
+    pub fn has_local(&self) -> bool {
+        self.local_owners.load(Ordering::Acquire) > 0
+    }
+}
+
+pub struct LocalPortLease {
+    gate: Arc<PortGate>,
+}
+
+impl Drop for LocalPortLease {
+    fn drop(&mut self) {
+        self.gate.local_owners.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub fn port_gate(base: &Url, is_local: bool) -> (Arc<PortGate>, Option<Arc<LocalPortLease>>) {
+    let port = base.port_or_known_default().unwrap_or_default();
+    let gate = {
+        let mut gates = PORT_GATES.lock().unwrap_or_else(|error| error.into_inner());
+        gates.retain(|_, g| g.strong_count() > 0);
+        if let Some(existing) = gates.get(&port).and_then(Weak::upgrade) {
+            existing
+        } else {
+            let created = Arc::new(PortGate {
+                lock: Arc::new(RwLock::new(())),
+                local_owners: AtomicUsize::new(0),
+            });
+            gates.insert(port, Arc::downgrade(&created));
+            created
+        }
+    };
+    let lease = if is_local {
+        gate.local_owners.fetch_add(1, Ordering::AcqRel);
+        Some(Arc::new(LocalPortLease {
+            gate: Arc::clone(&gate),
+        }))
+    } else {
+        None
+    };
+    (gate, lease)
+}
 
 /// One generation at a time per physical loopback server. Every loopback
 /// host alias and every path on a port share the slot, across profiles,

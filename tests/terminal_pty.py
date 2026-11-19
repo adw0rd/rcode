@@ -327,18 +327,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.rfile.read(int(self.headers["Content-Length"]))
             self.reply({"access_token": "pty-giga-token", "expires_at": int(time.time() + 3600) * 1000})
             return
+        if self.path == "/giga/v1/chat/completions":
+            assert self.headers.get("Authorization") == "Bearer pty-giga-token", self.headers
+            length = int(self.headers.get("Content-Length", "0"))
+            giga_body = json.loads(self.rfile.read(length))
+            assert giga_body.get("model") == "GigaChat-3-Ultra", giga_body
+            sys_text = giga_body["messages"][0]["content"]
+            assert '"provider":"gigachat"' in sys_text and '"model":"GigaChat-3-Ultra"' in sys_text, sys_text
+            self.reply({
+                "choices": [{"message": {"role": "assistant", "content": "PTY_GIGA_SUBAGENT_REVIEW_OK"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 31, "completion_tokens": 9},
+            })
+            return
         assert self.path == "/v1/chat/completions", self.path
         length = int(self.headers.get("Content-Length", "0"))
         assert 0 < length <= 512 * 1024, "Unexpected fixture request size"
         body = json.loads(self.rfile.read(length))
         with self.server.lock:
             self.server.requests.append(body)
+        if body.get("model") == "advisor-pty-model":
+            assert not body.get("tools"), f"advisor request must be toolless: {body}"
+            self.reply({
+                "choices": [{"message": {"role": "assistant", "content": "PTY_ADVISOR_GUIDANCE_OK"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 28, "completion_tokens": 8},
+            })
+            return
         prompt = next(message["content"] for message in reversed(body["messages"])
                       if message["role"] == "user")
         actual_user = next((index for index in reversed(range(len(body["messages"])))
                             if body["messages"][index]["role"] == "user"
                             and not body["messages"][index]["content"].startswith("[rcode runtime feedback")), None)
         loop_prompt = body["messages"][actual_user]["content"] if actual_user is not None else None
+        if loop_prompt == "ADVISOR_AND_ROUTE_PTY":
+            tool_names = [tool["function"]["name"] for tool in body.get("tools", [])]
+            assert "advisor" in tool_names, tool_names
+            turn = body["messages"][actual_user + 1:]
+            tool_msgs = [m for m in turn if m["role"] == "tool"]
+            if len(tool_msgs) == 0:
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_pty_adv", "type": "function", "function": {
+                               "name": "advisor",
+                               "arguments": json.dumps({"focus": "архитектура маршрутов"})}}]},
+                           "finish_reason": "tool_calls"}]})
+            elif len(tool_msgs) == 1:
+                adv_receipt = json.loads(tool_msgs[-1]["content"])
+                assert adv_receipt.get("advisory") is True, adv_receipt
+                assert "PTY_ADVISOR_GUIDANCE_OK" in adv_receipt.get("guidance", ""), adv_receipt
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_pty_route_spawn", "type": "function", "function": {
+                               "name": "spawn_agent",
+                               "arguments": json.dumps({
+                                   "task": "Проверь изменения через GigaChat",
+                                   "role": "reviewer",
+                                   "route": "гигачат",
+                               })}}]},
+                           "finish_reason": "tool_calls"}]})
+            elif len(tool_msgs) == 2:
+                spawn_receipt = json.loads(tool_msgs[-1]["content"])
+                assert spawn_receipt.get("agent_id"), spawn_receipt
+                self.reply({"choices": [{"message": {"role": "assistant", "content": None,
+                           "tool_calls": [{"id": "call_pty_route_wait", "type": "function", "function": {
+                               "name": "wait_agent",
+                               "arguments": json.dumps({"agent_id": spawn_receipt["agent_id"]})}}]},
+                           "finish_reason": "tool_calls"}]})
+            else:
+                wait_receipt = json.loads(tool_msgs[-1]["content"])
+                assert wait_receipt.get("status") == "completed", wait_receipt
+                assert wait_receipt.get("provider") == "gigachat", wait_receipt
+                assert wait_receipt.get("result") == "PTY_GIGA_SUBAGENT_REVIEW_OK", wait_receipt
+                self.reply({"choices": [{"message": {"role": "assistant", "content": "ADVISOR_AND_ROUTE_PTY_DONE"},
+                                         "finish_reason": "stop"}]})
+            return
         if "Почему выбран Rust для CLI?" in prompt:
             assert not body.get("tools"), f"/btw request must never advertise tools: {body}"
             self.reply({
@@ -1547,6 +1608,49 @@ def main(binary):
                 assert review_terminal.status == 0
             finally:
                 review_terminal.close()
+
+            # Exercise `/advisor` and cross-provider `spawn_agent(route)` one-time
+            # session approval (even in `full-access`) in an isolated PTY home.
+            adv_workspace, adv_home = root / "advisor-project", root / "advisor-config"
+            adv_workspace.mkdir(mode=0o700)
+            adv_home.mkdir(mode=0o700)
+            adv_config_path = adv_home / "config.json"
+            adv_config_path.write_text(json.dumps({
+                "version": 1, "active": "custom",
+                "providers": {
+                    "custom": {"kind": "custom", "model": "adv-primary", "base_url": endpoint, "stream": False},
+                    "openrouter": {"kind": "openrouter", "model": "advisor-pty-model", "base_url": endpoint, "stream": False},
+                    "gigachat": {
+                        "kind": "gigachat", "model": "GigaChat-3-Ultra",
+                        "base_url": f"http://127.0.0.1:{fixture.server_port}/giga/v1",
+                        "auth_url": f"http://127.0.0.1:{fixture.server_port}/giga/oauth",
+                        "stream": False,
+                    },
+                },
+            }))
+            adv_config_path.chmod(0o600)
+            adv_terminal = Terminal(binary, adv_workspace, adv_home, args=("--approval-mode", "full-access"))
+            try:
+                adv_terminal.until(adv_terminal.editor_ready, "isolated advisor PTY editor")
+                adv_terminal.command("/advisor status", "выключен")
+                adv_terminal.command("/advisor openrouter advisor-pty-model", "Советник (/advisor): openrouter / advisor-pty-model")
+                adv_terminal.command("/status", "advisor-pty-model")
+                turn_mark = adv_terminal.mark()
+                adv_terminal.send("ADVISOR_AND_ROUTE_PTY\r")
+                adv_terminal.until(
+                    lambda: any("Разрешить этот маршрут до конца текущей сессии" in row for row in adv_terminal.grid.rows()),
+                    "cross-provider route approval panel shown even in full-access",
+                    seconds=6,
+                )
+                adv_terminal.send("\r")
+                adv_terminal.editor_after("ADVISOR_AND_ROUTE_PTY_DONE", turn_mark, wait=8.0)
+                adv_terminal.command("/cost", "Маршрутизированные субагенты")
+                adv_terminal.command("/advisor off", "Советник (/advisor) выключен")
+                adv_terminal.send("\x04")
+                adv_terminal.until(lambda: adv_terminal.status is not None, "advisor PTY exits")
+                assert adv_terminal.status == 0
+            finally:
+                adv_terminal.close()
             # The legacy readline handler must not swallow SIGINT during API I/O.
             plain = Terminal(binary, workspace, home, args=("--plain",))
             try:

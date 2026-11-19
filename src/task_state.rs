@@ -226,8 +226,20 @@ impl TaskState {
         Ok(())
     }
 
+    pub fn goal_source(&self) -> Option<&TaskReference> {
+        self.goal_source.as_ref()
+    }
+
+    pub fn current_source(&self) -> Option<&TaskReference> {
+        self.current_source.as_ref()
+    }
+
     pub fn request_journal(&self) -> Option<&TaskReference> {
         self.request_journal.as_ref()
+    }
+
+    pub(crate) fn is_sliced_request_preview(text: &str) -> bool {
+        text.contains("\n[Выдержка. Полный запрос и ограничения: read_tool_output artifact_id=")
     }
 
     /// The runtime stores the full request before constructing this bounded
@@ -520,15 +532,38 @@ impl TaskState {
     }
 
     pub fn projection(&self) -> Result<String> {
+        self.projection_redacted(&[])
+    }
+
+    pub fn projection_redacted(&self, secrets: &[String]) -> Result<String> {
+        self.projection_redacted_with_artifacts(secrets, None)
+    }
+
+    pub fn projection_redacted_with_artifacts(
+        &self,
+        secrets: &[String],
+        artifacts: Option<&crate::artifacts::ArtifactStore>,
+    ) -> Result<String> {
         self.validate()?;
+        let compiled_dict =
+            (!secrets.is_empty()).then(|| crate::redaction::SecretDictionary::new(secrets));
+        let redact_field = |text: &str| -> String {
+            match &compiled_dict {
+                None => text.to_owned(),
+                Some(Ok(dict)) => crate::redaction::redact_text_idempotent_with(dict, text)
+                    .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into()),
+                Some(Err(_)) => "[rcode: текст скрыт из-за ошибки redaction]".into(),
+            }
+        };
         // Full state/hash/session metadata stays on disk. The model needs a
         // bounded reminder and opaque read IDs, not duplicate user messages.
         let preview = |text: &str| -> String {
-            if text.chars().count() <= 256 {
-                return text.to_owned();
+            let clean = redact_field(text);
+            if clean.chars().count() <= 256 {
+                return clean;
             }
-            let head: String = text.chars().take(192).collect();
-            let tail: String = text
+            let head: String = clean.chars().take(192).collect();
+            let tail: String = clean
                 .chars()
                 .rev()
                 .take(64)
@@ -538,16 +573,48 @@ impl TaskState {
                 .collect();
             format!("{head}\n[выдержка; полный запрос в source]\n{tail}")
         };
-        let same = self.current_request == self.goal;
+        let resolve_preview = |stored: &str, src_ref: Option<&TaskReference>| -> String {
+            if !Self::is_sliced_request_preview(stored) {
+                return preview(stored);
+            }
+            if src_ref.is_some_and(|r| {
+                r.artifact_id
+                    .starts_with("00000000-0000-4000-8000-00000000000")
+            }) {
+                return preview(stored);
+            }
+            if let (Some(r), Some(store)) = (src_ref, artifacts)
+                && let Ok(full) = store.load_complete_host_source(r)
+            {
+                return preview(&full);
+            }
+            if secrets.is_empty() {
+                return preview(stored);
+            }
+            "[выдержка опущена после обновления ключей; прочитайте полный запрос в source]".into()
+        };
+        let same = self.current_source == self.goal_source && self.current_request == self.goal;
+        let clean_steps: Vec<serde_json::Value> = self
+            .steps
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": redact_field(&item.id),
+                    "step": redact_field(&item.step),
+                    "status": item.status,
+                })
+            })
+            .collect();
+        let clean_explanation = self.explanation.as_deref().map(&redact_field);
         let mut value = serde_json::json!({
             "version":self.version,"revision":self.revision,
-            "goal_preview":preview(&self.goal),
-            "current_request_preview":if same {None}else{Some(preview(&self.current_request))},
+            "goal_preview":resolve_preview(&self.goal, self.goal_source.as_ref()),
+            "current_request_preview":if same {None}else{Some(resolve_preview(&self.current_request, self.current_source.as_ref()))},
             "current_is_goal":same,
             "goal_source":self.goal_source.as_ref().map(|r|r.artifact_id.as_str()),
             "current_source":self.current_source.as_ref().filter(|r|self.goal_source.as_ref()!=Some(*r)).map(|r|r.artifact_id.as_str()),
             "request_journal":self.request_journal.as_ref().map(|r|r.artifact_id.as_str()),
-            "steps":self.steps,"explanation":self.explanation,
+            "steps":clean_steps,"explanation":clean_explanation,
         });
         if let Some(operation) = &self.last_operation {
             value["operation_receipts"] = serde_json::json!({

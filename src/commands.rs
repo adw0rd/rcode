@@ -42,6 +42,7 @@ pub(crate) struct UserCommand {
     #[expect(dead_code, reason = "путь нужен в `rcode commands list` (T9)")]
     pub(crate) path: PathBuf,
     pub(crate) description: String,
+    pub(crate) description_from_body: bool,
     pub(crate) hint: Option<String>,
     pub(crate) template: String,
     pub(crate) unsupported: Vec<&'static str>,
@@ -116,14 +117,33 @@ impl CommandRegistry {
     }
 
     pub(crate) fn menu(&self) -> Vec<crate::terminal::MenuCommand> {
+        self.menu_redacted(&[])
+    }
+
+    pub(crate) fn menu_redacted(&self, secrets: &[String]) -> Vec<crate::terminal::MenuCommand> {
+        let dict = (!secrets.is_empty()).then(|| crate::redaction::SecretDictionary::new(secrets));
+        let redact_item = |text: &str| -> Option<String> {
+            match &dict {
+                None => Some(text.to_owned()),
+                Some(Ok(d)) => crate::redaction::redact_text_idempotent_with(d, text).ok(),
+                Some(Err(_)) => None,
+            }
+        };
         self.commands
             .iter()
             .filter(|command| command.shadowed_by.is_none())
-            .map(|command| crate::terminal::MenuCommand {
-                name: format!("/{}", command.name),
-                description: format!("{} · {}", command.description, command.scope.as_str()),
-                custom: true,
-                skill: None,
+            .filter_map(|command| {
+                let name = format!("/{}", command.name);
+                if redact_item(&name)? != name {
+                    return None;
+                }
+                let desc = command.description_redacted(secrets);
+                Some(crate::terminal::MenuCommand {
+                    name,
+                    description: format!("{desc} · {}", command.scope.as_str()),
+                    custom: true,
+                    skill: None,
+                })
             })
             .collect()
     }
@@ -134,6 +154,26 @@ impl CommandRegistry {
 }
 
 impl UserCommand {
+    pub(crate) fn description_redacted(&self, secrets: &[String]) -> String {
+        if secrets.is_empty() {
+            return self.description.clone();
+        }
+        let redact = |text: &str| -> String {
+            crate::redaction::redact_text_idempotent(text, secrets)
+                .unwrap_or_else(|_| "[rcode: текст скрыт из-за ошибки redaction]".into())
+        };
+        if self.description_from_body {
+            let line = self
+                .template
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            first_line(&redact(line))
+        } else {
+            redact(&self.description)
+        }
+    }
+
     /// Single-pass substitution: argument values are never re-expanded.
     pub(crate) fn expand(&self, arguments: &str) -> Result<String> {
         let positional: Vec<String> = crate::images::tokens(arguments)
@@ -490,6 +530,7 @@ impl Discovery {
         ignored_fields.extend(nested);
         ignored_fields.sort();
         ignored_fields.dedup();
+        let description_from_body = !fields.contains_key("description");
         let description = fields
             .get("description")
             .cloned()
@@ -509,6 +550,7 @@ impl Discovery {
                     scope,
                     path: absolute.clone(),
                     description,
+                    description_from_body,
                     hint,
                     template: body,
                     unsupported,
@@ -533,6 +575,7 @@ impl Discovery {
                             scope,
                             path: absolute.clone(),
                             description,
+                            description_from_body,
                             hint,
                             template: body,
                             unsupported,
@@ -563,6 +606,7 @@ impl Discovery {
                 scope,
                 path: absolute,
                 description,
+                description_from_body,
                 hint,
                 template: body,
                 unsupported,
@@ -672,6 +716,7 @@ mod tests {
             scope: CommandScope::User,
             path: PathBuf::new(),
             description: String::new(),
+            description_from_body: false,
             hint: None,
             template: "Задача $1 из $ARGUMENTS; дословно $$ и $10 и $HOME и ${X}".into(),
             unsupported: Vec::new(),
@@ -692,6 +737,7 @@ mod tests {
             scope: CommandScope::Project,
             path: PathBuf::new(),
             description: String::new(),
+            description_from_body: false,
             hint: None,
             template: "Проверь.".into(),
             unsupported: Vec::new(),
@@ -716,6 +762,7 @@ mod tests {
             scope: CommandScope::User,
             path: PathBuf::new(),
             description: String::new(),
+            description_from_body: false,
             hint: None,
             template: "$ARGUMENTS".into(),
             unsupported: Vec::new(),

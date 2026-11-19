@@ -5,13 +5,22 @@ use crate::{
     app::Events,
     cli::Cli,
     config::{ConfigStore, CredentialState, ProviderKind, ProviderSettings, Settings},
-    local::{endpoint_identity, validate_profile_name},
+    local::endpoint_identity,
     provider::ProviderClient,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 const NO_PROFILE: &str = "Профиль local не выбран. Добавьте его: rcode local add ИМЯ --base-url http://127.0.0.1:ПОРТ/v1 --activate, или rcode connect local";
+
+/// Resolves the active local profile with slot/kind validation, or returns an
+/// unsaved draft `Local` snapshot when no active profile is configured.
+pub(crate) fn active_local_or_draft(settings: &Settings) -> Result<ProviderSettings> {
+    if let Some(active) = settings.local.active.as_deref() {
+        return profile(settings, active);
+    }
+    Ok(ProviderSettings::new(ProviderKind::Local))
+}
 
 /// The provider chosen on the command line. `--profile` implies local and
 /// conflicts with any other `--provider`.
@@ -24,18 +33,17 @@ pub(crate) fn requested_provider(
             bail!("--profile выбирает локальный профиль и несовместим с --provider {kind}")
         }
         (Some(name), _) => profile(settings, name).map(Some),
-        (None, Some(kind)) => Ok(Some(settings.provider(kind))),
+        (None, Some(ProviderKind::Local)) => active_local_or_draft(settings).map(Some),
+        (None, Some(kind)) => Ok(Some(
+            crate::model_route::configured_cloud_provider(settings, kind)?
+                .unwrap_or_else(|| settings.provider(kind)),
+        )),
         (None, None) => Ok(None),
     }
 }
 
 pub(crate) fn profile(settings: &Settings, name: &str) -> Result<ProviderSettings> {
-    validate_profile_name(name)?;
-    settings
-        .local
-        .profiles
-        .get(name)
-        .cloned()
+    crate::model_route::configured_local_profile(settings, name)?
         .with_context(|| format!("Профиль local «{name}» не найден: rcode local list"))
 }
 
@@ -60,21 +68,36 @@ pub(crate) fn remember_keys(store: &ConfigStore, settings: &Settings, events: &m
     }
 }
 
-/// Creates a client for `provider` with the key the resolver binds to its
-/// endpoint. `missing` explains a missing cloud key in the caller's context.
+#[cfg(test)]
 pub(crate) fn client(
     store: &ConfigStore,
     provider: &ProviderSettings,
     events: &mut Events,
     missing: &str,
 ) -> Result<ProviderClient> {
+    let cred = store.credential_for(provider)?;
+    client_with_credential(provider, cred, events, missing)
+}
+
+pub(crate) fn client_with_credential(
+    provider: &ProviderSettings,
+    cred: CredentialState,
+    events: &mut Events,
+    missing: &str,
+) -> Result<ProviderClient> {
     let local = provider.kind == ProviderKind::Local;
-    match store.credential_for(provider)? {
+    match cred {
         CredentialState::Present(credential) => {
             events.remember(credential.value.clone());
-            ProviderClient::connect(provider.clone(), Some(credential.value))
+            let mut client = ProviderClient::connect(provider.clone(), Some(credential.value))?;
+            client.bind_secret_sink(events.shared_secrets());
+            Ok(client)
         }
-        CredentialState::NotRequired => ProviderClient::connect(provider.clone(), None),
+        CredentialState::NotRequired => {
+            let mut client = ProviderClient::connect(provider.clone(), None)?;
+            client.bind_secret_sink(events.shared_secrets());
+            Ok(client)
+        }
         CredentialState::Missing if local => {
             let name = profile_name(provider);
             bail!("Сервер профиля local «{name}» требует ключ: rcode local key {name} --stdin")
@@ -83,10 +106,9 @@ pub(crate) fn client(
     }
 }
 
-/// Before persisting a local selection: the snapshot must still describe the
-/// saved profile. A resumed session whose profile moved or was deleted must not
-/// rewrite it, otherwise a key entered for one address would follow another.
-pub(crate) fn check_commit(settings: &Settings, provider: &ProviderSettings) -> Result<()> {
+/// Verifies that the local profile still exists and points to the same loopback
+/// endpoint identity (ignoring temporary session `--ca-file` / model overrides).
+pub(crate) fn check_endpoint(settings: &Settings, provider: &ProviderSettings) -> Result<()> {
     if provider.kind != ProviderKind::Local {
         return Ok(());
     }
@@ -104,12 +126,51 @@ pub(crate) fn check_commit(settings: &Settings, provider: &ProviderSettings) -> 
     Ok(())
 }
 
-/// `check_commit` against the settings on disk, not the ones this process
-/// loaded earlier: `rcode local add --force` or `remove` in another process
-/// may have moved or deleted the profile since.
-pub(crate) fn check_current(store: &ConfigStore, provider: &ProviderSettings) -> Result<Settings> {
+/// Before persisting a local selection: the snapshot must still describe the
+/// saved profile (both endpoint and TLS/CA connection parameters). A resumed or
+/// mid-menu session whose profile moved, changed CA, or was deleted must not
+/// rewrite it, otherwise a key or model chosen for one connection would follow another.
+pub(crate) fn check_commit(settings: &Settings, provider: &ProviderSettings) -> Result<()> {
+    if provider.kind != ProviderKind::Local {
+        return Ok(());
+    }
+    check_endpoint(settings, provider)?;
+    let name = profile_name(provider);
+    if let Some(saved) = settings.local.profiles.get(name)
+        && !crate::model_route::RouteIdentity::same_connection(saved, provider)
+    {
+        bail!(
+            "Параметры подключения профиля local «{name}» изменились после начала сессии. Выберите профиль заново через /provider local"
+        );
+    }
+    Ok(())
+}
+
+/// Verifies both that `session_provider` still points to the saved loopback
+/// endpoint AND that `disk_baseline` (the profile snapshot on disk when the
+/// session/menu started, including any legacy relative `ca_file` overridden by
+/// `--ca-file`) has not drifted in another process.
+pub(crate) fn check_current_with_baseline(
+    store: &ConfigStore,
+    session_provider: &ProviderSettings,
+    disk_baseline: &ProviderSettings,
+) -> Result<Settings> {
     let settings = store.load()?;
-    check_commit(&settings, provider)?;
+    check_endpoint(&settings, session_provider)?;
+    if disk_baseline.kind == ProviderKind::Local {
+        let name = profile_name(disk_baseline);
+        let saved = crate::model_route::configured_local_profile(&settings, name)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Профиль local «{name}» больше не сохранён. Выберите профиль через /provider local"
+                )
+            })?;
+        if !crate::model_route::RouteIdentity::disk_unchanged(&saved, disk_baseline) {
+            bail!(
+                "Параметры подключения профиля local «{name}» изменились после начала сессии. Выберите профиль заново через /provider local"
+            );
+        }
+    }
     Ok(settings)
 }
 
@@ -140,14 +201,22 @@ pub(crate) fn doctor_fields(
         .local
         .clone()
         .unwrap_or_else(crate::local::draft_settings);
+    let clean_profile = crate::model_route::redact_route_display_field(store, &[], &local.profile);
+    let clean_endpoint = provider
+        .base_url
+        .as_deref()
+        .map(|u| crate::model_route::redact_route_display_field(store, &[], u));
+    let clean_error = error
+        .as_deref()
+        .map(|e| crate::model_route::redact_route_display_field(store, &[], e));
     (
         json!({
             "local": true,
-            "profile": local.profile,
+            "profile": clean_profile,
             "runtime": local.runtime,
-            "endpoint": provider.base_url,
+            "endpoint": clean_endpoint,
             "credential": credential,
-            "credential_error": error,
+            "credential_error": clean_error,
             "context_tokens": budget.context_tokens,
             "context_source": budget.source.as_str(),
             "input_budget_tokens": budget.limit,

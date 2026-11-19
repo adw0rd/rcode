@@ -13,8 +13,88 @@ use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 use std::fmt;
 
 const MAX_SECRETS: usize = 128;
-const MAX_SECRET_BYTES: usize = 8192;
+pub(crate) const MAX_SECRET_BYTES: usize = 8192;
 const MAX_PATTERN_BYTES: usize = 4 * 1024 * 1024;
+const OVERSIZED_SENTINEL_LEN: usize = MAX_SECRET_BYTES + 1;
+
+fn strip_auth_prefix(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    for prefix in ["Basic ", "Bearer ", "Api-Key "] {
+        if trimmed.len() > prefix.len()
+            && trimmed.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        {
+            let rest = trimmed[prefix.len()..].trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
+    }
+    None
+}
+
+fn push_one_secret_variants(secrets: &mut Vec<String>, raw: &str) {
+    if raw.is_empty() {
+        return;
+    }
+    if raw.len() > MAX_SECRET_BYTES {
+        let sentinel = "x".repeat(OVERSIZED_SENTINEL_LEN);
+        if !secrets.contains(&sentinel) {
+            secrets.push(sentinel);
+        }
+        return;
+    }
+    if secrets.iter().any(|existing| existing == raw) {
+        return;
+    }
+    let mut variant = raw.to_owned();
+    for _ in 0..3 {
+        if variant.len() > MAX_SECRET_BYTES {
+            let sentinel = "x".repeat(OVERSIZED_SENTINEL_LEN);
+            if !secrets.contains(&sentinel) {
+                secrets.push(sentinel);
+            }
+            break;
+        }
+        if !secrets.contains(&variant) {
+            secrets.push(variant.clone());
+        }
+        let encoded = serde_json::to_string(&variant).expect("string serialization");
+        variant = encoded[1..encoded.len() - 1].to_owned();
+    }
+}
+
+pub(crate) fn push_secret_variants(secrets: &mut Vec<String>, raw: &str) {
+    if raw.is_empty() {
+        return;
+    }
+    push_one_secret_variants(secrets, raw);
+    if let Some(stripped) = strip_auth_prefix(raw) {
+        push_one_secret_variants(secrets, stripped);
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+}
+
+pub(crate) fn merge_secret_variants(secrets: &mut Vec<String>, incoming: &[String]) {
+    let mut ordered: Vec<&str> = incoming
+        .iter()
+        .map(String::as_str)
+        .filter(|item| !item.is_empty())
+        .collect();
+    // Visit shorter strings first so a base secret `s0` expands into `[s0, s1, s2]`
+    // before its longer JSON-escaped variants are checked, keeping repeated merges
+    // of longest-first snapshots idempotent while bounding >8192-byte inputs to a
+    // fixed sentinel so `SecretDictionary::new` fails closed without large allocations.
+    ordered.sort_by_key(|item| item.len());
+    for raw in ordered {
+        push_one_secret_variants(secrets, raw);
+        if let Some(stripped) = strip_auth_prefix(raw) {
+            push_one_secret_variants(secrets, stripped);
+        }
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+}
 // Bound the simultaneous dictionary metadata allocations independently of
 // encoded input bytes. A dictionary may meet the input cap and still require
 // far too many trie records to compile safely for each output connection.
@@ -25,6 +105,7 @@ const PENDING_MASK: &[u8] = b"[REDACTED_PENDING]";
 // A Standard NFA state represents the longest trie-prefix suffix of the input.
 // State IDs are opaque, sparse offsets, not array indices. Every reachable
 // non-start state is visited while walking the dictionary's full prefixes.
+#[derive(Clone)]
 struct PrefixNode {
     id: StateID,
     depth: usize,
@@ -35,10 +116,12 @@ struct PrefixNode {
     terminal_suffix: Option<usize>,
 }
 
+#[derive(Clone)]
 struct PrefixTracker {
     nfa: NFA,
     // Sorted by opaque state ID; only actual trie states occupy this table.
     nodes: Vec<PrefixNode>,
+    root: usize,
     state: usize,
     #[cfg(test)]
     work: usize,
@@ -142,10 +225,23 @@ impl PrefixTracker {
         Ok(Self {
             nfa,
             nodes,
+            root,
             state: root,
             #[cfg(test)]
             work: 0,
         })
+    }
+
+    fn advance_stateless(&self, state: &mut usize, byte: u8) -> Option<usize> {
+        let id = self
+            .nfa
+            .next_state(Anchored::No, self.nodes[*state].id, byte);
+        let index = self
+            .nodes
+            .binary_search_by_key(&id, |node| node.id)
+            .expect("a reachable NFA state is a dictionary prefix");
+        *state = self.nodes[index].proper_suffix;
+        self.nodes[index].terminal_suffix
     }
 
     fn advance(&mut self, byte: u8) -> Option<usize> {
@@ -166,6 +262,21 @@ impl PrefixTracker {
 
     fn depth(&self) -> usize {
         self.nodes[self.state].depth
+    }
+
+    fn proper_suffix_depth(&self, bytes: impl IntoIterator<Item = u8>) -> usize {
+        let mut state = self.state;
+        for byte in bytes {
+            let id = self
+                .nfa
+                .next_state(Anchored::No, self.nodes[state].id, byte);
+            let index = self
+                .nodes
+                .binary_search_by_key(&id, |node| node.id)
+                .expect("a reachable NFA state is a dictionary prefix");
+            state = self.nodes[index].proper_suffix;
+        }
+        self.nodes[state].depth
     }
 
     fn clip(&mut self, available: usize) {
@@ -209,6 +320,8 @@ pub struct StreamingRedactor {
     prefixes: Option<PrefixTracker>,
     longest: usize,
     pending: VecDeque<u8>,
+    recent_emitted: VecDeque<u8>,
+    suppress_emitted: usize,
     matches: BinaryHeap<MatchEvent>,
     consumed: usize,
     end: usize,
@@ -253,6 +366,8 @@ fn percent_encoded(secret: &str, all: bool, lower: bool) -> String {
 pub struct SecretDictionary {
     secrets: Vec<String>,
     patterns: Vec<Vec<u8>>,
+    matcher: Option<AhoCorasick>,
+    prefixes: Option<std::sync::Arc<PrefixTracker>>,
 }
 impl SecretDictionary {
     pub fn new(secrets: &[String]) -> Result<Self> {
@@ -293,9 +408,22 @@ impl SecretDictionary {
         }
         let patterns: Vec<_> = patterns.into_iter().collect();
         PrefixTracker::check_budget(&patterns)?;
+        let (matcher, prefixes) = if patterns.is_empty() {
+            (None, None)
+        } else {
+            let leftmost = AhoCorasickBuilder::new()
+                .kind(Some(AhoCorasickKind::ContiguousNFA))
+                .match_kind(MatchKind::LeftmostLongest)
+                .build(&patterns)
+                .context("Не удалось построить redaction matcher")?;
+            let tracker = PrefixTracker::new(&patterns)?;
+            (Some(leftmost), Some(std::sync::Arc::new(tracker)))
+        };
         Ok(Self {
             secrets: secrets.to_vec(),
             patterns,
+            matcher,
+            prefixes,
         })
     }
 
@@ -356,20 +484,25 @@ impl StreamingRedactor {
         let (matcher, prefixes) = if patterns.is_empty() {
             (None, None)
         } else {
-            // Preflight the metadata budget before building either automaton.
-            let prefixes = PrefixTracker::new(patterns)?;
-            let matcher = AhoCorasickBuilder::new()
-                .kind(Some(AhoCorasickKind::ContiguousNFA))
-                .match_kind(MatchKind::LeftmostLongest)
-                .build(patterns)
-                .context("Не удалось построить redaction matcher")?;
-            (Some(matcher), Some(prefixes))
+            let mut tracker = dictionary
+                .prefixes
+                .as_deref()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Отсутствует таблица префиксов redaction"))?;
+            tracker.state = tracker.root;
+            #[cfg(test)]
+            {
+                tracker.work = 0;
+            }
+            (dictionary.matcher.clone(), Some(tracker))
         };
         Ok(Self {
             matcher,
             prefixes,
             longest,
             pending: VecDeque::new(),
+            recent_emitted: VecDeque::new(),
+            suppress_emitted: 0,
             matches: BinaryHeap::new(),
             consumed: 0,
             end: 0,
@@ -378,9 +511,25 @@ impl StreamingRedactor {
         })
     }
 
+    fn record_recent_emitted(&mut self, bytes: &[u8]) {
+        const MAX_RECENT_EMITTED: usize = MAX_SECRET_BYTES * 3;
+        if bytes.len() >= MAX_RECENT_EMITTED {
+            self.recent_emitted.clear();
+            self.recent_emitted
+                .extend(bytes[bytes.len() - MAX_RECENT_EMITTED..].iter().copied());
+            return;
+        }
+        let overflow = (self.recent_emitted.len() + bytes.len()).saturating_sub(MAX_RECENT_EMITTED);
+        if overflow > 0 {
+            self.recent_emitted.drain(..overflow);
+        }
+        self.recent_emitted.extend(bytes.iter().copied());
+    }
+
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
         ensure!(!self.closed, "Поток redaction уже закрыт");
         if self.matcher.is_none() {
+            self.record_recent_emitted(bytes);
             return Ok(bytes.to_vec());
         }
         self.end
@@ -401,15 +550,58 @@ impl StreamingRedactor {
         Ok(output)
     }
 
+    /// Rebuilds the streaming automaton with an expanded secret set while
+    /// replaying both un-emitted `pending` bytes and any live dictionary prefix
+    /// suffix from `recent_emitted` so a secret whose prefix escaped before
+    /// registration cannot finish in subsequent chunks.
+    pub fn rekey(&mut self, secrets: &[String]) -> Result<Vec<u8>> {
+        ensure!(!self.closed, "Поток redaction уже закрыт");
+        let unemitted: Vec<u8> = self
+            .pending
+            .iter()
+            .skip(self.suppress_emitted)
+            .copied()
+            .collect();
+        let mut fresh = Self::new(secrets)?;
+        let overlap_len = fresh.prefixes.as_ref().map_or(0, |prefixes| {
+            prefixes.proper_suffix_depth(self.recent_emitted.iter().copied())
+        });
+        fresh.recent_emitted = self.recent_emitted.clone();
+        let released = if overlap_len > 0 {
+            let skip = self.recent_emitted.len() - overlap_len;
+            let mut replay: Vec<u8> = self.recent_emitted.iter().skip(skip).copied().collect();
+            fresh.suppress_emitted = overlap_len;
+            replay.extend_from_slice(&unemitted);
+            fresh.push(&replay)?
+        } else if !unemitted.is_empty() {
+            fresh.push(&unemitted)?
+        } else {
+            Vec::new()
+        };
+        *self = fresh;
+        Ok(released)
+    }
+
     fn discard_to(&mut self, end: usize) {
         let count = end - self.consumed;
         self.pending.drain(..count);
+        self.suppress_emitted = self.suppress_emitted.saturating_sub(count);
         self.consumed = end;
     }
 
     fn emit_to(&mut self, end: usize, output: &mut Vec<u8>) {
         let count = end - self.consumed;
-        output.extend(self.pending.drain(..count));
+        let start_len = output.len();
+        for byte in self.pending.drain(..count) {
+            if self.suppress_emitted > 0 {
+                self.suppress_emitted -= 1;
+            } else {
+                output.push(byte);
+            }
+        }
+        if output.len() > start_len {
+            self.record_recent_emitted(&output[start_len..]);
+        }
         self.consumed = end;
     }
 
@@ -447,6 +639,7 @@ impl StreamingRedactor {
             self.matches.pop();
             self.emit_to(start, output);
             output.extend_from_slice(MASK);
+            self.recent_emitted.clear();
             self.discard_to(end);
             self.prefixes.as_mut().unwrap().clip(self.pending.len());
         }
@@ -462,14 +655,27 @@ impl StreamingRedactor {
         // LeftmostLongest matcher as the authority for the remaining tail.
         let pending = self.pending.make_contiguous();
         let mut consumed = 0;
+        let mut suppress = self.suppress_emitted;
+        let emit_slice = |slice: &[u8], suppress: &mut usize, out: &mut Vec<u8>| {
+            let skip = (*suppress).min(slice.len());
+            *suppress -= skip;
+            out.extend_from_slice(&slice[skip..]);
+        };
         if let Some(matcher) = &self.matcher {
             for matched in matcher.find_iter(&pending[..]) {
-                output.extend_from_slice(&pending[consumed..matched.start()]);
+                emit_slice(
+                    &pending[consumed..matched.start()],
+                    &mut suppress,
+                    &mut output,
+                );
                 output.extend_from_slice(MASK);
+                suppress = suppress.saturating_sub(matched.end() - matched.start());
                 consumed = matched.end();
             }
         }
-        output.extend_from_slice(&pending[consumed..]);
+        emit_slice(&pending[consumed..], &mut suppress, &mut output);
+        self.suppress_emitted = 0;
+        self.recent_emitted.clear();
         self.pending.clear();
         self.matches.clear();
         self.consumed = self.end;
@@ -486,7 +692,11 @@ impl StreamingRedactor {
         self.closed = true;
         self.incomplete = true;
         self.matches.clear();
-        if self.pending.is_empty() {
+        self.recent_emitted.clear();
+        let unemitted_len = self.pending.len().saturating_sub(self.suppress_emitted);
+        self.suppress_emitted = 0;
+        if unemitted_len == 0 {
+            self.pending.clear();
             return Vec::new();
         }
         self.pending.clear();
@@ -511,10 +721,163 @@ impl StreamingRedactor {
 
 /// Complete text at confirmed EOF. Streaming producers use their own instance.
 pub fn redact_text(text: &str, secrets: &[String]) -> Result<String> {
-    let mut redactor = StreamingRedactor::new(secrets)?;
-    let mut bytes = redactor.push(text.as_bytes())?;
-    bytes.extend(redactor.finish()?);
-    String::from_utf8(bytes).context("Некорректный UTF-8 после redaction")
+    if secrets.is_empty() {
+        return Ok(text.to_owned());
+    }
+    let dictionary = SecretDictionary::new(secrets)?;
+    redact_text_with(&dictionary, text)
+}
+
+/// Complete idempotent text redaction preserving existing `[REDACTED]` markers.
+pub fn redact_text_idempotent(text: &str, secrets: &[String]) -> Result<String> {
+    if secrets.is_empty() {
+        return Ok(text.to_owned());
+    }
+    let dictionary = SecretDictionary::new(secrets)?;
+    redact_text_idempotent_with(&dictionary, text)
+}
+
+/// Complete text redaction reusing a precompiled `SecretDictionary` across many
+/// chunks/messages without rebuilding any automaton per call.
+pub fn redact_text_with(dictionary: &SecretDictionary, text: &str) -> Result<String> {
+    let Some(matcher) = &dictionary.matcher else {
+        return Ok(text.to_owned());
+    };
+    let input = text.as_bytes();
+    let mut output = Vec::with_capacity(input.len());
+    let mut consumed = 0;
+    for matched in matcher.find_iter(input) {
+        output.extend_from_slice(&input[consumed..matched.start()]);
+        output.extend_from_slice(MASK);
+        consumed = matched.end();
+    }
+    output.extend_from_slice(&input[consumed..]);
+    String::from_utf8(output).context("Некорректный UTF-8 после redaction")
+}
+
+/// Idempotent text redaction for persisted session records: existing standalone
+/// `[REDACTED]` markers are not expanded again when a short secret (such as `"E"`)
+/// matches characters inside `MASK`, while any secret crossing a marker boundary
+/// (including overlapping effective secrets) is coalesced and masked in full.
+/// Uses `O(N)` single-pass prefix tracking (independent of overlapping match count)
+/// and fails closed to a fixed sentinel if boundary cascades do not converge within 8 passes.
+pub fn redact_text_idempotent_with(dictionary: &SecretDictionary, text: &str) -> Result<String> {
+    Ok(redact_text_idempotent_tracking_offset(dictionary, text, 0, false)?.0)
+}
+
+/// Idempotent text redaction that also maps a byte boundary `tracked_byte` into
+/// the redacted output string. When a redacted match crosses `tracked_byte`
+/// (`start < tracked_byte <= end`), `include_crossing_at_end = true` maps it to
+/// the end of `[REDACTED]` (for head slices) and `false` maps it to the start
+/// of `[REDACTED]` (for tail slices).
+pub fn redact_text_idempotent_tracking_offset(
+    dictionary: &SecretDictionary,
+    text: &str,
+    mut tracked_byte: usize,
+    include_crossing_at_end: bool,
+) -> Result<(String, usize)> {
+    const IDEMPOTENT_FALLBACK: &str = "[rcode: текст скрыт из-за ошибки redaction]";
+    tracked_byte = tracked_byte.min(text.len());
+    if text.is_empty() || text == IDEMPOTENT_FALLBACK {
+        let out_off = if text == IDEMPOTENT_FALLBACK {
+            if include_crossing_at_end {
+                text.len()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        return Ok((text.to_owned(), out_off));
+    }
+    let Some(prefixes) = &dictionary.prefixes else {
+        return Ok((text.to_owned(), tracked_byte));
+    };
+    let mut current = text.to_owned();
+    for _ in 0..8 {
+        let input = current.as_bytes();
+        let mut mask_spans = Vec::new();
+        let mut pos = 0;
+        while pos + MASK.len() <= input.len() {
+            if &input[pos..pos + MASK.len()] == MASK {
+                mask_spans.push((pos, pos + MASK.len()));
+                pos += MASK.len();
+            } else {
+                pos += 1;
+            }
+        }
+        let mut state = prefixes.root;
+        let mut m_idx = 0usize;
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (idx, &byte) in input.iter().enumerate() {
+            let end = idx + 1;
+            let Some(term) = prefixes.advance_stateless(&mut state, byte) else {
+                continue;
+            };
+            let mut start = end - prefixes.nodes[term].depth;
+            while m_idx < mask_spans.len() && mask_spans[m_idx].1 < end {
+                m_idx += 1;
+            }
+            if m_idx < mask_spans.len()
+                && mask_spans[m_idx].0 <= start
+                && end <= mask_spans[m_idx].1
+            {
+                continue;
+            }
+            while let Some(&(prev_s, prev_e)) = merged.last() {
+                if start <= prev_s {
+                    merged.pop();
+                } else if start < prev_e {
+                    let s = prev_s;
+                    merged.pop();
+                    start = s;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            merged.push((start, end));
+        }
+        let in_len = input.len();
+        if merged.is_empty() {
+            return Ok((current, tracked_byte.min(in_len)));
+        }
+        let mut output = Vec::with_capacity(input.len());
+        let mut consumed = 0usize;
+        let mut next_tracked: Option<usize> = None;
+        for (start, end) in merged {
+            if next_tracked.is_none() && tracked_byte <= start {
+                next_tracked = Some(output.len() + tracked_byte.saturating_sub(consumed));
+            }
+            output.extend_from_slice(&input[consumed..start]);
+            if next_tracked.is_none() && tracked_byte <= end {
+                next_tracked = Some(if tracked_byte == end || include_crossing_at_end {
+                    output.len() + MASK.len()
+                } else {
+                    output.len()
+                });
+            }
+            output.extend_from_slice(MASK);
+            consumed = end;
+        }
+        if next_tracked.is_none() {
+            next_tracked =
+                Some(output.len() + tracked_byte.min(input.len()).saturating_sub(consumed));
+        }
+        output.extend_from_slice(&input[consumed..]);
+        let next = String::from_utf8(output).context("Некорректный UTF-8 после redaction")?;
+        tracked_byte = next_tracked.unwrap_or(0).min(next.len());
+        if next == current {
+            return Ok((next, tracked_byte));
+        }
+        current = next;
+    }
+    let fallback_off = if include_crossing_at_end {
+        IDEMPOTENT_FALLBACK.len()
+    } else {
+        0
+    };
+    Ok((IDEMPOTENT_FALLBACK.to_owned(), fallback_off))
 }
 
 #[cfg(test)]
@@ -778,5 +1141,94 @@ mod tests {
             .collect();
         assert!(first.extended(&oversized).is_err());
         assert!(first.contains(b"old/key\"x"));
+    }
+
+    #[test]
+    fn merge_secret_variants_is_idempotent_and_preserves_oversized_for_fail_closed() {
+        let mut store = Vec::new();
+        push_secret_variants(&mut store, r#"sk-secret-"quoted"\slash"#);
+        assert_eq!(store.len(), 3);
+        let baseline = store.clone();
+
+        // Merging a longest-first snapshot into a fresh Vec or existing Vec must stay O(1) idempotent.
+        let mut fresh = Vec::new();
+        merge_secret_variants(&mut fresh, &baseline);
+        assert_eq!(fresh, baseline);
+        for _ in 0..20 {
+            merge_secret_variants(&mut fresh, &baseline);
+        }
+        assert_eq!(fresh, baseline);
+
+        // Oversized (>8192-byte) secrets must be bounded to a fixed fail-closed sentinel
+        // (never silently dropped and never cloning multi-megabyte strings).
+        let long_secret = "z".repeat(MAX_SECRET_BYTES + 4096);
+        let mut oversized_store = Vec::new();
+        push_secret_variants(&mut oversized_store, &long_secret);
+        assert_eq!(oversized_store.len(), 1);
+        assert_eq!(oversized_store[0].len(), OVERSIZED_SENTINEL_LEN);
+        assert!(redact_text(&format!("leak: {long_secret}"), &oversized_store).is_err());
+        assert!(StreamingRedactor::new(&oversized_store).is_err());
+
+        // Auth-scheme-prefixed credentials (`Basic `, `Bearer `, `Api-Key `) must register
+        // both the full header value and the bare secret used on the wire.
+        let mut prefixed = Vec::new();
+        push_secret_variants(&mut prefixed, "Basic giga-base64-raw-key");
+        push_secret_variants(&mut prefixed, "Api-Key yandex-raw-key");
+        assert_eq!(
+            redact_text("a=giga-base64-raw-key b=yandex-raw-key", &prefixed).unwrap(),
+            "a=[REDACTED] b=[REDACTED]"
+        );
+
+        // Mid-stream `rekey` when the beginning of a newly minted token already left the stream
+        // must prevent the token from completing while preserving non-matching text losslessly.
+        let mut stream = StreamingRedactor::new(&[]).unwrap();
+        let mut out1 = stream.push(b"prefix SEC").unwrap();
+        out1.extend(stream.rekey(&["SECRET123".into()]).unwrap());
+        out1.extend(stream.push(b"RET123!").unwrap());
+        out1.extend(stream.finish().unwrap());
+        let text1 = String::from_utf8(out1).unwrap();
+        assert!(!text1.contains("SECRET123"), "{text1}");
+        assert_eq!(text1, "prefix SEC[REDACTED]!");
+
+        let mut stream2 = StreamingRedactor::new(&[]).unwrap();
+        let mut out2 = stream2.push(b"read SEC").unwrap();
+        out2.extend(stream2.rekey(&["SECRET123".into()]).unwrap());
+        out2.extend(stream2.push(b"TION ok").unwrap());
+        out2.extend(stream2.finish().unwrap());
+        assert_eq!(String::from_utf8(out2).unwrap(), "read SECTION ok");
+
+        // Overlapping match starting inside `[REDACTED]` and ending outside must never
+        // be hidden by an earlier internal match inside `[REDACTED]`.
+        let overlap_dict = SecretDictionary::new(&["REDACT".into(), "CTED]XYZ".into()]).unwrap();
+        let after_right = redact_text_idempotent_with(&overlap_dict, "[REDACTED]XYZ").unwrap();
+        assert!(!after_right.contains("CTED]XYZ"), "{after_right}");
+        assert!(!after_right.contains("XYZ"), "{after_right}");
+        assert_eq!(
+            redact_text_idempotent_with(&overlap_dict, &after_right).unwrap(),
+            after_right
+        );
+
+        let overlap_left_dict =
+            SecretDictionary::new(&["REDACT".into(), "XYZ[RED".into()]).unwrap();
+        let after_left = redact_text_idempotent_with(&overlap_left_dict, "XYZ[REDACTED]").unwrap();
+        assert!(!after_left.contains("XYZ[RED"), "{after_left}");
+        assert!(!after_left.contains("XYZ"), "{after_left}");
+        assert_eq!(
+            redact_text_idempotent_with(&overlap_left_dict, &after_left).unwrap(),
+            after_left
+        );
+
+        // Two overlapping effective ranges (`CTED]ABC` and `BCDEF`) must coalesce so
+        // the tail of the second secret (`DEF`) is never left exposed after masking the first.
+        let double_overlap_dict =
+            SecretDictionary::new(&["REDACT".into(), "CTED]ABC".into(), "BCDEF".into()]).unwrap();
+        let after_double =
+            redact_text_idempotent_with(&double_overlap_dict, "[REDACTED]ABCDEF").unwrap();
+        assert!(!after_double.contains("DEF"), "{after_double}");
+        assert!(!after_double.contains("ABC"), "{after_double}");
+        assert_eq!(
+            redact_text_idempotent_with(&double_overlap_dict, &after_double).unwrap(),
+            after_double
+        );
     }
 }
