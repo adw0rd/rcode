@@ -25,6 +25,7 @@ struct Args {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn execute(
     store: &ArtifactStore,
     value: &Value,
